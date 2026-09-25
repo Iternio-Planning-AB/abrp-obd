@@ -1,0 +1,8 @@
+{
+  "version": 7,
+  "size": 1771968,
+  "sha256": "d1e4d14eb2f61def7327cda1bd4cf980d9f71c12da96f522055c4454f6770a96",
+  "signature": "a5105e8bb0dd8d7cf7ede0148c1827527c28e367ee6c36edbe0f7ba1250e4f338201977e2db0419950bac053bf16c08d487810a0ad147f609d0c719eb8a82a66",
+  "sig_alg": "ecdsa-p256-sha256",
+  "firmware": "firmware.bin"
+}

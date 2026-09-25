@@ -1,0 +1,252 @@
+#pragma once
+/*
+  GPS/GNSS helpers - position + GNSS time handling.
+  Contains: the GNSS->RTC clock seed (setClockFromGps), the parked-location freeze that
+  captures the last good driving fix (freezeParkedLocation), and addGpsData() which attaches
+  position/heading to a telemetry frame (frozen fix when parked, live fix when driving).
+
+  Extracted verbatim from logger.ino (definitions moved, logic unchanged). This file is
+  #included by logger.ino into the single sketch translation unit - it is NOT a standalone
+  compilation unit - so it shares logger.ino's globals and the config.h feature flags.
+*/
+
+/*
+  Set the RTC from the GNSS date/time fields (the u-blox reports these in UTC). Returns true when a
+  fix with a valid date was applied. This is the primary time source: outdoors the GNSS fix provides
+  UTC directly, so no NTP round-trip is needed.
+*/
+bool setClockFromGps() {
+  if (!gd || gd->date == 0) return false; // date stays 0 until the GNSS locks - no fix yet
+  int year = ( gd->date % 100 ) + 2000;
+  int month = ( gd->date / 100 ) % 100;
+  int day = gd->date / 10000;
+  int hour = gd->time / 1000000;
+  int minute = ( gd->time % 1000000 ) / 10000;
+  int second = ( gd->time % 10000 ) / 100;
+  setClock(CLK_GPS, utcToEpoch(year, month, day, hour, minute, second));
+  return true;
+}
+
+/*
+  Is the GNSS reporting real movement? gd->speed is in KNOTS (see GPS_DATA), so *1.852 -> km/h.
+  This is deliberately INDEPENDENT of the OBD: the vehicle-speed PID goes quiet whenever the car's ECUs sleep
+  or when a profile doesn't provide speed, and the position logic must not depend on it (that dependency is
+  exactly what made a moving car keep reporting its old parking spot).
+*/
+static bool gpsHasFix() { return gd && gd->lat != 0 && gd->lng != 0; }
+
+/*
+  HOW OLD IS THE FIX, really.
+
+  gd->ts cannot answer this on the co-processor link path: FreematicsPlus.cpp stamps it with millis()
+  when a $GNIFO reply is PARSED, and the co-processor re-echoes its last known fix on every request.
+  So ts refreshes on every poll whether or not the GNSS produced anything new, and every staleness
+  bound built on it silently never fires - which is what let a latched "moving" verdict survive a
+  garage indefinitely.
+
+  gd->date and gd->time come from the sentence itself and only advance when the receiver produces a
+  genuinely new fix, so a CHANGE in that pair is the only honest evidence of one. This tracks when
+  the pair last changed; the age is measured from there. Drive into a garage and the pair freezes,
+  so the age grows without bound, which is exactly the signal that was missing.
+
+  gps_fix_seq increments per new fix and gives parkAccumSample() a dedupe key that actually
+  distinguishes fixes - its old ts-based guard could never fire on this path either.
+*/
+static uint32_t gps_fix_date = 0;
+static uint32_t gps_fix_time = 0;
+static uint32_t gps_fix_seq = 0;
+static unsigned long gps_fix_changed_ms = 0;
+
+// Must be called once per poll cycle EVEN WITHOUT A FIX - that is the case whose age has to grow.
+static void gpsNoteFix() {
+  if (!gd) return;
+  if (gd->date != gps_fix_date || gd->time != gps_fix_time) {
+    gps_fix_date = gd->date;
+    gps_fix_time = gd->time;
+    gps_fix_changed_ms = millis();
+    gps_fix_seq++;
+  }
+}
+
+// Age of the newest genuinely-new fix. A wake that never saw one answers "infinitely old", so every
+// caller treats "GNSS never worked" the same as "GNSS went stale" - unknown is not evidence.
+static unsigned long gpsFixAgeMs() {
+  if (gps_fix_seq == 0) return ULONG_MAX;
+  return millis() - gps_fix_changed_ms;
+}
+
+static bool gpsIsMoving() {
+  return gpsHasFix() && (gd->speed * 1.852f) >= (float)GPS_MOVING_MIN_KMH;
+}
+
+/*
+  Stationary-fix accumulator, used to freeze an AVERAGED parking position instead of one instantaneous sample.
+  FIELD EVIDENCE (8 PARKED_LOC events, 5 of them the same parking spot): single-sample freezes scattered up to
+  22.4 m apart, individual samples up to 14.9 m from their own mean - while fix quality was good throughout
+  (HDOP 0.47-0.69, 12 satellites). So the error was not poor reception, it was using ONE sample: the device sits
+  still for ~5 minutes before latching parked (~60 samples at the 5s poll cadence) and threw all but the last
+  one away. Averaging independent samples shrinks that random error by roughly sqrt(N).
+  Only samples taken while the GNSS says we are STOPPED are accumulated, and any real movement clears the
+  accumulator - so it always describes the final resting place, never the approach to it.
+*/
+static double park_acc_lat = 0.0;
+static double park_acc_lon = 0.0;
+static uint16_t park_acc_n = 0;
+static const uint16_t PARK_ACC_MAX = 240;   // ~20 min at the 5s cadence; caps drift in the running mean
+
+// Consecutive samples reporting movement. Used ONLY to debounce the is_parked latch, never the coordinates:
+// a lone jittery speed sample from a stationary receiver would otherwise unlatch parked for a full
+// ACTIVE_TIMER, and because is_charging and the max-awake backstop are both parked-gated, that would suppress
+// charge detection for 5 minutes. Two consecutive samples (~10s) is trivially satisfied by a car pulling away.
+static uint8_t gps_moving_streak = 0;
+static const uint8_t GPS_MOVING_CONFIRM = 2;
+
+/*
+  Per-poll GNSS bookkeeping: maintain the stationary parking average and the movement streak.
+  IDEMPOTENT PER FIX. Two reasons: the poll cycle now calls this early (the OBD-alarm gate needs a
+  fresh movement verdict BEFORE it decides whether polling is allowed) while addGpsData() still
+  calls it on the way past, and a poll cadence faster than the GNSS 1Hz update would otherwise feed
+  the same fix into the average several times and over-weight it.
+
+  Keyed on gps_fix_seq, NOT gd->ts. ts was supposed to advance once per received fix and does not on
+  the co-processor link path - it is re-stamped every time a reply is parsed, so this guard could
+  never fire there and the average WAS being over-weighted by repeats of the same fix. gps_fix_seq
+  only advances when the sentence's own date/time changes, which is the real thing.
+*/
+static uint32_t park_last_ts = 0;
+
+static void parkAccumSample() {
+  gpsNoteFix(); // before the fix check: a wake with no fix still has to age
+  if (!gpsHasFix()) return;
+  if (gps_fix_seq == park_last_ts) return;   // already processed this fix
+  park_last_ts = gps_fix_seq;
+  if (gpsIsMoving()) {            // moving -> this is the approach, not the parking spot
+    if (gps_moving_streak < 255) gps_moving_streak++;
+    park_acc_lat = park_acc_lon = 0.0;
+    park_acc_n = 0;
+    return;
+  }
+  gps_moving_streak = 0;
+  if (park_acc_n >= PARK_ACC_MAX) return;
+  park_acc_lat += gd->lat;
+  park_acc_lon += gd->lng;
+  park_acc_n++;
+}
+
+/* Debounced "the GNSS is sure we are moving" - drives the is_parked latch and the awake leash. */
+static bool gpsMovingConfirmed() { return gps_moving_streak >= GPS_MOVING_CONFIRM; }
+
+/*
+  Same verdict, but only while a RECENT fix still vouches for it. Deliberately a separate function:
+  gpsMovingConfirmed() above is LATCHED - the streak resets only when a fresh STATIONARY fix arrives,
+  so once fixes stop coming (garage, tunnel) it stays true indefinitely.
+
+  This is now measured with gpsFixAgeMs(), not gd->ts. The previous version's comment claimed ts was
+  "device millis() stamped when the fix was decoded, so this is a true staleness bound" - it is not,
+  on the path this device actually uses. ts is stamped when a $GNIFO reply is parsed and the
+  co-processor re-echoes its last fix on every request, so the bound never fired and every caller
+  believed it had staleness protection it did not have.
+
+  Two things that cost, both found in the field:
+    - the alarm gate's garage-then-charge exposure (ALARM_GNSS_MAX_AGE_MS), where latched movement
+      would permit polling on a locked, armed car;
+    - the is_parked latch, which the old comment here waved off as "fails open, and the latch has an
+      independent time-based re-latch". It does not: the GNSS unlatch branch refreshes
+      g_last_speed_ms on every cycle, so the 5-minute re-latch can never expire. A car driven into a
+      garage and plugged in therefore reported is_parked=0 and, since is_charging is gated on the
+      latch, charging_state NOT_CHARGING at -52 A - for as long as the wake lasted.
+
+  No fix at all, and a GNSS that was never powered this wake, both resolve to "not moving": unknown
+  is not evidence of movement.
+*/
+static bool gpsMovingFresh(unsigned long max_age_ms) {
+  if (!gd || !gpsMovingConfirmed()) return false;
+  return gpsFixAgeMs() <= max_age_ms;
+}
+
+// Capture the parking position on the is_parked 0->1 transition (from changeState() and the time-based
+// re-latch). Prefers the mean of the stationary samples collected since the car stopped moving; falls back to
+// the instantaneous fix when too few samples exist (e.g. a very short stop). Never overwrites a good frozen
+// fix with garbage (keeps the previous one if there is no fix at all).
+void freezeParkedLocation() {
+  if (park_acc_n >= PARK_ACC_MIN) {
+    frozen_lat = park_acc_lat / (double)park_acc_n;
+    frozen_lon = park_acc_lon / (double)park_acc_n;
+    frozen_valid = true;
+#if ENABLE_LOGGING
+    logEvent("PARKED_LOC frozen lat=%.6f lon=%.6f avg_of=%u hdop=%d",
+      frozen_lat, frozen_lon, (unsigned)park_acc_n, gd ? gd->hdop : 0);
+#endif
+  } else if (gpsHasFix()) {
+    frozen_lat = gd->lat;
+    frozen_lon = gd->lng;
+    frozen_valid = true;
+#if ENABLE_LOGGING
+    logEvent("PARKED_LOC frozen lat=%.6f lon=%.6f single (only %u stationary sample(s)) hdop=%d",
+      gd->lat, gd->lng, (unsigned)park_acc_n, gd->hdop);
+#endif
+  } else {
+#if ENABLE_LOGGING
+    logEvent("PARKED_LOC kept previous (no valid fix this drive)");
+#endif
+  }
+  park_acc_lat = park_acc_lon = 0.0;   // start a fresh average for the next stop
+  park_acc_n = 0;
+}
+
+void addGpsData(OBDVector& vec) {
+  // Keep refining the parking average whenever we hold a live fix, so the freeze has something to average.
+  if (g_gps_powered) parkAccumSample();
+
+  // Parked: reuse the FROZEN fix - a GNSS that just powered up on a parked wake can't re-stabilize in the few
+  // seconds we're awake, so its fresh reading is worse than the averaged one we captured while stopped (and on
+  // a stationary sample wake we don't even power the GNSS).
+  if (is_currently_parked) {
+    // ...EXCEPT when the GNSS itself says we are moving. is_currently_parked stays latched until a poll returns
+    // vehicle speed > 0, so on a motion wake - or any drive where the car's speed PID is unavailable - this
+    // branch would keep publishing the LAST PARKING SPOT while the car is actually under way, teleporting the
+    // vehicle backwards on the map. A live fix that shows movement is always the truth, so prefer it. Reporting
+    // nothing is also better than reporting a stale position, hence no frozen fallback while moving.
+    if (gpsIsMoving()) {
+      vec.emplace_back("lon", gd->lng);
+      vec.emplace_back("lat", gd->lat);
+      if (last_gd.date != gd->date || last_gd.time != gd->time) {
+        setClockFromGps();
+        last_gd = *gd;
+      }
+      return;
+    }
+    if (frozen_valid) {
+      vec.emplace_back("lon", frozen_lon);
+      vec.emplace_back("lat", frozen_lat);
+    } else if (g_gps_powered && gpsHasFix()) {
+      // Cold-boot fallback: no frozen fix yet, but we did power GNSS this wake and it has one - use it.
+      vec.emplace_back("lon", gd->lng);
+      vec.emplace_back("lat", gd->lat);
+    }
+    return;
+  }
+
+  if (!gd) return; // GPS re-init can fail after a wake (e.g. in a garage), leaving gd null - don't deref it
+  if (gd->lat != 0 && gd->lng != 0 && ( last_gd.lat != gd->lat || last_gd.lng != gd->lng )) {
+#if PRINT
+    Serial.printf("Adding coords to vec\n");
+#endif
+    vec.emplace_back("lon", gd->lng);
+    vec.emplace_back("lat", gd->lat);
+  }
+  // Heading = GNSS course-over-ground (gd->heading, already parsed from RMC/VTG). Emit ONLY when actually
+  // MOVING: at standstill COG is undefined noise, so we'd otherwise feed ABRP a spinning map marker. Gating
+  // on GNSS speed (same source as the heading, so they're consistent) means we include it for essentially
+  // the whole drive - even slow sections - and omit it only when stopped. When omitted, ABRP holds the last
+  // heading we sent (its normal behavior), which locks the last good direction in place. API path only: the
+  // BLE serializer strips heading (the phone reports its own) - see bleTlmString. Requires a live fix, so a
+  // no-GPS wake (parked returns above; garage = lat/lng 0) naturally sends nothing.
+  if (gd->lat != 0 && gd->lng != 0 && gd->speed * 1.852f >= HEADING_MIN_SPEED_KMH) {
+    vec.emplace_back("heading", (double)gd->heading);
+  }
+  if (last_gd.date != gd->date || last_gd.time != gd->time) { // refresh clock whenever the GNSS time advances
+    setClockFromGps();
+    last_gd = *gd;
+  }
+}
