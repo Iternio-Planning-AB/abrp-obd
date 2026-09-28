@@ -277,7 +277,7 @@ than being held awake, so the car's own ECUs are never kept alive by us.
 
 ## License
 
-Copyright 2024-2026 Iternio AB. Licensed under the [Apache License 2.0](LICENSE); see also
+Copyright 2024-2026 Rivian LLC. Licensed under the [Apache License 2.0](LICENSE); see also
 [`NOTICE`](NOTICE). Vendored and linked third-party code keeps its own licence; see
 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 
