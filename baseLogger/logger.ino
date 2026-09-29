@@ -822,8 +822,15 @@ void setup() {
     net_ok = network.init(false);
 #if ENABLE_LOGGING
     if (net_ok) logEvent("NET init=up t=%lus", (millis() - t0) / 1000UL);
-    else logEvent("NET init FAILED t=%lus -> continuing offline (loop re-attaches when registered)",
-      (millis() - t0) / 1000UL);
+    else {
+      logEvent("NET init FAILED t=%lus -> continuing offline (loop re-attaches when registered)",
+        (millis() - t0) / 1000UL);
+#if ENABLE_CELL
+      auto diag = network.initFailureDiag();
+      logEvent("NET init diag %s", diag.first.c_str());
+      if (!diag.second.empty()) logEvent("NET init radio %s", diag.second.c_str());
+#endif
+    }
 #endif
   }
   network.set_car(tlm_push_token);
@@ -1171,7 +1178,14 @@ void loop() {
     // silent search is why cold-attach behavior looked random - a cold LTE-M roaming scan can take
     // many minutes, and without this line there is no way to tell "still scanning" from "stuck".
     static unsigned long last_search_log = 0;
-    if (millis() - last_search_log > 60000) {
+    static char last_reg = '?';
+    char reg = network.registrationState();
+    if (reg != '?' && reg != last_reg) {
+      logEvent("NET reg %c->%c", last_reg, reg);
+      last_reg = reg;
+      last_search_log = millis();
+    }
+    if (!network.connected() && millis() - last_search_log > 60000) {
       last_search_log = millis();
       logEvent("NET searching %s t=%lus", network.netDiag().c_str(), millis() / 1000UL);
     }
@@ -1892,6 +1906,13 @@ void loop() {
 #if ENABLE_LOGGING
             logEvent("NET recover done: link=%s (power-cycle %d since last ok)",
               network.connected() ? "up" : "STILL DOWN", g_recovers_since_ok);
+#if ENABLE_CELL
+            if (!network.connected()) {
+              auto diag = network.initFailureDiag();
+              logEvent("NET recover diag %s", diag.first.c_str());
+              if (!diag.second.empty()) logEvent("NET recover radio %s", diag.second.c_str());
+            }
+#endif
 #endif
             // Escalation: a wedged modem has survived 3 consecutive power-cycles in the field - the only
             // recovery that has EVER worked is a fresh ESP32 boot. Take it deliberately through the normal

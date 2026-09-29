@@ -1,4 +1,5 @@
 #include "cellwrapper.h"
+#include <algorithm>
 #include <sstream>
 
 #ifndef PRINT
@@ -9,12 +10,14 @@ CellWrapper::CellWrapper(FreematicsESP32 sys, std::string apn) : NetworkWrapper(
 
 bool CellWrapper::init(const bool retry/* = false */) {
   do {
+    m_init_stage = "begin";
     Serial.printf("net begin\n");
     if (!net.begin(&sys)) {
       Serial.printf("No net connected\n");
       continue;
     }
     Serial.printf("net begun\n");
+    m_init_stage = "sim";
     if (!net.checkSIM()) {
       Serial.printf("No SIM CARD\n");
       continue;
@@ -86,6 +89,7 @@ bool CellWrapper::init(const bool retry/* = false */) {
     // recovered after the modem had camped in the background across a later run. 45s lets a normal cold camp
     // finish. If it still fails (true no-signal/garage), the loop's reconnect() probe completes it the moment
     // the modem registers - so we never lose a registration, we just stop blocking.
+    m_init_stage = "registration";
     if (!net.setup(apn.c_str(), 45000)) {
       Serial.printf("Failed to connect to server using apn %s\n", apn.c_str());
       // Full persistent-radio-config dump on the FIRST failure of this boot (read-only). Includes
@@ -204,6 +208,7 @@ void CellWrapper::reconnect() {
   sys.xbReceive(b, sizeof(b), 1000, okerr, 2);
   bool answered = strstr(b, "+CEREG:") != nullptr;
   char* p = strstr(b, "+CEREG: 0,");
+  if (p && p[10] >= '0' && p[10] <= '5') m_registration = p[10];
   bool registered = p && ( *( p + 10 ) == '1' || *( p + 10 ) == '5' );
   if (!registered) {
     memset(b, 0, sizeof(b));
@@ -488,12 +493,42 @@ std::string CellWrapper::netDiag() {
   sys.xbWrite("AT+CEREG?\r");
   sys.xbReceive(b, sizeof(b), 800, okerr, 2);
   p = strstr(b, "+CEREG: 0,");
-  if (p) cereg = *( p + 10 );
+  if (p && p[10] >= '0' && p[10] <= '5') {
+    cereg = p[10];
+    m_registration = cereg;
+  }
 
   int dbm = (csq != 99) ? (csq * 2 - 113) : 0;
   char out[72];
   snprintf(out, sizeof(out), "csq=%d(%ddBm) vbat=%s cereg=%c", csq, dbm, vbat, cereg);
   return std::string(out);
+}
+
+std::pair<std::string, std::string> CellWrapper::initFailureDiag() {
+  std::string result = std::string("stage=") + m_init_stage;
+  if (strcmp(m_init_stage, "registration") != 0) return { result, {} };
+  result += " " + netDiag();
+  std::string radio;
+  std::string cpsi = sendRawAt("AT+CPSI?", 1000);
+  size_t start = cpsi.find("+CPSI:");
+  if (start != std::string::npos) {
+    start += 6;
+    while (start < cpsi.size() && cpsi[start] == ' ') ++start;
+    size_t end = cpsi.find_first_of("\r\n", start);
+    if (end == std::string::npos) end = cpsi.size();
+    size_t comma = cpsi.find(',', start);
+    if (comma < end) {
+      size_t second = cpsi.find(',', comma + 1);
+      if (second < end) end = second;
+    }
+    radio = "cpsi=" + cpsi.substr(start, std::min(end - start, size_t(24)));
+  }
+  std::string cops = sendRawAt("AT+COPS?", 1000);
+  int mode;
+  const char* p = strstr(cops.c_str(), "+COPS:");
+  if (!radio.empty()) radio += " ";
+  radio += "cops=" + (p && sscanf(p, "+COPS: %d", &mode) == 1 ? std::to_string(mode) : "?");
+  return { result, radio };
 }
 
 HttpResponse CellWrapper::sendData(std::string payload) {

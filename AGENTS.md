@@ -102,6 +102,11 @@ and upload cycle), `Helpers/state_machine.h` (activity states and cadences), `He
 ## Etiquette
 
 - Do not commit, push or open PRs unless asked. Branch work off `main`.
+- Commit messages are used to generate release notes. Use Conventional Commits:
+  `type(scope): imperative summary` (scope optional). Describe the user-visible change, not just
+  the implementation; use `feat` for features, `fix` for bug fixes, and `docs`, `refactor`, `test`
+  or `chore` as appropriate. Mark breaking changes with `!` and a `BREAKING CHANGE:` footer that
+  explains the impact and migration.
 - Check `git remote -v` before reaching for a forge CLI: `gh` only works if the remote is GitHub.
 - The app side lives in the ABRP app repository and has its own `AGENTS.md`. Protocol changes touch both repos
   and land together; a firmware change that moves a wire format without the app is a broken pair.
