@@ -120,7 +120,7 @@ std::string bulkStringV2(const std::vector<OBDVector>& frames) {
     // frames under v1 too, so skipping it here loses nothing and saves a round trip.
     time_t utc = 0;
     double is_charging = 0, is_dcfc = 0, is_parked = 0;
-    bool have_parked = false, have_charging = false;
+    bool have_parked = false, have_charging = false, have_current = false;
     double lat = 0, lon = 0;
     bool have_lat = false, have_lon = false;
     for (const auto& res : frame) {
@@ -128,6 +128,7 @@ std::string bulkStringV2(const std::vector<OBDVector>& frames) {
       else if (res.first == "is_charging") { is_charging = res.second; have_charging = true; }
       else if (res.first == "is_dcfc") is_dcfc = res.second;
       else if (res.first == "is_parked") { is_parked = res.second; have_parked = true; }
+      else if (res.first == "current") have_current = res.second > -2000.0 && res.second < 2000.0;
       else if (res.first == "lat") { lat = res.second; have_lat = true; }
       else if (res.first == "lon") { lon = res.second; have_lon = true; }
     }
@@ -152,7 +153,7 @@ std::string bulkStringV2(const std::vector<OBDVector>& frames) {
 
       if (k == "soc")                     put("soc", "frac", v / 100.0);
       else if (k == "soh")                put("soh", "frac", v / 100.0);
-      else if (k == "soe")                put("soe", "wh", v * 1000.0);
+      else if (k == "soe")                put("soe", "wh", v);
       else if (k == "capacity")           put("batteryCapacity", "wh", v * 1000.0);
       else if (k == "kwh_charged")        put("chargingEnergyAdded", "wh", v * 1000.0);
       else if (k == "power")              put("power", "w", v * 1000.0);
@@ -187,7 +188,7 @@ std::string bulkStringV2(const std::vector<OBDVector>& frames) {
       fixed separately (gpsMovingFresh); this makes the mapping honest regardless of which way the
       latch is wrong, which is the property worth having in a typed API.
     */
-    if (have_charging && have_parked && is_parked != 0) {
+    if (have_charging && have_current && have_parked && is_parked != 0) {
       json v = json::object();
       v["time"] = t;
       v["state"] = (is_charging != 0) ? (is_dcfc != 0 ? "CHARGING_DC" : "CHARGING_AC") : "NOT_CHARGING";

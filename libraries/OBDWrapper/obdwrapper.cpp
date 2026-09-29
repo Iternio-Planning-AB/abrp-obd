@@ -2,6 +2,7 @@
 #include <fstream>
 #include <sstream>
 #include <cmath>
+#include <stdexcept>
 
 #ifndef PRINT
 #define PRINT 0
@@ -82,7 +83,11 @@ std::vector<std::string> OBDWrapper::get_pids() const {
   return pids;
 }
 
-std::vector<int> genericProtocol(std::string data, std::string protocol) {
+struct UnexpectedPidResponse : std::runtime_error {
+  UnexpectedPidResponse() : std::runtime_error("unexpected PID response") {}
+};
+
+std::vector<int> genericProtocol(std::string data, std::string protocol, const std::string& requested) {
 #if PRINT
   Serial.printf("Buffer in: %s\n", data.c_str());
   Serial.printf("Buffer len: %d\n", data.length());
@@ -125,6 +130,9 @@ std::vector<int> genericProtocol(std::string data, std::string protocol) {
     } else {
       payload = data.substr(5);
     }
+    if (requested.size() == 6 && requested.compare(0, 2, "22") == 0 &&
+        payload.compare(0, 6, "62" + requested.substr(2)) != 0)
+      throw UnexpectedPidResponse();
     for (int i{}; i < payload.length() - 2; ) {
       if (
         payload[i] == identifier[0] &&
@@ -153,6 +161,7 @@ bool OBDWrapper::readBuffer(std::string pid_string, char* buffer, int bufsize = 
   }
 
   int ret = link->receive(buffer, bufsize, OBD_TIMEOUT_SHORT); //OBD_TIMEOUT_SHORT);
+  if (pid_string == "220105") raw_220105_reply.assign(buffer, strnlen(buffer, bufsize));
   // Truncated reply: still decoded (fields past the cut fail the parser's bounds check), but counted.
   if (ret >= bufsize - 1 && !strchr(buffer, '>')) drop_trunc++;
   for (int f = 0; f < strlen(buffer); f++) {
@@ -236,6 +245,10 @@ static double jsonToDouble(const json& j) {
 
 OBDVector OBDWrapper::readPIDs(bool print) {
   std::vector<std::pair<std::string, double>> results{};
+  anomalous_220105_reply.clear();
+  anomalous_220105_reason.clear();
+  good_220105_reply.clear();
+  raw_220105_reply.clear();
   // A profile without a string obd_protocol can't be polled; throwing here would reboot the dongle.
   if (!vehicle_commands.contains("obd_protocol") || !vehicle_commands["obd_protocol"].is_string()) return results;
   std::string protocol = vehicle_commands["obd_protocol"].get<std::string>();
@@ -285,7 +298,16 @@ OBDVector OBDWrapper::readPIDs(bool print) {
     // "STOPPED", "CAN ERROR", short frames); uncaught, that is a reboot.
     std::vector<int> variables{};
     try {
-      variables = genericProtocol(buffer, protocol);
+      variables = genericProtocol(buffer, protocol, pid_string);
+    }
+    catch (const UnexpectedPidResponse&) {
+      if (pid_string == "220105") {
+        anomalous_220105_reason = "wrong_did";
+        anomalous_220105_reply = raw_220105_reply;
+      }
+      Serial.printf("failed to decode reply to %s\n", pid_string.c_str());
+      drop_eval += fields.size();
+      continue;
     }
     catch (...) {
       Serial.printf("failed to decode reply to %s\n", pid_string.c_str());
@@ -300,6 +322,7 @@ OBDVector OBDWrapper::readPIDs(bool print) {
     Serial.printf("\n");
 #endif
 
+    bool low_soc = false, soh_bad = false, have_soc = false, have_soh = false;
     for (const auto& f : fields) {
       const std::string& key = f.first;
       const std::string& equation = f.second;
@@ -310,12 +333,14 @@ OBDVector OBDWrapper::readPIDs(bool print) {
       catch (...) {
         // Dropped, never reported as 0: a 0 soc/current would reach the upload and the charge logic.
         Serial.printf("failed to parse evaluation: %s\n", key.c_str());
+        if (key == "soh") soh_bad = true;
         drop_eval++;
         continue;
       }
       // NaN passes the range check below, and "nan" is invalid JSON in the BLE frame.
       if (!std::isfinite(res)) {
         Serial.printf("Dropped non-finite %s\n", key.c_str());
+        if (key == "soh") soh_bad = true;
         drop_eval++;
         continue;
       }
@@ -331,9 +356,20 @@ OBDVector OBDWrapper::readPIDs(bool print) {
       if (vc.contains("maxValue") && res > jsonToDouble(vc["maxValue"])) in_range = false;
       if (in_range) {
         results.push_back(std::make_pair(key, res));
+        if (key == "soc") { have_soc = true; low_soc = res == 0.5; }
+        else if (key == "soh") have_soh = true;
       } else {
         Serial.printf("Dropped out-of-range %s = %f\n", key.c_str(), res);
+        if (key == "soh") soh_bad = true;
         drop_range++;
+      }
+    }
+    if (pid_string == "220105") {
+      if (low_soc && soh_bad) {
+        anomalous_220105_reason = "soc0.5_soh_drop";
+        anomalous_220105_reply = raw_220105_reply;
+      } else if (have_soc && have_soh) {
+        good_220105_reply = raw_220105_reply;
       }
     }
   }

@@ -280,6 +280,9 @@ bool g_taper_confirm = false;                  // this wake is a taper confirm-p
 // the sample we need to survive is what makes it useless here, and this pair exists to outlive that sample.
 RTC_DATA_ATTR double prev_parked_soc = -1.0;
 RTC_DATA_ATTR double prev_parked_kwh = -1.0;
+RTC_DATA_ATTR char last_good_220105_reply[513] = {};
+RTC_DATA_ATTR uint8_t obd_anomaly_logs = 0;
+RTC_DATA_ATTR uint64_t obd_anomaly_last_us = 0;
 // Consecutive polls with no charge evidence while the charge latch was still set (CHARGE_RELEASE_POLLS).
 RTC_DATA_ATTR uint8_t charge_release_polls = 0;
 
@@ -1010,7 +1013,9 @@ void setup() {
 #endif
   }
   config_initialized = true;
+#if ENABLE_NETWORK
   network.set_car(tlm_push_token);
+#endif
 
 #if ENABLE_NETWORK && ENABLE_LOGGING
   // Restore telemetry that couldn't be uploaded before the last sleep (wedged bearer / dead spot). Only
@@ -1327,6 +1332,37 @@ void loop() {
     if (obd_count > 0) heartbeat_asleep_streak = 0;
     else if (g_sample_poke && heartbeat_asleep_streak < 16) heartbeat_asleep_streak++;
 #if ENABLE_LOGGING
+    if (obd_read_attempted) {
+      const uint64_t now_us = esp_rtc_get_time_us();
+      if (!obd.anomalous_220105_reason.empty() && obd_anomaly_logs < 3 &&
+          (!obd_anomaly_last_us || now_us < obd_anomaly_last_us ||
+           now_us - obd_anomaly_last_us >= 15ULL * 60ULL * 1000000ULL)) {
+        const size_t prev_len = strnlen(last_good_220105_reply, sizeof(last_good_220105_reply));
+        logEvent("OBD220105 reason=%s raw=%u prev=%u", obd.anomalous_220105_reason.c_str(),
+          (unsigned)obd.anomalous_220105_reply.size(), (unsigned)prev_len);
+        auto logRaw = [&](const char* kind, const char* data, size_t size) {
+          for (size_t off = 0; off < size; off += 40) {
+            size_t n = size - off;
+            if (n > 40) n = 40;
+            char hex[81];
+            for (size_t i = 0; i < n; ++i)
+              snprintf(hex + 2 * i, 3, "%02X", (unsigned char)data[off + i]);
+            logEvent("OBDRAW %s %u/%u %s", kind, (unsigned)(off / 40 + 1),
+              (unsigned)((size + 39) / 40), hex);
+          }
+        };
+        logRaw("prev", last_good_220105_reply, prev_len);
+        logRaw("bad", obd.anomalous_220105_reply.data(), obd.anomalous_220105_reply.size());
+        obd_anomaly_last_us = now_us;
+        obd_anomaly_logs++;
+      }
+      if (!obd.good_220105_reply.empty()) {
+        size_t n = obd.good_220105_reply.size();
+        if (n >= sizeof(last_good_220105_reply)) n = sizeof(last_good_220105_reply) - 1;
+        memcpy(last_good_220105_reply, obd.good_220105_reply.data(), n);
+        last_good_220105_reply[n] = '\0';
+      }
+    }
     // The key question for the 12V drain: is our polling keeping the car's ECUs awake? obd_count > 0 means
     // the CAN bus answered = the car is awake (and our Mode 22 requests are part of why). Log it ONCE per
     // wake (first poll) so it's a clear marker without flooding the log every 5 s; the per-row obd_pids
@@ -1458,6 +1494,7 @@ void loop() {
     // Feature A - is_charging from the current PID's sign. Charging pushes current INTO the battery (negative,
     // ~-51A); discharge/idle is >= 0. Gate on parked so a drive's regen braking isn't mislabeled. Per-frame.
     bool is_charging = false;
+    bool charging_current_valid = false;
     if (is_currently_parked) {
       for (const auto& res : current_frame) {
         if (res.first == "current") {
@@ -1465,12 +1502,16 @@ void loop() {
           // reads) is < CHARGING_CURRENT_THRESHOLD and would falsely flag charging -> trip fast cadence.
           // readPIDs already clamps to the profile's [-2000,2000], but don't depend on it here.
           float c = res.second;
-          if (c > -2000.0f && c < 2000.0f) is_charging = (c < CHARGING_CURRENT_THRESHOLD);
+          if (c > -2000.0f && c < 2000.0f) {
+            charging_current_valid = true;
+            is_charging = (c < CHARGING_CURRENT_THRESHOLD);
+          }
           break;
         }
       }
     }
-    current_frame.emplace_back("is_charging", is_charging ? 1.0 : 0.0);
+    if (!is_currently_parked || charging_current_valid)
+      current_frame.emplace_back("is_charging", is_charging ? 1.0 : 0.0);
 
     /*
       CHARGE PROGRESS - the second, independent charge signal (CHARGE_PROGRESS_* in config.h).
@@ -1870,9 +1911,9 @@ void loop() {
         }
         last_broadcast = millis();
       }
+#endif
 #if ENABLE_BLE
     }
-#endif
 #endif
     last_poll = millis();
 

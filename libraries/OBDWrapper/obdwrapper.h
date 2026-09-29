@@ -75,6 +75,9 @@ public:
   uint32_t drop_eval{ 0 };
   uint32_t drop_range{ 0 };
   uint32_t drop_trunc{ 0 };
+  std::string anomalous_220105_reply;
+  std::string anomalous_220105_reason;
+  std::string good_220105_reply;
 
   /* Generate fake values from above */
   OBDVector getFakeReading() const;
@@ -87,6 +90,7 @@ private:
   std::vector<std::string> init_commands{};
   std::vector<std::string> pids{};
   std::map<std::string, json> car_models{};
+  std::string raw_220105_reply;
   /* See setPollGuard */
   bool (*poll_guard)(){ nullptr };
 
