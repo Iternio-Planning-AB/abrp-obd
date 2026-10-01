@@ -42,7 +42,7 @@ absent from the Freematics GitHub org, no source or image anywhere in this repo,
 without an ST-LINK and a real brick risk if readout protection is set).
 
 **Two repos:**
-- Firmware: `obd-standalone` (this one).
+- Firmware: `abrp-obd` (this one).
 - App: the ABRP React Native app — `tlm_type: 'abrpobd'` identifies this dongle; the older generic
   dongle lane is `'obdble'`. **The two lanes must stay separate** — see §8.
 
