@@ -1835,6 +1835,14 @@ void loop() {
           // g_http0_streak never advanced, no cleanup, and the recovery ladder never fired - so the loop
           // silently stalled (field-confirmed: ~2 min of zero upload attempts after a single http=0). Now an
           // open failure is handled in the else below so recovery still engages.
+          // The kept-alive session sat idle for the whole phone session, and reusing it failed http=0 on every
+          // handoff in the field (13/13, idle 3-34 min). Drop it so this upload opens a fresh one.
+          if (ble_handoff_fire) {
+            network.disconnect();
+#if ENABLE_LOGGING
+            logEvent("UPLOAD handoff: fresh session after BLE");
+#endif
+          }
           if (network.connect()) {
           g_ble_handoff_pending = false; // one-shot: consume the fast handoff only once a session is actually open
 #if ENABLE_LOGGING
