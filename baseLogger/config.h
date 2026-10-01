@@ -301,6 +301,14 @@
 // dead bearer; a full modem restart (begin/checkSIM/APN/CNCFG) does. 2 = recover fast without thrashing on a blip.
 #define HTTP0_RESTART_THRESHOLD 2
 
+// A kept-alive SH/TLS session idle longer than this is closed and reopened instead of reused. Field log
+// (24-30 Sep): reuse at the normal 60-75 s cadence failed ~4%, but every reuse after >200 s idle failed
+// http=0 after ~8 s (13/13 after a phone session paused uploads, idle 3-34 min). 120 s keeps the normal
+// cadence on the reused session and costs one TLS handshake after any longer pause.
+#ifndef SESSION_IDLE_MAX_MS
+#define SESSION_IDLE_MAX_MS 120000UL
+#endif
+
 // How long the clock may go without a real time source before re-acquiring one is worth the cost.
 //
 // Deep sleep keeps time on the ESP32's internal RC oscillator, measured at 30 s/hour FAST on a parked

@@ -867,6 +867,7 @@ void setup() {
   }
 #elif ENABLE_CELL
   network.set_url(CELL_HOST);
+  network.set_session_idle_max_ms(SESSION_IDLE_MAX_MS);
 
   // Acquire UTC for the cellular path. Skipped entirely on a deep-sleep wake (the ESP32 RTC keeps running
   // and stays valid), so this only actually executes on a cold/POWERON boot.
@@ -1835,20 +1836,13 @@ void loop() {
           // g_http0_streak never advanced, no cleanup, and the recovery ladder never fired - so the loop
           // silently stalled (field-confirmed: ~2 min of zero upload attempts after a single http=0). Now an
           // open failure is handled in the else below so recovery still engages.
-          // The kept-alive session sat idle for the whole phone session, and reusing it failed http=0 on every
-          // handoff in the field (13/13, idle 3-34 min). Drop it so this upload opens a fresh one.
-          if (ble_handoff_fire) {
-            network.disconnect();
-#if ENABLE_LOGGING
-            logEvent("UPLOAD handoff: fresh session after BLE");
-#endif
-          }
           if (network.connect()) {
           g_ble_handoff_pending = false; // one-shot: consume the fast handoff only once a session is actually open
 #if ENABLE_LOGGING
           // Signal + modem-voltage snapshot right before the POST, so each upload outcome below can be
           // attributed to RF (low csq), power (sagging vbat), or session (both healthy but still http=0).
-          logEvent("NET diag %s ble=%d obd=%d", network.netDiag().c_str(), g_ble_up ? 1 : 0, obd_count);
+          logEvent("NET diag %s ble=%d obd=%d open=%s", network.netDiag().c_str(), g_ble_up ? 1 : 0, obd_count,
+            network.lastOpenTrace().c_str());
 #endif
           int before = (int)obd_result_vector.size();
           bool ok = uploadBuffered(false); // send one capped batch (<= MAX_FRAMES_PER_POST); drains backlog over cycles

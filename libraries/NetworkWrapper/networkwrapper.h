@@ -65,6 +65,9 @@ public:
   // TX, both healthy -> session/protocol issue. Default empty; cellular overrides.
   virtual std::string netDiag() { return std::string(); }
 
+  /* Close and reopen a kept-alive session idle longer than this instead of reusing it (0 = always reuse) */
+  virtual void set_session_idle_max_ms(unsigned long ms) {}
+
   /* How the last connect() went (empty if the transport doesn't say) */
   virtual std::string lastOpenTrace() { return std::string(); }
 

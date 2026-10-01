@@ -61,7 +61,10 @@ public:
   std::pair<std::string, std::string> initFailureDiag();
   char registrationState() const { return m_registration; }
 
-  /* net.openTrace() of the last connect(), or "reused" if it kept a live session */
+  void set_session_idle_max_ms(unsigned long ms) override { m_idle_max_ms = ms; }
+
+  /* net.openTrace() of the last connect(), "reused" if it kept a live session, prefixed "idle=Ns" if it
+     closed one that had sat idle too long */
   std::string lastOpenTrace() override;
 
   /* ms since init() completed (registered + APN bound), or -1 if not ready */
@@ -88,6 +91,9 @@ private:
   char m_registration = '?';
   unsigned long m_ready_ms = 0; // millis() when m_ready last went true
   bool m_reused = false;        // last connect() kept a live session instead of calling net.open()
+  unsigned long m_last_use_ms = 0;  // millis() of the session's last open or request
+  unsigned long m_idle_max_ms = 0;  // reuse limit, see set_session_idle_max_ms
+  long m_idle_closed_s = -1;        // idle seconds of the session the last connect() closed, -1 if none
   unsigned long m_last_cfun_ms = 0; // last AT+CFUN radio cycle; used to rate-limit re-attach (roaming throttle guard)
   unsigned long m_dead_rf_since = 0; // millis() when csq=99-while-unregistered was first seen (0 = radio alive)
   uint8_t m_revive_stage = 0;        // dead-RF ladder: 0 none, 1 CFUN cycled, 2 modem rebooted, 3 power-cycled

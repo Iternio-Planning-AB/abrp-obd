@@ -153,9 +153,16 @@ bool CellWrapper::connect() {
   // WiFiWrapper::connect (which returns true when https is already connected). The caller now disconnects
   // ONLY after a failed upload, so a healthy session is reused (no per-cycle TLS handshake); a dead session
   // fails once, gets closed, and the next connect() opens a fresh one.
+  m_idle_closed_s = -1;
+  if (net.state() == HTTP_CONNECTED && m_idle_max_ms && millis() - m_last_use_ms > m_idle_max_ms) {
+    m_idle_closed_s = (long)((millis() - m_last_use_ms) / 1000);
+    net.close(); // a long-idle session is dead server- or NAT-side; reusing it costs an ~8 s http=0
+  }
   m_reused = net.state() == HTTP_CONNECTED;
   if (m_reused) return true;
-  return net.open(url.c_str(), 443);
+  bool ok = net.open(url.c_str(), 443);
+  if (ok) m_last_use_ms = millis();
+  return ok;
 }
 
 void CellWrapper::disconnect() {
@@ -538,6 +545,7 @@ HttpResponse CellWrapper::sendData(std::string payload) {
   Serial.printf("telemetry dump: \n%s\n", payload.c_str());
 #endif
   auto response = net.send(api_page.c_str(), payload.c_str(), payload.size(), carToken.c_str());
+  m_last_use_ms = millis();
   return HttpResponse{ response.returnValue, std::string(response.buffer) };
 }
 
@@ -549,11 +557,14 @@ HttpResponse CellWrapper::sendBulk(std::string payload) {
   Serial.printf("bulk body: %u bytes\n", (unsigned)payload.size());
 #endif
   auto response = net.send(api_page.c_str(), payload.data(), payload.size(), nullptr);
+  m_last_use_ms = millis();
   return HttpResponse{ response.returnValue, std::string(response.buffer) };
 }
 
 std::string CellWrapper::lastOpenTrace() {
-  return m_reused ? "reused" : net.openTrace();
+  if (m_reused) return "reused";
+  if (m_idle_closed_s < 0) return net.openTrace();
+  return "idle=" + std::to_string(m_idle_closed_s) + "s " + net.openTrace();
 }
 
 long CellWrapper::upForMs() {
