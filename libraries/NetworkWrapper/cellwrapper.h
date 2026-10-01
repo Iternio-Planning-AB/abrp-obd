@@ -61,6 +61,12 @@ public:
   std::pair<std::string, std::string> initFailureDiag();
   char registrationState() const { return m_registration; }
 
+  /* net.openTrace() of the last connect(), or "reused" if it kept a live session */
+  std::string lastOpenTrace() override;
+
+  /* ms since init() completed (registered + APN bound), or -1 if not ready */
+  long upForMs() override;
+
   /* Raw AT passthrough for bench debugging (serial console "AT..." commands): sends cmd + CR and
      returns the raw modem reply (everything received before OK/ERROR/timeout). */
   std::string sendRawAt(const char* cmd, unsigned int timeout_ms = 10000);
@@ -80,6 +86,8 @@ private:
   bool m_ready = false;  // modem set up + APN attached; coarse "link up" flag for connected()
   const char* m_init_stage = "begin";
   char m_registration = '?';
+  unsigned long m_ready_ms = 0; // millis() when m_ready last went true
+  bool m_reused = false;        // last connect() kept a live session instead of calling net.open()
   unsigned long m_last_cfun_ms = 0; // last AT+CFUN radio cycle; used to rate-limit re-attach (roaming throttle guard)
   unsigned long m_dead_rf_since = 0; // millis() when csq=99-while-unregistered was first seen (0 = radio alive)
   uint8_t m_revive_stage = 0;        // dead-RF ladder: 0 none, 1 CFUN cycled, 2 modem rebooted, 3 power-cycled

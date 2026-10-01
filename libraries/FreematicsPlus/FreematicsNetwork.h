@@ -121,5 +121,11 @@ public:
     commandResponse send(const char* api_page, const char* payload, const int payloadSize, const char* car_token);
     commandResponse getEpoch(const char* api_page);
     char* receive(int* pbytes = 0, unsigned int timeout = HTTP_CONN_TIMEOUT);
+    // Outcome, step results and bearer state of the last open(); see open() for the fields.
+    const char* openTrace() { return m_open_trace; }
+private:
+    int bearerState(char* out, size_t len);
+    void recordOpenTrace(const char* fail_step, char req, const char* bo, const char* sh, unsigned long t0);
+    char m_open_trace[80] = {0};
 };
 #endif

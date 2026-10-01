@@ -114,21 +114,36 @@ void enterDeepSleep(bool modem_on) {
   // entirely instead of stalling for tens of seconds and draining the battery; the frames are safe in
   // LittleFS and go up on the next connected wake. (The POST itself is also bounded by the wrapper timeout.)
   if (!obd_result_vector.empty() && upload_fail_count < MAX_UPLOAD_FAILS_PER_WAKE) {
-    if (network.connected() && network.connect()) {
-      int n = (int)obd_result_vector.size();
-      Serial.printf("Flushing %d buffered frame(s) before sleep\n", n);
-      bool ok = uploadBuffered(true); // drain the whole buffer in capped batches - last chance before RAM is wiped
-#if ENABLE_LOGGING
-      logEvent("FLUSH %s http=%d sent=%d left=%d", ok ? "ok" : "partial", g_last_http,
-        n - (int)obd_result_vector.size(), (int)obd_result_vector.size());
-#endif
-      network.disconnect();
-    } else {
-      Serial.printf("Pre-sleep flush skipped: no network link - %d frame(s) kept in flash\n",
+    // up= is seconds since NET init=up, sampled before connect(): parked flushes ~25 s in failed while ~50 s
+    // succeeded. The open trace (see HTTPClientSIM::open) says which step failed and whether the bearer was up.
+    if (!network.connected()) {
+      Serial.printf("Pre-sleep flush skipped: not registered - %d frame(s) kept in flash\n",
         obd_result_vector.size());
 #if ENABLE_LOGGING
-      logEvent("FLUSH skipped: no link - %d frame(s) kept", (int)obd_result_vector.size());
+      logEvent("FLUSH skipped: not registered - %d kept", (int)obd_result_vector.size());
 #endif
+    } else {
+      int up_s = (int)(network.upForMs() / 1000);
+      if (!network.connect()) {
+        std::string why = network.lastOpenTrace();
+        Serial.printf("Pre-sleep flush skipped: open failed %s - %d frame(s) kept in flash\n", why.c_str(),
+          obd_result_vector.size());
+#if ENABLE_LOGGING
+        logEvent("FLUSH skipped: open failed %s up=%ds - %d kept", why.c_str(), up_s,
+          (int)obd_result_vector.size());
+        logEvent("FLUSH diag %s", network.netDiag().c_str()); // separates weak signal from slow TLS
+#endif
+      } else {
+        int n = (int)obd_result_vector.size();
+        Serial.printf("Flushing %d buffered frame(s) before sleep\n", n);
+        bool ok = uploadBuffered(true); // drain the whole buffer in capped batches - last chance before RAM is wiped
+#if ENABLE_LOGGING
+        logEvent("FLUSH %s http=%d sent=%d left=%d up=%ds %s", ok ? "ok" : "partial", g_last_http,
+          n - (int)obd_result_vector.size(), (int)obd_result_vector.size(), up_s,
+          network.lastOpenTrace().c_str());
+#endif
+        network.disconnect();
+      }
     }
   } else if (!obd_result_vector.empty()) {
     Serial.printf("Pre-sleep flush skipped: upload backed off - %d frame(s) kept in flash\n",

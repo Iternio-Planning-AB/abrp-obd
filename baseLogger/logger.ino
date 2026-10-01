@@ -1888,6 +1888,7 @@ void loop() {
 #if ENABLE_LOGGING
             logEvent("UPLOAD open FAILED %s awake=%d streak=%d kept=%d",
               network.netDiag().c_str(), car_awake ? 1 : 0, g_http0_streak, (int)obd_result_vector.size());
+            logEvent("UPLOAD open trace %s up=%lds", network.lastOpenTrace().c_str(), network.upForMs() / 1000);
 #endif
             network.disconnect();
           }

@@ -136,6 +136,7 @@ bool CellWrapper::init(const bool retry/* = false */) {
       memset(b, 0, sizeof(b));
       sys.xbPurge(); sys.xbWrite("AT+CEDRXS=0\r"); sys.xbReceive(b, sizeof(b), 2000, okerr, 2); // eDRX off
     }
+    if (!m_ready) m_ready_ms = millis();
     m_ready = true;
     m_dead_rf_since = 0; // radio proved alive - re-arm the dead-RF revival ladder
     m_revive_stage = 0;
@@ -152,7 +153,8 @@ bool CellWrapper::connect() {
   // WiFiWrapper::connect (which returns true when https is already connected). The caller now disconnects
   // ONLY after a failed upload, so a healthy session is reused (no per-cycle TLS handshake); a dead session
   // fails once, gets closed, and the next connect() opens a fresh one.
-  if (net.state() == HTTP_CONNECTED) return true;
+  m_reused = net.state() == HTTP_CONNECTED;
+  if (m_reused) return true;
   return net.open(url.c_str(), 443);
 }
 
@@ -548,6 +550,14 @@ HttpResponse CellWrapper::sendBulk(std::string payload) {
 #endif
   auto response = net.send(api_page.c_str(), payload.data(), payload.size(), nullptr);
   return HttpResponse{ response.returnValue, std::string(response.buffer) };
+}
+
+std::string CellWrapper::lastOpenTrace() {
+  return m_reused ? "reused" : net.openTrace();
+}
+
+long CellWrapper::upForMs() {
+  return m_ready ? (long)(millis() - m_ready_ms) : -1;
 }
 
 bool CellWrapper::connected() {

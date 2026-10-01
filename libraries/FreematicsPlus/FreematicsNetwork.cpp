@@ -516,8 +516,30 @@ bool HTTPClientSIM::setGPS(bool on) {
   return false;
 }
 
+// PDP context 0 from AT+CNACT? as "<status>,<ip|noip>" ("?" if unanswered). Returns 1 if active with an IP,
+// 0 if not, -1 if the modem didn't answer.
+int HTTPClientSIM::bearerState(char* out, size_t len) {
+  snprintf(out, len, "?");
+  if (!sendCommand("AT+CNACT?\r", 1000)) return -1;
+  char* p = strstr(m_buffer, "+CNACT: 0,");
+  if (!p || p[10] < '0' || p[10] > '9') return -1;
+  char st = p[10];
+  char* eol = strpbrk(p, "\r\n");
+  char* ip = strchr(p, '\"');
+  bool has_ip = ip && (!eol || ip < eol) && ip[1] && ip[1] != '0' && ip[1] != '\"';
+  snprintf(out, len, "%c,%s", st, has_ip ? "ip" : "noip");
+  return st == '1' && has_ip ? 1 : 0;
+}
+
+static char rvCode(const commandResponse& r) {
+  return r.returnValue == 1 ? 'o' : r.returnValue == 2 ? 'e' : 't'; // OK / ERROR / timeout
+}
+
 bool HTTPClientSIM::open(const char* host, uint16_t port) {
-  sendCommand("AT+CNACT=0,1\r");
+  // Trace of this open() for the caller to log: activate-request result, bearer before SHCONF, each SHCONN
+  // result, bearer at failure, duration. Kept for successes too, so failures have a baseline.
+  unsigned long t0 = millis();
+  char req = rvCode(sendCommand("AT+CNACT=0,1\r")); // ERROR here means context 0 was already active
   sendCommand("AT+CACID=0\r");
   // delay(5000);
 
@@ -535,8 +557,12 @@ bool HTTPClientSIM::open(const char* host, uint16_t port) {
     sendCommand(m_buffer);
   }
 
+  char bo[8];
+  bearerState(bo, sizeof(bo));
+  char sh[3] = "--";
   sprintf(m_buffer, "AT+SHCONF=\"URL\",\"%s://%s\"\r", useSSL ? "https" : "http", host);
   if (!sendCommand(m_buffer)) {
+    recordOpenTrace("shconf", req, bo, sh, t0);
     return false;
   }
   sendCommand("AT+SHCONF=\"HEADERLEN\",256\r");
@@ -545,8 +571,11 @@ bool HTTPClientSIM::open(const char* host, uint16_t port) {
   // first attempt doesn't reach SHSTATE:1, force a clean SHDISC, settle briefly, and try once more. (This is
   // why bare SHDISC recovery "sometimes failed to open" before - a back-to-back disconnect/connect needs a
   // moment to settle; the retry here absorbs that.)
+  const char* sh_step = "shconn";
   for (int attempt = 0; attempt < 2; attempt++) {
-    sendCommand("AT+SHCONN\r", HTTP_CONN_TIMEOUT); // HTTP_CONN_TIMEOUT);
+    commandResponse conn = sendCommand("AT+SHCONN\r", HTTP_CONN_TIMEOUT); // HTTP_CONN_TIMEOUT);
+    sh[attempt] = rvCode(conn);
+    sh_step = conn ? "shstate" : "shconn";
     if (sendCommand("AT+SHSTATE?\r") && strstr(m_buffer, "+SHSTATE: 1")) {
       m_state = HTTP_CONNECTED;
       m_host = host;
@@ -556,6 +585,7 @@ bool HTTPClientSIM::open(const char* host, uint16_t port) {
       sendCommand("AT+SHAHEAD=\"Connection\",\"keep-alive\"\r");
       sendCommand("AT+SHAHEAD=\"Accept\",\"*/*\"\r");
       m_state = HTTP_CONNECTED;
+      recordOpenTrace(0, req, bo, sh, t0);
       return true;
     }
     sendCommand("AT+SHDISC\r", 2000);
@@ -564,8 +594,25 @@ bool HTTPClientSIM::open(const char* host, uint16_t port) {
   checkGPS();
   Serial.println(m_buffer);
   m_state = HTTP_ERROR;
+  recordOpenTrace(sh_step, req, bo, sh, t0);
 #endif
   return false;
+}
+
+// fail_step is 0 on success. A failure with the bearer down reports as cnact whatever SH step tripped over
+// it; nores means AT+CNACT? itself went unanswered (wedged modem, not a bearer verdict).
+void HTTPClientSIM::recordOpenTrace(const char* fail_step, char req, const char* bo, const char* sh,
+    unsigned long t0) {
+  char verdict[20] = "ok", bf[16] = "";
+  if (fail_step) {
+    char b[8];
+    int up = bearerState(b, sizeof(b));
+    if (up == 1) snprintf(verdict, sizeof(verdict), "%s", fail_step);
+    else snprintf(verdict, sizeof(verdict), "%s (%s)", up == 0 ? "cnact" : "nores", fail_step);
+    snprintf(bf, sizeof(bf), " bf=%s", b);
+  }
+  snprintf(m_open_trace, sizeof(m_open_trace), "%s req=%c bo=%s sh=%s%s t=%.1fs",
+    verdict, req, bo, sh, bf, (millis() - t0) / 1000.0f);
 }
 
 void HTTPClientSIM::setHeaders(const HeaderVector& headers) {

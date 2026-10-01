@@ -65,6 +65,12 @@ public:
   // TX, both healthy -> session/protocol issue. Default empty; cellular overrides.
   virtual std::string netDiag() { return std::string(); }
 
+  /* How the last connect() went (empty if the transport doesn't say) */
+  virtual std::string lastOpenTrace() { return std::string(); }
+
+  /* ms since connected() last became true, or -1 if it isn't / the transport doesn't track it */
+  virtual long upForMs() { return -1; }
+
   virtual void set_headers(const HeaderVector new_headers) = 0;
   virtual bool connect() = 0;
   virtual bool connected() = 0;
