@@ -79,7 +79,7 @@ std::string bulkString(const std::vector<OBDVector>& frames, const std::string& 
 /*
   Build a /2/app/tlm request body: the v2 InputPointList, an array of typed points.
 
-    [{"provider":"APP_OBD","soc":{"time":"2026-09-07T17:22:07Z","frac":0.8}, ...}, ...]
+    [{"provider":"ABRP_OTA","soc":{"time":"2026-09-07T17:22:07Z","frac":0.8}, ...}, ...]
 
   The v1 endpoint took whatever keys the vehicle profile happened to produce and sorted it out server
   side. v2 is TYPED: every value is a named object with its own timestamp and a fixed unit. That is what
@@ -93,7 +93,10 @@ std::string bulkString(const std::vector<OBDVector>& frames, const std::string& 
   not km/h, fractions not percent - while the profiles are in the human units v1 used. Every conversion
   below is doing real work; none of them is cosmetic.
 */
-static const char* const V2_PROVIDER = "APP_OBD";
+// The telemetry provider for the dongle's own cellular uploads (no relation to firmware OTA); the phone
+// posts frames it relays over BLE as APP_OBD. Self-declared, so it attributes data but proves nothing
+// about origin. The API validates this enum: a value it does not list fails the whole POST with a 400.
+static const char* const V2_PROVIDER = "ABRP_OTA";
 
 // Per-point keys that are metadata or are consumed by a state field below, so they never map 1:1.
 static bool isV2MetaKey(const std::string& k) {

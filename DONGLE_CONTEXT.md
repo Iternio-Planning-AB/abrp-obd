@@ -281,7 +281,10 @@ awake.** Polling a sleeping EV wakes its ECUs, which then stay awake on the *car
 
 **Cellular upload** (`network_upload.h`, `NetworkWrapper`): APN `hologram`, host `api.iternio.com`.
 Buffered frames → `POST /2/app/tlm`, the v2 endpoint, as a **gzipped** typed `InputPointList` built by
-`bulkStringV2` (`provider: APP_OBD`, every value its own object with an RFC-3339 time and an SI unit).
+`bulkStringV2` (`provider: ABRP_OTA`, every value its own object with an RFC-3339 time and an SI unit).
+`ABRP_OTA` marks the dongle's own cellular uploads (the phone posts relayed BLE frames as `APP_OBD`); it
+is self-declared, not proof of origin. A backend whose provider enum lacks it answers every cellular
+POST with a 400.
 Auth is two headers: `X-TLM-TOKEN` (the vehicle's telemetry token, which is what routes the data) and
 `X-API-KEY` (`API_KEY`, which attributes the integration). HTTP 200 *is* the acceptance — v2 has no
 `status` field in the body.
