@@ -90,6 +90,7 @@ is not verified by a bench test, and saying so is part of reporting it.
 | Log retrieval | §5 |
 | Sleep, wake gates, battery protection | §6 |
 | Cloud upload, profiles, where they come from | §6a |
+| Co-processor command limits, cars it can't read (BMW i3 …) | §6b |
 | The OBD-alarm gate (built, bypassed) | §7 |
 | App-side rules, `abrpobd` vs `obdble` | §8 |
 | Diagnosing a dongle that went quiet | §9 |

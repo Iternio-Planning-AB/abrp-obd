@@ -39,7 +39,8 @@ and why the power logic matters (nobody is around to notice a flattened 12 V bat
 owns the vehicle interface: CAN, K-line, pin-16 voltage). We talk to the STM32 with ELM327-style AT
 commands over a UART link. We cannot change the STM32 firmware — it was never published (verified:
 absent from the Freematics GitHub org, no source or image anywhere in this repo, no flash path
-without an ST-LINK and a real brick risk if readout protection is set).
+without an ST-LINK and a real brick risk if readout protection is set). It implements only part of
+the ELM327 command set, and that rules some cars out entirely (BMW i3/iX3 among them): see §6b.
 
 **Two repos:**
 - Firmware: `abrp-obd` (this one).
@@ -318,6 +319,57 @@ return nothing — `init_commands` is arbitrary CAN, so it puts wrong frames on 
 
 ---
 
+## 6b. What the co-processor can do on the bus, and the cars it rules out
+
+The STM32 reports `OBD2USART V1.4` and answers `ATZ` with `ELM327 v1.5`, but it is a partial
+emulation. Bench results (2026-09-24, each command sent raw to the co-processor):
+
+| Reply | Commands |
+|---|---|
+| `OK` | `ATZ ATE0 ATS0 ATH1 ATSP6 ATSP7 ATM1 ATM0`; `ATSH ATCF ATCM` once a protocol is set |
+| `?` | `ATCEA` (extended addressing), `ATFCSH ATFCSD ATFCSM` (flow control), `ATCAF0/1` (raw mode), `ATPB`, `ATCRA` (the firmware rewrites it to `ATCF`/`ATCM`), plus harmless defaults (`ATD ATAL ATBI ATAT ATST`) |
+| `ERROR` | `ATSPB` (user-defined protocol) |
+
+- **Every request gets the co-processor's own length byte.** There is no raw mode, so a profile
+  cannot control the first data byte of a frame. That rules out extended addressing and hand-built
+  frames.
+- **`NO DATA` proves nothing.** It also comes back with no bus attached at all. Only a reply shows the
+  dongle is on the bus.
+- **Monitor mode works.** Lines arrive as `$MON,<4 ID bytes, big-endian>,<DLC>,<data...>` (verified on
+  an i3 by filtering on the ID). A request sent while in `ATM1` is processed and monitoring continues.
+
+**Backend profiles this hardware cannot run** (checked against all 50 in `abrp/obd` as of 2026-09-24):
+
+| Profile | Why |
+|---|---|
+| `i3`, `ix3`, `ix60`, `i3_test` | extended addressing (`ATCEA07`), protocol B (`ATSPB`), flow control carrying the address byte |
+| `eGolf`, `MEB_new` | hand-built raw frames, which need `ATCAF0`. `MEB`/`MEB_audi` read the same values without it |
+| Mazda MX-30 (uncertain) | flow control goes out on `72B`, not the request ID; depends on which ID the co-processor picks |
+
+21 profiles set `ATFCSH`, which the co-processor ignores. They work only if its default flow-control
+ID matches; the Scenic (29-bit) has field evidence, the 11-bit profiles do not. A check against this
+list before pushing a profile would tell an owner up front instead of leaving them with silence.
+
+**The BMW i3 in detail** (car tests 2026-10-01, listen-only build `pio run -e esp32dev_i3listen` on
+branch `i3-testing`, `Helpers/can_listen.h`):
+- **The OBD port carries one broadcast frame: `0x130`**, BMW terminal status, 10 Hz, DLC 5. With the
+  filter wide open nothing else arrives on 11-bit or 29-bit at 500 kbps. The gateway forwards nothing
+  else unrequested, and the i3's Ethernet pins (3/8/11/12/13) are not wired on this board (Appendix I
+  §3). Passive SoC is ruled out.
+- **`0x130` data byte 0 is the ignition state:** `00` off, `01` accessory (100 ms on the way through,
+  once 7 s), `05` ignition on. Locking and unlocking change nothing, and the frame keeps coming with
+  the car off. It matches a published F30 sniff, so it likely holds for other BMWs.
+- **Active reads got no reply.** A 7-byte payload `03 22 <DID> 00 00 00` should go out as
+  `07 03 22 <DID> ...`, a correctly addressed request to the SME (ext address 07), because the
+  co-processor's length byte becomes `07`. `DD68`, `DDBC` and `DDB4` got no reply, in normal mode or
+  sent from monitor mode with every ID visible. Standard `7DF 0100` got none either. We have never
+  seen a reply to any transmission from this dongle on an i3, so a wrong frame and no frame at all
+  look the same from here.
+- **Next:** an OBD Y-splitter with a second dongle in `ATM1` shows the exact bytes on the wire. Until
+  then an i3 on this dongle gets location and ignition state, no battery data.
+
+---
+
 ## 7. The OBD-alarm gate (built, bypassed — read before re-enabling)
 
 **The problem:** some cars (BMW i3 confirmed, with a positive control) sound their anti-theft alarm
@@ -356,6 +408,11 @@ ABD5 info JSON for read-back), plus a permit predicate gating all bus traffic on
 - **`ALARM_GNSS_MAX_AGE_MS` is currently inert**: `gd->ts` is stamped at *call* time, not fix time,
   on the co-processor GNSS path, so a re-echoed stale fix stays "fresh" forever. Fails toward
   permitting. Fix requires keying on the `$GNIFO` date/time fields changing.
+
+**A passive ignition signal on BMWs (2026-10-01):** `0x130` data byte 0 reads `05` with the ignition
+on, and reading it transmits nothing (§6b). That is positive evidence of "in use", which the gate
+lacks. It says nothing about locked/armed, and the frame keeps running with the car off, so only the
+value counts, never the frame's presence.
 
 ---
 
@@ -433,6 +490,7 @@ Everything below except `README.md` is embedded verbatim in **Part II** of this 
 | OBD-alarm architecture + decisions | Appendix I |
 | Why the alarm gate is off + fix plan | Appendix J |
 | Backend expectations | Appendix E |
+| What the co-processor can't do, cars it rules out (BMW i3 …) | §6b |
 
 ---
 
@@ -3584,6 +3642,7 @@ All existing hardware, none transmit on the bus.
 | Rail voltage (co-proc) | `getVoltage()` → `ATRV` | Same, cross-check; local measurement, no bus traffic |
 | Motion / WOM | ICM-42627 | Someone is at the car — but so is a tow truck. **Weak evidence, never a licence to transmit.** |
 | CAN bus activity | `sniff()` → `ATM1` + `ATCF`/`ATCM` | Bus awake. Optional; gated on the §9 silence test |
+| BMW terminal status | `ATM1`, filter `130` | Byte 0 `05` = ignition on (Part I §6b). Not lock state; the frame runs with the car off |
 
 GNSS speed also fixes the original draft's re-verification circularity: it is independent of
 polling, so it can *falsify* a broken detector ("GNSS says 60 km/h while the gate says asleep"),
@@ -3867,6 +3926,10 @@ document that no amount of source reading can settle.
 pass (alarms almost certainly watch for diagnostic requests, and a sleeping bus has no frames to
 ACK), but it is one bench test against an assumption in someone else's firmware.
 
+**Partial result (i3, 2026-10-01):** the listen-only build sat in `ATM1` through one short lock and
+unlock, and the alarm did not sound. The bus was not asleep: `0x130` kept arriving at 10 Hz, so any
+ACKs were going out while the car was locked. One brief cycle, not the ten-minute armed test above.
+
 ---
 
 ## 10. Configuration & persistence
@@ -4017,6 +4080,8 @@ research track, not a promise:
 - Needs per-model passive **frame** decoding — the profile system carries PID *request* definitions
   (`data_commands`, `ATCRA` handling), not a frame map. New profile concept, new decoder.
 - Scope the i3 first: it produced §2, and OVMS has published its CAN IDs.
+- **i3 checked 2026-10-01: ruled out at the OBD port.** It carries only `0x130` (terminal status); the
+  gateway forwards no other broadcast, so there is nothing to decode (Part I §6b).
 - Prerequisite tooling: a serial `SNIFF` diagnostic dumping live frame IDs/rates (`STAT`/`RADIO`
   family, physical-access only).
 
@@ -4061,8 +4126,8 @@ why they run first rather than when 4–5 are reached.
 | Flag published in ABD5 info JSON for read-back | **New**, zero GATT handles (§10.4) |
 | Edit path = unlink + re-pair; no serial command | **Decision** (§10.5) |
 | Init-command locality check on alarm cars | **New**, small — also closes §4.3 (§8) |
-| `ATM1` silence test | **Prerequisite** for anything using sniffing (§9) |
-| Passive frame decoding for parked-charge telemetry | **Research track**, i3 first (§12) |
+| `ATM1` silence test | **Prerequisite** for anything using sniffing (§9). Partial pass on an i3 (§9) |
+| Passive frame decoding for parked-charge telemetry | **Research track** (§12). i3: ruled out, only `0x130` reaches the port |
 | Fleet-learned per-model pin map | **New**, app-side, verify-don't-trust (§11) |
 | BimmerCode / CAN isolation / pin-16 reroute | **Not required** — silence suffices |
 
