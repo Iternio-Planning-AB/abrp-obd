@@ -161,6 +161,8 @@ std::string bulkStringV2(const std::vector<OBDVector>& frames) {
       else if (k == "voltage")            put("voltage", "v", v);
       else if (k == "current")            put("current", "a", v);
       else if (k == "batt_temp")          put("batteryTemperature", "c", v);
+      else if (k == "batt_temp_min")      put("batteryTemperatureMin", "c", v);
+      else if (k == "batt_temp_max")      put("batteryTemperatureMax", "c", v);
       else if (k == "ext_temp")           put("externalTemperature", "c", v);
       else if (k == "cabin_temp")         put("cabinTemperature", "c", v);
       else if (k == "odometer")           put("odometer", "m", v * 1000.0);

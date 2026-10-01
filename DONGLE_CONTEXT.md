@@ -302,11 +302,11 @@ token stops the upload, so an unpaired dongle advertises on BLE and does nothing
 reference.)
 
 **Telemetry keys** the frame can carry: `soc, soh, voltage, current, power, is_charging, is_parked,
-speed, kwh_charged, ext_temp, lat, lon, heading, utc` (exact set is per-vehicle-profile). `is_parked`
-and `is_charging` are derived on-device; `lat/lon/heading` come from GNSS. Note `bleTlmString()`
-**trims `lat`/`lon`/`utc`/`heading` from the BLE frame** — the phone supplies its own position — so
-a BLE frame is smaller than the cellular body, and a frame that is *only* position (no PID answered)
-serialises to `{"tlm":{"is_parked":…,"is_charging":…}}`.
+speed, kwh_charged, ext_temp, batt_temp, batt_temp_min, batt_temp_max, lat, lon, heading, utc` (exact
+set is per-vehicle-profile). `is_parked` and `is_charging` are derived on-device; `lat/lon/heading`
+come from GNSS. Note `bleTlmString()` **trims `lat`/`lon`/`utc`/`heading` from the BLE frame** — the
+phone supplies its own position — so a BLE frame is smaller than the cellular body, and a frame that is
+*only* position (no PID answered) serialises to `{"tlm":{"is_parked":…,"is_charging":…}}`.
 
 **Where the PID list / vehicle profile comes from:** the app fetches it from the ABRP backend by
 `typecode` (`getObdBlePids`), gets back `{ obdPids, jws }`, and pushes it to the dongle over ABD2.
@@ -316,6 +316,8 @@ is supported by adding its profile **on the backend**, not by reflashing — the
 carries no profile of its own at all. It used to: a dozen `init*()` PID blobs in `obdwrapper.cpp`, one
 of which ran as a pre-pairing stand-in. Removed, because a profile for the wrong car does not merely
 return nothing — `init_commands` is arbitrary CAN, so it puts wrong frames on a stranger's bus.
+The one thing a profile cannot add is a new telemetry key: BLE forwards every key, but the cellular
+upload drops one until `bulkStringV2` has a line mapping it to a v2 field.
 
 ---
 
