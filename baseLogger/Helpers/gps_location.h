@@ -242,7 +242,7 @@ void addGpsData(OBDVector& vec) {
   // heading we sent (its normal behavior), which locks the last good direction in place. API path only: the
   // BLE serializer strips heading (the phone reports its own) - see bleTlmString. Requires a live fix, so a
   // no-GPS wake (parked returns above; garage = lat/lng 0) naturally sends nothing.
-  if (gd->lat != 0 && gd->lng != 0 && gd->speed * 1.852f >= HEADING_MIN_SPEED_KMH) {
+  if (gd->lat != 0 && gd->lng != 0 && gd->speed * 1.852f >= HEADING_MIN_SPEED_KMH && gd->heading != GPS_HEADING_INVALID) {
     vec.emplace_back("heading", (double)gd->heading);
   }
   if (last_gd.date != gd->date || last_gd.time != gd->time) { // refresh clock whenever the GNSS time advances

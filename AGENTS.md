@@ -30,8 +30,8 @@ Flash and watch with `pio run -e esp32dev -t upload -t monitor` (115200 baud).
 A clean build prints two pre-existing `"PRINT" redefined` warnings, from `FreematicsOBD.cpp` and
 `mathparser/parser.cpp`. They are not yours; anything else probably is.
 
-**Nothing here is unit tested and there is no CI.** A green build proves it compiles and nothing more.
-See *Testing* below, because that gap is the single biggest difference from a normal repo.
+**There is no CI; only heading handling has host regression tests.** A green build proves it compiles
+and nothing more. See *Testing* below, because that gap is the single biggest difference from a normal repo.
 
 ## The rules that bite first
 
@@ -67,7 +67,16 @@ find. Do not delete one unless you are deleting the code it describes.
 
 ## Testing
 
-There are no tests. Verification is a real dongle, and the loop is:
+Run `python3 tests/run_heading_checks.py` from the repo root for the heading regression checks (Python
+standard library and `clang++`, or set `CXX`). The runner extracts the complete current `gpsGetData()`
+method on every run, includes the real GPS types and telemetry/upload helpers, and compiles the real
+TinyGPS implementation with ASan/UBSan. Serial and HTTP transports are fakes; host date writes emulate
+the ESP32's 32-bit `unsigned long`. Checks remain enabled regardless of `NDEBUG`. The synthetic
+in-memory queue test verifies all 120 points arrive once, in order, with battery data intact; it does
+not exercise LittleFS restoration or the cellular modem. Pass a group name (`link-range`,
+`link-failures`, `direct-missing`, `direct-range`, or `queue`) to run just that group.
+
+Hardware verification still requires a real dongle, and the loop is:
 
 1. Build.
 2. Flash, and reproduce on hardware — a bench supply and the desktop fake car cover the transport, but

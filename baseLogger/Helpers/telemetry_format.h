@@ -172,7 +172,11 @@ std::string bulkStringV2(const std::vector<OBDVector>& frames) {
       else if (k == "est_battery_range")  put("estimatedBatteryRange", "m", v * 1000.0);
       else if (k == "speed")              put("speed", "ms", v / 3.6);
       else if (k == "elevation")          put("elevation", "m", v);
-      else if (k == "heading")            put("heading", "degrees", v);
+      // Last line of defence, and the only one that reaches frames already saved in the flash backlog:
+      // the API rejects the WHOLE batch over one out-of-range heading (-360 < degrees < 360), and a
+      // rejected batch is retried forever. 360 is north; anything else outside 0-360 (including NaN,
+      // the uint16 wrap of a negative angle and GPS_HEADING_INVALID) drops just the heading.
+      else if (k == "heading")            { if (v >= 0 && v <= 360) put("heading", "degrees", v == 360 ? 0 : v); }
       // else: no v2 field for this key (the profile's private _-prefixed values land here). Dropped.
     }
 

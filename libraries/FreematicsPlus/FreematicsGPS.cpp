@@ -228,9 +228,10 @@ bool TinyGPS::term_complete()
   // the first term determines the sentence type
   if (_term_number == 0)
   {
-    if (!gpsstrcmp(_term, _GPRMC_TERM))
+    if (!gpsstrcmp(_term, _GPRMC_TERM)) {
       _sentence_type = _GPS_SENTENCE_GPRMC;
-    else if (!gpsstrcmp(_term, _GPGGA_TERM))
+      _new_course = GPS_INVALID_ANGLE;
+    } else if (!gpsstrcmp(_term, _GPGGA_TERM))
       _sentence_type = _GPS_SENTENCE_GPGGA;
     else
       _sentence_type = _GPS_SENTENCE_OTHER;

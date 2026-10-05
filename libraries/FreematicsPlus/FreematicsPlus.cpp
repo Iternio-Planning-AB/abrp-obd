@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <errno.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -599,6 +600,8 @@ bool FreematicsESP32::gpsBegin() {
 bool FreematicsESP32::gpsGetData(GPS_DATA** pgd) {
   if (pgd) *pgd = &gpsData;
   if (m_flags & FLAG_GNSS_USE_LINK) {
+    // A reply cut short below must not leave the previous fix's course in place.
+    gpsData.heading = GPS_HEADING_INVALID;
     char buf[160];
     if (!link || link->sendCommand("ATGPS\r", buf, sizeof(buf), 100) == 0) {
       return false;
@@ -629,7 +632,22 @@ bool FreematicsESP32::gpsGetData(GPS_DATA** pgd) {
       if (!( s = strchr(s, ',') )) break;
       gpsData.speed = (float)atoi(++s) / 100;
       if (!( s = strchr(s, ',') )) break;
-      gpsData.heading = atoi(++s) / 100;
+      /*
+        Course over ground in hundredths of a degree. Range-checked here because this path had no check
+        at all, unlike the direct-UART path below (course < 36000). Field result, Oct 4: the receiver
+        reported exactly 360 degrees, it went up as heading 360, and the API (which requires
+        -360 < degrees < 360) rejected the whole batch 18 times over ~7 hours, blocking the backlog.
+        360 is due north, so it becomes 0. Negative angles (reported by some u-blox firmware) are
+        wrapped while still signed - wrapping them after the store into uint16_t gives the wrong
+        direction. Empty or impossible values become "no heading" rather than a made-up one.
+      */
+      char* end;
+      errno = 0;
+      long course = strtol(++s, &end, 10);
+      if (end != s && *end == ',' && errno != ERANGE && course > -36000 && course <= 36000) {
+        if (course < 0) course += 36000;
+        gpsData.heading = course == 36000 ? 0 : course / 100;
+      }
       if (!( s = strchr(s, ',') )) break;
       gpsData.sat = atoi(++s);
       if (!( s = strchr(s, ',') )) break;
@@ -665,7 +683,7 @@ bool FreematicsESP32::gpsGetData(GPS_DATA** pgd) {
     unsigned long knot = gps.speed();
     if (knot != TinyGPS::GPS_INVALID_SPEED) gpsData.speed = (float)knot / 100;
     unsigned long course = gps.course();
-    if (course < 36000) gpsData.heading = course / 100;
+    gpsData.heading = course == 36000 ? 0 : course < 36000 ? course / 100 : GPS_HEADING_INVALID;
     unsigned short sat = gps.satellites();
     if (sat != TinyGPS::GPS_INVALID_SATELLITES) gpsData.sat = sat;
     unsigned long hdop = gps.hdop();

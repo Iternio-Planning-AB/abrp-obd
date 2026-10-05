@@ -50,12 +50,15 @@ typedef struct {
 	float lng;
 	float alt; /* meter */
 	float speed; /* knot */
-	uint16_t heading; /* degree */
+	uint16_t heading; /* degree, 0-359, or GPS_HEADING_INVALID */
 	uint8_t hdop;
 	uint8_t sat;
 	uint16_t sentences;
 	uint16_t errors;
 } GPS_DATA;
+
+// GPS_DATA.heading when the receiver reported no usable course. Never a real direction: valid values are 0-359.
+#define GPS_HEADING_INVALID 0xFFFF
 
 class CLink
 {
