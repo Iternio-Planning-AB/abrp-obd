@@ -25,13 +25,21 @@ cd baseLogger && pio run -e esp32dev
 ```
 
 `pio` may not be on `PATH` in a non-login shell — check before concluding the toolchain is missing.
+If it is unavailable, this isolated invocation has been verified from `baseLogger/` and does not
+install Python packages globally:
+
+```sh
+uv run --no-project --with platformio==6.1.18 pio run -e esp32dev
+```
+
 Flash and watch with `pio run -e esp32dev -t upload -t monitor` (115200 baud).
 
 A clean build prints two pre-existing `"PRINT" redefined` warnings, from `FreematicsOBD.cpp` and
 `mathparser/parser.cpp`. They are not yours; anything else probably is.
 
-**There is no CI; only heading handling has host regression tests.** A green build proves it compiles
-and nothing more. See *Testing* below, because that gap is the single biggest difference from a normal repo.
+**There is no CI; host regressions cover GPS parsing, selected GNSS freshness/parking paths and
+heading/telemetry handling.** A green build proves it compiles and nothing more. See *Testing* below,
+because that gap is the single biggest difference from a normal repo.
 
 ## The rules that bite first
 
@@ -67,14 +75,27 @@ find. Do not delete one unless you are deleting the code it describes.
 
 ## Testing
 
-Run `python3 tests/run_heading_checks.py` from the repo root for the heading regression checks (Python
-standard library and `clang++`, or set `CXX`). The runner extracts the complete current `gpsGetData()`
-method on every run, includes the real GPS types and telemetry/upload helpers, and compiles the real
-TinyGPS implementation with ASan/UBSan. Serial and HTTP transports are fakes; host date writes emulate
-the ESP32's 32-bit `unsigned long`. Checks remain enabled regardless of `NDEBUG`. The synthetic
-in-memory queue test verifies all 120 points arrive once, in order, with battery data intact; it does
-not exercise LittleFS restoration or the cellular modem. Pass a group name (`link-range`,
-`link-failures`, `direct-missing`, `direct-range`, or `queue`) to run just that group.
+Run `python3 tests/run_heading_checks.py` from the repo root for the heading/GPS regression checks
+(Python standard library and `clang++`, or set `CXX`). The runner extracts the complete current
+`gpsGetData()` method and the GNSS-unlatch block from `logger.ino` on every run, reads the production
+movement-age limit, includes the real GPS types and location/telemetry/upload helpers, and compiles
+the real TinyGPS implementation with ASan/UBSan. Serial and HTTP transports are fakes; co-processor
+replies are synthetic and host `millis()` is controlled. Host date writes emulate the ESP32's 32-bit
+`unsigned long`. Checks remain enabled regardless of `NDEBUG`.
+
+Parser checks cover rejected/truncated replies preserving the accepted record, malformed and
+32-bit-overflowing required integers, coordinate rejection/recovery and optional heading handling.
+Selected GNSS integration checks follow the real sampling/frame/unlatch order: the first moving fix
+emits live coordinates while still PARK, the next distinct moving fix unlatches DRIVE, replayed or
+rejected replies do not create fresh movement, and fresh zero-speed fixes still use the frozen parked
+position. Each group starts from a reset fixture. These are not full state-machine, OBD-profile,
+power-gate or GNSS-hardware tests. The synthetic in-memory queue test verifies all 120 points arrive
+once, in order, with battery data intact; it does not exercise LittleFS restoration or the cellular
+modem.
+
+Pass a group name (`link-range`, `link-failures`, `link-truncated`, `link-required`, `link-atomic`,
+`link-valid`, `gps-replay`, `gps-rejected`, `gps-stationary`, `direct-missing`, `direct-range`, or
+`queue`) to run just that group.
 
 Hardware verification still requires a real dongle, and the loop is:
 

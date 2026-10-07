@@ -602,6 +602,7 @@ bool FreematicsESP32::gpsGetData(GPS_DATA** pgd) {
   if (m_flags & FLAG_GNSS_USE_LINK) {
     // A reply cut short below must not leave the previous fix's course in place.
     gpsData.heading = GPS_HEADING_INVALID;
+    GPS_DATA candidate = gpsData;
     char buf[160];
     if (!link || link->sendCommand("ATGPS\r", buf, sizeof(buf), 100) == 0) {
       return false;
@@ -612,26 +613,27 @@ bool FreematicsESP32::gpsGetData(GPS_DATA** pgd) {
     char* s = strstr(buf, "$GNIFO,");
     if (!s) return false;
     s += 7;
-    float lat = 0;
-    float lng = 0;
-    float alt = 0;
-    bool good = false;
+    int32_t fields[6];
+    for (byte i = 0; i < 6; i++) {
+      while (*s == ' ' || *s == '\t') ++s;
+      if (*s != '+' && *s != '-' && (*s < '0' || *s > '9')) return false;
+      char* end;
+      errno = 0;
+      long value = strtol(s, &end, 10);
+      if (end == s || errno == ERANGE || value < INT32_MIN || value > INT32_MAX) return false;
+      if (*end != ',' && (i != 5 || (*end != '\r' && *end != '\n' && *end != 0))) return false;
+      fields[i] = (int32_t)value;
+      s = end;
+      if (i < 5) ++s;
+    }
+    candidate.date = fields[0];
+    candidate.time = fields[1];
+    float lat = (float)fields[2] / 1000000;
+    float lng = (float)fields[3] / 1000000;
+    float alt = (float)fields[4] / 100;
+    candidate.speed = (float)fields[5] / 100;
     do {
-      uint32_t date = atoi(s);
-      if (!( s = strchr(s, ',') )) break;
-      uint32_t time = atoi(++s);
-      if (!( s = strchr(s, ',') )) break;
-      gpsData.date = date;
-      gpsData.time = time;
-      lat = (float)atoi(++s) / 1000000;
-      if (!( s = strchr(s, ',') )) break;
-      lng = (float)atoi(++s) / 1000000;
-      if (!( s = strchr(s, ',') )) break;
-      alt = (float)atoi(++s) / 100;
-      good = true;
-      if (!( s = strchr(s, ',') )) break;
-      gpsData.speed = (float)atoi(++s) / 100;
-      if (!( s = strchr(s, ',') )) break;
+      if (*s != ',') break;
       /*
         Course over ground in hundredths of a degree. Range-checked here because this path had no check
         at all, unlike the direct-UART path below (course < 36000). Field result, Oct 4: the receiver
@@ -646,22 +648,22 @@ bool FreematicsESP32::gpsGetData(GPS_DATA** pgd) {
       long course = strtol(++s, &end, 10);
       if (end != s && *end == ',' && errno != ERANGE && course > -36000 && course <= 36000) {
         if (course < 0) course += 36000;
-        gpsData.heading = course == 36000 ? 0 : course / 100;
+        candidate.heading = course == 36000 ? 0 : course / 100;
       }
       if (!( s = strchr(s, ',') )) break;
-      gpsData.sat = atoi(++s);
+      candidate.sat = atoi(++s);
       if (!( s = strchr(s, ',') )) break;
-      gpsData.hdop = atoi(++s);
+      candidate.hdop = atoi(++s);
     } while (0);
-    if (good && ( gpsData.lat || gpsData.lng )) {
+    if (gpsData.lat || gpsData.lng) {
       // filter out invalid coordinates
-      good = ( abs(lat * 1000000 - gpsData.lat * 1000000) < 100000 && abs(lng * 1000000 - gpsData.lng * 1000000) < 100000 );
+      if (!( abs(lat * 1000000 - gpsData.lat * 1000000) < 100000 && abs(lng * 1000000 - gpsData.lng * 1000000) < 100000 )) return false;
     }
-    if (!good) return false;
-    gpsData.lat = lat;
-    gpsData.lng = lng;
-    gpsData.alt = alt;
-    gpsData.ts = millis();
+    candidate.lat = lat;
+    candidate.lng = lng;
+    candidate.alt = alt;
+    candidate.ts = millis();
+    gpsData = candidate;
     return true;
   } else {
     gps.stats(&gpsData.sentences, &gpsData.errors);
