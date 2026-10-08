@@ -15,12 +15,35 @@
   Convert vector of PID results to suitable form for iternio telemetry API
 */
 
+#include <cmath>
+
+bool isGeoMetaKey(const std::string& key) { return key.compare(0, 6, "__geo_") == 0; }
+
+bool isGeoValueKey(const std::string& key) { return key == "lat" || key == "lon" || key == "heading"; }
+
+void scrubGeoMetadata(OBDVector& frame) {
+  for (auto it = frame.begin(); it != frame.end();) {
+    if (isGeoMetaKey(it->first)) it = frame.erase(it);
+    else ++it;
+  }
+}
+
+bool geoValidUtc(double value, double frame_utc) {
+  return std::isfinite(value) && value >= 978307200.0 && value <= 4294967295.0 &&
+         std::floor(value) == value && value <= frame_utc;
+}
+
+bool geoValidLocation(double lat, double lon) {
+  return std::isfinite(lat) && std::isfinite(lon) && lat >= -90 && lat <= 90 &&
+         lon >= -180 && lon <= 180;
+}
+
 std::string logString(OBDVector vec) {
   json tlm = json::object(); // force a JSON object so an empty frame serializes to {} and never the literal null
   std::stringstream ss;
 
   for (auto res : vec) {
-    tlm[res.first] = res.second;
+    if (!isGeoMetaKey(res.first) && !isGeoValueKey(res.first)) tlm[res.first] = res.second;
   }
   ss << "{\"tlm\":" << tlm.dump() << "}";
   return ss.str();
@@ -38,7 +61,7 @@ std::string bleTlmString(const OBDVector& vec) {
   bool first = true;
   for (const auto& res : vec) {
     const std::string& k = res.first;
-    if (k == "lat" || k == "lon" || k == "utc" || k == "heading") continue; // phone supplies location/heading/utc itself
+    if (isGeoMetaKey(k) || isGeoValueKey(k) || k == "utc") continue; // phone supplies location/heading/utc itself
     if (!first) ss << ",";
     first = false;
     ss << "\"" << k << "\":";
@@ -64,7 +87,7 @@ std::string bulkString(const std::vector<OBDVector>& frames, const std::string& 
   for (const auto& frame : frames) {
     json tlm = json::object();
     for (const auto& res : frame) {
-      tlm[res.first] = res.second;
+      if (!isGeoMetaKey(res.first) && !isGeoValueKey(res.first)) tlm[res.first] = res.second;
     }
     tlm_list.push_back(tlm);
   }
@@ -100,7 +123,7 @@ static const char* const V2_PROVIDER = "ABRP_OTA";
 
 // Per-point keys that are metadata or are consumed by a state field below, so they never map 1:1.
 static bool isV2MetaKey(const std::string& k) {
-  return k == "utc" || k == "is_parked" || k == "is_charging" || k == "is_dcfc" ||
+  return isGeoMetaKey(k) || k == "utc" || k == "is_parked" || k == "is_charging" || k == "is_dcfc" ||
          k == "lat" || k == "lon";
 }
 
@@ -124,7 +147,7 @@ std::string bulkStringV2(const std::vector<OBDVector>& frames) {
     time_t utc = 0;
     double is_charging = 0, is_dcfc = 0, is_parked = 0;
     bool have_parked = false, have_charging = false, have_current = false;
-    double lat = 0, lon = 0;
+    double lat = 0, lon = 0, loc_utc = 0, head_utc = 0;
     bool have_lat = false, have_lon = false;
     for (const auto& res : frame) {
       if (res.first == "utc") utc = (time_t)res.second;
@@ -134,6 +157,8 @@ std::string bulkStringV2(const std::vector<OBDVector>& frames) {
       else if (res.first == "current") have_current = res.second > -2000.0 && res.second < 2000.0;
       else if (res.first == "lat") { lat = res.second; have_lat = true; }
       else if (res.first == "lon") { lon = res.second; have_lon = true; }
+      else if (res.first == "__geo_loc_utc") loc_utc = res.second;
+      else if (res.first == "__geo_head_utc") head_utc = res.second;
     }
     if (utc <= 0) continue;
     const std::string t = v2Time(utc);
@@ -176,7 +201,12 @@ std::string bulkStringV2(const std::vector<OBDVector>& frames) {
       // the API rejects the WHOLE batch over one out-of-range heading (-360 < degrees < 360), and a
       // rejected batch is retried forever. 360 is north; anything else outside 0-360 (including NaN,
       // the uint16 wrap of a negative angle and GPS_HEADING_INVALID) drops just the heading.
-      else if (k == "heading")            { if (v >= 0 && v <= 360) put("heading", "degrees", v == 360 ? 0 : v); }
+      else if (k == "heading")            {
+        if (geoValidUtc(head_utc, utc) && v >= 0 && v <= 360) {
+          put("heading", "degrees", v == 360 ? 0 : v);
+          p["heading"]["time"] = v2Time((time_t)head_utc);
+        }
+      }
       // else: no v2 field for this key (the profile's private _-prefixed values land here). Dropped.
     }
 
@@ -213,9 +243,9 @@ std::string bulkStringV2(const std::vector<OBDVector>& frames) {
     }
     // Coordinates travel as one value, and the schema requires BOTH halves - a frame carrying only one
     // is a GNSS fix mid-acquisition, so it is dropped rather than sent as a half position.
-    if (have_lat && have_lon) {
+    if (have_lat && have_lon && geoValidLocation(lat, lon) && geoValidUtc(loc_utc, utc)) {
       json v = json::object();
-      v["time"] = t;
+      v["time"] = v2Time((time_t)loc_utc);
       v["lat"] = lat;
       v["long"] = lon; // "long", not "lon" - v2 spells it out
       p["location"] = v;

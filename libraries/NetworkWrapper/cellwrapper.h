@@ -58,6 +58,7 @@ public:
 
   /* One-line signal (AT+CSQ) + modem voltage (AT+CBC) + CEREG state snapshot for diagnostics */
   std::string netDiag() override;
+  HTTPTransferDiagnostics transferDiagnostics() const override { return net.transferDiagnostics(); }
   std::pair<std::string, std::string> initFailureDiag();
   char registrationState() const { return m_registration; }
 

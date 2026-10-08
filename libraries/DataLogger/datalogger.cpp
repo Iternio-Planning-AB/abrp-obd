@@ -92,10 +92,24 @@ bool DataLogger::begin(const std::string& header) {
   int hi = highestIndex();
   if (hi < 0) {
     openSegment(0); // first ever boot: fresh segment
-  } else if (openSegment(hi) && activeSize >= SEGMENT_BYTES) {
-    active.close();           // newest segment already full -> start the next one
-    enforceBudget();
-    openSegment(hi + 1);
+  } else {
+    bool schema_changed = false;
+    if (!header_.empty()) {
+      File previous = LittleFS.open(pathFor(hi).c_str(), "r");
+      schema_changed = !previous;
+      if (previous && previous.size()) {
+        for (size_t i = 0; i < header_.size(); ++i) {
+          if (previous.read() != (unsigned char)header_[i]) { schema_changed = true; break; }
+        }
+        if (!schema_changed && previous.read() != '\n') schema_changed = true;
+      }
+      previous.close();
+    }
+    if (openSegment(hi) && (schema_changed || activeSize >= SEGMENT_BYTES)) {
+      active.close();           // newest segment full or old schema -> start the next one
+      enforceBudget();
+      openSegment(hi + 1);
+    }
   }
   printStats(Serial);
   return mounted;

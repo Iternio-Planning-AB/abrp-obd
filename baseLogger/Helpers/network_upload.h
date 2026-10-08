@@ -12,6 +12,52 @@
 */
 
 #if ENABLE_NETWORK
+#if ENABLE_LOGGING
+#include <mbedtls/sha256.h>
+#include <cmath>
+
+constexpr size_t UPLOAD_DIAGNOSTIC_MESSAGE_BYTES = 120;
+constexpr size_t UPLOAD_DIAGNOSTIC_SHA256_BYTES = 6;
+unsigned long g_upload_request_id = 0;
+
+bool uploadErrorContains(const std::string& body, const char* phrase) {
+  const size_t n = strlen(phrase);
+  for (size_t i = 0; i + n <= body.size(); ++i) {
+    size_t j = 0;
+    for (; j < n; ++j) {
+      unsigned char c = body[i + j];
+      if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+      if (c != (unsigned char)phrase[j]) break;
+    }
+    if (j == n) return true;
+  }
+  return false;
+}
+
+const char* uploadErrorCategory(const std::string& body) {
+  if (body.empty()) return "empty";
+  if ((!tlm_push_token.empty() && body.find(tlm_push_token) != std::string::npos) ||
+      (!api_key.empty() && body.find(api_key) != std::string::npos)) return "redacted";
+  for (const char* marker : {"token", "api_key", "api-key", "authorization", "bearer", "password", "secret"})
+    if (uploadErrorContains(body, marker)) return "redacted";
+  size_t credential_run = 0;
+  for (unsigned char c : body) {
+    bool credential_char = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+      (c >= '0' && c <= '9') || c == '_' || c == '-';
+    credential_run = credential_char ? credential_run + 1 : 0;
+    if (credential_run >= 24) return "redacted";
+  }
+  if (uploadErrorContains(body, "<html") || uploadErrorContains(body, "<!doctype")) return "html";
+  if (uploadErrorContains(body, "invalid header")) return "gzip_header";
+  if (uploadErrorContains(body, "checksum")) return "gzip_checksum";
+  if (uploadErrorContains(body, "length check")) return "gzip_length";
+  if (uploadErrorContains(body, "unexpected eof")) return "incomplete";
+  if (uploadErrorContains(body, "gzip")) return "gzip_other";
+  if (uploadErrorContains(body, "unauthorized") || uploadErrorContains(body, "forbidden")) return "auth";
+  if (uploadErrorContains(body, "validation")) return "validation";
+  return "other";
+}
+#endif
 /*
   Use the activated network to send data to Iternio API.
   Takes a vector of multiple OBDVectors, allows for temporary storage of data if connection is lost for shorter periods of time
@@ -44,7 +90,8 @@ bool logNetwork(const std::vector<OBDVector>& obd_result_vector) {
   // PSRAM was unavailable would be a far bigger failure than losing the ratio.
   const size_t raw_bytes = payload.size();
   std::string gzipped;
-  if (gzipBody(payload, gzipped)) {
+  const bool gzip_used = gzipBody(payload, gzipped);
+  if (gzip_used) {
     headers.emplace_back("Content-Encoding", "gzip");
     payload.swap(gzipped);
   }
@@ -54,8 +101,31 @@ bool logNetwork(const std::vector<OBDVector>& obd_result_vector) {
   // build or a boot log says whether compression is actually engaging - and the failure mode is silent
   // by design (an uncompressed body still uploads, just with fewer points under the modem's cap). raw
   // == wire in the dump means gzip is off; that is the line to look for on the first drive.
-  logEvent("UPLOAD body raw=%uB wire=%uB frames=%d", (unsigned)raw_bytes, (unsigned)payload.size(),
-    (int)obd_result_vector.size());
+  const unsigned long request_id = ++g_upload_request_id;
+  unsigned char digest[32];
+  char fingerprint[UPLOAD_DIAGNOSTIC_SHA256_BYTES * 2 + 1] = "?";
+  if (mbedtls_sha256_ret((const unsigned char*)payload.data(), payload.size(), digest, 0) == 0) {
+    for (size_t i = 0; i < UPLOAD_DIAGNOSTIC_SHA256_BYTES; ++i)
+      snprintf(fingerprint + i * 2, 3, "%02x", digest[i]);
+  }
+  unsigned long source_first = 0, source_last = 0;
+  for (const auto& frame : obd_result_vector) {
+    for (const auto& res : frame) {
+      if (res.first != "utc" || !std::isfinite(res.second) || res.second <= 0 || res.second > UINT32_MAX) continue;
+      unsigned long utc = (unsigned long)res.second;
+      if (!source_first || utc < source_first) source_first = utc;
+      if (utc > source_last) source_last = utc;
+    }
+  }
+  const std::string& raw = gzip_used ? gzipped : payload;
+  unsigned points = 0;
+  for (size_t pos = 0; (pos = raw.find("\"provider\":", pos)) != std::string::npos; ++pos) ++points;
+  char diagnostic[UPLOAD_DIAGNOSTIC_MESSAGE_BYTES];
+  snprintf(diagnostic, sizeof(diagnostic),
+    "UPLOAD body raw=%uB wire=%uB id=%lu enc=%c sha=%s src=%u pts=%u sutc=%lu..%lu",
+    (unsigned)raw_bytes, (unsigned)payload.size(), request_id, gzip_used ? 'g' : 'j', fingerprint,
+    (unsigned)obd_result_vector.size(), points, source_first, source_last);
+  logEvent("%s", diagnostic);
 #endif
 
   unsigned long post_t0 = millis();
@@ -63,6 +133,16 @@ bool logNetwork(const std::vector<OBDVector>& obd_result_vector) {
   unsigned long post_ms = millis() - post_t0; // instant-fail vs full-timeout distinguishes wedge modes
   g_last_post_ms = post_ms;
   g_last_http = response.responseCode; // recorded in the data log
+#if ENABLE_LOGGING
+  const char* error_category = response.responseCode == 200 ? "none" : uploadErrorCategory(response.payload);
+  const auto transfer = network.transferDiagnostics();
+  snprintf(diagnostic, sizeof(diagnostic),
+    "UPLOAD id=%lu http=%d err=%s t=%lu p/a/r=%d/%d/%d rx=%d/%d/%d cut=%d w=?",
+    request_id, response.responseCode, error_category, post_ms, transfer.prompt_result,
+    transfer.body_ack_result, transfer.post_result, transfer.declared_response_length,
+    transfer.shread_length, transfer.captured_response_length, (int)transfer.response_incomplete);
+  if (response.responseCode == 200) logEvent("%s", diagnostic);
+#endif
 
   // The server's Date response header is a coarse time anchor. It's present on ANY HTTP response - even one
   // the API rejects for a missing utc - so it works as a fallback time source even before we have a clock.
@@ -70,18 +150,18 @@ bool logNetwork(const std::vector<OBDVector>& obd_result_vector) {
   time_t serverEpoch = parseHttpDate(network.getDateHeader().c_str());
   if (serverEpoch) setClock(CLK_HTTP, serverEpoch);
 #if PRINT
-  Serial.printf("Bulk response: %d %s\n", response.responseCode, response.payload.c_str());
+  Serial.printf("Bulk response: %d [body omitted]\n", response.responseCode);
 #endif
 
   // HTTP error codes are reserved for severe (API key) issues.
   if (response.responseCode != 200) {
     ++logging_errors; // tracked so the caller resets the network after too many failures in a row
     g_last_status = "http_err";
-    Serial.printf("Failed to upload bulk tlm (HTTP %d): %s\n", response.responseCode, response.payload.c_str());
+    Serial.printf("Failed to upload bulk tlm (HTTP %d): [body omitted]\n", response.responseCode);
 #if ENABLE_LOGGING
-    // Log the server's rejection body - a non-200 is reserved for auth/URL issues, so the body says WHY. This
-    // was the missing piece: it only ever went to Serial, never the flash DUMP.
-    logEvent("UPLOAD http=%d t=%lums body=%.70s", response.responseCode, post_ms, response.payload.c_str());
+    // Classify the server's rejection without logging its body or credentials. This
+    // keeps failure evidence in the flash DUMP instead of only on Serial.
+    logEvent("%s", diagnostic);
 #endif
     return false;
   }
@@ -194,9 +274,7 @@ void saveUploadBacklog() {
   File f = LittleFS.open(UPLOAD_BACKLOG_PATH, "w");
   if (!f) { Serial.printf("Backlog: open for write failed\n"); return; }
   for (const auto& frame : obd_result_vector) {
-    json tlm = json::object();
-    for (const auto& res : frame) tlm[res.first] = res.second;
-    f.println(tlm.dump().c_str());
+    f.println(encodeUploadFrame(frame).dump().c_str());
   }
   f.close();
   Serial.printf("Backlog: %d unsent frame(s) persisted to flash\n", (int)obd_result_vector.size());
@@ -217,8 +295,7 @@ void loadUploadBacklog() {
     if (!line.length()) continue;
     try {
       json tlm = json::parse(line.c_str());
-      OBDVector frame;
-      for (auto& el : tlm.items()) frame.emplace_back(el.key(), el.value().get<double>());
+      OBDVector frame = decodeUploadFrame(tlm);
       if (!frame.empty()) { obd_result_vector.push_back(frame); n++; }
     }
     catch (const json::exception&) { /* skip a corrupt line (e.g. power lost mid-write) */ }

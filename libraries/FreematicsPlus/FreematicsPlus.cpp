@@ -598,23 +598,36 @@ bool FreematicsESP32::gpsBegin() {
 }
 
 bool FreematicsESP32::gpsGetData(GPS_DATA** pgd) {
+  m_gps_read_diagnostics = GPSReadDiagnostics{};
   if (pgd) *pgd = &gpsData;
   if (m_flags & FLAG_GNSS_USE_LINK) {
     // A reply cut short below must not leave the previous fix's course in place.
     gpsData.heading = GPS_HEADING_INVALID;
     GPS_DATA candidate = gpsData;
     char buf[160];
-    if (!link || link->sendCommand("ATGPS\r", buf, sizeof(buf), 100) == 0) {
+    if (!link) {
+      m_gps_read_diagnostics.result = GPSReadResult::LinkUnavailable;
+      return false;
+    }
+    const int replyBytes = link->sendCommand("ATGPS\r", buf, sizeof(buf), 100);
+    m_gps_read_diagnostics.reply_bytes = replyBytes > 0 ? replyBytes : 0;
+    if (replyBytes == 0) {
+      m_gps_read_diagnostics.result = GPSReadResult::NoReply;
       return false;
     }
 #if print
     Serial.printf(" ATGPS buf: %s\n", buf);
 #endif
     char* s = strstr(buf, "$GNIFO,");
-    if (!s) return false;
+    if (!s) {
+      m_gps_read_diagnostics.result = GPSReadResult::MarkerMissing;
+      return false;
+    }
     s += 7;
     int32_t fields[6];
+    m_gps_read_diagnostics.result = GPSReadResult::RequiredFieldInvalid;
     for (byte i = 0; i < 6; i++) {
+      m_gps_read_diagnostics.field = i;
       while (*s == ' ' || *s == '\t') ++s;
       if (*s != '+' && *s != '-' && (*s < '0' || *s > '9')) return false;
       char* end;
@@ -626,6 +639,7 @@ bool FreematicsESP32::gpsGetData(GPS_DATA** pgd) {
       s = end;
       if (i < 5) ++s;
     }
+    m_gps_read_diagnostics.field = -1;
     candidate.date = fields[0];
     candidate.time = fields[1];
     float lat = (float)fields[2] / 1000000;
@@ -657,17 +671,24 @@ bool FreematicsESP32::gpsGetData(GPS_DATA** pgd) {
     } while (0);
     if (gpsData.lat || gpsData.lng) {
       // filter out invalid coordinates
-      if (!( abs(lat * 1000000 - gpsData.lat * 1000000) < 100000 && abs(lng * 1000000 - gpsData.lng * 1000000) < 100000 )) return false;
+      if (!( abs(lat * 1000000 - gpsData.lat * 1000000) < 100000 && abs(lng * 1000000 - gpsData.lng * 1000000) < 100000 )) {
+        m_gps_read_diagnostics.result = GPSReadResult::CoordinateRejected;
+        return false;
+      }
     }
     candidate.lat = lat;
     candidate.lng = lng;
     candidate.alt = alt;
     candidate.ts = millis();
     gpsData = candidate;
+    m_gps_read_diagnostics.result = GPSReadResult::Accepted;
     return true;
   } else {
     gps.stats(&gpsData.sentences, &gpsData.errors);
-    if (!gpsHasDecodedData) return false;
+    if (!gpsHasDecodedData) {
+      m_gps_read_diagnostics.result = GPSReadResult::DirectNoData;
+      return false;
+    }
     long lat, lng;
     bool good = true;
     gps.get_position(&lat, &lng, 0);
@@ -675,7 +696,10 @@ bool FreematicsESP32::gpsGetData(GPS_DATA** pgd) {
       // filter out invalid coordinates
       good = ( abs(lat - gpsData.lat * 1000000) < 100000 && abs(lng - gpsData.lng * 1000000) < 100000 );
     }
-    if (!good) return false;
+    if (!good) {
+      m_gps_read_diagnostics.result = GPSReadResult::CoordinateRejected;
+      return false;
+    }
     gpsData.ts = millis();
     gpsData.lat = (float)lat / 1000000;
     gpsData.lng = (float)lng / 1000000;
@@ -691,6 +715,7 @@ bool FreematicsESP32::gpsGetData(GPS_DATA** pgd) {
     unsigned long hdop = gps.hdop();
     gpsData.hdop = hdop > 2550 ? 255 : hdop / 10;
     gpsHasDecodedData = false;
+    m_gps_read_diagnostics.result = GPSReadResult::Accepted;
     return true;
   }
 }

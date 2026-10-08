@@ -141,3 +141,57 @@ and upload cycle), `Helpers/state_machine.h` (activity states and cadences), `He
 - Check `git remote -v` before reaching for a forge CLI: `gh` only works if the remote is GitHub.
 - The app side lives in the ABRP app repository and has its own `AGENTS.md`. Protocol changes touch both repos
   and land together; a firmware change that moves a wire format without the app is a broken pair.
+
+## Diagnostic host checks
+
+Run `python3 tests/run_log_diagnostics_checks.py` for actual DataLogger, CSV, and GPS-selection checks.
+The filesystem is in memory; tests cover schema rotation, failed opens, partial headers, serial dump,
+BLE byte-stream reading, cached GPS fields, and native millis wrap. `--capture-helper <absolute-script-path>`
+also verifies a synthetic dump through the updated capture helper, including actual historical
+`eacc642` logger-begin and CSV-builder code simulating a firmware rollback; this does not open a device.
+`CXX="clang++ -DNDEBUG"` keeps assertions checked.
+
+Run `python3 tests/run_upload_checks.py` for real SIM7070 send/AT parsing and upload-helper checks with
+ASan/UBSan and NDEBUG. UART is fake. Python stdlib hashlib independently supplies SHA256 test results.
+Run `python3 tests/run_gzip_container_checks.py` for the actual gzip container wrapper, independent
+Python decompression/CRC/ISIZE checks, and fallback paths. ROM deflate, ROM CRC, and PSRAM are shims;
+these checks do not validate the real ROM output or modem transport.
+
+GPS CSV `gps_read=ok` means parsing accepted a reply, including replies with zero coordinates.
+`gps_fix` still means cached nonzero coordinates. Date/time, speed, and raw coordinates are the cached
+accepted record, not fields from a rejected reply. `gps_field` is 0=date, 1=time, 2=latitude,
+3=longitude, 4=altitude, 5=speed; -1 is not applicable. `gps_time_age_ms` measures elapsed time since
+receiver date/time changed, not proven position-observation age; blank means unknown. Reply bytes
+count only co-processor bytes, not direct UART bytes. `gps_source` records the GPS helper's actual
+coordinate selection (gnss/frozen/omitted), not final wire eligibility. The freshness serializer can
+subsequently omit selected coordinates when their observation time is unknown or invalid. Source
+selection does not itself establish that a location was uploaded.
+Raw coordinates intentionally include positions suppressed from uploads and increase sensitive data
+collection. Use this investigative build and private captures accordingly; the existing circular flash
+budget bounds storage size, not retention duration or at-rest encryption. GPS columns are an optional
+tail after the exact legacy CSV prefix. Rollback rows require the updated capture helper, which reports
+legacy-shaped rows and leaves absent diagnostics blank rather than guessing their origin or values.
+
+Upload request IDs reset each wake. The 12-hex SHA256 is a truncated final-wire-payload fingerprint,
+not an authentication or exactly-once guarantee. `src` counts source frames, `pts` serialized points,
+and `sutc` spans source frame UTCs, including frames omitted by serialization. `p/a/r` is the observed
+prompt/body-ACK/POST result; `rx` is declared/SHREAD/captured response length. `w=?` explicitly means
+UART-written length is unknown. `cut=-1` means response completeness is unknown, 0 measured complete,
+and 1 measured incomplete. Raw server bodies are not recorded: only fixed categories and length/
+truncation metadata. The body-ACK outcome remains diagnostic; POST acceptance and retries are unchanged.
+
+## Combined freshness verification and rollout
+
+The combined heading/GPS runner now has 29 groups. Run it normally and with `CXX='clang++ -DNDEBUG'`.
+It covers accepted-record observation UTC, strict calendars, independent location/heading times,
+frozen-average contributor times, and valid GPS clock seeding before a coordinate fix. The backlog
+oracle compiles the historical `eacc642` loader/serializer/resave path; it verifies numeric battery
+FIFO preservation and prevents old firmware from restamping protected geo. A successful historical
+battery upload deliberately discards protected geo history. Queue power-loss atomicity is unchanged.
+
+`__geo_` is reserved, scrubbed from profile results and public serializers, and stored as numeric
+shadow metadata only in the private backlog. Legacy/invalid geo provenance drops geo, not otherwise
+eligible battery/state. Actual RTC retention, cross-image resets, ROM gzip and modem behavior remain
+hardware gates. Deploy the paired backend age filtering and SSE ordering protection before firmware
+rollout; existing backend clock-skew normalization is unchanged. Keep this investigative build and
+its raw-location logs private.

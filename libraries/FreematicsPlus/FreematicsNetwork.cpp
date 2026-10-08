@@ -7,6 +7,8 @@ on
 *************************************************************************/
 
 #include <Arduino.h>
+#include <cerrno>
+#include <climits>
 #include "FreematicsBase.h"
 #include "FreematicsNetwork.h"
 
@@ -711,6 +713,7 @@ commandResponse HTTPClientSIM::getEpoch(const char* api_page) {
 }
 
 commandResponse HTTPClientSIM::send(const char* api_page, const char* payload, const int payloadSize, const char* car_token) {
+  m_transfer_diagnostics = {};
   // Start the transaction clean: leftovers from a previous exchange (a late URC, an unread body
   // tail) would otherwise satisfy this transaction's expected-string matches.
   m_device->xbPurge();
@@ -720,7 +723,9 @@ commandResponse HTTPClientSIM::send(const char* api_page, const char* payload, c
   // (The inline AT+SHBOD="...",<len> form returns ERROR on this modem.) Streaming raw also avoids the
   // 512-byte command buffer limit for the body - it's bounded only by AT+SHCONF "BODYLEN".
   sprintf(m_buffer, "AT+SHBOD=%d,10000\r", payloadSize);
-  if (!sendCommand(m_buffer, 3000, ">")) {   // wait for the download prompt
+  auto prompt = sendCommand(m_buffer, 3000, ">");
+  m_transfer_diagnostics.prompt_result = prompt.returnValue;
+  if (!prompt) {   // wait for the download prompt
     // No prompt = the modem REFUSED the body (dead session, or payloadSize over the SHCONF
     // BODYLEN=1024 cap). Writing the payload anyway would feed raw JSON straight into the AT
     // command parser and desynchronize the command stream for everything that follows - this was
@@ -729,7 +734,7 @@ commandResponse HTTPClientSIM::send(const char* api_page, const char* payload, c
     return { 0, "" };
   }
   m_device->xbWrite(payload, payloadSize);   // exactly payloadSize bytes
-  sendCommand(0, 3000);                       // consume the "OK" emitted after the body is received
+  m_transfer_diagnostics.body_ack_result = sendCommand(0, 3000).returnValue;                       // consume the "OK" emitted after the body is received
 
   // Issue the POST and wait for the unsolicited result line "+SHREQ: \"POST\",<code>,<len>". It arrives
   // AFTER the HTTP round-trip (not in AT+SHREAD=?, which only reports the readable range), so capture it
@@ -758,7 +763,31 @@ commandResponse HTTPClientSIM::send(const char* api_page, const char* payload, c
       }
     }
   }
+  m_transfer_diagnostics.post_result = req.returnValue;
   auto size = handlePair(req.buffer, "+SHREQ: \"POST\",");   // {http_code, body_len}
+  auto diagnosticNumber = [](const char*& s, int& number) {
+    while (*s == ' ' || *s == '\t') ++s;
+    if (*s < '0' || *s > '9') return false;
+    char* end;
+    errno = 0;
+    const long value = strtol(s, &end, 10);
+    if (errno == ERANGE || value > INT_MAX) return false;
+    number = (int)value;
+    s = end;
+    while (*s == ' ' || *s == '\t') ++s;
+    return true;
+  };
+  const char* post_header = strstr(req.buffer, "+SHREQ: \"POST\",");
+  if (post_header) {
+    const char* s = post_header + strlen("+SHREQ: \"POST\",");
+    int status, length;
+    if (diagnosticNumber(s, status) && *s++ == ',' && diagnosticNumber(s, length) &&
+        (*s == '\r' || *s == '\n') && status >= 100 && status <= 599) {
+      m_transfer_diagnostics.declared_response_length = length;
+      m_transfer_diagnostics.captured_response_length = 0;
+      m_transfer_diagnostics.response_incomplete = length > 0;
+    }
+  }
 #if PRINT
   Serial.printf("POST result: code=%d len=%d\n", size.first, size.second);
 #endif
@@ -788,14 +817,27 @@ commandResponse HTTPClientSIM::send(const char* api_page, const char* payload, c
       m_device->xbReceive(m_buffer + used, RECV_BUF_SIZE - used, 50); // collect the tail
     }
   }
+  const char* read_header = strstr(response.buffer, "+SHREAD:");
+  if (read_header) {
+    const char* s = read_header + 8;
+    int length;
+    if (diagnosticNumber(s, length) && (*s == '\r' || *s == '\n')) m_transfer_diagnostics.shread_length = length;
+  }
   auto buf = handleResponse(response.buffer, "+SHREAD");
+  m_transfer_diagnostics.captured_response_length = strlen(buf);
+  if (m_transfer_diagnostics.declared_response_length >= 0 || m_transfer_diagnostics.shread_length >= 0) {
+    m_transfer_diagnostics.response_incomplete =
+      m_transfer_diagnostics.captured_response_length < m_transfer_diagnostics.declared_response_length ||
+      m_transfer_diagnostics.captured_response_length < m_transfer_diagnostics.shread_length;
+  }
 #if PRINT
-  Serial.printf("Response body: %s\n", buf);
+  Serial.printf("Response body: [omitted]\n");
 #endif
   return { size.first, buf };
 }
 
 bool HTTPClientSIM::send(HTTP_METHOD method, const char* path, bool keepAlive, const char* payload, int payloadSize) {
+  m_transfer_diagnostics = {};
   String header = genHeader(method, path, keepAlive, payload, payloadSize);
   int len = header.length();
   sprintf(m_buffer, "AT+CHTTPSSEND=%u\r", len + payloadSize);

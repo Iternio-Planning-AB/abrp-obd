@@ -64,6 +64,7 @@ public:
   // in the field to tell apart the failure modes: low csq -> RF/signal, sagging vbat -> power brownout during
   // TX, both healthy -> session/protocol issue. Default empty; cellular overrides.
   virtual std::string netDiag() { return std::string(); }
+  virtual HTTPTransferDiagnostics transferDiagnostics() const { return {}; }
 
   /* Close and reopen a kept-alive session idle longer than this instead of reusing it (0 = always reuse) */
   virtual void set_session_idle_max_ms(unsigned long ms) {}

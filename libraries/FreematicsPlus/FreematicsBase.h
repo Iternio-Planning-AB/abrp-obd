@@ -60,6 +60,23 @@ typedef struct {
 // GPS_DATA.heading when the receiver reported no usable course. Never a real direction: valid values are 0-359.
 #define GPS_HEADING_INVALID 0xFFFF
 
+enum class GPSReadResult : uint8_t {
+	NotAttempted,
+	Accepted,
+	LinkUnavailable,
+	NoReply,
+	MarkerMissing,
+	RequiredFieldInvalid,
+	CoordinateRejected,
+	DirectNoData
+};
+
+struct GPSReadDiagnostics {
+	GPSReadResult result = GPSReadResult::NotAttempted;
+	uint16_t reply_bytes = 0;
+	int8_t field = -1;
+};
+
 class CLink
 {
 public:

@@ -15,15 +15,44 @@
   fix with a valid date was applied. This is the primary time source: outdoors the GNSS fix provides
   UTC directly, so no NTP round-trip is needed.
 */
+static GPS_DATA geo_accepted{};
+static uint32_t geo_accepted_utc = 0;
+
+uint32_t gpsUtc(const GPS_DATA& fix) {
+  int year = fix.date % 100 + 2000;
+  int month = fix.date / 100 % 100;
+  int day = fix.date / 10000;
+  int hour = fix.time / 1000000;
+  int minute = fix.time / 10000 % 100;
+  int second = fix.time / 100 % 100;
+  const int days[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  bool leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+  if (month < 1 || month > 12 || day < 1 || day > days[month - 1] + (month == 2 && leap) ||
+      hour > 23 || minute > 59 || second > 59 || year < 2001) return 0;
+  time_t epoch = utcToEpoch(year, month, day, hour, minute, second);
+  return geoValidUtc((double)epoch, 4294967295.0) ? (uint32_t)epoch : 0;
+}
+
+bool pollGpsData() {
+  bool accepted = sys.gpsGetData(&gd);
+  if (accepted) {
+    geo_accepted = gd ? *gd : GPS_DATA{};
+    geo_accepted_utc = gd && geoValidLocation(gd->lat, gd->lng) && gd->lat != 0 && gd->lng != 0 ? gpsUtc(*gd) : 0;
+  }
+  return accepted;
+}
+
+uint32_t gpsLocationUtc() {
+  return gd && gd->date == geo_accepted.date && gd->time == geo_accepted.time &&
+         gd->lat == geo_accepted.lat && gd->lng == geo_accepted.lng ? geo_accepted_utc : 0;
+}
+
 bool setClockFromGps() {
   if (!gd || gd->date == 0) return false; // date stays 0 until the GNSS locks - no fix yet
-  int year = ( gd->date % 100 ) + 2000;
-  int month = ( gd->date / 100 ) % 100;
-  int day = gd->date / 10000;
-  int hour = gd->time / 1000000;
-  int minute = ( gd->time % 1000000 ) / 10000;
-  int second = ( gd->time % 10000 ) / 100;
-  setClock(CLK_GPS, utcToEpoch(year, month, day, hour, minute, second));
+  if (gd->date != geo_accepted.date || gd->time != geo_accepted.time) return false;
+  uint32_t epoch = gpsUtc(geo_accepted);
+  if (!epoch) return false;
+  setClock(CLK_GPS, epoch);
   return true;
 }
 
@@ -92,6 +121,18 @@ static bool gpsIsMoving() {
 static double park_acc_lat = 0.0;
 static double park_acc_lon = 0.0;
 static uint16_t park_acc_n = 0;
+static uint32_t park_acc_utc = 0;
+static bool park_acc_unknown_utc = false;
+RTC_DATA_ATTR uint32_t frozen_geo_utc = 0;
+RTC_DATA_ATTR double frozen_geo_lat = 0, frozen_geo_lon = 0;
+
+void resetFrozenGpsProvenance(bool deep_sleep) {
+  if (!deep_sleep) frozen_geo_utc = 0;
+}
+
+uint32_t frozenGpsUtc() {
+  return frozen_lat == frozen_geo_lat && frozen_lon == frozen_geo_lon ? frozen_geo_utc : 0;
+}
 static const uint16_t PARK_ACC_MAX = 240;   // ~20 min at the 5s cadence; caps drift in the running mean
 
 // Consecutive samples reporting movement. Used ONLY to debounce the is_parked latch, never the coordinates:
@@ -124,6 +165,8 @@ static void parkAccumSample() {
     if (gps_moving_streak < 255) gps_moving_streak++;
     park_acc_lat = park_acc_lon = 0.0;
     park_acc_n = 0;
+    park_acc_utc = 0;
+    park_acc_unknown_utc = false;
     return;
   }
   gps_moving_streak = 0;
@@ -131,6 +174,9 @@ static void parkAccumSample() {
   park_acc_lat += gd->lat;
   park_acc_lon += gd->lng;
   park_acc_n++;
+  uint32_t epoch = gpsLocationUtc();
+  if (!epoch) park_acc_unknown_utc = true;
+  if (epoch > park_acc_utc) park_acc_utc = epoch;
 }
 
 /* Debounced "the GNSS is sure we are moving" - drives the is_parked latch and the awake leash. */
@@ -173,6 +219,9 @@ void freezeParkedLocation() {
     frozen_lat = park_acc_lat / (double)park_acc_n;
     frozen_lon = park_acc_lon / (double)park_acc_n;
     frozen_valid = true;
+    frozen_geo_utc = park_acc_unknown_utc ? 0 : park_acc_utc;
+    frozen_geo_lat = frozen_lat;
+    frozen_geo_lon = frozen_lon;
 #if ENABLE_LOGGING
     logEvent("PARKED_LOC frozen lat=%.6f lon=%.6f avg_of=%u hdop=%d",
       frozen_lat, frozen_lon, (unsigned)park_acc_n, gd ? gd->hdop : 0);
@@ -181,6 +230,9 @@ void freezeParkedLocation() {
     frozen_lat = gd->lat;
     frozen_lon = gd->lng;
     frozen_valid = true;
+    frozen_geo_utc = gpsLocationUtc();
+    frozen_geo_lat = frozen_lat;
+    frozen_geo_lon = frozen_lon;
 #if ENABLE_LOGGING
     logEvent("PARKED_LOC frozen lat=%.6f lon=%.6f single (only %u stationary sample(s)) hdop=%d",
       gd->lat, gd->lng, (unsigned)park_acc_n, gd->hdop);
@@ -192,9 +244,16 @@ void freezeParkedLocation() {
   }
   park_acc_lat = park_acc_lon = 0.0;   // start a fresh average for the next stop
   park_acc_n = 0;
+  park_acc_utc = 0;
+  park_acc_unknown_utc = false;
 }
 
+static const char* gps_location_source = "omitted";
+static const char* gpsLocationSource() { return gps_location_source; }
+
 void addGpsData(OBDVector& vec) {
+  gps_location_source = "omitted";
+  scrubGeoMetadata(vec);
   // Keep refining the parking average whenever we hold a live fix, so the freeze has something to average.
   if (g_gps_powered) parkAccumSample();
 
@@ -208,8 +267,10 @@ void addGpsData(OBDVector& vec) {
     // vehicle backwards on the map. A live fix that shows movement is always the truth, so prefer it. Reporting
     // nothing is also better than reporting a stale position, hence no frozen fallback while moving.
     if (gpsIsMoving()) {
+      gps_location_source = "gnss";
       vec.emplace_back("lon", gd->lng);
       vec.emplace_back("lat", gd->lat);
+      vec.emplace_back("__geo_loc_utc", gpsLocationUtc());
       if (last_gd.date != gd->date || last_gd.time != gd->time) {
         setClockFromGps();
         last_gd = *gd;
@@ -217,12 +278,16 @@ void addGpsData(OBDVector& vec) {
       return;
     }
     if (frozen_valid) {
+      gps_location_source = "frozen";
       vec.emplace_back("lon", frozen_lon);
       vec.emplace_back("lat", frozen_lat);
+      vec.emplace_back("__geo_loc_utc", frozenGpsUtc());
     } else if (g_gps_powered && gpsHasFix()) {
       // Cold-boot fallback: no frozen fix yet, but we did power GNSS this wake and it has one - use it.
+      gps_location_source = "gnss";
       vec.emplace_back("lon", gd->lng);
       vec.emplace_back("lat", gd->lat);
+      vec.emplace_back("__geo_loc_utc", gpsLocationUtc());
     }
     return;
   }
@@ -232,8 +297,10 @@ void addGpsData(OBDVector& vec) {
 #if PRINT
     Serial.printf("Adding coords to vec\n");
 #endif
+    gps_location_source = "gnss";
     vec.emplace_back("lon", gd->lng);
     vec.emplace_back("lat", gd->lat);
+    vec.emplace_back("__geo_loc_utc", gpsLocationUtc());
   }
   // Heading = GNSS course-over-ground (gd->heading, already parsed from RMC/VTG). Emit ONLY when actually
   // MOVING: at standstill COG is undefined noise, so we'd otherwise feed ABRP a spinning map marker. Gating
@@ -244,6 +311,7 @@ void addGpsData(OBDVector& vec) {
   // no-GPS wake (parked returns above; garage = lat/lng 0) naturally sends nothing.
   if (gd->lat != 0 && gd->lng != 0 && gd->speed * 1.852f >= HEADING_MIN_SPEED_KMH && gd->heading != GPS_HEADING_INVALID) {
     vec.emplace_back("heading", (double)gd->heading);
+    vec.emplace_back("__geo_head_utc", gd->heading == geo_accepted.heading ? gpsLocationUtc() : 0);
   }
   if (last_gd.date != gd->date || last_gd.time != gd->time) { // refresh clock whenever the GNSS time advances
     setClockFromGps();

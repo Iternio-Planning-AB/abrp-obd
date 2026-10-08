@@ -151,6 +151,7 @@ public:
   void gpsEnd(bool powerOff = true);
   // get parsed GPS data (returns the number of data parsed since last invoke)
   bool gpsGetData(GPS_DATA** pgd);
+  const GPSReadDiagnostics& gpsReadDiagnostics() const { return m_gps_read_diagnostics; }
   // get buffered NMEA data
   int gpsGetNMEA(char* buffer, int bufsize);
   // send command string to GPS
@@ -183,6 +184,7 @@ public:
 	// co-processor link
 	CLink *link = 0;
 private:
+  GPSReadDiagnostics m_gps_read_diagnostics{};
   byte m_flags = 0;
   byte m_pinGPSPower = 0;
 };

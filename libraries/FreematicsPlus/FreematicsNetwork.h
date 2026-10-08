@@ -61,6 +61,16 @@ struct commandResponse{
   }
 };
 
+struct HTTPTransferDiagnostics {
+    int prompt_result = -1;
+    int body_ack_result = -1;
+    int post_result = -1;
+    int declared_response_length = -1;
+    int shread_length = -1;
+    int captured_response_length = -1;
+    int8_t response_incomplete = -1;
+};
+
 class HTTPClientClass
 {
 public:
@@ -123,7 +133,9 @@ public:
     char* receive(int* pbytes = 0, unsigned int timeout = HTTP_CONN_TIMEOUT);
     // Outcome, step results and bearer state of the last open(); see open() for the fields.
     const char* openTrace() { return m_open_trace; }
+    const HTTPTransferDiagnostics& transferDiagnostics() const { return m_transfer_diagnostics; }
 private:
+    HTTPTransferDiagnostics m_transfer_diagnostics;
     int bearerState(char* out, size_t len);
     void recordOpenTrace(const char* fail_step, char req, const char* bo, const char* sh, unsigned long t0);
     char m_open_trace[80] = {0};

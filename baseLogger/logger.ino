@@ -368,6 +368,7 @@ void changeState(ActivityState new_state);     // Helpers/state_machine.h
 #include "Helpers/mems.h"
 #include "Helpers/clock_sync.h"
 #include "Helpers/telemetry_format.h"
+#include "Helpers/geo_backlog.h"
 #include "Helpers/sleep_power.h"
 #include "Helpers/ble.h"
 #include "Helpers/logging.h"
@@ -412,6 +413,7 @@ extern "C" bool verifyRollbackLater() { return true; }
 
 void setup() {
   esp_sleep_wakeup_cause_t wake_cause = esp_sleep_get_wakeup_cause();
+  resetFrozenGpsProvenance(esp_reset_reason() == ESP_RST_DEEPSLEEP);
 #if PRINT
   // Only stall on a true power-on, so a serial monitor can attach in time to see boot output. Skip it on
   // every deep-sleep wake - periodic, motion, and especially the WiFi RF-flush recovery - so those reboots
@@ -563,7 +565,7 @@ void setup() {
 
 #if FILE_TEST
   sys.gpsBegin();
-  sys.gpsGetData(&gd);
+  pollGpsData();
 #endif
 
   // NOTE: BLE is NO LONGER brought up here. It used to init before the ATRV gate, so it came up on every wake
@@ -981,7 +983,7 @@ void setup() {
     g_gps_powered = sys.gpsBegin();
     Serial.printf(g_gps_powered ? "GPS success\n" : "GPS Setup failed - will retry from the loop\n");
     if (g_gps_powered) {
-      sys.gpsGetData(&gd);
+      pollGpsData();
     }
 #if ENABLE_LOGGING
     else logEvent("GPS init FAILED at wake - retrying once per poll cycle");
@@ -1275,7 +1277,7 @@ void loop() {
 #endif
 #if ENABLE_GPS
     if (g_gps_powered) {
-      sys.gpsGetData(&gd);
+      pollGpsData();
       parkAccumSample();   // advance the movement streak now; idempotent, so addGpsData() below is a no-op for this fix
     }
 #endif
@@ -1309,7 +1311,7 @@ void loop() {
     if (!g_gps_powered && !g_sample_poke) {
       if (sys.gpsBegin()) {
         g_gps_powered = true;
-        sys.gpsGetData(&gd);
+        pollGpsData();
         Serial.printf("GPS recovered on a later attempt\n");
 #if ENABLE_LOGGING
         logEvent("GPS init recovered after a failed wake attempt");
@@ -1418,6 +1420,7 @@ void loop() {
     }
 #endif
 
+    scrubGeoMetadata(current_frame);
 #if ENABLE_GPS
     // gd was refreshed at the top of this cycle (the alarm gate needs the movement verdict before it
     // decides), so only the frame-building call remains here.

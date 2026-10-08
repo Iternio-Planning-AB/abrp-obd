@@ -10,13 +10,17 @@
   compilation unit - so it shares logger.ino's globals and the config.h feature flags.
 */
 
+static unsigned long gpsFixAgeMs();
+static const char* gpsLocationSource();
+
 #if ENABLE_LOGGING
-// CSV column order for the data log. Diagnostics first, then the vehicle metrics. Must stay in sync with
+// CSV column order for the data log. Legacy prefix, then optional GPS diagnostics. Must stay in sync with
 // buildLogLine() below.
 const std::string LOG_HEADER =
   "millis,utc,boot,sleep,wake,state,batt12v,rail_v,free_heap,min_heap,max_block,free_psram,rssi,wifi,"
   "gps_fix,gps_sat,gps_hdop,gps_alt,obd_pids,up_http,up_status,reset,clean_sleep,note,"
-  "soc,soh,voltage,current,power,kwh_charged,speed,ext_temp,is_parked,is_charging,lat,lon";
+  "soc,soh,voltage,current,power,kwh_charged,speed,ext_temp,is_parked,is_charging,lat,lon,"
+  "gps_read,gps_reply_bytes,gps_field,gps_date,gps_time,gps_time_age_ms,gps_speed_kmh,gps_lat,gps_lon,gps_source";
 
 static const char* stateName(ActivityState s) {
   switch (s) {
@@ -39,6 +43,19 @@ static std::string fcol(const OBDVector& f, const char* key) {
     }
   }
   return std::string();
+}
+
+static const char* gpsReadName(GPSReadResult result) {
+  switch (result) {
+  case GPSReadResult::Accepted: return "ok";
+  case GPSReadResult::LinkUnavailable: return "link";
+  case GPSReadResult::NoReply: return "no_reply";
+  case GPSReadResult::MarkerMissing: return "marker";
+  case GPSReadResult::RequiredFieldInvalid: return "field";
+  case GPSReadResult::CoordinateRejected: return "coord";
+  case GPSReadResult::DirectNoData: return "direct_none";
+  default: return "none";
+  }
 }
 
 // Assemble one CSV row: hardware diagnostics + the vehicle metrics from this reading. obd_count is the
@@ -87,6 +104,15 @@ std::string buildLogLine(const OBDVector& frame, int obd_count) {
     g_clean_sleep ? 1 : 0, // clean_sleep: 1 = came through our sleep path; 0 = uncommanded boot (trust rail_v only when 1)
     note);
 
+  const GPSReadDiagnostics diagnostics = g_gps_powered ? sys.gpsReadDiagnostics() : GPSReadDiagnostics{};
+  const unsigned long age = gpsFixAgeMs();
+  char age_text[24] = {};
+  if (age != ULONG_MAX) snprintf(age_text, sizeof(age_text), "%lu", age);
+  char gps_columns[160];
+  snprintf(gps_columns, sizeof(gps_columns), "%s,%u,%d,%lu,%lu,%s,%.2f,%.6f,%.6f,%s",
+    gpsReadName(diagnostics.result), (unsigned)diagnostics.reply_bytes, (int)diagnostics.field,
+    (unsigned long)(gd ? gd->date : 0), (unsigned long)(gd ? gd->time : 0), age_text,
+    gd ? gd->speed * 1.852f : 0, gd ? gd->lat : 0, gd ? gd->lng : 0, gpsLocationSource());
   std::string line(head);
   const char* tcols[] = { "soc", "soh", "voltage", "current", "power", "kwh_charged",
                           "speed", "ext_temp", "is_parked", "is_charging", "lat", "lon" };
@@ -94,6 +120,8 @@ std::string buildLogLine(const OBDVector& frame, int obd_count) {
     line += ",";
     line += fcol(frame, c);
   }
+  line += ",";
+  line += gps_columns;
   return line;
 }
 
