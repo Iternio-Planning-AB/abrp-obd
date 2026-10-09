@@ -4,8 +4,8 @@ A release is one press: **Actions → Release → Run workflow** on `main`. The 
 (`.github/workflows/release.yml`):
 
 1. **build** job: picks the version from the Conventional Commits since the last release (`git cliff
-   --bumped-version`: `feat` → minor, `fix`/`perf`/`revert` → patch, any `type!:` or `BREAKING CHANGE` → major),
-   unless you type one, then builds the commit you dispatched on with that version injected;
+   --bumped-version`: `feat` → minor, `fix`/`perf`/`revert` → patch, any `type!:` or `BREAKING CHANGE` → major, or
+   minor before 1.0.0), unless you type one, then builds the commit you dispatched on with that version injected;
 2. **publish** job: refuses an image that wasn't built as that version or doesn't carry the trusted public key,
    signs it with the AWS KMS key, checks the signature against `Helpers/ota_pubkey.h`, then stages a draft GitHub
    Release with every asset and publishes it. Publishing creates tag `vX.Y.Z` on that commit.
@@ -30,11 +30,12 @@ build), `factory.bin` (bootloader, partitions and app in one file for `esptool.p
 
 ## Versions
 
-`X.Y.Z` packs into the uint32 the dongle compares: `major*1000000 + minor*1000 + patch` (`tools/fw_version.py`),
-so minor and patch stop at 999. The BLE protocol, the signed blob and the anti-downgrade check are unchanged. The
-pre-semver releases were the integers 1–7, and 1.0.0 (1000000) is above all of them. An rc and its final share a
-code: the dongle accepts the final over its rc because it allows an equal version, but an app that only offers a
-strictly newer `version` will not offer it (see Known gaps).
+`X.Y.Z` packs into the uint32 the dongle compares: `major*1000000 + minor*1000 + patch` (`tools/fw_version.py`), so
+minor and patch stop at 999. The BLE protocol, the signed blob and the anti-downgrade check are unchanged. The
+pre-semver releases were the integers 1–7, and the first release, 0.1.0 (1000), is above all of them. Before 1.0.0 a
+breaking change bumps minor, not major; type `1.0.0` as the `version` input when it's time. An rc and its final
+share a code: the dongle accepts the final over its rc because it allows an equal version, but an app that only
+offers a strictly newer `version` will not offer it (see Known gaps).
 
 The version is never edited by hand. `tools/pio_version.py` sets `OTA_FW_VERSION` and `FW_BUILD_TAG` at build time:
 

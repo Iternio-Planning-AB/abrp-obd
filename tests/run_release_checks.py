@@ -606,10 +606,20 @@ class ReleaseNotes(unittest.TestCase):
         self.repo = Repo()
         self.addCleanup(self.repo.close)
 
-    def test_first_release_is_1_0_0_even_over_pre_convention_history(self):
+    def test_first_release_is_0_1_0_even_over_breaking_or_pre_convention_history(self):
         self.repo.commit("Initial commit")
         self.repo.commit("feat(upload): send cell temperatures")
-        self.assertEqual(cliff(self.repo.path, "--bumped-version").strip(), "v1.0.0")
+        self.repo.commit("feat(release): cut releases", "BREAKING CHANGE: versions are semver now")
+        self.assertEqual(cliff(self.repo.path, "--bumped-version").strip(), "v0.1.0")
+
+    def test_before_1_0_0_a_breaking_change_bumps_minor_not_major(self):
+        self.repo.commit("feat: a")
+        self.repo.tag("v0.1.0")
+        self.repo.commit("refactor(upload)!: drop the v1 wire format")
+        self.assertEqual(cliff(self.repo.path, "--bumped-version").strip(), "v0.2.0")
+        self.repo.tag("v0.2.0")
+        self.repo.commit("fix: b")
+        self.assertEqual(cliff(self.repo.path, "--bumped-version").strip(), "v0.2.1")
 
     def test_bump_follows_conventional_commits_and_skips_candidates(self):
         self.repo.commit("feat: a")

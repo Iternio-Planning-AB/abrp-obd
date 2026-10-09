@@ -36,7 +36,8 @@ commit_parsers = [
 ]
 
 [bump]
-# Pre-semver releases were integers up to 7; 1.0.0 encodes to 1000000, above every existing dongle's floor.
-initial_tag = "v1.0.0"
+# Pre-semver releases were integers up to 7; 0.1.0 encodes to 1000, above every existing dongle's floor.
+initial_tag = "v0.1.0"
 features_always_bump_minor = true
-breaking_always_bump_major = true
+# Before 1.0.0 a breaking change bumps minor; 1.0.0 is a deliberate `version` input, not a side effect.
+breaking_always_bump_major = false

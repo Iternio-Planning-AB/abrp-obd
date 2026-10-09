@@ -1719,7 +1719,7 @@ that version's `firmware.bin`.
 | Field | Type | Meaning | Encoding gotcha |
 |---|---|---|---|
 | `version` | integer | Monotonic firmware version: the `OTA_FW_VERSION` the image was built with, `major*1000000 + minor*1000 + patch` of `version_name`. Compare this, never the tag. | plain JSON number, not a string |
-| `version_name` | string | Release name `X.Y.Z` or `X.Y.Z-rc.N`, for display. Absent from releases before 1.0.0 | an rc and its final share `version` |
+| `version_name` | string | Release name `X.Y.Z` or `X.Y.Z-rc.N`, for display. Absent from the pre-semver integer releases | an rc and its final share `version` |
 | `size` | integer | Exact byte length of `firmware.bin`. | **Verify this against the downloaded file's actual length before doing anything else** — a truncated download is the single most likely bench-test failure, and catching it here costs nothing vs. discovering it after a 3-minute BLE transfer |
 | `sha256` | string | SHA-256 of the raw image bytes, hex, **lowercase**, 64 chars = 32 bytes | Must become **32 raw bytes** for the BLE START payload — hex-decode it, don't send the hex string |
 | `signature` | string | ECDSA-P256 signature, hex, lowercase, 128 chars = 64 bytes | This is **raw `r‖s`** (32 bytes r, then 32 bytes s, both big-endian) — **NOT DER-encoded**. If you use a crypto library that hands you a DER signature, this is not that; `tools/ota_sign.py` already converts DER→raw before writing this field, so just hex-decode it directly into 64 bytes |
@@ -1747,7 +1747,7 @@ explaining what the repo is, optionally a `CHANGELOG.md`. Don't put `.bin` files
 
 ### 2.2 One release per version, tag = `v<N>`
 
-> **Superseded for 1.0.0 onwards:** tags are `vX.Y.Z` / `vX.Y.Z-rc.N` (`RELEASING.md`), so
+> **Superseded from 0.1.0 onwards:** tags are `vX.Y.Z` / `vX.Y.Z-rc.N` (`RELEASING.md`), so
 > `parseInt(tag.slice(1))` no longer orders them. Read every release's `manifest.json` and take the
 > max `version`, which is still the integer below.
 ```
