@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Host checks for the release tooling in baseLogger/tools (versioning, signing, workflow)."""
 
+import base64
 import hashlib
+import http.server
 import json
 import os
 import re
@@ -11,6 +13,8 @@ import struct
 import subprocess
 import sys
 import tempfile
+import textwrap
+import threading
 import unittest
 from pathlib import Path
 
@@ -488,7 +492,6 @@ class WorkflowGuards(unittest.TestCase):
 
     def test_signing_job_runs_no_downloaded_build_tooling(self):
         publish = self.wf.jobs["publish"]
-        self.assertIn("environment: release", publish)
         self.assertIn("id-token: write", publish)
         actions = {u.split("@")[0] for u in re.findall(r"uses: *([^\s#]+)", publish)}
         self.assertEqual(actions, {"actions/checkout", "actions/download-artifact",
@@ -498,6 +501,58 @@ class WorkflowGuards(unittest.TestCase):
             with self.subTest(step=step.splitlines()[0]):
                 for tool in ("pip", "pio ", "uv", "git cliff", "npm", "npx", "curl ", "wget "):
                     self.assertNotIn(tool, script)
+
+    def test_signing_identity_comes_from_cloudops_managed_variables(self):
+        # The AWS role trusts only release.yml on main; cloudops (tf/abrp-obd) sets these variables.
+        publish = self.wf.jobs["publish"]
+        self.assertNotIn("secrets.", publish)
+        aws = self.wf.step("publish", "AWS credentials")
+        self.assertIn("role-to-assume: ${{ vars.OTA_SIGNING_ROLE_ARN }}", aws)
+        self.assertIn("aws-region: eu-central-1", aws)
+        sign = self.wf.step("publish", "Sign")
+        self.assertIn("KMS_KEY_ID: ${{ vars.OTA_KMS_KEY_ID }}", sign)
+        self.assertIn('--kms-key-id "$KMS_KEY_ID"', self.wf.run_script(sign))
+
+    def test_dry_run_shows_the_oidc_claims_but_never_the_token(self):
+        steps = self.wf.steps("publish")
+        claims = self.wf.step("publish", "Show OIDC claims")
+        aws = self.wf.step("publish", "AWS credentials")
+        self.assertLess(steps.index(claims), steps.index(aws), "shown before an assume-role failure can stop the job")
+        self.assertRegex(claims, r"(?m)^        if: \$\{\{ inputs\.dry_run \}\}$")
+
+        # Run it against a fake token endpoint: the output must be the listed claims and nothing else.
+        def b64(data):
+            return base64.urlsafe_b64encode(json.dumps(data).encode()).rstrip(b"=").decode()
+        claims_in = {"aud": "sts.amazonaws.com", "sub": "repo:o@1/r@2:ref:refs/heads/main", "ref": "refs/heads/main",
+                     "job_workflow_ref": "o/r/.github/workflows/release.yml@refs/heads/main",
+                     "repository_id": "2", "repository_owner_id": "1", "actor": "not-printed"}
+        token = f"{b64({'alg': 'RS256'})}.{b64(claims_in)}.signature-not-printed"
+
+        class TokenEndpoint(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                ok = self.headers["Authorization"] == "bearer request-token" and "audience=sts.amazonaws.com" in self.path
+                self.send_response(200 if ok else 403)
+                self.end_headers()
+                self.wfile.write(json.dumps({"value": token}).encode())
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), TokenEndpoint)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        env = {"PATH": os.environ["PATH"], "ACTIONS_ID_TOKEN_REQUEST_TOKEN": "request-token",
+               "ACTIONS_ID_TOKEN_REQUEST_URL": f"http://127.0.0.1:{server.server_port}/token?api-version=2.0"}
+        block = self.wf.run_script(claims)
+        self.assertTrue(block.startswith("|"))
+        script = textwrap.dedent(block.split("\n", 1)[1])
+        # stderr too: the run log shows both.
+        out = subprocess.run(["bash", "-e", "-c", script], env=env, check=True, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True).stdout
+        expected = {k: v for k, v in claims_in.items() if k != "actor"}
+        self.assertEqual(json.loads(out), expected)
+        for secret in ("request-token", "signature-not-printed", token.split(".")[1]):
+            self.assertNotIn(secret, out)
 
     def test_build_runs_the_tooling_checks_from_full_history_before_building(self):
         names = [s.splitlines()[0].strip() for s in self.wf.steps("build")]

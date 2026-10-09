@@ -60,101 +60,41 @@ git cliff --bumped-version               # what the next version would be
 
 ## One-time setup
 
-Nothing below is automated. Do it once, in this order.
+The AWS and GitHub side lives in the Bitbucket repo `abrp/cloudops`, stack `tf/abrp-obd` (applied by
+Flux in the `frankfurt` cluster, eu-central-1). Nothing here is created by hand. It holds:
 
-### 1. AWS: signing key
-
-Create an asymmetric key that never leaves KMS:
-
-```sh
-aws kms create-key --key-spec ECC_NIST_P256 --key-usage SIGN_VERIFY \
-  --description "abrp-obd OTA firmware signing" --policy file://key-policy.json
-aws kms create-alias --alias-name alias/abrp-obd-ota-signing --target-key-id <key-id>
-```
-
-The key policy allows `kms:Sign` (digest, ECDSA_SHA_256 only) and `kms:GetPublicKey` only to the release role. It
-denies deletion and disabling to everyone, admins included; lifting that takes a deliberate `PutKeyPolicy`. Losing
-this key means every dongle needs a USB re-flash before it accepts another update. The account root keeps key
-administration so the key can't be orphaned if the admin role is deleted:
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    { "Sid": "Root", "Effect": "Allow", "Principal": { "AWS": "arn:aws:iam::<account>:root" },
-      "Action": ["kms:Describe*", "kms:Get*", "kms:List*", "kms:PutKeyPolicy"], "Resource": "*" },
-    { "Sid": "Admin", "Effect": "Allow", "Principal": { "AWS": "arn:aws:iam::<account>:role/<admin-role>" },
-      "Action": ["kms:Describe*", "kms:Get*", "kms:List*", "kms:PutKeyPolicy", "kms:TagResource",
-                 "kms:CreateAlias", "kms:UpdateAlias", "kms:DeleteAlias"],
-      "Resource": "*" },
-    { "Sid": "ReleaseSigns", "Effect": "Allow", "Principal": { "AWS": "arn:aws:iam::<account>:role/abrp-obd-release" },
-      "Action": "kms:Sign", "Resource": "*",
-      "Condition": { "StringEquals": { "kms:SigningAlgorithm": "ECDSA_SHA_256", "kms:MessageType": "DIGEST" } } },
-    { "Sid": "ReleaseReadsKey", "Effect": "Allow",
-      "Principal": { "AWS": "arn:aws:iam::<account>:role/abrp-obd-release" },
-      "Action": "kms:GetPublicKey", "Resource": "*" },
-    { "Sid": "NoDeletion", "Effect": "Deny", "Principal": "*",
-      "Action": ["kms:ScheduleKeyDeletion", "kms:DisableKey"], "Resource": "*" }
-  ]
-}
-```
-
-### 2. AWS: role for the workflow
-
-Add `token.actions.githubusercontent.com` as an OIDC identity provider (audience `sts.amazonaws.com`) if the
-account doesn't have it, then create role `abrp-obd-release` with this trust policy. The subject pins the repo
-**and** the `release` environment, so no other repo, branch or job can assume it. Matching is case-sensitive.
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Effect": "Allow",
-    "Principal": { "Federated": "arn:aws:iam::<account>:oidc-provider/token.actions.githubusercontent.com" },
-    "Action": "sts:AssumeRoleWithWebIdentity",
-    "Condition": { "StringEquals": {
-      "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
-      "token.actions.githubusercontent.com:sub": "repo:Iternio-Planning-AB/abrp-obd:environment:release"
-    } }
-  }]
-}
-```
-
-It needs no permissions policy beyond what the key policy grants. Check the org's subject template first
-(`gh api orgs/Iternio-Planning-AB/actions/oidc/customization/sub`); if it is customised, change `sub` to match. Keep
-`StringEquals`, never `StringLike` with wildcards.
-
-### 3. GitHub: environment and secrets
-
-In *Settings → Environments*, create `release` with a deployment branch rule that allows only `main`. Add these
-environment secrets (not repository secrets, so only that environment's jobs can read them):
-
-| Secret | Value |
-| --- | --- |
-| `OTA_SIGNING_ROLE_ARN` | `arn:aws:iam::<account>:role/abrp-obd-release` |
-| `OTA_SIGNING_REGION` | the key's region |
-| `OTA_KMS_KEY_ID` | `alias/abrp-obd-ota-signing` |
+- KMS key `alias/abrp-obd-ota-signing` (ECC_NIST_P256). Only role `abrp-obd-ota-release` may sign with it
+  (digests, ECDSA_SHA_256), nobody can delete or disable it, and only the `admin-breakglass` SSO role can change
+  its policy. Losing this key means every dongle needs a USB re-flash before it accepts another update.
+- Role `abrp-obd-ota-release`, which trusts only `.github/workflows/release.yml` on `main` of this repo. If assuming
+  it fails, a `dry_run` prints the OIDC claims the job got, to compare with the trust policy
+  (`tf/abrp-obd/release-role.tf`).
+- This repo's Actions **variables** (not secrets; neither grants anything) `OTA_SIGNING_ROLE_ARN` and
+  `OTA_KMS_KEY_ID`, set through the GitHub App `iternio-cloudops-terraform`.
 
 There are no long-lived credentials: the job swaps a short-lived OIDC token for 15-minute role credentials, and the
 private key never leaves KMS.
 
-**Do before the first real release.** Until these exist, anyone who can push to this repo can produce firmware
-every dongle trusts:
+### Accepted risks
 
-- a ruleset on `main`: PR required, no force-push, no deletion. Without it, a pushed commit gets signed, and a new
-  workflow file that names `environment: release` gets the same OIDC subject;
-- a tag ruleset restricting creation of `v*` tags to admins (the workflow's `GITHUB_TOKEN` can still create them).
-  Versions are computed from existing tags, so a pushed `v9.0.0` would drag the next release, and the fleet's floor,
-  up with it;
-- optionally, a required reviewer on `release` with "prevent self-review" (a second pair of eyes, at the cost of the
-  one press), and a custom OIDC subject that includes `job_workflow_ref`, pinned to `release.yml@refs/heads/main`.
+The org is on GitHub Free: no environments, rulesets or branch protection on a private repo. So:
 
-### 4. Switch the firmware to the KMS key
+- **Anyone who can push to `main` can get firmware signed**, by pushing a change to `release.yml` and running it.
+  Keep write access to this repo small.
+- **A pushed `vX.Y.Z` tag drags the next version**, and with it the fleet's floor, up.
+- **An `admin-breakglass` session can grant itself Sign** by rewriting the key policy.
+- **Anyone who can rewrite the release role's trust can also sign**: the `tf-aws-infra` user and
+  `tf-access-infra-assumable`. The cloudops infra and env tf-runners can too, after attaching more policy to their
+  own roles, so a malicious cloudops merge to any env stack is enough. Fixing it means moving the key to a member
+  account with an SCP; SCPs don't apply in the management account.
+- Nothing alerts on any of this, or on Sign; CloudTrail's 90-day event history is the only record.
+
+### Switch the firmware to the KMS key
 
 The dongles trust the public key compiled into them. To make them trust the KMS key:
 
 ```sh
-python3 baseLogger/tools/ota_keygen.py --from-kms alias/abrp-obd-ota-signing   # needs kms:GetPublicKey
+python3 baseLogger/tools/ota_keygen.py --from-kms alias/abrp-obd-ota-signing   # AWS admin, eu-central-1
 ```
 
 Commit the regenerated `Helpers/ota_pubkey.h`, then **re-flash every existing dongle over USB**
