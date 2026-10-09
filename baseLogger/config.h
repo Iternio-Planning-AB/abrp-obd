@@ -55,8 +55,6 @@
 // ------------------------------------------------------------------------------------
 // 5. DEVELOPER MAINTAINED (Check these before compiling!)
 // ------------------------------------------------------------------------------------
-// OTA_FW_VERSION              7  // CRITICAL: Must be bumped every release. A stale value 
-                                  // causes "dongle already runs newer firmware" OTA aborts.
 // HEARTBEAT_POLL_MAX_MINUTES 30  // Test value ("CONFIRMATION run"). Inert right now because 
                                   // ENABLE_PARKED_HEARTBEAT is 0. If ever enabling heartbeat 
                                   // for production, change this to 1440.
@@ -739,20 +737,27 @@
 #define ENABLE_OTA 1
 #endif
 
-// Monotonic firmware version. BUMP THIS ON EVERY RELEASE. Two jobs: (1) anti-downgrade - a START whose
-// version is BELOW the running version is refused (equal IS allowed, so a bench re-flash of the same build
-// works); (2) rollback detection - it's recorded in NVS before the commit reboot, so if the bootloader
-// reverts, the old firmware sees "attempted version != my version" and can report ROLLED_BACK to the app.
-#define OTA_FW_VERSION 7
+// Monotonic firmware version, injected by tools/pio_version.py: X.Y.Z packs to major*1000000 + minor*1000 + patch
+// (tools/fw_version.py). A release build gets the version the release workflow chose; any other build gets the
+// newest v* tag reachable from HEAD. Two jobs: (1) anti-downgrade - a START whose version is BELOW the running
+// version is refused (equal IS allowed, so a bench re-flash of the same build works); (2) rollback detection -
+// it's recorded in NVS before the commit reboot, so if the bootloader reverts, the old firmware sees "attempted
+// version != my version" and can report ROLLED_BACK to the app. Pre-semver releases were plain integers up to 7.
+// The fallback only covers compiles outside PlatformIO (host tests); 0 is below every real release.
+#ifndef OTA_FW_VERSION
+#define OTA_FW_VERSION 0
+#endif
 
-// Build identity banner. EDIT THIS STRING before building an update, then watch for it on the serial monitor
-// after the dongle reboots: seeing your new tag is positive proof the new image is the one now running (and
-// that it survived its trial boot). Also written to the flash log as an EVT and exposed in the ABD5 info JSON,
-// so a DUMP tells you which firmware produced which rows. __DATE__/__TIME__ are appended automatically so the
-// banner is unique per build even if the tag is left unchanged.
+// Build identity banner, injected alongside OTA_FW_VERSION: "v1.2.0" for a release, "v1.2.0+3.gabc1234.dirty"
+// for a build 3 commits past it with local changes. Watch for it on the serial monitor after the dongle reboots:
+// seeing the expected tag is positive proof the new image is the one now running (and that it survived its trial
+// boot). Also written to the flash log as an EVT and exposed in the ABD5 info JSON, so a DUMP tells you which
+// firmware produced which rows. __DATE__/__TIME__ are appended to the banner automatically.
 // NOTE: the timestamp makes builds non-byte-reproducible. That only matters if delta/patch OTA is adopted
 // later (a patch's base image must match exactly) - irrelevant for full-image updates.
-#define FW_BUILD_TAG "OTA-TESTING-v7-ENCRYPT"
+#ifndef FW_BUILD_TAG
+#define FW_BUILD_TAG "unversioned"
+#endif
 
 // Require a valid ECDSA-P256 signature before an update is allowed to commit. THIS IS THE TRUST BOUNDARY:
 // with it enabled, neither a tampered GitHub release, a malicious app, nor anyone speaking BLE to the dongle

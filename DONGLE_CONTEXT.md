@@ -198,8 +198,10 @@ stands in front of.
 - Two frame types on ABD5: the sector ACK **and** a status frame (START accept/reject, verify/commit
   progress). Early docs only described the first.
 - Trial boot + rollback; a 90 s resume window if the link drops mid-transfer.
-- `OTA_FW_VERSION` **must be bumped every release** — three stale-binary releases have happened. The
-  trip-wire catches them at boot but the pipeline shouldn't be able to produce them.
+- `OTA_FW_VERSION` is injected from the release version at build time (`X.Y.Z` → `major*1000000 +
+  minor*1000 + patch`), and `ota_sign.py` refuses an image not built as the version it signs. Three
+  stale-binary releases happened back when it was hand-bumped; the boot trip-wire stays as a backstop.
+  See `RELEASING.md`.
 - `OTARESET` clears the persisted anti-downgrade floor after a bench flash to a lower version.
 
 ### Distribution — the release repo
@@ -221,6 +223,9 @@ phone-side in-memory cache, then streams it over BLE.
 - **Signing keypair:** `tools/ota_keygen.py` generates it, `tools/ota_sign.py` signs a build. The
   public key is embedded at `Helpers/ota_pubkey.h`; if it is ever rotated, firmware and signer change
   together and the new firmware must reach devices *before* anything signed with the new key.
+- **Release pipeline (staged):** the manual GitHub Actions *Release* workflow signs with an AWS KMS key and
+  publishes GitHub Releases in this repo (`RELEASING.md`). The app does not read those yet, and moving to
+  the KMS key means a USB re-flash of every dongle.
 
 ---
 
@@ -501,7 +506,7 @@ Everything below except `README.md` is embedded verbatim in **Part II** of this 
 
 ## 11. If you change one thing, know this
 
-1. **Bump `OTA_FW_VERSION`** before any release.
+1. **Release through the workflow** (`RELEASING.md`); `OTA_FW_VERSION` comes from the tag, not an edit.
 2. **Don't reorder the GATT table** — append only (FROZEN TABLE).
 3. **Don't do flash/crypto/OBD work on a BLE callback** — stash and let the loop task handle it.
 4. **Don't add a peripheral-initiated pairing request** — gate an attribute instead.
@@ -1713,7 +1718,8 @@ that version's `firmware.bin`.
 
 | Field | Type | Meaning | Encoding gotcha |
 |---|---|---|---|
-| `version` | integer | Monotonic firmware version. Must equal the GitHub release tag (§2) and the `OTA_FW_VERSION` the image was built with. | plain JSON number, not a string |
+| `version` | integer | Monotonic firmware version: the `OTA_FW_VERSION` the image was built with, `major*1000000 + minor*1000 + patch` of `version_name`. Compare this, never the tag. | plain JSON number, not a string |
+| `version_name` | string | Release name `X.Y.Z` or `X.Y.Z-rc.N`, for display. Absent from releases before 1.0.0 | an rc and its final share `version` |
 | `size` | integer | Exact byte length of `firmware.bin`. | **Verify this against the downloaded file's actual length before doing anything else** — a truncated download is the single most likely bench-test failure, and catching it here costs nothing vs. discovering it after a 3-minute BLE transfer |
 | `sha256` | string | SHA-256 of the raw image bytes, hex, **lowercase**, 64 chars = 32 bytes | Must become **32 raw bytes** for the BLE START payload — hex-decode it, don't send the hex string |
 | `signature` | string | ECDSA-P256 signature, hex, lowercase, 128 chars = 64 bytes | This is **raw `r‖s`** (32 bytes r, then 32 bytes s, both big-endian) — **NOT DER-encoded**. If you use a crypto library that hands you a DER signature, this is not that; `tools/ota_sign.py` already converts DER→raw before writing this field, so just hex-decode it directly into 64 bytes |
@@ -1740,6 +1746,10 @@ LFS needed, up to 2 GB/asset). Keep the repo's actual tree minimal — a `README
 explaining what the repo is, optionally a `CHANGELOG.md`. Don't put `.bin` files in commits.
 
 ### 2.2 One release per version, tag = `v<N>`
+
+> **Superseded for 1.0.0 onwards:** tags are `vX.Y.Z` / `vX.Y.Z-rc.N` (`RELEASING.md`), so
+> `parseInt(tag.slice(1))` no longer orders them. Read every release's `manifest.json` and take the
+> max `version`, which is still the integer below.
 ```
 tag: v1, v2, v3, ...     (N = the integer OTA_FW_VERSION, no other format)
 ```
@@ -3301,9 +3311,9 @@ out; the in-use copy has not. Low risk, but it's a library edit that deserves it
   Cosmetic, but it buries real errors; the fix is written out in §8 and gated on the multi-peer decision there.
 - **App-side poller tests** for `isFirmwareUpdateOngoing` / `isDongleLogFetchOngoing`, mirroring the existing
   wizard/PID-test cases. The three guard sites are exactly the poller behaviour that branch changed.
-- **`ota_sign.py` should derive the version** from the binary (or `config.h`) instead of taking `--version`,
-  or refuse to sign on a mismatch. Three stale-binary releases have happened (v2-over-v1, v5-over-v4,
-  3-over-v2); the trip-wire catches them at boot, but the pipeline shouldn't be able to produce them.
+- ~~**`ota_sign.py` should derive the version**~~ Done: the version is injected at build time and `ota_sign.py`
+  refuses an image whose `FW_BUILD_TAG` doesn't match. Three stale-binary releases preceded it (v2-over-v1,
+  v5-over-v4, 3-over-v2).
 
 ---
 

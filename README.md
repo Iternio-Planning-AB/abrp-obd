@@ -88,14 +88,11 @@ Signed firmware is distributed through a **private release repository**. The ABR
 newest release from there and streams it to the dongle over BLE; the dongle verifies the ECDSA
 signature before applying and rolls back if anything fails.
 
-1. **Bump `OTA_FW_VERSION`** in `config.h` (mandatory — a stale version makes every dongle refuse
-   the update as a downgrade).
-2. Build with PlatformIO → `firmware.bin`.
-3. Sign it: `tools/ota_sign.py` produces the signature with the private signing key (the matching
-   public key is baked into the firmware in `Helpers/ota_pubkey.h`).
-4. Upload **exactly two assets** to the repo's release: `firmware.bin` and `manifest.json`
-   (version, size, sha256, signature, `sig_alg: ecdsa-p256-sha256`, description).
-5. The app re-reads the manifest on every check, so the release is live immediately.
+Releases are cut by the manual **Release** GitHub Actions workflow: it takes the version from the
+Conventional Commits, builds, signs in AWS KMS and publishes a GitHub Release. The version is injected
+from the tag at build time, never edited by hand. See [`RELEASING.md`](RELEASING.md) for the setup, the
+version scheme and what to do when a run fails. The app still reads the older release repository
+until it moves to GitHub Releases.
 
 Access to the repo uses an access token that testers **enter manually in the app** — it is never
 committed anywhere. If a token leaks, revoke it and mint a new one; dongles are unaffected either
@@ -141,8 +138,9 @@ way, because they trust the **signature**, not the repository.
 
 | File | What it does |
 |---|---|
-| `tools/ota_keygen.py` | Generate the OTA signing keypair. |
-| `tools/ota_sign.py` | Sign a firmware image for OTA. |
+| `tools/ota_keygen.py` | Generate a local OTA signing keypair, or write `ota_pubkey.h` from the KMS key (`--from-kms`). |
+| `tools/ota_sign.py` | Sign a firmware image for OTA (KMS in the release workflow, or a local PEM). |
+| `tools/fw_version.py`, `tools/pio_version.py` | Release version naming, and its injection into the build. |
 | `utils/serial_monitor.py`, `serial_to_file.py`, `file_to_serial.py` | Serial helpers (e.g. capturing a `DUMP` to a file). |
 
 ### `libraries/` — vendored dependencies
@@ -200,7 +198,7 @@ values — read that first. The load-bearing flags:
 
 | Macro | Now | Meaning |
 |---|---|---|
-| `OTA_FW_VERSION` | `7` | **Bump every release.** A stale value makes OTA abort as "dongle already runs newer firmware". |
+| `OTA_FW_VERSION` | from the tag | Injected at build time from the release version (`RELEASING.md`). Not edited by hand. |
 | `API_KEY` | — | Identifies the integration to the ABRP API. Ships in every image by design; useless without a per-vehicle token. |
 | `ENABLE_CELL` / `ENABLE_WIFI` | `1` / `0` | Transport select. This is the cellular build. |
 | `ENABLE_BLE`, `ENABLE_GPS`, `ENABLE_MEMS`, `ENABLE_LOGGING`, `ENABLE_SLEEP`, `ENABLE_OTA` | `1` | Feature toggles; each should degrade gracefully when off. |

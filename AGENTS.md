@@ -34,6 +34,10 @@ uv run --no-project --with platformio==6.1.18 pio run -e esp32dev
 
 Flash and watch with `pio run -e esp32dev -t upload -t monitor` (115200 baud).
 
+`OTA_FW_VERSION` and `FW_BUILD_TAG` are injected by `tools/pio_version.py` from the newest `vX.Y.Z` tag
+(fetch tags from the GitHub remote), never edited by hand. Releases are cut by the manual *Release* workflow; see
+`RELEASING.md`.
+
 A clean build prints two pre-existing `"PRINT" redefined` warnings, from `FreematicsOBD.cpp` and
 `mathparser/parser.cpp`. They are not yours; anything else probably is.
 
@@ -96,6 +100,10 @@ modem.
 Pass a group name (`link-range`, `link-failures`, `link-truncated`, `link-required`, `link-atomic`,
 `link-valid`, `gps-replay`, `gps-rejected`, `gps-stationary`, `direct-missing`, `direct-range`, or
 `queue`) to run just that group.
+
+Run `python3 tests/run_release_checks.py` for the release tooling: version naming and selection, build-tag
+resolution, signing through a fake `aws` with throwaway keys, and the workflow's safety properties. The
+release-notes group needs `git-cliff` (or set `GIT_CLIFF`); without it, it is skipped, and with `CI` set it fails.
 
 Hardware verification still requires a real dongle, and the loop is:
 
