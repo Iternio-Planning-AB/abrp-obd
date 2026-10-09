@@ -42,4 +42,6 @@ struct FakeLittleFS {
   std::string contents() const { return *files.at("/upload_backlog.jsonl"); }
 } LittleFS;
 
+#if !ENABLE_LOGGING
 template<typename... Args> void logEvent(const char*, Args...) {}
+#endif

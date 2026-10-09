@@ -62,7 +62,7 @@ const char* uploadErrorCategory(const std::string& body) {
   Use the activated network to send data to Iternio API.
   Takes a vector of multiple OBDVectors, allows for temporary storage of data if connection is lost for shorter periods of time
 */
-bool logNetwork(const std::vector<OBDVector>& obd_result_vector) {
+static bool logNetworkAt(const std::vector<OBDVector>& obd_result_vector, double send_utc) {
 #if PRINT
   Serial.printf("Logging via network (bulk)\n");
   Serial.printf("URL: %s\n", network.getUrl().c_str());
@@ -70,7 +70,7 @@ bool logNetwork(const std::vector<OBDVector>& obd_result_vector) {
 
   // All buffered frames go up in a single POST, instead of one request per frame. Far fewer requests ->
   // less data/airtime, which is the whole point of buffering.
-  std::string payload = bulkStringV2(obd_result_vector);
+  std::string payload = bulkStringV2(obd_result_vector, send_utc);
   if (payload == "[]") {
     // Nothing in this batch survived the v2 mapping (every key unmapped, or no usable utc). Report
     // success so the caller clears the frames - re-sending them would fail the same way forever.
@@ -182,6 +182,15 @@ bool logNetwork(const std::vector<OBDVector>& obd_result_vector) {
   return true;
 }
 
+static double uploadSendUtc() {
+  const uint32_t now = rtc.getEpoch();
+  return clockNeedsSync(now) ? 0 : (double)now;
+}
+
+bool logNetwork(const std::vector<OBDVector>& frames) {
+  return logNetworkAt(frames, uploadSendUtc());
+}
+
 // Upload the RAM buffer in bounded batches (<= MAX_FRAMES_PER_POST per POST) so a backlog can't build a
 // giant, timeout-prone payload. Sent frames are erased on success. Assumes the link is already connected
 // (caller does network.connect()/disconnect()). Stops on the first failed POST (never hammers a dead link).
@@ -207,6 +216,7 @@ bool uploadBuffered(bool drain) {
     size_t n = obd_result_vector.size();
     if (n > cap) n = cap;
     std::vector<OBDVector> batch(obd_result_vector.begin(), obd_result_vector.begin() + n);
+    const double send_utc = uploadSendUtc();
 #if ENABLE_CELL
     // Enforce the modem's per-POST body ceiling in BYTES, not frames: the SIM7070 session is configured
     // with SHCONF BODYLEN=1024 (its hard maximum), and an oversized body makes the POST undeliverable.
@@ -215,8 +225,8 @@ bool uploadBuffered(bool drain) {
     // JSON would cut batches to a fifth of what fits and throw away the entire point of compressing.
     // Compression is not free (a ~300 KB PSRAM compressor pass per call), so this shrinks by a ratio
     // estimate first and only then verifies, instead of compressing once per popped frame.
-    auto wireSize = [](const std::vector<OBDVector>& b) {
-      std::string body = bulkStringV2(b);
+    auto wireSize = [send_utc](const std::vector<OBDVector>& b) {
+      std::string body = bulkStringV2(b, send_utc);
       std::string gz;
       return gzipBody(body, gz) ? gz.size() : body.size();
     };
@@ -250,7 +260,7 @@ bool uploadBuffered(bool drain) {
     logEvent("UPLOAD try frames=%d free=%lu maxblock=%lu ble=%d", (int)n,
       (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getMaxAllocHeap(), g_ble_up ? 1 : 0);
 #endif
-    if (!logNetwork(batch)) { ok = false; break; }
+    if (!logNetworkAt(batch, send_utc)) { ok = false; break; }
     obd_result_vector.erase(obd_result_vector.begin(), obd_result_vector.begin() + n);
     if (!drain && ++batches >= UPLOAD_MAX_BATCHES_PER_CYCLE) break; // bounded burst; drain=true is unlimited
   }

@@ -19,7 +19,11 @@
 unsigned long last_gps_sync = 0;            // millis() of the last live-GPS clock update (0 = never)
 const unsigned long GPS_STALE_MS = 60000;   // GPS counts as stale this long after its last fix
 
-bool clockValid() { return rtc.getEpoch() > 1000000000UL; } // > 2001-09-09 == a real time has been set
+bool clockValid(uint64_t epoch) {
+  return epoch > 1000000000 && epoch <= CLOCK_MAX_EPOCH;
+}
+
+bool clockValid() { return clockValid(rtc.getEpoch()); } // > 2001-09-09 == a real time has been set
 
 /*
   When the clock was last set from a real time source, as an EPOCH rather than a millis() stamp -
@@ -55,18 +59,21 @@ RTC_DATA_ATTR time_t last_clock_sync_epoch = 0;
 /* Has the clock gone long enough without a real source that it is worth spending an NTP round trip?
    Measured with the drifting clock itself, which is fine at this resolution: 0.83 % of an hour is
    30 s of error in the interval, and the decision only needs to be right to within minutes. */
-bool clockStale() {
-  if (last_clock_sync_epoch == 0) return true;      // never synced this power-up
-  const time_t now = rtc.getEpoch();
-  if (now < last_clock_sync_epoch) return true;     // went backwards: a correction landed, or garbage
-  return (now - last_clock_sync_epoch) > CLOCK_RESYNC_SECONDS;
+bool clockStale(uint64_t now) {
+  if (!clockValid(now) || !clockValid(last_clock_sync_epoch)) return true;      // never synced this power-up
+  if (now < (uint64_t)last_clock_sync_epoch) return true;     // went backwards: a correction landed, or garbage
+  return (now - (uint64_t)last_clock_sync_epoch) > CLOCK_RESYNC_SECONDS;
 }
+
+bool clockStale() { return clockStale(rtc.getEpoch()); }
 
 /* The one question every clock-acquisition site asks: is it worth spending a time source on this?
    Two different needs behind it - "we have no clock at all, so frames would be dropped for want of a
    utc" and "we have one but it has drifted" - and both want the same answer, so they share a
    predicate rather than each carrying half of the condition. */
-bool clockNeedsSync() { return !clockValid() || clockStale(); }
+bool clockNeedsSync(uint64_t now) { return !clockValid(now) || clockStale(now); }
+
+bool clockNeedsSync() { return clockNeedsSync(rtc.getEpoch()); }
 
 // UTC calendar time -> Unix epoch seconds, with no timezone/library dependency (Howard Hinnant's
 // days_from_civil). Correct regardless of the runtime TZ, unlike mktime().

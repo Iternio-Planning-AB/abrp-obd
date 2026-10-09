@@ -33,6 +33,12 @@ bool geoValidUtc(double value, double frame_utc) {
          std::floor(value) == value && value <= frame_utc;
 }
 
+bool geoEligibleAtSend(double value, double frame_utc, double send_utc) {
+  if (!geoValidUtc(value, frame_utc) || value > CLOCK_MAX_EPOCH) return false;
+  return send_utc > 1000000000.0 && send_utc <= CLOCK_MAX_EPOCH && geoValidUtc(send_utc, send_utc) &&
+         send_utc - value <= GEO_MAX_SEND_AGE_SECONDS;
+}
+
 bool geoValidLocation(double lat, double lon) {
   return std::isfinite(lat) && std::isfinite(lon) && lat >= -90 && lat <= 90 &&
          lon >= -180 && lon <= 180;
@@ -137,7 +143,7 @@ static std::string v2Time(time_t utc) {
   return std::string(buf);
 }
 
-std::string bulkStringV2(const std::vector<OBDVector>& frames) {
+std::string bulkStringV2(const std::vector<OBDVector>& frames, double send_utc = 0) {
   json points = json::array();
 
   for (const auto& frame : frames) {
@@ -202,7 +208,7 @@ std::string bulkStringV2(const std::vector<OBDVector>& frames) {
       // rejected batch is retried forever. 360 is north; anything else outside 0-360 (including NaN,
       // the uint16 wrap of a negative angle and GPS_HEADING_INVALID) drops just the heading.
       else if (k == "heading")            {
-        if (geoValidUtc(head_utc, utc) && v >= 0 && v <= 360) {
+        if (geoEligibleAtSend(head_utc, utc, send_utc) && v >= 0 && v <= 360) {
           put("heading", "degrees", v == 360 ? 0 : v);
           p["heading"]["time"] = v2Time((time_t)head_utc);
         }
@@ -243,7 +249,7 @@ std::string bulkStringV2(const std::vector<OBDVector>& frames) {
     }
     // Coordinates travel as one value, and the schema requires BOTH halves - a frame carrying only one
     // is a GNSS fix mid-acquisition, so it is dropped rather than sent as a half position.
-    if (have_lat && have_lon && geoValidLocation(lat, lon) && geoValidUtc(loc_utc, utc)) {
+    if (have_lat && have_lon && geoValidLocation(lat, lon) && geoEligibleAtSend(loc_utc, utc, send_utc)) {
       json v = json::object();
       v["time"] = v2Time((time_t)loc_utc);
       v["lat"] = lat;

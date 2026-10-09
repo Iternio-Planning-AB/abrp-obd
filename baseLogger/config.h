@@ -65,6 +65,10 @@
 #ifndef CONFIG_H_INCLUDED
 #define CONFIG_H_INCLUDED
 
+#include <cstdint>
+#include <ctime>
+#include <limits>
+
 #ifndef PRINT
 #define PRINT 0
 #endif
@@ -323,6 +327,8 @@
 // NTP remains the fallback for SIMs whose visited networks push no NITZ; on those this cadence does cost
 // a ~1 s exchange per 15 min of awake time, which is still small against the 60 s upload cadence.
 #define CLOCK_RESYNC_SECONDS 900
+#define CLOCK_MAX_EPOCH ((uint64_t)std::numeric_limits<time_t>::max() < UINT32_MAX ? \
+                         (uint64_t)std::numeric_limits<time_t>::max() : (uint64_t)UINT32_MAX)
 
 // Passive CAN-bus sniff (DIAGNOSTIC / observe-only for now). Each wake, BEFORE any active polling, the
 // device puts the OBD adapter in ELM monitor-all mode (ATM1) and just LISTENS for CAN_SNIFF_WINDOW_MS,
@@ -508,6 +514,7 @@
 // 1000 leaves margin). uploadBuffered() shrinks each batch until its serialized body fits, so richer
 // frames (more OBD PIDs) automatically mean fewer frames per POST instead of undeliverable POSTs.
 #define CELL_MAX_POST_BYTES 1000
+#define GEO_MAX_SEND_AGE_SECONDS (29UL * 24UL * 60UL * 60UL)
 
 // Catch-up burst: how many capped POSTs the STEADY-STATE (in-loop) upload may fire back-to-back in one
 // transmission cycle. More SMALL posts, never bigger ones (see the hard per-POST size ceiling above).

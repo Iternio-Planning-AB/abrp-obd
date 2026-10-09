@@ -192,6 +192,55 @@ battery upload deliberately discards protected geo history. Queue power-loss ato
 `__geo_` is reserved, scrubbed from profile results and public serializers, and stored as numeric
 shadow metadata only in the private backlog. Legacy/invalid geo provenance drops geo, not otherwise
 eligible battery/state. Actual RTC retention, cross-image resets, ROM gzip and modem behavior remain
-hardware gates. Deploy the paired backend age filtering and SSE ordering protection before firmware
-rollout; existing backend clock-skew normalization is unchanged. Keep this investigative build and
+hardware gates. Server freshness/SSE ordering protection remains recommended before a broad firmware
+canary, but sender-only geo eligibility does not depend on an ingest deployment or a backend expired-geo
+exception. Existing backend clock-skew normalization is unchanged. Keep this investigative build and
 its raw-location logs private.
+
+## Send-time geo expiry verification
+
+Upload groups `geo-expiry`, `geo-retry`, and `geo-sizing` exercise the real public upload path,
+including in-memory LittleFS save/restore and failed-send resaves. The runner uses production
+`config.h` constants, including the 1000-byte cap and `GEO_MAX_SEND_AGE_SECONDS` (29 * 24 * 60 * 60
+seconds, inclusive). The one-day margin under the server's 30-day window mitigates clock/transport
+error; it does not guarantee safety for a bad but apparently recently synchronized clock. Expiry,
+clock-quality retry, and sizing checks also run with logging disabled. Compiling RED assertions
+cover unknown clocks with valid fresh geo/SOC, unsynced retained RTC, the former 30-day boundary,
+invalid explicit formatter time, and raw-RTC retry/sizing policy regressions.
+
+`logNetwork(frames)` has no freshness-bypass parameter. Its internal `uploadSendUtc()` captures the
+uint32 RTC once and validates that snapshot through the real `clockNeedsSync(now)` predicate. The
+snapshot must be > 1e9 and at most `CLOCK_MAX_EPOCH`, the smaller of UINT32_MAX and the native
+`time_t` positive maximum. `last_clock_sync_epoch` must also be valid, nonzero, not future, and at most
+`CLOCK_RESYNC_SECONDS` (900) seconds old. Never-synced, stale, inconsistent, unrepresentable, and unknown
+clocks omit geo, not eligible battery/driving/charging data. Snapshot-aware `uint64_t` overloads of
+`clockValid`, `clockStale`, and `clockNeedsSync` validate raw uint32 epochs without signed narrowing;
+the existing no-argument acquisition APIs remain. The retained `RTC_DATA_ATTR time_t` sync field and
+its layout are unchanged.
+
+Buffered uploads take one trust-aware UTC snapshot per attempted batch and use that exact eligible
+policy for both sizing and final serialization, even if clock quality changes during compression.
+Each retry and subsequent batch takes a new snapshot. The internal `logNetworkAt(frames, send_utc)`
+is not a new public sender entry point. The shared `bulkStringV2(frames, send_utc = 0)` formatter
+fails closed on missing, invalid, fractional, nonfinite, or out-of-native-calendar send times. Location
+and heading observation UTCs must also fit the same native-calendar bound before their `time_t` casts.
+An explicit valid formatter time represents caller-validated clock trust; offline mapping tests use
+fixed explicit trusted times, never frame UTC as the actual send clock. Historical numeric backlog
+provenance/calendar acceptance is not narrowed by this wire-only eligibility bound.
+
+Eligible location and heading retain their independent original observation UTC. Filtering never
+rewrites source frames or failed-send backlog provenance. Eligible battery/state retain original
+frame UTC, with stale-battery handling unchanged. Geo-only omitted batches keep the successful
+no-POST rule. Future-relative-to-corrected-send-clock normalization remains the backend's existing
+policy. Both host runners extract the production clock-quality predicates instead of faking them;
+UART, clocks, compression, and filesystems remain fakes. Real RTC retention, clock acquisition,
+modem timing, ROM gzip and hardware remain unverified; no device was flashed by these checks.
+
+Run `python3 tests/run_clock_range_checks.py` normally and with `CXX='clang++ -DNDEBUG'` for extracted
+production predicates, sender snapshots, and formatter checks under both host-native `time_t` and a
+signed32 target alias. Add `--target-cxx /path/to/xtensa-esp32-elf-g++` to compile native type/bound and
+unchanged RTC-sync ABI probes using the actual target compiler. Host calendar bridging emulates signed32
+writes but is not ESP32 runtime verification. The current ESP32 toolchain has signed32 `time_t`:
+INT32_MAX (2038-01-19T03:14:07Z) is inclusive; INT32_MAX+1 and UINT32_MAX are untrusted. Native time64
+hosts retain the uint32 ceiling. This patch does not upgrade existing time-source/GPS conversion or
+battery/calendar formatting for dates after 2038; that broader firmware limitation remains unsupported.

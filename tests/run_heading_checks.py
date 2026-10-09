@@ -29,6 +29,9 @@ with tempfile.TemporaryDirectory(prefix="obd-heading-checks-") as temporary:
     (build / "gps_read_diagnostics_private.inc").write_text(diagnostics_member + "\n")
     (build / "gps_unlatch.inc").write_text(moving_age + "\n" + logger[unlatch_start:unlatch_end])
     (build / "utc_converter.inc").write_text(clock[clock_start:clock_end])
+    quality_start = clock.index("bool clockValid(")
+    quality_end = clock.index("// UTC calendar time", quality_start)
+    (build / "clock_quality.inc").write_text(clock[quality_start:quality_end])
     reset_line = next(line for line in logger.splitlines() if "resetFrozenGpsProvenance(" in line)
     (build / "gps_reset.inc").write_text(reset_line)
     if "sys.gpsGetData(&gd)" in logger or logger.count("pollGpsData();") != 4:

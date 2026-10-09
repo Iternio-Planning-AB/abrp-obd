@@ -21,11 +21,7 @@
 #define ENABLE_LOGGING 0
 #define ENABLE_NETWORK 1
 #define ENABLE_CELL 0
-#define HEADING_MIN_SPEED_KMH 3
-#define GPS_MOVING_MIN_KMH 5
-#define PARK_ACC_MIN 12
-#define MAX_FRAMES_PER_POST 12
-#define UPLOAD_MAX_BATCHES_PER_CYCLE 3
+#include "../baseLogger/config.h"
 #define FLAG_GNSS_USE_LINK 1
 
 using json = nlohmann::json;
@@ -86,7 +82,9 @@ double frozen_lat = 0, frozen_lon = 0;
 enum ClockSource { CLK_GPS, CLK_HTTP };
 #include "utc_converter.inc"
 time_t clock_epoch = 0;
-void setClock(ClockSource, time_t epoch) { clock_epoch = epoch; }
+struct RTCStub { uint32_t getEpoch() { return clock_epoch; } } rtc;
+#include "clock_quality.inc"
+void setClock(ClockSource, time_t epoch) { clock_epoch = (uint32_t)epoch; last_clock_sync_epoch = epoch; }
 time_t parseHttpDate(const char*) { return 0; }
 void esp_task_wdt_reset() {}
 #include "telemetry_format.h"
@@ -140,6 +138,7 @@ void resetFixture() {
   LittleFS.fail_open = false;
   historical::obd_result_vector.clear();
   clock_epoch = 0;
+  last_clock_sync_epoch = 0;
   geo_accepted = GPS_DATA{};
   geo_accepted_utc = park_acc_utc = frozen_geo_utc = 0;
   park_acc_unknown_utc = false;
@@ -318,7 +317,7 @@ void linkFailures() {
     rejectLink(reply, lastGood, "transport/no-GNIFO reply");
     OBDVector frame{{"utc", 1791500000}, {"soc", 50}};
     addGpsData(frame);
-    const auto point = json::parse(bulkStringV2({frame}))[0];
+    const auto point = json::parse(bulkStringV2({frame}, 1791500000))[0];
     check(!point.contains("heading") && point.contains("location") && point["soc"]["frac"] == 0.5,
           "failed reply preserves position and battery, never uploads stale heading");
   }
@@ -437,7 +436,7 @@ void linkValid() {
           "optional quality retains legacy conversion/defaults: " + tail.raw);
     OBDVector frame{{"utc", 1791500000}, {"soc", 50}};
     addGpsData(frame);
-    const auto point = json::parse(bulkStringV2({frame}))[0];
+    const auto point = json::parse(bulkStringV2({frame}, 1791500000))[0];
     check(point.contains("location") && point["soc"]["frac"] == 0.5 &&
           point.contains("heading") == (tail.heading != GPS_HEADING_INVALID),
           "optional heading validity only controls heading emission");
@@ -460,7 +459,7 @@ OBDVector gpsFrame() {
 }
 
 json checkState(const OBDVector& frame, bool parked, const std::string& label) {
-  const auto point = json::parse(bulkStringV2({frame}))[0];
+  const auto point = json::parse(bulkStringV2({frame}, 1791500000))[0];
   check(is_currently_parked == parked && point["drivingState"]["state"] == (parked ? "PARK" : "DRIVE") &&
         json::parse(bleTlmString(frame))["tlm"]["is_parked"] == parked,
         label + " preserves observable latch and serialized PARK/DRIVE state");
@@ -647,7 +646,7 @@ void directGpsDiagnostics() {
 void serializerAndQueue() {
   for (double heading : {0.0, 90.0, 359.0, 360.0, 360.01, 65446.0, 65535.0, -90.0,
                          std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::infinity()}) {
-    const auto points = json::parse(bulkStringV2({{{"utc", 1791500000}, {"soc", 50}, {"heading", heading}, {"__geo_head_utc", 1791500000}}}));
+    const auto points = json::parse(bulkStringV2({{{"utc", 1791500000}, {"soc", 50}, {"heading", heading}, {"__geo_head_utc", 1791500000}}}, 1791500000));
     check(points.size() == 1 && points[0]["soc"]["frac"] == 0.5, "bad heading preserves battery point");
     if (heading >= 0 && heading <= 360)
       check(points[0]["heading"]["degrees"] == (heading == 360 ? 0 : heading), "serialized heading normalized");
@@ -657,7 +656,7 @@ void serializerAndQueue() {
   acceptLink("$GNIFO,41026,11070000,1000000,2000000,2500,1000,,12,7\r", "accepted position without heading");
   OBDVector position{{"utc", 1791500000}, {"soc", 50}};
   addGpsData(position);
-  const auto point = json::parse(bulkStringV2({position}))[0];
+  const auto point = json::parse(bulkStringV2({position}, 1791500000))[0];
   check(!point.contains("heading") && point.contains("location"), "invalid heading preserves live position");
 
   obd_result_vector.clear();
@@ -666,6 +665,7 @@ void serializerAndQueue() {
     obd_result_vector.push_back({{"utc", 1791500000.0 + i}, {"soc", 50}, {"batt_temp_min", 20},
                                 {"batt_temp_max", 25}, {"heading", i == 2 ? 360.0 : 90.0},
                                 {"__geo_head_utc", 1791500000.0 + i}});
+  setClock(CLK_HTTP, 1791500000);
   network.responseCode = 503;
   check(!uploadBuffered(false) && obd_result_vector.size() == 120 && network.received.empty(),
         "failed POST retains every queued point");
@@ -690,15 +690,15 @@ void geoRtc() {
   parkedFixture();
   gd = nullptr;
   g_gps_powered = false;
-  auto point = json::parse(bulkStringV2({gpsFrame()}))[0];
+  auto point = json::parse(bulkStringV2({gpsFrame()}, 1791500000))[0];
   const auto original_time = point["location"]["time"];
   reset_reason = ESP_RST_DEEPSLEEP;
   gpsResetFromSetup();
-  point = json::parse(bulkStringV2({gpsFrame()}))[0];
+  point = json::parse(bulkStringV2({gpsFrame()}, 1791500000))[0];
   check(point["location"]["time"] == original_time, "same-image deep sleep fake preserves frozen UTC");
   const auto old_lat = frozen_lat;
   frozen_lat += 0.001;
-  point = json::parse(bulkStringV2({gpsFrame()}))[0];
+  point = json::parse(bulkStringV2({gpsFrame()}, 1791500000))[0];
   check(!point.contains("location"), "RTC coordinate snapshot mismatch drops wire geo");
   frozen_lat = old_lat;
   for (auto reason : {ESP_RST_POWERON, ESP_RST_SW, ESP_RST_PANIC, ESP_RST_WDT}) {
@@ -708,7 +708,7 @@ void geoRtc() {
     reset_reason = reason;
     gpsResetFromSetup();
     const auto frame = gpsFrame();
-    point = json::parse(bulkStringV2({frame}))[0];
+    point = json::parse(bulkStringV2({frame}, 1791500000))[0];
     bool selected = false;
     for (const auto& item : frame) if (item.first == "lat") selected = item.second == frozen_lat;
     check(selected && frozen_valid && !point.contains("location") && point.contains("soc"),
@@ -726,7 +726,7 @@ void geoRecordHistory() {
   const auto seq = gps_fix_seq;
   fake_ms += 5000;
   rejectLink("$GNIFO,51026,12000000,59330000", before, "partial valid calendar rejected");
-  auto point = json::parse(bulkStringV2({gpsFrame()}))[0];
+  auto point = json::parse(bulkStringV2({gpsFrame()}, 1791500000))[0];
   check(point["location"]["time"] == v2Time(epoch) && !point.contains("heading") &&
         clock_epoch == epoch && gps_fix_seq == seq && park_acc_n == 1,
         "rejected calendar leaves clock sequence mean and location UTC unchanged");
@@ -739,32 +739,32 @@ void geoRecordHistory() {
     is_currently_parked = true;
     fake_ms += 5000;
     acceptLink("$GNIFO," + record.first + ",59329000,18068000,2500,2000,9000,12,7\r", "replay/backwards record");
-    point = json::parse(bulkStringV2({gpsFrame()}))[0];
+    point = json::parse(bulkStringV2({gpsFrame()}, 1791500000))[0];
     check(point["location"]["time"] == record.second, "replayed/backwards record retains original UTC");
   }
   is_currently_parked = false;
   acceptLink("$GNIFO,310426,11075700,59330000,18069000,2500,2000,9000,12,7\r", "accepted invalid calendar");
-  point = json::parse(bulkStringV2({gpsFrame()}))[0];
+  point = json::parse(bulkStringV2({gpsFrame()}, 1791500000))[0];
   check(!point.contains("location") && !point.contains("heading"), "accepted invalid calendar clears provenance");
   acceptLink("$GNIFO,41026,11075800,59331000,18070000,2500,2000,9000,12,7\r", "accepted recovery");
-  point = json::parse(bulkStringV2({gpsFrame()}))[0];
+  point = json::parse(bulkStringV2({gpsFrame()}, 1791500000))[0];
   check(point.contains("location") && point.contains("heading"), "valid recovery restores provenance");
-  point = json::parse(bulkStringV2({gpsFrame()}))[0];
+  point = json::parse(bulkStringV2({gpsFrame()}, 1791500000))[0];
   check(!point.contains("location") && point.contains("heading"), "unchanged unparked coords selection gate preserved");
   gd->lat += 0.001f;
-  point = json::parse(bulkStringV2({gpsFrame()}))[0];
+  point = json::parse(bulkStringV2({gpsFrame()}, 1791500000))[0];
   check(!point.contains("location") && !point.contains("heading"),
         "unaccepted mutable coordinates cannot produce geo provenance");
   check(setClockFromGps() && v2Time(clock_epoch) == "2026-10-04T11:07:58Z",
         "matching accepted UTC remains clock eligible despite mutable coordinates");
   gd->lat = 0;
-  point = json::parse(bulkStringV2({gpsFrame()}))[0];
+  point = json::parse(bulkStringV2({gpsFrame()}, 1791500000))[0];
   check(!point.contains("location") && !point.contains("heading"), "both nonzero GPS eligibility unchanged");
   for (const auto& coords : {std::string("91000000,18068000"), std::string("59329000,181000000"),
                              std::string("0,18068000"), std::string("59329000,0")}) {
     gpsData = GPS_DATA{};
     acceptLink("$GNIFO,41026,12000000," + coords + ",2500,2000,9000,12,7\r", "accepted unusable cold coordinates");
-    point = json::parse(bulkStringV2({gpsFrame()}))[0];
+    point = json::parse(bulkStringV2({gpsFrame()}, 1791500000))[0];
     check(!point.contains("location") && !point.contains("heading") && point["soc"]["frac"] == 0.5,
           "accepted invalid/zero coordinates reset provenance without changing parser acceptance");
   }
@@ -781,13 +781,13 @@ void geoFreezeBounds() {
   check(park_acc_n == PARK_ACC_MAX, "stationary cap unchanged");
   freezeParkedLocation();
   is_currently_parked = true;
-  auto point = json::parse(bulkStringV2({gpsFrame()}))[0];
+  auto point = json::parse(bulkStringV2({gpsFrame()}, 1791500000))[0];
   checkLocation(point, 59.329, 18.068, "mean ignores capped later fix");
   check(point["location"]["time"] == "2026-10-04T00:03:59Z", "cap time ignores later noncontributor");
   gd = nullptr;
   park_acc_n = 0;
   freezeParkedLocation();
-  point = json::parse(bulkStringV2({gpsFrame()}))[0];
+  point = json::parse(bulkStringV2({gpsFrame()}, 1791500000))[0];
   check(point["location"]["time"] == "2026-10-04T00:03:59Z", "keep previous frozen coords keeps old time");
   resetFixture();
   g_gps_powered = true;
@@ -798,7 +798,7 @@ void geoFreezeBounds() {
   }
   freezeParkedLocation();
   is_currently_parked = true;
-  point = json::parse(bulkStringV2({gpsFrame()}))[0];
+  point = json::parse(bulkStringV2({gpsFrame()}, 1791500000))[0];
   check(point["location"]["time"] == "2026-10-04T11:07:30Z", "mean uses latest chronological contributor");
   resetFixture();
   g_gps_powered = true;
@@ -809,7 +809,7 @@ void geoFreezeBounds() {
   }
   freezeParkedLocation();
   is_currently_parked = true;
-  point = json::parse(bulkStringV2({gpsFrame()}))[0];
+  point = json::parse(bulkStringV2({gpsFrame()}, 1791500000))[0];
   check(frozen_valid && !point.contains("location") && point.contains("soc"), "unknown contributor makes mean time unknown");
   is_currently_parked = false;
   acceptLink("$GNIFO,41026,12000000,59329000,18068000,2500,2000,9000,12,7\r", "movement resets mean");
@@ -817,7 +817,7 @@ void geoFreezeBounds() {
   acceptLink("$GNIFO,41026,12000100,59329000,18068000,2500,0,9000,12,7\r", "single fix after movement");
   freezeParkedLocation();
   is_currently_parked = true;
-  point = json::parse(bulkStringV2({gpsFrame()}))[0];
+  point = json::parse(bulkStringV2({gpsFrame()}, 1791500000))[0];
   check(point["location"]["time"] == "2026-10-04T12:00:01Z", "movement and freeze reset unknown mean bookkeeping");
 }
 
@@ -825,11 +825,12 @@ void gpsClockWithoutPosition() {
   link.response = "$GNIFO,41026,11075700,0,0,2500,0,9000,12,7\r";
   check(pollGpsData(), "canonical valid UTC without position remains accepted");
   check(gpsLocationUtc() == 0, "zero coordinates have unknown geo provenance");
-  const auto point = json::parse(bulkStringV2({gpsFrame()}))[0];
+  const auto point = json::parse(bulkStringV2({gpsFrame()}, 1791500000))[0];
   check(!point.contains("location") && !point.contains("heading") && point["soc"]["frac"] == 0.5,
         "accepted UTC without position omits geo but retains battery");
-  check(setClockFromGps() && v2Time(clock_epoch) == "2026-10-04T11:07:57Z",
-        "accepted valid GPS UTC seeds clock before position fix");
+  check(setClockFromGps() && v2Time(clock_epoch) == "2026-10-04T11:07:57Z" &&
+        last_clock_sync_epoch == clock_epoch && !clockNeedsSync(),
+        "accepted valid GPS UTC seeds fresh trusted clock before position fix");
   const auto epoch = clock_epoch;
   gd->date = 51026;
   check(!setClockFromGps() && clock_epoch == epoch, "unaccepted mutable date cannot seed clock");
@@ -858,12 +859,17 @@ void geoCalendar() {
     acceptLink("$GNIFO," + entry.first + ",59329000,18068000,2500,2000,9000,12,7\r", "calendar record");
     OBDVector frame{{"utc", 4294967295.0}, {"soc", 50}};
     addGpsData(frame);
-    const auto point = json::parse(bulkStringV2({frame}))[0];
-    check(point.contains("location") == !entry.second.empty() && point.contains("heading") == !entry.second.empty(),
-          "strict calendar geo eligibility " + entry.first);
+    const auto point = json::parse(bulkStringV2({frame}, 1709251200))[0];
+    const bool wire_eligible = !entry.second.empty() && entry.first != "10101,0";
+    check(point.contains("location") == wire_eligible && point.contains("heading") == wire_eligible,
+          "strict calendar geo eligibility under fixed trusted formatter time " + entry.first);
+    check((gpsLocationUtc() != 0) == !entry.second.empty(), "strict calendar observation provenance " + entry.first);
     check(setClockFromGps() == !entry.second.empty(), "strict calendar clock eligibility " + entry.first);
-    if (!entry.second.empty()) check(point["location"]["time"] == entry.second && v2Time(clock_epoch) == entry.second,
-                                    "UTC conversion independent of host timezone " + entry.first);
+    if (!entry.second.empty()) {
+      check(v2Time(gpsLocationUtc()) == entry.second && v2Time(clock_epoch) == entry.second,
+            "UTC conversion independent of host timezone " + entry.first);
+      if (wire_eligible) check(point["location"]["time"] == entry.second, "eligible calendar geo preserves observation UTC");
+    }
     else check(clock_epoch == 0, "invalid calendar never seeds clock");
   }
   unsetenv("TZ");
@@ -879,14 +885,14 @@ void geoFreeze() {
   }
   freezeParkedLocation();
   is_currently_parked = true;
-  const auto point = json::parse(bulkStringV2({gpsFrame()}))[0];
+  const auto point = json::parse(bulkStringV2({gpsFrame()}, 1791500000))[0];
   check(point.contains("location") && point["location"]["time"] == "2026-10-04T11:07:11Z",
         "frozen mean uses last actual contributor UTC");
 }
 
 void geoAccepted() {
   acceptLink("$GNIFO,41026,11075700,59329000,18068000,2500,2000,9000,12,7\r", "coherent UTC fix");
-  const auto point = json::parse(bulkStringV2({gpsFrame()}))[0];
+  const auto point = json::parse(bulkStringV2({gpsFrame()}, 1791500000))[0];
   check(point.contains("location") && point.contains("heading"), "accepted GPS record publishes geo");
   check(point["location"]["time"] == "2026-10-04T11:07:57Z" &&
         point["heading"]["time"] == "2026-10-04T11:07:57Z", "accepted record UTC not frame UTC");
@@ -936,7 +942,7 @@ void geoDowngrade() {
   check(!std::getline(after_save, after_line), "historical resave never adds queued rows");
   obd_result_vector.clear();
   loadUploadBacklog();
-  auto points = json::parse(bulkStringV2(obd_result_vector));
+  auto points = json::parse(bulkStringV2(obd_result_vector, 1791500000));
   check(points.size() == MAX_UPLOAD_BUFFER, "new loader restores every historical resave frame");
   for (size_t i = 0; i < points.size(); ++i)
     check(points[i]["location"]["time"] == v2Time(1791000000 + i) &&
@@ -1046,7 +1052,7 @@ void geoBacklogRows() {
   obd_result_vector.clear();
   loadUploadBacklog();
   check(obd_result_vector.size() == rows.size(), "mixed legacy/malformed private rows retain all valid core frames");
-  const auto points = json::parse(bulkStringV2(obd_result_vector));
+  const auto points = json::parse(bulkStringV2(obd_result_vector, 1791500000));
   check(points.size() == rows.size(), "every eligible battery frame serialized");
   for (size_t i = 0; i < points.size(); ++i) {
     check(points[i]["soc"]["frac"] == 0.5 && points[i]["soc"]["time"] == v2Time(1791500000) &&
@@ -1067,7 +1073,7 @@ void geoBacklogRows() {
   loadUploadBacklog();
   check(obd_result_vector.size() == MAX_UPLOAD_BUFFER && !LittleFS.exists(UPLOAD_BACKLOG_PATH),
         "MAX120 load cap and existing load/delete behavior unchanged");
-  const auto bounded_points = json::parse(bulkStringV2(obd_result_vector));
+  const auto bounded_points = json::parse(bulkStringV2(obd_result_vector, 1791500000));
   for (size_t i = 0; i < bounded_points.size(); ++i)
     check(bounded_points[i]["soc"]["time"] == v2Time(1791500000 + i), "mixed queue load cap preserves FIFO");
 }
@@ -1086,7 +1092,7 @@ void geoBacklog() {
   obd_result_vector.clear();
   loadUploadBacklog();
   check(obd_result_vector.size() == 1 && !LittleFS.exists(UPLOAD_BACKLOG_PATH), "new backlog restores and deletes existing path");
-  const auto point = json::parse(bulkStringV2(obd_result_vector))[0];
+  const auto point = json::parse(bulkStringV2(obd_result_vector, 1791500000))[0];
   check(point["location"]["time"] == "2026-10-04T11:07:57Z" && point["heading"]["degrees"] == 90 &&
         point["soc"]["frac"] == 0.5, "backlog round trip retains original geo and battery UTC");
 }
@@ -1098,11 +1104,11 @@ void geoProfile() {
                   {"__geo_head_utc", 1791000000}, {"__geo_future", 123}, {"_soh", 99}};
   const auto hostile = frame;
   finalizeNoGpsFrame(frame);
-  auto point = json::parse(bulkStringV2({frame}))[0];
+  auto point = json::parse(bulkStringV2({frame}, 1791500000))[0];
   check(!point.contains("location") && !point.contains("heading"), "GPS disabled logger scrubs metadata");
   frame = hostile;
   finalizeGpsFrame(frame);
-  point = json::parse(bulkStringV2({frame}))[0];
+  point = json::parse(bulkStringV2({frame}, 1791500000))[0];
   check(!point.contains("location") && !point.contains("heading") && point["soc"]["frac"] == 0.5,
         "hostile duplicate profile metadata cannot spoof no-GPS frame provenance");
   for (const auto& res : frame) check(!isGeoMetaKey(res.first), "profile reserved namespace removed completely");
@@ -1110,7 +1116,7 @@ void geoProfile() {
   frame = hostile;
   acceptLink("$GNIFO,41026,11075700,59330000,18069000,2500,2000,9000,12,7\r", "trusted fix after hostile profile");
   finalizeGpsFrame(frame);
-  point = json::parse(bulkStringV2({frame}))[0];
+  point = json::parse(bulkStringV2({frame}, 1791500000))[0];
   checkLocation(point, gd->lat, gd->lng, "trusted metadata follows actual coordinates not spoofed profile");
   check(point["location"]["time"] == "2026-10-04T11:07:57Z" &&
         point["heading"]["time"] == "2026-10-04T11:07:57Z", "spoofed duplicate observation times removed before trusted append");
@@ -1122,7 +1128,7 @@ void geoPrivacy() {
                   {"lat", 59.329}, {"lon", 18.068}, {"heading", 90}, {"_soh", 98},
                   {"__geo_loc_utc", 1791000000}, {"__geo_head_utc", 1791000060},
                   {"__geo_future_key", 42}, {"__geo_v", 1}, {"__geo_lat", 59}};
-  for (const auto& wire : {logString(frame), bleTlmString(frame), bulkString({frame}, "test"), bulkStringV2({frame})})
+  for (const auto& wire : {logString(frame), bleTlmString(frame), bulkString({frame}, "test"), bulkStringV2({frame}, 1791500000)})
     check(wire.find("__geo_") == std::string::npos, "entire reserved namespace stays private");
   const auto legacy = json::parse(logString(frame))["tlm"];
   const auto bulk = json::parse(bulkString({frame}, "test"))["data"][0]["tlm_list"][0];
@@ -1139,7 +1145,7 @@ void geoTimes() {
   OBDVector frame{{"utc", 1791500000}, {"soc", 50}, {"is_parked", 1},
                   {"lat", 59.329}, {"lon", 18.068}, {"heading", 360},
                   {"__geo_loc_utc", 1791000000}, {"__geo_head_utc", 1791000060}};
-  auto point = json::parse(bulkStringV2({frame}))[0];
+  auto point = json::parse(bulkStringV2({frame}, 1791500000))[0];
   check(point["location"]["time"] == v2Time(1791000000) &&
         point["heading"]["time"] == v2Time(1791000060) && point["heading"]["degrees"] == 0 &&
         point["soc"]["time"] == v2Time(1791500000), "geo retains independent observation UTC");
@@ -1147,33 +1153,33 @@ void geoTimes() {
                        std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::infinity()};
   for (double value : bad) {
     frame[6].second = value;
-    point = json::parse(bulkStringV2({frame}))[0];
+    point = json::parse(bulkStringV2({frame}, 1791500000))[0];
     check(!point.contains("location") && point.contains("heading") && point["soc"]["frac"] == 0.5,
           "invalid location UTC only drops location");
     frame[6].second = 1791000000;
     frame[7].second = value;
-    point = json::parse(bulkStringV2({frame}))[0];
+    point = json::parse(bulkStringV2({frame}, 1791500000))[0];
     check(point.contains("location") && !point.contains("heading") && point.contains("drivingState"),
           "invalid heading UTC only drops heading");
     frame[7].second = 1791000060;
   }
   for (double value : {91.0, -91.0, std::numeric_limits<double>::quiet_NaN()}) {
     frame[3].second = value;
-    check(!json::parse(bulkStringV2({frame}))[0].contains("location"), "invalid latitude drops location");
+    check(!json::parse(bulkStringV2({frame}, 1791500000))[0].contains("location"), "invalid latitude drops location");
   }
   frame[3].second = 90;
   for (double value : {181.0, -181.0, std::numeric_limits<double>::infinity()}) {
     frame[4].second = value;
-    check(!json::parse(bulkStringV2({frame}))[0].contains("location"), "invalid longitude drops location");
+    check(!json::parse(bulkStringV2({frame}, 1791500000))[0].contains("location"), "invalid longitude drops location");
   }
   frame[4].second = -180;
-  check(json::parse(bulkStringV2({frame}))[0].contains("location"), "coordinate limits inclusive");
+  check(json::parse(bulkStringV2({frame}, 1791500000))[0].contains("location"), "coordinate limits inclusive");
 }
 
 void geoLegacy() {
   const OBDVector frame{{"utc", 1791500000}, {"soc", 50}, {"is_parked", 1},
                         {"lat", 59.329}, {"lon", 18.068}, {"heading", 90}};
-  const auto points = json::parse(bulkStringV2({frame}));
+  const auto points = json::parse(bulkStringV2({frame}, 1791500000));
   check(points.size() == 1 && points[0]["soc"]["frac"] == 0.5 &&
         points[0]["drivingState"]["state"] == "PARK", "legacy frame retains battery and state");
   check(!points[0].contains("location") && !points[0].contains("heading"),

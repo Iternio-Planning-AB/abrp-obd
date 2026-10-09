@@ -124,9 +124,7 @@ File File::openNextFile() {
 #define ENABLE_MEMS 0
 #define ENABLE_WIFI 0
 #define PRINT 0
-#define GPS_MOVING_MIN_KMH 5
-#define HEADING_MIN_SPEED_KMH 3
-#define PARK_ACC_MIN 12
+#include "../baseLogger/config.h"
 
 #define RTC_DATA_ATTR
 using json = nlohmann::json;
