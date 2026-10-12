@@ -241,6 +241,51 @@ void schemaChecks() {
   check(empty.begin(LOG_HEADER) && LittleFS.files.size() == 1, "empty segment needs a header, not another segment");
 }
 
+static_assert(IO36_LOCKOUT_HIGH < CHARGE_END_POLL_FLOOR && CHARGE_END_POLL_FLOOR < RAIL_TAPER_FLOOR &&
+              RAIL_TAPER_FLOOR < RAIL_AWAKE_VOLTS, "wake-gate rail bands must stay ordered");
+
+// The setup() wake gate, extracted whole: its RTC latches are members so each check controls the wake.
+struct WakeGate {
+  bool recently_charging = false, charge_end_polled = false, g_taper_confirm = false;
+  bool taper = false, charge_end = false;
+  uint32_t taper_confirm_wakes = 0;
+  int corroboration_resets = 0;
+  void resetChargeCorroboration() { corroboration_resets++; }
+  bool poll(float rail, bool is_cold = false, bool is_motion = false, bool awake = false,
+            bool heartbeat_due = false) {
+#include "wake_gate.inc"
+    taper = taper_bridge;
+    charge_end = charge_end_poll;
+    return should_poll;
+  }
+};
+
+void wakeGateChecks() {
+  WakeGate gate;
+  check(!gate.poll(12.7f), "a parked rail with no charge latch is not polled");
+  gate.recently_charging = true;
+  check(gate.poll(13.4f) && !gate.charge_end && gate.recently_charging, "a high rail is a charging sample");
+  check(gate.poll(13.1f) && gate.taper && gate.recently_charging, "a taper-band rail spends a confirm poll");
+  check(gate.poll(12.7f) && gate.charge_end && !gate.recently_charging && gate.corroboration_resets == 1,
+        "a rail below the taper band gets one charge-end read and drops the latch");
+  gate.recently_charging = true;  // the final read still saw charging current
+  check(!gate.poll(12.7f) && !gate.charge_end && !gate.recently_charging,
+        "a re-latch after the charge-end read is not polled on a low rail");
+  check(gate.poll(13.4f) && !gate.charge_end_polled, "a high-rail sample re-arms the charge-end read");
+  gate.recently_charging = true;
+  check(gate.poll(12.7f) && gate.charge_end, "the next charge gets its own charge-end read");
+  gate.recently_charging = true;
+  gate.charge_end_polled = false;
+  gate.taper_confirm_wakes = TAPER_CONFIRM_MAX_WAKES;
+  check(!gate.poll(13.1f) && !gate.charge_end && !gate.recently_charging,
+        "a spent stall budget gets no extra read");
+  gate.recently_charging = true;
+  check(!gate.poll(12.1f) && !gate.charge_end && !gate.recently_charging,
+        "a rail under the charge-end floor is not polled");
+  gate.recently_charging = true;
+  check(!gate.poll(10.5f, true) && gate.recently_charging, "a weak rail is never polled, even on a cold boot");
+}
+
 void profileChecks(const std::string& directory) {
   Parser parser;
   for (const auto& name : {"scenic", "scenic_devel", "ix3", "ix3_devel"}) {
@@ -272,10 +317,11 @@ void profileChecks(const std::string& directory) {
 
 int main(int argc, char** argv) {
   const std::string group = argc > 1 ? argv[1] : "all";
-  check(group == "all" || group == "progress" || group == "corroboration" ||
+  check(group == "all" || group == "progress" || group == "corroboration" || group == "wake-gate" ||
         group == "logging" || group == "transport" || group == "profiles" || group == "schema", "known test group");
   if (group == "all" || group == "progress") progressChecks();
   if (group == "all" || group == "corroboration") corroborationChecks();
+  if (group == "all" || group == "wake-gate") wakeGateChecks();
   if (group == "all" || group == "logging") loggingChecks();
   if (group == "all" || group == "schema") schemaChecks();
   if (group == "all" || group == "transport") transportChecks();

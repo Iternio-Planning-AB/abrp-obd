@@ -248,6 +248,7 @@ during setup, and parked charge sampling is suppressed. The remaining limits for
 | `WAKE_CHARGING_MINUTES` / `WAKE_DC_CHARGING_MINUTES` | `3` / `1` | Faster cadence while AC / DC charging. |
 | `MAX_AWAKE_MINUTES` | `60` | Hard backstop: force sleep after this even if something is holding it awake. |
 | `ACTIVE_TIMER` / `CHARGING_TIMER` | 5 / 5 min | Inactivity leashes between state transitions. |
+| `CHARGE_END_POLL_FLOOR` | `12.2` V | After a charge, a rail between this and 13.0 V gets one final read, so the charge end and final SoC reach ABRP. |
 | `IO36_LOCKOUT_LOW` / `_HIGH` | 8.0 / 11.0 V | Weak-battery band: suppress all polling so a recoverable 12 V isn't pushed over the edge. |
 
 `RAIL_AWAKE_VOLTS` was calibrated on one car with almost no margin: driving 13.25–15.2 V,

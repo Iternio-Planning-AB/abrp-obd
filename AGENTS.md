@@ -260,7 +260,8 @@ battery/calendar formatting for dates after 2038; that broader firmware limitati
 
 ## Energy and temperature host checks
 
-Run `python3 tests/run_energy_checks.py` for charge progress/corroboration, telemetry serialization,
-CSV columns, and schema-rotation checks under ASan/UBSan. Add `--profiles /path/to/abrp/obd` to exercise
-actual Scenic/iX3 production/developer equations with the firmware parser. The runner extracts the
-current charging and logging code; filesystem and hardware are fakes, not on-device verification.
+Run `python3 tests/run_energy_checks.py` for charge progress/corroboration, the `setup()` wake gate
+(taper and charge-end reads), telemetry serialization, CSV columns, and schema-rotation checks under
+ASan/UBSan. Add `--profiles /path/to/abrp/obd` to exercise actual Scenic/iX3 production/developer
+equations with the firmware parser. The runner extracts the current charging and logging code;
+filesystem and hardware are fakes, not on-device verification.

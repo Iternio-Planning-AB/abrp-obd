@@ -275,6 +275,10 @@ RTC_DATA_ATTR bool recently_charging = false;
 // bounds only UNPRODUCTIVE bridging - a stuck-negative sensor, or the 100% balancing tail - never a legit
 // still-climbing taper. SoC, not current, is what separates "still charging" from "stuck / done".
 RTC_DATA_ATTR uint32_t taper_confirm_wakes = 0;
+// The charge-end read (CHARGE_END_POLL_FLOOR) has been spent. Re-armed only by a high-rail sample: a car
+// whose rail sits under the taper floor while charging, or a current stuck negative, would otherwise re-latch
+// on every final read and poll a low rail at charging cadence with no stall budget.
+RTC_DATA_ATTR bool charge_end_polled = false;
 RTC_DATA_ATTR double prev_charge_soc = 0.0;   // highest SoC seen while charging, for the stall test above
 bool g_taper_confirm = false;                  // this wake is a taper confirm-poll (set in gate, read in loop)
 
@@ -668,17 +672,25 @@ void setup() {
     // cadence WITHOUT holding the car awake - we sleep between samples, so the rail can truthfully fall when
     // the charge ends (a free exit, no rail-drop masking, no continuous-poll state machine needed).
     bool rail_awake = rail >= RAIL_AWAKE_VOLTS;
-    if (rail_awake) taper_confirm_wakes = 0; // a real high-rail sample resets the taper-bridge budget
+    if (rail_awake) {                    // a real high-rail sample resets the taper-bridge budget
+      taper_confirm_wakes = 0;
+      charge_end_polled = false;
+    }
 
     // TAPER BRIDGE: the last poll saw charging but the rail has since dropped into the taper band (below
     // RAIL_AWAKE yet >= RAIL_TAPER_FLOOR). Rail alone can't tell a taper from a parked car here, so spend a
     // confirm-poll to read the current sign. Bounded by taper_confirm_wakes. If the rail is below the floor
     // (weak/collapsed) or the budget is spent, give up: it's not a recoverable taper -> clear the latch.
     bool taper_bridge = false;
+    bool charge_end_poll = false;
     if (recently_charging && !rail_awake && !weak_rail) {
       if (rail >= RAIL_TAPER_FLOOR && taper_confirm_wakes < (uint32_t)TAPER_CONFIRM_MAX_WAKES) {
         taper_bridge = true;             // confirm-poll; the loop updates the budget from SoC progress
       } else {
+        // Rail fell out of the taper band: read the car once more so the charge end and final SoC reach ABRP
+        // (CHARGE_END_POLL_FLOOR). A spent stall budget gets no extra read - those polls already reported.
+        charge_end_poll = !charge_end_polled && rail < RAIL_TAPER_FLOOR && rail >= CHARGE_END_POLL_FLOOR;
+        if (charge_end_poll) charge_end_polled = true;
         recently_charging = false;       // give up: rail too low, or too many SoC-stalled confirm-polls
         taper_confirm_wakes = 0;
         resetChargeCorroboration();
@@ -689,8 +701,9 @@ void setup() {
     // Decide whether to poll. A plain TIMER wake on a PARKED car (rail ~12.6) does NOT poll - polling a parked
     // Scenic returns nothing useful and only costs a voltage sag. We poll only for a real reason, never on a
     // weak rail:  cold boot | motion + awake (a drive) | rail high (charging/climate) | taper bridge (confirm
-    // a tapering charge whose rail dropped) | optional parked heartbeat. ATRV's 8V threshold is just a collapse detector.
-    bool should_poll = !weak_rail && (is_cold || (is_motion && awake) || rail_awake || taper_bridge || heartbeat_due);
+    // a tapering charge whose rail dropped) | charge end | optional parked heartbeat. ATRV's 8V threshold is just a collapse detector.
+    bool should_poll = !weak_rail &&
+      (is_cold || (is_motion && awake) || rail_awake || taper_bridge || charge_end_poll || heartbeat_due);
 #if OBD_ALARM_GATE
     // ALARM GATE (§8.2): on a flagged vehicle a STATIONARY poke - rail-awake charge sample, taper
     // confirm, heartbeat - is exactly the parked-and-armed scenario, and polling it trips the OBD
@@ -705,20 +718,24 @@ void setup() {
 #endif
     }
 #endif
-    // A "sample poke" = a stationary one-shot read (rail-awake / taper bridge / heartbeat): poll once, log,
-    // sleep, re-check next wake. NOT a drive (motion streams) and NOT a cold boot.
-    g_sample_poke = should_poll && (rail_awake || taper_bridge || heartbeat_due) && !is_motion && !is_cold;
+    // A "sample poke" = a stationary one-shot read (rail-awake / taper bridge / charge end / heartbeat): poll
+    // once, log, sleep, re-check next wake. NOT a drive (motion streams) and NOT a cold boot.
+    g_sample_poke = should_poll && (rail_awake || taper_bridge || charge_end_poll || heartbeat_due) &&
+      !is_motion && !is_cold;
     if (g_sample_poke) g_rail_before_poke = rail; // rail BEFORE the poke, vs rail_after in the fast-path
     if (should_poll) polls_count++; else skips_count++;
     const char* verdict = awake ? "AWAKE" : "ASLEEP";   // ATRV-vs-8V (collapse/bench detector)
     const char* action = !should_poll ? (weak_rail ? "skip(weak-rail)" : "skip")
                        : !g_sample_poke ? "poll"
                        : rail_awake ? "poll(rail-awake)"
-                       : taper_bridge ? "poll(taper-confirm)" : "poll(heartbeat)";
+                       : taper_bridge ? "poll(taper-confirm)"
+                       : charge_end_poll ? "poll(charge-end)" : "poll(heartbeat)";
 #if ENABLE_LOGGING
     if (taper_bridge)
       logEvent("TAPER_CONFIRM attempt=%lu/%d rail=%.2f (recently_charging) -> confirm-poll",
         (unsigned long)taper_confirm_wakes, TAPER_CONFIRM_MAX_WAKES, rail);
+    if (charge_end_poll)
+      logEvent("CHARGE_END rail=%.2f < taper floor %.2f -> final poll, latch cleared", rail, RAIL_TAPER_FLOOR);
 #endif
     Serial.printf("ATRVGATE: atrv=%.2f rail=%.2f -> %s, %s %s\n",
       v, rail, verdict, action, ATRV_GATE_ENFORCE ? "[ENFORCE]" : "[observe]");

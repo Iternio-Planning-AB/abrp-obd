@@ -51,7 +51,8 @@ worked, and what to do if it doesn't.
   the first phone to finish setup is the only one that can connect to it.
 - **It looks after your 12 V battery.** While the car is parked the dongle sleeps, and wakes every
   30 minutes (more often while charging) or when the car moves. It checks whether the car is awake
-  before it asks it anything, so it never wakes the car up.
+  before it asks it anything; the one exception is a single read right after a charge, so ABRP sees
+  the charge end.
 - **It keeps a log** on the dongle itself, which the app can download. That log is how problems get
   found. It records where the car has been, so share it privately, never in a public issue.
 - **This is an active project.** The Bluetooth link is encrypted, and once set up only the dongle's

@@ -487,6 +487,14 @@
 #define RAIL_TAPER_FLOOR        13.0f  // confirm-poll only if rail >= this. NOT a charge signal (taper ~13.18
                                        // and parked-rest ~13.19 both sit above it) - purely a safety floor so
                                        // we never confirm-poll a weak/collapsing battery. Current sign decides.
+// Charge-end read: when the rail falls below RAIL_TAPER_FLOOR with the latch still up, the charge has most
+// likely just ended, and without one more poll ABRP keeps the last CHARGING point until the next drive. FIELD
+// (Scenic, 2026-10-09): rail 13.17 -> 12.70 three minutes after a 20kW AC charge, the latch dropped silently,
+// and ABRP showed CHARGING at 78% for 5.3h while the car had finished at 80.5%. Not vehicle-specific: any car
+// whose rail falls when its charge ends takes this path. One poll per charge, re-armed only by a high-rail
+// sample, so a car that charges with its rail under the taper floor is not polled at charging cadence. The
+// floor is about the 12V battery, not the car: well above the IO36_LOCKOUT band, so a sagging one is never polled.
+#define CHARGE_END_POLL_FLOOR   12.2f
 #define TAPER_CONFIRM_MAX_WAKES 8      // give up after this many consecutive SoC-STALLED confirm-polls (no SoC
                                        // gain). A still-rising taper resets the count, so it's NEVER cut off no
                                        // matter how long; this only bounds a stuck sensor / the 100% tail

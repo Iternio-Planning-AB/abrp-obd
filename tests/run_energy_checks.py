@@ -8,7 +8,7 @@ import tempfile
 
 arguments = argparse.ArgumentParser()
 arguments.add_argument("group", nargs="?", default="all",
-                       choices=["all", "progress", "corroboration", "logging", "schema", "transport", "profiles"])
+                       choices=["all", "progress", "corroboration", "wake-gate", "logging", "schema", "transport", "profiles"])
 arguments.add_argument("--profiles", type=Path)
 args = arguments.parse_args()
 if args.group == "profiles" and args.profiles is None:
@@ -22,7 +22,8 @@ compiler = shlex.split(os.environ.get("CXX", "clang++"))
 with tempfile.TemporaryDirectory(prefix="obd-energy-checks-") as temporary:
     build = Path(temporary)
     (build / "charge_config.inc").write_text("\n".join(re.findall(
-        r"^#define (?:CHARGE_PROGRESS_\w+|CLOCK_MAX_EPOCH|GEO_MAX_SEND_AGE_SECONDS)\b.*(?:\n[ \t]+.*)*",
+        r"^#define (?:CHARGE_PROGRESS_\w+|CLOCK_MAX_EPOCH|GEO_MAX_SEND_AGE_SECONDS|RAIL_AWAKE_VOLTS|RAIL_TAPER_FLOOR|"
+        r"CHARGE_END_POLL_FLOOR|TAPER_CONFIRM_MAX_WAKES|IO36_LOCKOUT_\w+)\b.*(?:\n[ \t]+.*)*",
         config, re.MULTILINE)))
     start = logger.index("    auto chargeCounterRose =")
     end = logger.index("\n    /*\n      DC or AC", start)
@@ -30,6 +31,9 @@ with tempfile.TemporaryDirectory(prefix="obd-energy-checks-") as temporary:
     start = logger.index("    bool has_charge_counter = false;")
     end = logger.index("\n    const bool uncorroborated =", start)
     (build / "charge_corroboration.inc").write_text(logger[start:end])
+    start = logger.index("    bool weak_rail = (rail >= IO36_LOCKOUT_LOW")
+    end = logger.index("heartbeat_due);\n", start) + len("heartbeat_due);\n")
+    (build / "wake_gate.inc").write_text(logger[start:end])
     start = logger.index("void resetChargeCorroboration() {") + len("void resetChargeCorroboration() {")
     end = logger.index("\n}", start)
     (build / "reset_corroboration.inc").write_text(logger[start:end])
