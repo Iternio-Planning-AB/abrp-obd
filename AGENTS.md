@@ -257,3 +257,10 @@ writes but is not ESP32 runtime verification. The current ESP32 toolchain has si
 INT32_MAX (2038-01-19T03:14:07Z) is inclusive; INT32_MAX+1 and UINT32_MAX are untrusted. Native time64
 hosts retain the uint32 ceiling. This patch does not upgrade existing time-source/GPS conversion or
 battery/calendar formatting for dates after 2038; that broader firmware limitation remains unsupported.
+
+## Energy and temperature host checks
+
+Run `python3 tests/run_energy_checks.py` for charge progress/corroboration, telemetry serialization,
+CSV columns, and schema-rotation checks under ASan/UBSan. Add `--profiles /path/to/abrp/obd` to exercise
+actual Scenic/iX3 production/developer equations with the firmware parser. The runner extracts the
+current charging and logging code; filesystem and hardware are fakes, not on-device verification.

@@ -423,17 +423,18 @@
 // from the same frame, proved the charge never stopped: soc 28.19 -> 28.44 -> 29.31 and kwh_charged
 // 24.407 -> 24.626 -> 25.397 (0.219kWh over the 213s bracketing the bad sample = 3.7kW). Cost of believing
 // the sample: cadence relaxed 3min -> 30min, the taper latch dropped, and the charge went unreported for
-// half an hour. So the cadence now also asks whether the car's own cumulative counters MOVED - they only
-// rise while energy is going in, and no single-sample glitch can walk them back.
+// half an hour. So cadence also asks whether energy or SoC MOVED. This Scenic field was misnamed:
+// kwh_charged there was estimated remaining energy, now soe in Wh, not a cumulative charging counter.
 //
-// Thresholds are the "is this bigger than noise" floor, not a rate. kwh_charged is the trustworthy one
-// (a monotone energy counter with no re-estimation drift) and gets a floor just above its quantum; soc is
-// the fallback for profiles that carry no kwh_charged, and needs the wider band because a resting BMS
-// re-estimates SoC by a couple of tenths with no energy involved. Both are compared against a RATCHETED
-// baseline (see logger.ino), so a coarsely-quantised soc accumulates across polls instead of showing zero
-// change at every single interval.
+// Thresholds are the "is this bigger than noise" floor, not a rate. Genuine cumulative kwh_charged retains
+// its 0.005 kWh floor. Estimated soe needs 200 Wh: the Scenic test car rose 61 Wh at unchanged SoC without
+// charging, while the measured 3.7 kW charge rose 219 Wh across the bad current sample. SoC retains its
+// wider band because a resting BMS can re-estimate it without energy transfer. All use a RATCHETED
+// baseline (see logger.ino), so coarsely-quantised values accumulate across polls instead of showing zero
+// change at every single interval; while driving the baselines track each sample to exclude regen.
 #define CHARGE_PROGRESS_KWH     0.005  // kWh; kwh_charged rise since the baseline that counts as charging
-#define CHARGE_PROGRESS_SOC_PCT 0.20   // percentage points; soc rise that counts, when there is no kwh_charged
+#define CHARGE_PROGRESS_SOC_PCT 0.20   // percentage points; independent SoC progress evidence
+#define CHARGE_PROGRESS_SOE_WH  200.0
 
 // Consecutive polls with NO charge evidence (neither current sign nor counter progress) before the charge
 // latch releases and the cadence relaxes to WAKE_PARKED_MINUTES. 1 = the old behaviour that this whole

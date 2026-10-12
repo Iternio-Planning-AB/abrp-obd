@@ -247,18 +247,20 @@ RTC_DATA_ATTR uint32_t charging_fast_minutes = 0;
 // (a stuck rail+current can't keep fast-waking us). Cleared only when the car is genuinely not charging, so
 // the cap actually holds slow instead of resetting and bouncing back to fast every interval.
 RTC_DATA_ATTR bool charging_cap_latched = false;
-// Charge corroboration (CHARGE_CORROBORATE_MINUTES): real seconds of fast cadence since soc/kwh_charged
+// Charge corroboration (CHARGE_CORROBORATE_MINUTES): real seconds of fast cadence since soc/energy
 // last rose above their high-water marks. High-water, not the progress ratchet, so a soc dithering by one
 // step can't keep re-corroborating. Seconds from the RTC clock: polls come every few seconds while awake.
 RTC_DATA_ATTR uint32_t charge_uncorroborated_s = 0;
 RTC_DATA_ATTR uint64_t charge_corr_last_us = 0;
 RTC_DATA_ATTR double charge_corr_soc_hw = -1.0;
 RTC_DATA_ATTR double charge_corr_kwh_hw = -1.0;
+RTC_DATA_ATTR double charge_corr_soe_hw = -1.0;
 void resetChargeCorroboration() {
   charge_uncorroborated_s = 0;
   charge_corr_last_us = 0;
   charge_corr_soc_hw = -1.0;
   charge_corr_kwh_hw = -1.0;
+  charge_corr_soe_hw = -1.0;
 }
 
 // Charge-taper bridge: recently_charging = the charge latch. Set when the last poll found EVIDENCE of a
@@ -276,15 +278,16 @@ RTC_DATA_ATTR uint32_t taper_confirm_wakes = 0;
 RTC_DATA_ATTR double prev_charge_soc = 0.0;   // highest SoC seen while charging, for the stall test above
 bool g_taper_confirm = false;                  // this wake is a taper confirm-poll (set in gate, read in loop)
 
-// Charge-PROGRESS baselines (CHARGE_PROGRESS_* in config.h): the last soc / kwh_charged we anchored on, so
+// Charge-PROGRESS baselines (CHARGE_PROGRESS_* in config.h): the last SoC / energy we anchored on, so
 // the next poll can ask whether the car's own counters moved. -1 = no baseline yet (cold boot / power loss),
 // which anchors silently rather than reading the first sample as a rise.
 //
 // Deliberately NOT prev_charge_soc, which looks similar and is not interchangeable: that one is the taper
 // bridge's stall budget - charging-gated, and zeroed the moment a poll reads current >= 0. Zeroing on exactly
-// the sample we need to survive is what makes it useless here, and this pair exists to outlive that sample.
+// the sample we need to survive is what makes it useless here; these baselines outlive that sample.
 RTC_DATA_ATTR double prev_parked_soc = -1.0;
 RTC_DATA_ATTR double prev_parked_kwh = -1.0;
+RTC_DATA_ATTR double prev_parked_soe = -1.0;
 RTC_DATA_ATTR char last_good_220105_reply[513] = {};
 RTC_DATA_ATTR uint8_t obd_anomaly_logs = 0;
 RTC_DATA_ATTR uint64_t obd_anomaly_last_us = 0;
@@ -1550,9 +1553,9 @@ void loop() {
       is built. The field case that forced this: a car charging at a measured 3.7kW returned +0.479A on
       that one sample, which relaxed the cadence 3min -> 30min and dropped the taper latch mid-charge.
 
-      The car's own cumulative counters cannot be wrong the same way. soc and kwh_charged only RISE while
-      energy is going in, so a rise since the last poll is direct evidence of a charge that no single-sample
-      glitch can erase. This decides CADENCE only - the published is_charging stays the current-sign verdict,
+      SoC and energy progress offer evidence independent of the instantaneous current sample. Estimated
+      remaining energy (soe, Wh) needs a wider noise floor than a cumulative kwh_charged counter because
+      the BMS can re-estimate it. This decides CADENCE only - published is_charging stays the current-sign verdict,
       because that is what the frame has always meant and changing it changes what the API is told.
 
       RATCHETED, not last-poll-vs-this-poll. The baseline moves up only when a value actually crosses the
@@ -1565,7 +1568,7 @@ void loop() {
       for (const auto& res : current_frame) {
         if (res.first != key) continue;
         const double v = res.second;
-        if (baseline < 0.0)          baseline = v;   // first ever sample: anchor, claim nothing
+        if (!is_currently_parked || baseline < 0.0) baseline = v; // driving / first sample: anchor only
         else if (v > baseline + eps) { baseline = v; return true; }
         else if (v < baseline)       baseline = v;   // fell: re-anchor (discharge / counter reset)
         break;
@@ -1576,9 +1579,10 @@ void loop() {
     // pre-drive value would make the first parked poll after arriving read the regen as a charge.
     const bool soc_rose = chargeCounterRose("soc", prev_parked_soc, CHARGE_PROGRESS_SOC_PCT);
     const bool kwh_rose = chargeCounterRose("kwh_charged", prev_parked_kwh, CHARGE_PROGRESS_KWH);
-    // Same parked gate as is_charging: while driving soc falls and kwh_charged climbs on regen, and neither
+    const bool soe_rose = chargeCounterRose("soe", prev_parked_soe, CHARGE_PROGRESS_SOE_WH);
+    // Same parked gate as is_charging: SoC / energy changes during a drive can include regen, and neither
     // says anything about a charge session.
-    const bool charge_progress = is_currently_parked && (soc_rose || kwh_rose);
+    const bool charge_progress = is_currently_parked && (soc_rose || kwh_rose || soe_rose);
 
     /*
       DC or AC? The driver of a fast-charging car is usually watching progress from somewhere else in
@@ -1686,12 +1690,15 @@ void loop() {
         } else if (res.first == "kwh_charged") {
           has_charge_counter = true;
           corroborated |= roseAboveHigh(res.second, charge_corr_kwh_hw, CHARGE_PROGRESS_KWH);
+        } else if (res.first == "soe") {
+          has_charge_counter = true;
+          corroborated |= roseAboveHigh(res.second, charge_corr_soe_hw, CHARGE_PROGRESS_SOE_WH);
         }
       }
       if (corroborated) {
 #if ENABLE_LOGGING
         if (charge_uncorroborated_s >= (uint32_t)CHARGE_CORROBORATE_MINUTES * 60)
-          logEvent("CHARGE corroborated (soc/kwh_charged rose) -> charging cadence");
+          logEvent("CHARGE corroborated (soc/energy rose) -> charging cadence");
 #endif
         charge_uncorroborated_s = 0;
       }
@@ -1734,7 +1741,7 @@ void loop() {
 #if ENABLE_LOGGING
         if (before < (uint32_t)CHARGE_CORROBORATE_MINUTES * 60 &&
             charge_uncorroborated_s >= (uint32_t)CHARGE_CORROBORATE_MINUTES * 60)
-          logEvent("CHARGE uncorroborated %lus (soc/kwh_charged not rising) -> parked cadence",
+          logEvent("CHARGE uncorroborated %lus (soc/energy not rising) -> parked cadence",
             (unsigned long)charge_uncorroborated_s);
 #endif
       }

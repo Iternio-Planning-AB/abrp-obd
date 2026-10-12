@@ -20,7 +20,8 @@ const std::string LOG_HEADER =
   "millis,utc,boot,sleep,wake,state,batt12v,rail_v,free_heap,min_heap,max_block,free_psram,rssi,wifi,"
   "gps_fix,gps_sat,gps_hdop,gps_alt,obd_pids,up_http,up_status,reset,clean_sleep,note,"
   "soc,soh,voltage,current,power,kwh_charged,speed,ext_temp,is_parked,is_charging,lat,lon,"
-  "gps_read,gps_reply_bytes,gps_field,gps_date,gps_time,gps_time_age_ms,gps_speed_kmh,gps_lat,gps_lon,gps_source";
+  "gps_read,gps_reply_bytes,gps_field,gps_date,gps_time,gps_time_age_ms,gps_speed_kmh,gps_lat,gps_lon,gps_source,"
+  "soe,batt_temp,batt_temp_min,batt_temp_max";
 
 static const char* stateName(ActivityState s) {
   switch (s) {
@@ -122,6 +123,10 @@ std::string buildLogLine(const OBDVector& frame, int obd_count) {
   }
   line += ",";
   line += gps_columns;
+  for (auto c : { "soe", "batt_temp", "batt_temp_min", "batt_temp_max" }) {
+    line += ",";
+    line += fcol(frame, c);
+  }
   return line;
 }
 

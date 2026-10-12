@@ -158,7 +158,7 @@ double CschNode::evaluate() const {
 }
 
 double SignedNode::evaluate() const {
-  return static_cast<signed int8_t>(operand_->evaluate());
+  return static_cast<int8_t>(static_cast<int>(operand_->evaluate()));
 }
 
 double NotNode::evaluate() const {

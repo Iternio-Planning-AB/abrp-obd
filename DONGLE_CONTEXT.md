@@ -311,7 +311,7 @@ token stops the upload, so an unpaired dongle advertises on BLE and does nothing
 reference.)
 
 **Telemetry keys** the frame can carry: `soc, soh, voltage, current, power, is_charging, is_parked,
-speed, kwh_charged, ext_temp, batt_temp, batt_temp_min, batt_temp_max, lat, lon, heading, utc` (exact
+speed, kwh_charged, soe, ext_temp, batt_temp, batt_temp_min, batt_temp_max, lat, lon, heading, utc` (exact
 set is per-vehicle-profile). `is_parked` and `is_charging` are derived on-device; `lat/lon/heading`
 come from GNSS. Note `bleTlmString()` **trims `lat`/`lon`/`utc`/`heading` from the BLE frame** — the
 phone supplies its own position — so a BLE frame is smaller than the cellular body, and a frame that is
