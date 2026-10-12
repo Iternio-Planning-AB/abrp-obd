@@ -654,6 +654,15 @@ class ReleaseNotes(unittest.TestCase):
         notes = cliff(self.repo.path, "--unreleased", "--tag", "v2.0.0", "--strip", "all")
         self.assertIn("### Breaking Changes\n\n- **upload:** Drop the v1 wire format\n", notes)
 
+    def test_the_first_release_files_breaking_commits_under_their_type(self):
+        # No semver release came before it, but pre-semver dongles did: a migration footer still matters.
+        self.repo.commit("feat(release): cut releases", "BREAKING CHANGE: ota_sign.py takes --version-name")
+        self.repo.commit("fix(ble)!: renumber the OTA status frame")
+        notes = cliff(self.repo.path, "--unreleased", "--tag", "v0.1.0", "--strip", "all")
+        self.assertNotIn("Breaking Changes", notes)
+        self.assertIn("### Features\n\n- **release:** Cut releases - ota_sign.py takes --version-name\n", notes)
+        self.assertIn("### Bug Fixes\n\n- **ble:** Renumber the OTA status frame\n", notes)
+
     def test_commits_that_do_not_change_the_image_do_not_release(self):
         self.repo.commit("feat: a")
         self.repo.tag("v1.0.0")

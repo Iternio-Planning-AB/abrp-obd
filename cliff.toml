@@ -4,13 +4,36 @@
 [changelog]
 header = ""
 body = """
+{% macro entry(commit) -%}
+- {% if commit.scope %}**{{ commit.scope }}:** {% endif %}{{ commit.message | upper_first }}\
+{% if commit.breaking and commit.breaking_description != commit.message %} - {{ commit.breaking_description }}{% endif %}
+{%- endmacro entry %}
+{% if previous and previous.version %}\
 {% for group, commits in commits | group_by(attribute="group") %}
 ### {{ group | striptags | trim }}
 {% for commit in commits %}
-- {% if commit.scope %}**{{ commit.scope }}:** {% endif %}{{ commit.message | upper_first }}\
-{% if commit.breaking and commit.breaking_description != commit.message %} - {{ commit.breaking_description }}{% endif %}
+{{ self::entry(commit=commit) }}
 {%- endfor %}
-{% endfor %}
+{% endfor %}\
+{% else %}\
+{# No Breaking Changes section on the first release: a breaking commit goes under its own type, footer kept. #}\
+{% for title in ["Features", "Bug Fixes", "Performance", "Reverts", "Other Changes"] %}\
+{% set_global picked = [] %}\
+{% for commit in commits %}\
+{% set type = commit.raw_message | split(pat=":") | first | split(pat="(") | first | trim_end_matches(pat="!") %}\
+{% if type == "feat" %}{% set t = "Features" %}{% elif type == "fix" %}{% set t = "Bug Fixes" %}\
+{% elif type == "perf" %}{% set t = "Performance" %}{% elif type == "revert" %}{% set t = "Reverts" %}\
+{% else %}{% set t = "Other Changes" %}{% endif %}\
+{% if t == title %}{% set_global picked = picked | concat(with=commit) %}{% endif %}\
+{% endfor %}\
+{% if picked %}
+### {{ title }}
+{% for commit in picked %}
+{{ self::entry(commit=commit) }}
+{%- endfor %}
+{% endif %}\
+{% endfor %}\
+{% endif %}
 """
 footer = ""
 trim = true
