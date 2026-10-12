@@ -62,7 +62,7 @@ the ELM327 command set, and that rules some cars out entirely (BMW i3/iX3 among 
 | Link encryption / bonding | ✅ | ✅ `BLE_ENABLE_BONDING 1` | `blewrapper.cpp` |
 | HMAC access handshake | ✅ | ✅ unconditional (no flag) | `auth_gate.h`, ABD8 |
 | Signed vehicle profiles (JWS) | ✅ | ❌ `PROFILE_REQUIRE_SIGNATURE 0` | `jws_verify.h`, `profile_sig.h` |
-| OBD-alarm gate | ✅ | ❌ `OBD_ALARM_ENFORCE 0` | `alarm_gate.h` |
+| OBD-alarm gate | ✅ | ✅ per vehicle (app toggle → NVS flag) | `alarm_gate.h` |
 
 **Why bonding and the handshake are now on:** the staging that kept them off existed to speak the
 *older* app protocol, which had no ABD8 handshake and no JWS. That app no longer exists — the dongle
@@ -73,8 +73,9 @@ flipped, and `AUTH_ENFORCE` is gone as a concept. An ABD8 proof is now the only 
 not yet been watched succeed in the field, and a gate nobody has seen work should not be the only
 way in. It flips once there is evidence, not once the old app is gone.
 
-**Why the alarm gate is 0:** field testing found three enforcement-breaking bugs. Full autopsy in
-`ALARM_GATE_FIELD_FINDINGS.md` (Appendix J); summary in §7 here.
+**The alarm gate is per vehicle:** the app's toggle writes the NVS flag, and there is no compile-time
+bypass any more. It was bypassed while three enforcement-breaking bugs were open; two are fixed. What
+remains affects only an opted-in car: see §7 and `ALARM_GATE_FIELD_FINDINGS.md` (Appendix J).
 
 ---
 
@@ -121,7 +122,7 @@ handles silently breaks already-paired iPhones.
 
 ---
 
-## 3. The security stack (built; currently staged off)
+## 3. The security stack (pairing and handshake on; signed profiles not yet required)
 
 Three layers, in order. Each answers a different question and none substitutes for another. The order
 is enforced — you cannot reach layer 2 without clearing layer 1.
@@ -380,7 +381,7 @@ branch `i3-testing`, `Helpers/can_listen.h`):
 
 ---
 
-## 7. The OBD-alarm gate (built, bypassed — read before re-enabling)
+## 7. The OBD-alarm gate (enforced per vehicle — read before changing)
 
 **The problem:** some cars (BMW i3 confirmed, with a positive control) sound their anti-theft alarm
 when a device **transmits** on the OBD bus while the car is locked and armed. Passive presence is
@@ -389,18 +390,21 @@ fine. So silence-while-armed is a complete solution — no CAN isolation, no Bim
 **What was built:** a per-vehicle flag (app toggle → ABD2 `obd_alarm` → dongle NVS → published in the
 ABD5 info JSON for read-back), plus a permit predicate gating all bus traffic on a flagged car.
 
-**Why it's off:** three field-breaking bugs, all documented with evidence in
-`ALARM_GATE_FIELD_FINDINGS.md` (Part II):
+**History:** it was bypassed with a compile-time switch (`OBD_ALARM_ENFORCE`, now gone) after three
+field-breaking bugs, all documented with evidence in `ALARM_GATE_FIELD_FINDINGS.md` (Part II). Bugs 1
+and 3 are fixed (`config.h` above `ALARM_SETUP_PERMIT_MINUTES`); bug 2 and the per-vehicle rail margin
+remain, and affect only a flagged car:
 
 1. **`clean()` doesn't reset `setup_unlocked`** → a re-AUTH on a live connection is misparsed as a
    profile value and refused `UNSIGNED` → the push never completes → no setup permit → the wizard's
    PID test is denied → **and the flag becomes unrecoverable from the app** (Save needs the PID test).
-   ⚠️ **This bug is independent of the gate and still latent** — it predates it.
+   It was independent of the gate and predated it. **Fixed.**
 2. **Suppression sits upstream of BLE bring-up** → every timer wake on a stationary flagged car is
    radio-silent, so the dongle becomes invisible until physical motion. A *polling* decision
    accidentally became a *connectability* decision.
 3. **`gpsBegin()` is a one-shot that powers GNSS back down on failure**, while `g_gps_powered` is set
    `true` regardless → no fix all wake → permit structurally unreachable → a whole blind drive.
+   **Fixed.**
 
 **Design lessons worth keeping even if the feature never returns:**
 - The failure asymmetry: a false permit (transmit while armed) is unrecoverable; a false deny is
@@ -432,9 +436,9 @@ The app is the ABRP React Native app (Redux Toolkit, redux-persist + MMKV, `reac
 a **separate repository** from this firmware. This dongle's code lives under `src/state/ble/abrpObd/`,
 `src/state/firmwareUpdate/`, and the `ObdBleSetup` screen; the OBD-BLE test screens are behind
 developer options. Build/run is standard for that repo (`yarn`, its own README) — not covered here.
-Note the protocol level of the app you test against matters: an older build without the ABD8
-handshake / JWS support requires the security flags staged **off** (§1), which is the current
-firmware state.
+Note the protocol level of the app you test against matters: the firmware requires the ABD8
+handshake unconditionally and bonding is on (§1), so an app build without the handshake cannot get a
+session.
 
 - **`tlm_type: 'abrpobd'`** = this dongle. **`'obdble'`** = the older generic dongle lane.
   **Everything added for this dongle must be an add-on that leaves the obdble lane byte-identical.**
@@ -487,11 +491,12 @@ firmware state.
 
 ## 10. Where to look for what
 
-Everything below except `README.md` is embedded verbatim in **Part II** of this file.
+Everything below except `README.md` and `docs/` is embedded verbatim in **Part II** of this file.
 
 | Question | File |
 |---|---|
-| Fast tour, flags, file map, state machine | `README.md` (in repo) |
+| Setup, supported cars | `README.md`, `docs/getting-started.md` (in repo) |
+| Flags, file map, state machine | `docs/technical-overview.md` (in repo) |
 | BLE security design + phase history | Appendix A |
 | OTA wire protocol (authoritative) | Appendices C, B |
 | OTA app-side spec | Appendix D |

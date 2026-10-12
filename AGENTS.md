@@ -121,7 +121,7 @@ is not verified by a bench test, and saying so is part of reporting it.
 
 | Question | Section of `DONGLE_CONTEXT.md` |
 | --- | --- |
-| What is built, what is staged off | §1 |
+| What is built, what is enabled | §1 |
 | BLE service/characteristic layout (ABD0–ABD8) | §2 |
 | Auth, pairing, what a client may do | §3, Appendix A |
 | OTA firmware update | §4, Appendices B and C |
@@ -129,7 +129,7 @@ is not verified by a bench test, and saying so is part of reporting it.
 | Sleep, wake gates, battery protection | §6 |
 | Cloud upload, profiles, where they come from | §6a |
 | Co-processor command limits, cars it can't read (BMW i3 …) | §6b |
-| The OBD-alarm gate (built, bypassed) | §7 |
+| The OBD-alarm gate (per vehicle) | §7 |
 | App-side rules, `abrpobd` vs `obdble` | §8 |
 | Diagnosing a dongle that went quiet | §9 |
 | Invariants to check before changing something | §11 |
@@ -145,7 +145,12 @@ and upload cycle), `Helpers/state_machine.h` (activity states and cadences), `He
   `type(scope): imperative summary` (scope optional). Describe the user-visible change, not just
   the implementation; use `feat` for features, `fix` for bug fixes, and `docs`, `refactor`, `test`
   or `chore` as appropriate. Mark breaking changes with `!` and a `BREAKING CHANGE:` footer that
-  explains the impact and migration.
+  explains the impact and migration. Only `feat`, `fix`, `perf`, `revert` and breaking changes reach
+  the notes (`cliff.toml`); `docs`, `ci`, `chore`, `test` and `refactor` are left out and do not bump
+  the version, so a `!` on one of those still ships.
+- User docs: `README.md` (what it is, what you need, supported cars), `docs/getting-started.md`
+  (setup, step by step) and `docs/technical-overview.md` (code layout, settings, console). Keep the
+  car table and the settings tables current when the code changes.
 - Check `git remote -v` before reaching for a forge CLI: `gh` only works if the remote is GitHub.
 - The app side lives in the ABRP app repository and has its own `AGENTS.md`. Protocol changes touch both repos
   and land together; a firmware change that moves a wire format without the app is a broken pair.
