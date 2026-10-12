@@ -190,7 +190,7 @@ truncation metadata. The body-ACK outcome remains diagnostic; POST acceptance an
 
 ## Combined freshness verification and rollout
 
-The combined heading/GPS runner now has 29 groups. Run it normally and with `CXX='clang++ -DNDEBUG'`.
+The combined heading/GPS runner now has 30 groups; `upload-gate` covers which polls are buffered for upload. Run it normally and with `CXX='clang++ -DNDEBUG'`.
 It covers accepted-record observation UTC, strict calendars, independent location/heading times,
 frozen-average contributor times, and valid GPS clock seeding before a coordinate fix. The backlog
 oracle compiles the historical `eacc642` loader/serializer/resave path; it verifies numeric battery

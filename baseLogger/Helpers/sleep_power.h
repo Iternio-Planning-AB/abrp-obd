@@ -94,16 +94,17 @@ void enterDeepSleep(bool modem_on) {
   // but we sleep at the top of loop() before another frame can be polled/sent - and the periodic flush
   // may have just cleared the buffer with is_parked:0 frames - so the API would otherwise never learn the
   // trip ended. A fresh frame is truthful (prior buffered frames keep their real is_parked:0; this adds the
-  // closing is_parked:1 with no contradictory speed) and tiny (~35 bytes, once per sleep). Needs a valid utc,
+  // closing is_parked:1 with no contradictory speed) and tiny (~35 bytes, once per trip). Needs a valid utc,
   // which ABRP requires anyway.
   // Gated on the latch: the modem-recovery reboot sleeps MID-DRIVE (WOM re-wakes immediately), and an
-  // unconditional marker there would push a false is_parked:1 into the trip. Normal sleeps have the latch
-  // set (changeState latched it on the way to CHARGING/STANDBY), so the trip-end marker still goes out.
-  if (rtc.getEpoch() > 1e9 && is_currently_parked) {
+  // unconditional marker there would push a false is_parked:1 into the trip. And only when owed (see
+  // park_marker_owed): a parked heartbeat wake ended no trip and has nothing to mark.
+  if (rtc.getEpoch() > 1e9 && is_currently_parked && park_marker_owed) {
     OBDVector parked_frame;
     parked_frame.emplace_back("is_parked", 1.0);
     parked_frame.emplace_back("utc", rtc.getEpoch());
     obd_result_vector.push_back(parked_frame);
+    park_marker_owed = false;
   }
 
   // Flush before deep sleep wipes RAM. handleActivityState() can trigger sleep before loop()'s normal send

@@ -1186,6 +1186,62 @@ void geoLegacy() {
         "legacy geo without observation UTC must not be restamped");
 }
 
+// The real poll-upload gate, buffer push and pre-sleep trip-end marker (logger.ino, sleep_power.h).
+bool park_marker_owed = false;
+void bufferPoll(OBDVector current_frame) {
+#include "upload_gate.inc"
+#include "upload_buffer.inc"
+}
+void queueParkMarker() {
+#include "park_marker.inc"
+}
+
+void uploadGate() {
+  const double T = 1791500000;
+  resetFixture();
+  setClock(CLK_HTTP, T);
+  obd_result_vector.clear();
+  park_marker_owed = false;
+  check(!v2HasTelemetry({{"utc", T}}, T), "utc-only frame is not uploaded");
+  check(!v2HasTelemetry({{"utc", T}, {"_bms_soc", 50}}, T), "unmapped private key alone is not uploaded");
+  check(!v2HasTelemetry({{"soc", 50}}, T), "frame without utc is not uploaded");
+
+  parkedFixture();
+  OBDVector frozen{{"utc", T}};
+  addGpsData(frozen);
+  check(v2HasTelemetry(frozen, T), "eligible frozen location serializes with a send clock");
+  bufferPoll(frozen);
+  check(obd_result_vector.empty(), "parked poll carrying only the frozen fix is not buffered");
+  OBDVector parked{{"utc", T}, {"soc", 50}};
+  addGpsData(parked);
+  bufferPoll(parked);
+  check(obd_result_vector.size() == 1 && !park_marker_owed, "parked car value is buffered and owes no marker");
+  queueParkMarker();
+  check(obd_result_vector.size() == 1, "a parked wake that ended no trip queues no marker");
+  check(linkHeading("9000") == 90, "seed first moving fix");
+  OBDVector moving{{"utc", T + 30}};
+  addGpsData(moving);
+  bufferPoll(moving);
+  check(obd_result_vector.size() == 2 && json::parse(bulkStringV2({obd_result_vector.back()}, T + 30))[0]
+        .contains("location"), "a live fix still latched PARK is buffered with its location");
+
+  is_currently_parked = false;
+  OBDVector driving{{"utc", T + 60}, {"soc", 49}};
+  addGpsData(driving);
+  bufferPoll(driving);
+  check(obd_result_vector.size() == 3 && park_marker_owed, "driving poll is buffered and owes a marker");
+  queueParkMarker();
+  check(obd_result_vector.size() == 3 && park_marker_owed, "a mid-drive sleep queues no marker and keeps it owed");
+  is_currently_parked = true;
+  queueParkMarker();
+  queueParkMarker();
+  check(obd_result_vector.size() == 4 && !park_marker_owed, "the trip end queues exactly one marker");
+  const auto marker = json::parse(bulkStringV2({obd_result_vector.back()}, T));
+  check(marker.size() == 1 && marker[0].size() == 2 && marker[0]["drivingState"]["state"] == "PARK",
+        "trip-end marker serializes to a PARK point");
+  obd_result_vector.clear();
+}
+
 int main(int argc, char** argv) {
   const std::string selected = argc > 1 ? argv[1] : "all";
   const std::pair<std::string, void(*)()> tests[] = {
@@ -1198,7 +1254,7 @@ int main(int argc, char** argv) {
     {"geo-calendar", geoCalendar}, {"geo-freeze", geoFreeze}, {"gps-clock-no-position", gpsClockWithoutPosition},
     {"geo-history", geoRecordHistory}, {"geo-freeze-bounds", geoFreezeBounds}, {"geo-rtc", geoRtc},
     {"geo-profile", geoProfile}, {"geo-backlog", geoBacklog}, {"geo-downgrade", geoDowngrade},
-    {"geo-backlog-rows", geoBacklogRows}, {"geo-backlog-nonfinite", geoBacklogNonfinite},
+    {"geo-backlog-rows", geoBacklogRows}, {"geo-backlog-nonfinite", geoBacklogNonfinite}, {"upload-gate", uploadGate},
   };
   bool matched = false;
   for (const auto& test : tests) {

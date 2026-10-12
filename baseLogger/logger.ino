@@ -91,6 +91,11 @@ bool logging_message_printed = false; // print message once
 // unlatched to driving by speed > 0 in loop() and re-latched by the activity state machine once
 // motion has stopped (see changeState). This is the IMU "smart cheat" - there is no real gear PID.
 bool is_currently_parked = true;
+// Set when a DRIVE frame enters the upload buffer, cleared when the pre-sleep PARK marker is queued: the
+// server has been told DRIVE and not yet PARK. RTC so a trip end that straddles a reboot (the mid-drive
+// modem-recovery sleep, a WDT reset) is still closed on the next wake, while a parked heartbeat wake owes
+// nothing and opens no connection.
+RTC_DATA_ATTR bool park_marker_owed = false;
 // millis() of the last speed>0 frame. Drives the TIME-BASED parked re-latch below: the state-machine re-latch
 // (changeState -> CHARGING/STANDBY) never fires while a connected phone holds the leash in the BLE state, so
 // after a drive the latch stayed "driving" forever - which disabled the MAX_AWAKE backstop (parked-gated) AND
@@ -1504,9 +1509,15 @@ void loop() {
         (unsigned long)(ACTIVE_TIMER / 1000UL));
 #endif
     }
-    // Capture this before appending is_parked: a frame carrying nothing but is_parked is not worth
-    // sending, so this preserves the original empty-frame guard.
+    // Before is_parked is appended: a frame whose only v2 field would be drivingState is not worth a POST.
+    // utc is always present, so this asks the serializer. The frozen fix is not news either; a live fix still
+    // latched PARK (the first moving sample, the cold-boot fallback) is.
+#if ENABLE_NETWORK
+    bool frame_has_data = v2HasTelemetry(current_frame,
+      strcmp(gpsLocationSource(), "frozen") == 0 ? 0 : uploadSendUtc());
+#else
     bool frame_has_data = !current_frame.empty();
+#endif
     current_frame.emplace_back("is_parked", is_currently_parked ? 1.0 : 0.0);
 
     // Feature A - is_charging from the current PID's sign. Charging pushes current INTO the battery (negative,
@@ -1730,8 +1741,9 @@ void loop() {
       charge_corr_last_us = now_us;
     }
 
-    if (frame_has_data) { // skip frames that would carry only is_parked so we never POST a meaningless tlm
+    if (frame_has_data) { // skip frames that would carry only drivingState so we never POST a meaningless tlm
       obd_result_vector.push_back(current_frame); // store multiple frames to send at the same time, lowers cellular usage
+      if (!is_currently_parked) park_marker_owed = true;
       // Bound the RAM upload buffer so a long offline stretch can't grow it without limit (-> OOM). The
       // full history is already in flash; for live telemetry the freshest frames matter most, so drop the
       // oldest when over the cap.

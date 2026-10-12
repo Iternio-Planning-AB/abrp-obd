@@ -265,3 +265,8 @@ std::string bulkStringV2(const std::vector<OBDVector>& frames, double send_utc =
 
   return points.dump();
 }
+
+// Would this frame produce a v2 point? Asked before is_parked is added, so drivingState cannot count.
+bool v2HasTelemetry(const OBDVector& frame, double send_utc) {
+  return bulkStringV2({ frame }, send_utc) != "[]";
+}
