@@ -102,6 +102,9 @@ RTC_DATA_ATTR bool park_marker_owed = false;
 // is_charging (parked-gated). A phone forgotten in the car could then hold the device + the car's ECUs awake
 // indefinitely - the exact 12V-drain scenario the backstop exists to prevent.
 unsigned long g_last_speed_ms = 0;
+// Last sample whose current was above CHARGE_DISCHARGE_AMPS. Plain RAM: 0 at every wake, so a streaming wake
+// confirms a charge only after CHARGE_STREAM_CONFIRM_SECONDS of its own samples.
+unsigned long g_last_discharge_ms = 0;
 
 #if ENABLE_WIFI
 // One-shot guard for the cold-boot WiFi RF-flush recovery (see setup()). RTC memory survives the recovery
@@ -297,6 +300,8 @@ RTC_DATA_ATTR uint8_t obd_anomaly_logs = 0;
 RTC_DATA_ATTR uint64_t obd_anomaly_last_us = 0;
 // Consecutive polls with no charge evidence while the charge latch was still set (CHARGE_RELEASE_POLLS).
 RTC_DATA_ATTR uint8_t charge_release_polls = 0;
+// Consecutive latched polls the car did not answer, held off the release up to CHARGE_SILENT_HOLD_POLLS.
+RTC_DATA_ATTR uint8_t charge_silent_polls = 0;
 
 // Test B (brownout vs clean sleep): set true immediately before esp_deep_sleep_start(); checked on the next
 // boot. If we wake and it's NOT set, we did NOT go through our own sleep path -> an uncommanded reset
@@ -1542,24 +1547,30 @@ void loop() {
 
     // Feature A - is_charging from the current PID's sign. Charging pushes current INTO the battery (negative,
     // ~-51A); discharge/idle is >= 0. Gate on parked so a drive's regen braking isn't mislabeled. Per-frame.
+    // A streaming wake can still be a drive the latch has not caught yet, so there the sample is trusted only
+    // after CHARGE_STREAM_CONFIRM_SECONDS without a discharge sample (config.h); until then the frame carries no
+    // verdict, which the v2 mapping sends as no chargingState rather than NOT_CHARGING.
     bool is_charging = false;
     bool charging_current_valid = false;
-    if (is_currently_parked) {
-      for (const auto& res : current_frame) {
-        if (res.first == "current") {
-          // Bounds-guard the cadence-critical read: a garbage current (e.g. the -2.9e8 seen in bad buffer
-          // reads) is < CHARGING_CURRENT_THRESHOLD and would falsely flag charging -> trip fast cadence.
-          // readPIDs already clamps to the profile's [-2000,2000], but don't depend on it here.
-          float c = res.second;
-          if (c > -2000.0f && c < 2000.0f) {
-            charging_current_valid = true;
-            is_charging = (c < CHARGING_CURRENT_THRESHOLD);
-          }
-          break;
+    for (const auto& res : current_frame) {
+      if (res.first == "current") {
+        // Bounds-guard the cadence-critical read: a garbage current (e.g. the -2.9e8 seen in bad buffer
+        // reads) is < CHARGING_CURRENT_THRESHOLD and would falsely flag charging -> trip fast cadence.
+        // readPIDs already clamps to the profile's [-2000,2000], but don't depend on it here.
+        float c = res.second;
+        if (c > -2000.0f && c < 2000.0f) {
+          charging_current_valid = true;
+          if (c > CHARGE_DISCHARGE_AMPS) g_last_discharge_ms = millis();
+          is_charging = is_currently_parked && (c < CHARGING_CURRENT_THRESHOLD);
         }
+        break;
       }
     }
-    if (!is_currently_parked || charging_current_valid)
+    const bool charge_signal_trusted = g_sample_poke ||
+      millis() - g_last_discharge_ms >= (unsigned long)CHARGE_STREAM_CONFIRM_SECONDS * 1000UL;
+    const bool unconfirmed_charging = is_charging && !charge_signal_trusted;
+    if (!charge_signal_trusted) is_charging = false;
+    if (!is_currently_parked || (charging_current_valid && charge_signal_trusted))
       current_frame.emplace_back("is_charging", is_charging ? 1.0 : 0.0);
 
     /*
@@ -1599,7 +1610,7 @@ void loop() {
     const bool soe_rose = chargeCounterRose("soe", prev_parked_soe, CHARGE_PROGRESS_SOE_WH);
     // Same parked gate as is_charging: SoC / energy changes during a drive can include regen, and neither
     // says anything about a charge session.
-    const bool charge_progress = is_currently_parked && (soc_rose || kwh_rose || soe_rose);
+    const bool charge_progress = is_currently_parked && charge_signal_trusted && (soc_rose || kwh_rose || soe_rose);
 
     /*
       DC or AC? The driver of a fast-charging car is usually watching progress from somewhere else in
@@ -1658,9 +1669,16 @@ void loop() {
     */
     const bool was_recently_charging = recently_charging; // pre-poll latch, read before we overwrite it
     const bool charge_evidence = is_charging || charge_progress;
-    if (charge_evidence) {
+    // A silent poll (CHARGE_SILENT_HOLD_POLLS) is not evidence the charge ended, so it holds the release. An
+    // unconfirmed charging sample restarts it, so only consecutive non-charging samples release. Neither can
+    // set the latch.
+    const bool silent_hold = was_recently_charging && obd_count == 0 &&
+      charge_silent_polls < (uint8_t)CHARGE_SILENT_HOLD_POLLS;
+    if (obd_count > 0) charge_silent_polls = 0;
+    else if (silent_hold) charge_silent_polls++;
+    if (charge_evidence || unconfirmed_charging) {
       charge_release_polls = 0;
-    } else if (was_recently_charging && charge_release_polls < 255) {
+    } else if (was_recently_charging && !silent_hold && charge_release_polls < 255) {
       charge_release_polls++;
     }
     // Still "charging" for cadence purposes while the release is unconfirmed. Also the taper latch: the gate
@@ -1677,7 +1695,9 @@ void loop() {
       if (soc > prev_charge_soc)      taper_confirm_wakes = 0;        // SoC progressed -> productive, reset
       else if (g_taper_confirm)       taper_confirm_wakes++;          // confirm-poll with no SoC gain -> stall
       if (soc > 0.0)                  prev_charge_soc = soc;          // remember THIS poll's SoC for next compare
-    } else {
+    } else if (!recently_charging) {
+      // Released, not merely held by a silent or unconfirmed poll: a held poll resetting these would let an
+      // intermittently answering car defeat TAPER_CONFIRM_MAX_WAKES.
       taper_confirm_wakes = 0; // charge over -> reset the bridge budget
       prev_charge_soc = 0.0;   // ...and the SoC baseline, so the NEXT charge compares against its own start
     }
@@ -1748,7 +1768,12 @@ void loop() {
       // 1-minute DC tier the same count would represent a third of the wall clock, so a long DC
       // session would latch back to the parked cadence three times sooner than intended.
       charging_fast_minutes += (uint32_t)g_next_wake_minutes;
-      if (has_charge_counter && !corroborated && charge_corr_last_us && now_us > charge_corr_last_us) {
+      // A silent poll counts too: no answer is not corroboration, so a car that rarely answers still reaches
+      // CHARGE_CORROBORATE_MINUTES on wall-clock time. Only once a counter has answered this charge: a
+      // profile without one could never corroborate, and silence alone must not slow a real charge.
+      const bool counter_seen = charge_corr_soc_hw >= 0.0 || charge_corr_kwh_hw >= 0.0 || charge_corr_soe_hw >= 0.0;
+      if ((has_charge_counter || (obd_count == 0 && counter_seen)) && !corroborated && charge_corr_last_us &&
+          now_us > charge_corr_last_us) {
         // Capped at one fast interval, so time before this charge (or a long sleep) is never counted.
         uint64_t d = (now_us - charge_corr_last_us) / 1000000ULL;
         const uint64_t cap = (uint64_t)(WAKE_CHARGING_MINUTES + 1) * 60;

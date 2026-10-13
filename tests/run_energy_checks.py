@@ -8,7 +8,7 @@ import tempfile
 
 arguments = argparse.ArgumentParser()
 arguments.add_argument("group", nargs="?", default="all",
-                       choices=["all", "progress", "corroboration", "wake-gate", "logging", "schema", "transport", "profiles"])
+                       choices=["all", "progress", "signal", "release", "corroboration", "wake-gate", "logging", "schema", "transport", "profiles"])
 arguments.add_argument("--profiles", type=Path)
 args = arguments.parse_args()
 if args.group == "profiles" and args.profiles is None:
@@ -22,9 +22,17 @@ compiler = shlex.split(os.environ.get("CXX", "clang++"))
 with tempfile.TemporaryDirectory(prefix="obd-energy-checks-") as temporary:
     build = Path(temporary)
     (build / "charge_config.inc").write_text("\n".join(re.findall(
-        r"^#define (?:CHARGE_PROGRESS_\w+|CLOCK_MAX_EPOCH|GEO_MAX_SEND_AGE_SECONDS|RAIL_AWAKE_VOLTS|RAIL_TAPER_FLOOR|"
+        r"^#define (?:CHARGE_PROGRESS_\w+|CHARGING_CURRENT_THRESHOLD|CHARGE_DISCHARGE_AMPS|CHARGE_STREAM_CONFIRM_SECONDS|"
+        r"CHARGE_RELEASE_POLLS|CHARGE_SILENT_HOLD_POLLS|CHARGE_CORROBORATE_MINUTES|WAKE_PARKED_MINUTES|"
+        r"WAKE_CHARGING_MINUTES|WAKE_DC_CHARGING_MINUTES|WAKE_CHARGING_MAX_MINUTES|CLOCK_MAX_EPOCH|GEO_MAX_SEND_AGE_SECONDS|RAIL_AWAKE_VOLTS|RAIL_TAPER_FLOOR|"
         r"CHARGE_END_POLL_FLOOR|TAPER_CONFIRM_MAX_WAKES|IO36_LOCKOUT_\w+)\b.*(?:\n[ \t]+.*)*",
         config, re.MULTILINE)))
+    start = logger.index("    // Feature A - is_charging")
+    end = logger.index("\n    /*\n      CHARGE PROGRESS", start)
+    (build / "charge_signal.inc").write_text(logger[start:end])
+    start = logger.index("    const bool was_recently_charging")
+    end = logger.index("\n\n    if (frame_has_data) { // skip frames", start)
+    (build / "charge_release.inc").write_text(logger[start:end])
     start = logger.index("    auto chargeCounterRose =")
     end = logger.index("\n    /*\n      DC or AC", start)
     (build / "charge_progress.inc").write_text(logger[start:end])

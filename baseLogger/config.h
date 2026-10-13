@@ -415,6 +415,14 @@
 // is_charging when PARKED and current is below a small-negative threshold (the parked gate stops a drive's
 // regen-braking negative current from being mislabeled). Per-frame, read from the one sample - never latched.
 #define CHARGING_CURRENT_THRESHOLD -2.0f  // A; current below this (more negative) while parked = charging
+// The parked gate is only as good as the latch. FIELD (Ioniq 5-profile car, 2026-09-30..10-12): a motion wake
+// starts latched PARK, the profile has no speed PID, and the GNSS took 3.5-11.5 min to unlatch - so every regen
+// sample in that window published CHARGING_AC, on 9 of 13 drives. A streaming wake (motion / BLE / cold boot,
+// polling every few seconds) therefore believes a charging sample only once no sample above
+// CHARGE_DISCHARGE_AMPS has been seen for CHARGE_STREAM_CONFIRM_SECONDS: those drives drew discharge current
+// at least every 94 s, a plugged-in car draws none. A stationary sample poke keeps the single-sample verdict.
+#define CHARGE_DISCHARGE_AMPS          2.0f  // A; a sample above this is the car driving or running loads
+#define CHARGE_STREAM_CONFIRM_SECONDS  180
 
 // ---- Charge PROGRESS: the second, independent charge signal ----
 // FIELD (boot 14, 13:58 local, AC charge): the current sign is ONE instantaneous sample per wake - readPIDs
@@ -442,6 +450,12 @@
 // CONFIRMED by the next. The cost of being wrong is one extra WAKE_CHARGING_MINUTES wake at the end of
 // every charge; the cost of being wrong the other way is the 30-minute hole above.
 #define CHARGE_RELEASE_POLLS    2
+// A poll the car did not answer is not evidence the charge stopped. FIELD (Ioniq 5-profile car, 2026-10-05):
+// OBD went silent on ~60% of polls mid-charge at a 14.8 V rail; two silent polls released the latch while the
+// rail was still high, so neither the taper confirm nor the charge-end read fired and ABRP kept CHARGING at
+// 77%. Up to this many consecutive silent polls hold the release; past it they count, which bounds a car that
+// never answers to a few extra fast-cadence wakes.
+#define CHARGE_SILENT_HOLD_POLLS 4
 
 // ---- Adaptive wake cadence (Feature B) ----
 // The next deep-sleep timer is chosen PER-SLEEP from what this wake observed - there is no persistent "mode":
