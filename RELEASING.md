@@ -97,4 +97,3 @@ yours on official ones; that is the point.
 - The publish job trusts what the build job built. It checks only the build tag and the embedded public key, so a
   compromised PyPI or PlatformIO dependency can't reach the key but could still get a backdoored image signed.
   Pinning the platform and hashing the pip installs narrows that.
-- `tests/run_release_checks.py` covers the tooling with a fake `aws` and throwaway keys.

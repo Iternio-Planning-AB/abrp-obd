@@ -51,6 +51,5 @@ it in the pull request.
 
 ## Logs and private data
 
-Dongle logs and `DUMP` output record the car's location history. Never attach them, or anything
-with an ABRP token, to a public issue or pull request. If a maintainer needs a log, they will ask
-for it privately.
+Never attach dongle logs, `DUMP` output or ABRP tokens to a public issue or pull request; see
+[SECURITY.md](SECURITY.md).

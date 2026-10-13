@@ -209,7 +209,7 @@ stands in front of.
 
 Signed releases are GitHub Releases of this repo, cut by the manual *Release* workflow, which signs with
 an AWS KMS key (`RELEASING.md`). OTA reads `firmware.bin` and `manifest.json`
-(`{version, size, sha256, signature, sig_alg: "ecdsa-p256-sha256", firmware, description}`); the app
+(`{version, size, sha256, signature, sig_alg: "ecdsa-p256-sha256", firmware, version_name}`); the app
 re-reads the manifest on every check, downloads the `.bin` to a phone-side in-memory cache, then
 streams it over BLE.
 
@@ -1733,12 +1733,13 @@ order** — parse every tag yourself and take the numeric max, exactly as the ea
 side plan already assumed. This also means a release published slightly out of order, or
 one you mark `prerelease` for a beta channel, still sorts correctly.
 
-### 2.3 Each release has exactly two assets, exact filenames
+### 2.3 OTA uses two assets, exact filenames
 ```
 firmware.bin
 manifest.json
 ```
-No other naming, no versioned filenames (`firmware-v2.bin` etc.) — the version lives in
+Releases also carry `firmware.elf`, `factory.bin` and `SHA256SUMS`; select the two above by name and
+ignore the rest. No other naming, no versioned filenames (`firmware-v2.bin` etc.) — the version lives in
 the tag and inside `manifest.json`, not in the filename, so fetch code never needs to
 string-match a filename pattern.
 
@@ -1748,8 +1749,9 @@ GET  https://api.github.com/repos/{owner}/{repo}/releases
      Accept: application/vnd.github+json
 ```
 Returns an array; each entry has `tag_name` and `assets: [{ id, name, size, ... }]`.
-Parse every `tag_name` → integer, pick the max, find that release's `manifest.json` and
-`firmware.bin` assets by `name`.
+Skip `prerelease: true` entries unless the user opted into test firmware, read each remaining
+release's `manifest.json`, take the max `version` (break a tie on `version_name`, so a final beats
+its rc), and fetch that release's `firmware.bin` by `name`.
 
 ```
 GET  https://api.github.com/repos/{owner}/{repo}/releases/assets/{asset_id}
