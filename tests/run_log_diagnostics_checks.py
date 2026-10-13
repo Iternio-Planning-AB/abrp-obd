@@ -13,9 +13,21 @@ import tempfile
 root = Path(__file__).resolve().parents[1]
 compiler = shlex.split(os.environ.get("CXX", "clang++"))
 parser = argparse.ArgumentParser()
-parser.add_argument("group", nargs="?", default="all", choices=["all", "schema", "logging", "schema-failures"])
+parser.add_argument("group", nargs="?", default="all", choices=["all", "schema", "logging", "schema-failures", "ble-write"])
 parser.add_argument("--capture-helper", type=Path)
 arguments = parser.parse_args()
+# The ble-write group tests the summary; this keeps blewrapper.cpp using it. A log or print call that names a
+# raw write buffer (input/value) other than through bleWriteSummary(), or a client key other than through
+# bleKeyForLog(), would put the AUTH secret or tlm_push_token into the flash log or onto USB serial.
+if arguments.group in ("all", "ble-write"):
+    import re
+    ble_source = (root / "libraries/BLEWrapper/blewrapper.cpp").read_text()
+    calls = re.findall(r"(?:logEvt|logError|Serial\.printf)\((.*?)\);", ble_source, re.S)
+    leaks = [call for call in calls
+             if re.search(r"\b(input|value|message_key)\b",
+                          re.sub(r'bleWriteSummary\((input|value)\)|bleKeyForLog\(message_key\)|"(?:\\.|[^"\\])*"', "", call))]
+    if leaks or ble_source.count("bleWriteSummary(") < 2:
+        raise AssertionError(f"blewrapper.cpp logs a raw BLE write: {leaks}")
 with tempfile.TemporaryDirectory(prefix="obd-log-diagnostics-") as temporary:
     build = Path(temporary)
     source = (root / "libraries/DataLogger/datalogger.cpp").read_text()
@@ -50,6 +62,7 @@ with tempfile.TemporaryDirectory(prefix="obd-log-diagnostics-") as temporary:
         "-I", str(root / "libraries/DataLogger"),
         "-I", str(root / "libraries/FreematicsPlus"),
         "-I", str(root / "libraries/nlohmann"),
+        "-I", str(root / "libraries/BLEWrapper"),
         "-I", str(root / "baseLogger/Helpers"), "-I", str(build),
         str(root / "tests/log_diagnostics_checks.cpp"), "-o", str(executable),
     ], check=True)

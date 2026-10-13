@@ -9,6 +9,7 @@
 #include <cstring>
 #include <iostream>
 #include <map>
+#include "ble_write_summary.h"
 #include <memory>
 #include <set>
 #include <sstream>
@@ -358,11 +359,30 @@ void emitDump() {
   std::cout << dump.bytes;
 }
 
+void bleWriteChecks() {
+  const std::string token = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0";
+  const std::pair<std::string, std::string> cases[] = {
+    {"{\"AUTH\":\"" + token + "\"}", "keys=AUTH"},
+    {"{\"tlm_push_token\":\"" + token + "\"}", "keys=tlm_push_token"},
+    {"{\"AUTH\":\"" + token, "non-object"},
+    {"AUTH " + token, "non-object"},
+    {"[\"" + token + "\"]", "non-object"},
+    {"{\"" + token + "\":1}", "keys= +1 other"},
+    {"{\"CLEAN\":1,\"a\\nEVT,0\":2,\"obd_alarm\":0}", "keys=CLEAN,obd_alarm +1 other"},
+  };
+  for (const auto& [write, summary] : cases)
+    check(bleWriteSummary(write) == "len=" + std::to_string(write.size()) + " " + summary, "BLE write logs length and identifier keys only: " + bleWriteSummary(write));
+  check(std::string(bleKeyForLog("obd_alarm")) == "obd_alarm" && std::string(bleKeyForLog(token)) == "?" &&
+        std::string(bleKeyForLog("a\nEVT")) == "?", "a logged key is named only when identifier-shaped");
+}
+
 int main(int argc, char** argv) {
   const std::string group = argc > 1 ? argv[1] : "all";
   if (group == "dump") { emitDump(); return 0; }
-  check(group == "all" || group == "schema" || group == "logging" || group == "schema-failures", "known group");
+  check(group == "all" || group == "schema" || group == "logging" || group == "schema-failures" || group == "ble-write",
+        "known group");
   if (group == "all" || group == "schema") { schemaChecks(); std::cout << "PASS schema\n"; }
   if (group == "all" || group == "logging") { loggingChecks(); std::cout << "PASS logging\n"; }
   if (group == "all" || group == "schema-failures") { schemaFailureChecks(); std::cout << "PASS schema-failures\n"; }
+  if (group == "all" || group == "ble-write") { bleWriteChecks(); std::cout << "PASS ble-write\n"; }
 }

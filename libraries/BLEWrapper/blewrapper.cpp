@@ -1,4 +1,5 @@
 #include "blewrapper.h"
+#include "ble_write_summary.h"
 #include <stdarg.h>
 
 /*  
@@ -519,10 +520,10 @@ void StartupCallbacks::onWrite(BLECharacteristic* pStartupCharacteristic) {
   json j;
   std::string message_key{};
   if (input.length() > 0) {
-    // Log the RAW bytes of every app write to ABD2. The push packets are expected; what we're hunting for is
-    // ANY write that arrives AFTER SETUP OK (a keep-alive, nonce/challenge, or signed-auth message the app
-    // expects us to answer). If one shows up and we don't respond correctly, that's why the app drops us (0x13).
-    wrapper->logEvt("ABD2 rx: %.70s", input.c_str());
+    // Log every app write to ABD2 (keys only, never values). The push packets are expected; what we're hunting
+    // for is ANY write that arrives AFTER SETUP OK (a keep-alive, nonce/challenge, or signed-auth message the
+    // app expects us to answer). If one shows up and we don't respond correctly, that's why the app drops us (0x13).
+    wrapper->logEvt("ABD2 rx: %s", bleWriteSummary(input).c_str());
     // AUTHORIZATION GATE on the profile push. ABD2 is the highest-value write in the protocol: it
     // carries the vehicle profile (the PID list) and the tlm push token, so an unauthorized peer that
     // could write here could inject arbitrary PIDs at the CAN bus. Pairing alone does NOT earn that -
@@ -581,20 +582,20 @@ void StartupCallbacks::onWrite(BLECharacteristic* pStartupCharacteristic) {
         Serial.printf("Authentication error: %s\n", err.what());
         pStartupCharacteristic->setValue("ERROR");
         pStartupCharacteristic->notify();
-        wrapper->logError(std::string("ERROR: Expected authentication token, received " + input));
+        wrapper->logError("ERROR: Expected authentication token, received " + bleWriteSummary(input));
         return;
       }
       catch (json::parse_error err) {
-        Serial.printf("Parsing error: %s\n", err.what());
+        Serial.printf("Parsing error: id=%d\n", err.id); // what() quotes the input
         pStartupCharacteristic->setValue("ERROR");
         pStartupCharacteristic->notify();
-        wrapper->logError(std::string("ERROR: failed to parse " + input));
+        wrapper->logError("ERROR: failed to parse " + bleWriteSummary(input));
         return;
       }
       catch (...) {
         pStartupCharacteristic->setValue("ERROR");
         pStartupCharacteristic->notify();
-        wrapper->logError(std::string("ERROR: unknown error " + input));
+        wrapper->logError("ERROR: unknown error " + bleWriteSummary(input));
         return;
       }
     }
@@ -643,10 +644,10 @@ void StartupCallbacks::onWrite(BLECharacteristic* pStartupCharacteristic) {
       }
     }
     catch (json::parse_error& ex) {
-      Serial.printf("ERROR: Failed to parse string: \n%s\nas JSON\n", input.c_str()); // Print the string value
+      Serial.printf("ERROR: Failed to parse %s as JSON\n", bleWriteSummary(input).c_str());
       pStartupCharacteristic->setValue("ERROR");
       pStartupCharacteristic->notify();
-      wrapper->logError(std::string("ERROR: Failed to parse: " + input));
+      wrapper->logError("ERROR: Failed to parse: " + bleWriteSummary(input));
       return;
     }
     catch (std::out_of_range& ex) {
@@ -668,7 +669,7 @@ void StartupCallbacks::onWrite(BLECharacteristic* pStartupCharacteristic) {
 #endif
     } else {
 #if TIME
-      Serial.printf("Received %s: %d, %d\n", message_key.c_str(), millis() - wrapper->lastTime, millis() - wrapper->cleanTime);
+      Serial.printf("Received %s: %d, %d\n", bleKeyForLog(message_key), millis() - wrapper->lastTime, millis() - wrapper->cleanTime);
       wrapper->lastTime = millis();
 #endif
       if (message_key == "tlm_push_token") {
@@ -706,7 +707,7 @@ void StartupCallbacks::onWrite(BLECharacteristic* pStartupCharacteristic) {
     if (wrapper->profile_signature_required() &&
         message_key != "tlm_push_token" && message_key != "utc") {
       wrapper->logEvt("ABD2 refused unsigned profile key '%s' (signature required)",
-        message_key.c_str());
+        bleKeyForLog(message_key));
       pStartupCharacteristic->setValue(std::string("UNSIGNED"));
       pStartupCharacteristic->notify();
       return;
@@ -715,8 +716,9 @@ void StartupCallbacks::onWrite(BLECharacteristic* pStartupCharacteristic) {
   }
 
 #if PRINT 
-    Serial.printf("Successfully parsed string: \n%s\nas JSON\n", j.dump().c_str()); // Print the string value
-    Serial.printf("Complete config: \n%s\n", wrapper->getConfig().dump().c_str());
+    // Summaries only: the write and the config both carry tlm_push_token.
+    Serial.printf("Parsed %s\n", bleWriteSummary(input).c_str());
+    Serial.printf("Complete config: %s\n", bleWriteSummary(wrapper->getConfig().dump()).c_str());
 #endif
     wrapper->logEvt("push progress: keys=%d config=%d", (int)wrapper->keys().size(), (int)wrapper->getConfig().size());
     if (wrapper->keys().size() == wrapper->getConfig().size() && wrapper->keys().size() > 0) {
@@ -804,8 +806,8 @@ void DeveloperCallbacks::onWrite(BLECharacteristic* pDeveloperCharacteristic) {
   std::string value = pDeveloperCharacteristic->getValue();
   if (value.length() > 0) {
     // The app may use the "developer"/aux characteristic (ABD3) for a keep-alive or challenge. Log whatever
-    // arrives here to flash so a post-setup write on this channel shows up in the DUMP too.
-    wrapper->logEvt("ABD3 rx: %.70s", value.c_str());
+    // arrives here to flash (keys only) so a post-setup write on this channel shows up in the DUMP too.
+    wrapper->logEvt("ABD3 rx: %s", bleWriteSummary(value).c_str());
   }
 }
 

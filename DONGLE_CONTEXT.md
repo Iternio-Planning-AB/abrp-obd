@@ -942,6 +942,8 @@ ABD2 rx: {"AUTH":"<tlm_push_token>"}
 ABD2 rx: {"tlm_push_token":"<tlm_push_token>"}   ← same value
 ```
 
+(Firmware since then logs only the length and keys of each write, e.g. `ABD2 rx: len=48 keys=AUTH`.)
+
 Sniff it once → push fabricated telemetry for that vehicle forever.
 
 ### Handshake (replaces the AUTH write)
