@@ -113,7 +113,7 @@ jobs:
           name: unsigned
           path: dist
 
-      # What the AWS role's trust policy matches on (tf/abrp-obd in cloudops), for when assuming it fails.
+      # What the AWS role's trust policy matches on, for when assuming it fails.
       # Only these claims are printed, never the token.
       - name: Show OIDC claims
         if: ${{ inputs.dry_run }}
@@ -129,7 +129,7 @@ jobs:
           print(json.dumps({k: claims.get(k) for k in CLAIMS}, indent=2))
           PY
 
-      # Set by cloudops; the role trusts only this workflow file on main of this repo.
+      # Repo variables; the role trusts only this workflow file on main of this repo.
       - name: AWS credentials
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:

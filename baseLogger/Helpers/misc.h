@@ -83,7 +83,7 @@ void loadPreferences() {
     wifi_password = preferences.getString("password").c_str();
   } else if (!wifi_ssid.empty()) {
     // Seed NVS from the build-time default, but ONLY if there is one. The defaults in config.h are
-    // empty now (no credentials in the source tree), and seeding empty strings would be worse than
+    // empty (no credentials in the source tree), and seeding empty strings would be worse than
     // doing nothing: isKey("ssid") would then answer true forever, so this branch could never run
     // again and "never provisioned" would be indistinguishable from "provisioned with blanks".
     preferences.putString("ssid", wifi_ssid.c_str());

@@ -502,8 +502,8 @@ class WorkflowGuards(unittest.TestCase):
                 for tool in ("pip", "pio ", "uv", "git cliff", "npm", "npx", "curl ", "wget "):
                     self.assertNotIn(tool, script)
 
-    def test_signing_identity_comes_from_cloudops_managed_variables(self):
-        # The AWS role trusts only release.yml on main; cloudops (tf/abrp-obd) sets these variables.
+    def test_signing_identity_comes_from_repo_variables(self):
+        # The AWS role trusts only release.yml on main; these are repo variables, not secrets.
         publish = self.wf.jobs["publish"]
         self.assertNotIn("secrets.", publish)
         aws = self.wf.step("publish", "AWS credentials")

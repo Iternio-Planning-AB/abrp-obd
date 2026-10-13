@@ -141,13 +141,8 @@ and upload cycle), `Helpers/state_machine.h` (activity states and cadences), `He
 ## Etiquette
 
 - Do not commit, push or open PRs unless asked. Branch work off `main`.
-- Commit messages are used to generate release notes. Use Conventional Commits:
-  `type(scope): imperative summary` (scope optional). Describe the user-visible change, not just
-  the implementation; use `feat` for features, `fix` for bug fixes, and `docs`, `refactor`, `test`
-  or `chore` as appropriate. Mark breaking changes with `!` and a `BREAKING CHANGE:` footer that
-  explains the impact and migration. Only `feat`, `fix`, `perf`, `revert` and breaking changes reach
-  the notes (`cliff.toml`); `docs`, `ci`, `chore`, `test` and `refactor` are left out and do not bump
-  the version, so a `!` on one of those still ships.
+- Commit messages generate the release notes: follow *Commits* in `CONTRIBUTING.md` (Conventional
+  Commits, and which types reach the notes).
 - User docs: `README.md` (what it is, what you need, supported cars), `docs/getting-started.md`
   (setup, step by step) and `docs/technical-overview.md` (code layout, settings, console). Keep the
   car table and the settings tables current when the code changes.

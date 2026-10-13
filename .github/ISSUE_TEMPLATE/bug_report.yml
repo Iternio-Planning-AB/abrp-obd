@@ -1,0 +1,47 @@
+name: Bug report
+description: Something on the dongle doesn't work as expected
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Security problems (Bluetooth access, firmware updates, writing to the car) go to the
+        repository's **Security** tab, not here; see SECURITY.md.
+
+        **Do not paste logs, `DUMP` output, locations or tokens here.** The dongle's log records
+        where the car has been. Describe what you saw; if we need the log, we will ask for it privately.
+  - type: input
+    id: car
+    attributes:
+      label: Car
+      description: Make, model and year
+      placeholder: Hyundai Ioniq 5, 2023
+    validations:
+      required: true
+  - type: input
+    id: firmware
+    attributes:
+      label: Firmware version
+      description: The "FW BUILD" line at the top of the serial output, or the version you flashed
+      placeholder: v0.1.0
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you expected, what happened instead, and when (driving, charging, parked, setup)
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: If you know how to make it happen again
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy
+      options:
+        - label: I have not pasted logs, DUMP output, locations, VINs or tokens in this issue
+          required: true

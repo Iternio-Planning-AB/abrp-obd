@@ -65,6 +65,8 @@ worked, and what to do if it doesn't.
 - [`DONGLE_CONTEXT.md`](DONGLE_CONTEXT.md): everything else, from design history to protocols and
   field findings. Long; best read with an AI assistant
 - [`RELEASING.md`](RELEASING.md): how firmware releases are made
+- [`CONTRIBUTING.md`](CONTRIBUTING.md): building, testing and sending changes
+- [`SECURITY.md`](SECURITY.md): report security problems privately, never in a public issue
 
 ## License
 

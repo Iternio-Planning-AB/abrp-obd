@@ -1,0 +1,55 @@
+name: Car support
+description: Report how the dongle works with your car, or ask for a car to be supported
+labels: [car-support]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check the car table in the README first. A report from a car marked "Expected to work"
+        helps too, whether it worked or not.
+
+        **Do not paste logs, `DUMP` output, locations or tokens here.** If we need the log, we will
+        ask for it privately.
+  - type: input
+    id: car
+    attributes:
+      label: Car
+      description: Make, model, year and trim or battery size
+      placeholder: Renault Scenic E-Tech, 2024, 87 kWh
+    validations:
+      required: true
+  - type: input
+    id: profile
+    attributes:
+      label: ABRP car and OBD profile
+      description: The car you chose in the app during setup, if you got that far
+  - type: input
+    id: firmware
+    attributes:
+      label: Firmware version
+      placeholder: v0.1.0
+  - type: dropdown
+    id: result
+    attributes:
+      label: How did it go?
+      options:
+        - Not tried yet
+        - Works (driving and charging)
+        - Driving works, charging doesn't
+        - Connects, but no data in ABRP
+        - Doesn't connect to the car at all
+        - Set off the car's alarm
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: Details
+      description: What worked, what didn't, anything you noticed
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy
+      options:
+        - label: I have not pasted logs, DUMP output, locations, VINs or tokens in this issue
+          required: true

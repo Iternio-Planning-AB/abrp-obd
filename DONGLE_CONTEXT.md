@@ -205,28 +205,20 @@ stands in front of.
   See `RELEASING.md`.
 - `OTARESET` clears the persisted anti-downgrade floor after a bench flash to a lower version.
 
-### Distribution — the release repo
+### Distribution — GitHub Releases
 
-Signed releases live in a **separate private release repository**.
-Each release holds exactly two assets — `firmware.bin` and `manifest.json`
-(`{version, size, sha256, signature, sig_alg: "ecdsa-p256-sha256", firmware, description}`). The app
-re-reads the manifest on every check (newest release always wins), downloads the `.bin` to a
-phone-side in-memory cache, then streams it over BLE.
+Signed releases are GitHub Releases of this repo, cut by the manual *Release* workflow, which signs with
+an AWS KMS key (`RELEASING.md`). OTA reads `firmware.bin` and `manifest.json`
+(`{version, size, sha256, signature, sig_alg: "ecdsa-p256-sha256", firmware, description}`); the app
+re-reads the manifest on every check, downloads the `.bin` to a phone-side in-memory cache, then
+streams it over BLE.
 
-- **App side:** `src/state/firmwareUpdate/` — `verifyFirmwareTokenThunk` registers the token,
-  `fetchFirmwareUpdateThunk` pulls the manifest + image. Errors map to
-  `unauthorized` / `not_found` / `malformed` / `network`.
-- **Access:** a repository access token that testers **enter manually** in the app (developer tools).
-  It is deliberately never committed. **The dongle's trust is the ECDSA signature, not the repo** —
-  so a leaked token is a distribution problem (revoke + reissue), never a way to push
-  an unsigned image onto a dongle. Keep the *signing private key* off the repo entirely; only
-  `ota_pubkey.h` (the public half) lives in firmware.
-- **Signing keypair:** `tools/ota_keygen.py` generates it, `tools/ota_sign.py` signs a build. The
-  public key is embedded at `Helpers/ota_pubkey.h`; if it is ever rotated, firmware and signer change
-  together and the new firmware must reach devices *before* anything signed with the new key.
-- **Release pipeline (staged):** the manual GitHub Actions *Release* workflow signs with an AWS KMS key and
-  publishes GitHub Releases in this repo (`RELEASING.md`). The app does not read those yet, and moving to
-  the KMS key means a USB re-flash of every dongle.
+- **The dongle's trust is the ECDSA signature, not where the image came from.** Only `ota_pubkey.h`
+  (the public half) lives in firmware.
+- **Signing keypair:** `tools/ota_keygen.py` writes the header (`--from-kms` for the release key, or a
+  local keypair for a fork), `tools/ota_sign.py` signs a build. If the key is ever rotated, firmware and
+  signer change together and the new firmware must reach devices *before* anything signed with the new
+  key.
 
 ---
 
@@ -588,12 +580,8 @@ do everything a legitimate user can. That is the boundary of the design.
 
 ## 1. Note on firmware-image confidentiality
 
-Encrypting the BLE link does protect the `.bin` in flight. Worth knowing, though: the same file is downloadable
-by anyone holding the **release repository access token**, which lives in MMKV on every developer's phone.
-So if the binary's confidentiality matters, the token distribution is the larger exposure — worth addressing in
-parallel (short-lived tokens, or a backend proxy handing out pre-signed URLs instead of repo tokens).
-
-For protecting firmware IP *on the device* (someone with physical access dumping flash), the real answer is
+Releases are public; the firmware image is not secret, and the BLE link only protects it in flight.
+For protecting what is *on the device* (someone with physical access dumping flash), the answer is
 **ESP32 flash encryption + secure boot**, which is a separate, larger topic and not part of this plan.
 
 ---
@@ -1003,7 +991,6 @@ now encrypted by Phase E — whenever the profile is re-pushed.
 > Known consequence of the substitution: HMAC answers "who holds the secret", not "which user is
 > permitted". With QR sharing a secret propagates to whoever the holder chooses and there is no
 > per-person revocation — rotation is all-or-nothing (`AUTHCLEAR` → re-provision → re-share).
-> Acceptable for a controlled internal fleet; revisit if this ever ships more widely.
 
 Log fetch exfiltrates GPS traces, so "which user is allowed to pull this dongle's logs" is a live question that
 only the backend can answer.
@@ -1143,7 +1130,7 @@ network assumed available, that is simply a second backend call — no cached ti
 > against Bluedroid's hard `CONFIG_BT_SMP_MAX_BONDS=15`, pruned at BLE bring-up (loop task, nothing
 > connected). Eviction is arbitrary and frees a single slot; an evicted phone re-pairs silently.
 
-Gives confidentiality: the profile (and its PID list — the actual reverse-engineering IP), the provisioning
+Gives confidentiality: the profile (and its PID list), the provisioning
 secret, the firmware image in flight, and the telemetry values all stop being readable by a bystander.
 
 Fully supported by the installed Arduino BLE library — no forking:
@@ -1287,16 +1274,10 @@ This falls out of the dongle design; the app's only obligation is not to undermi
 
 ## 1. Settled decisions (v1)
 
-1. **Distribution:** a dedicated **private** GitHub repository holding only signed `.bin`
-   files + a manifest (zero source). The app fetches from it, then transfers over BLE.
-2. **Repo access:** a single vendor-owned **fine-grained PAT, Contents: read-only,
-   scoped to that one repo**, **compiled into the app at build time** (from a build env
-   var — never user-entered, never written to redux-persist/MMKV/AsyncStorage, no native
-   secure-storage dependency added). This is obscurity (keeps the repo from being
-   casually found), not security — the token is extractable from the app bundle, which is
-   acceptable because the binaries are signed and a read-only token only grants read of
-   already-verifiable firmware. Note: fine-grained PATs expire (max 1 year) → rotate the
-   token and ship an app update before expiry.
+1. **Distribution:** signed `.bin` files + a manifest as GitHub Releases of this repo. The
+   app fetches them, then transfers over BLE.
+2. **Repo access:** none. The signature is the trust boundary, so authenticated
+   distribution buys nothing.
 3. **Signing trust root:** central vendor signing — one private key, kept offline/secure
    (ideally HSM/hardware token); the corresponding public key is compiled into the dongle
    firmware.
@@ -1529,19 +1510,10 @@ Actions: `setPhase`, `setVersions`, `setProgress`, `setError`, `reset`. Async in
 400-sector transfer doesn't dispatch hundreds of actions/sec. **Blacklist the slice from
 redux-persist** — it's transient.
 
-### 4.3 Distribution access (private repo + compiled-in read-only PAT)
-- The signed `.bin` + manifest live in a **private** GitHub repo. The app reads them via the
-  GitHub REST API (Releases/Contents) using a **fine-grained PAT, Contents: read-only, scoped
-  to that one repo**, injected at **build time** from a build env var — **not** user-entered,
-  **not** stored in redux-persist/MMKV/AsyncStorage, and **no** native secure-storage
-  dependency added.
-- HTTP via the already-present `axios` (`^1.7.7`); the blob is saved with the already-present
-  `expo-file-system` (`~57`).
-- The app selects the newest image by parsing the monotonic integer version itself.
-- **Understood limitation:** a compiled-in token is extractable from the app bundle, so this
-  is obscurity (repo isn't casually discoverable), not confidentiality. Acceptable because the
-  binaries are signed and the token is read-only to already-verifiable firmware. Rotate the
-  token (and ship an app update) before its expiry (≤ 1 year).
+### 4.3 Distribution access (public GitHub Releases)
+- The signed `.bin` + manifest are public GitHub Releases; no token. HTTP via the
+  already-present `axios`; the blob is saved with the already-present `expo-file-system`.
+- Select the newest image by `manifest.version` (see Appendix C §2.2), never by tag order.
 
 ### 4.4 BLE transfer layer — reuse, don't rebuild
 Additive on the **existing** connection. **Do not open a second BLE connection** — reuse
@@ -1615,8 +1587,8 @@ by bench testing. Gate loop before commit: `yarn format` → `yarn lint` → `ya
 
 1. **Enter** `FirmwareUpdateScreen` → app `setFirmwareUpdateOngoing(true)`; read the dongle's
    current version. Poller backs off.
-2. **Check** → `checkFirmwareUpdateThunk`: `axios.get` the manifest (private repo, compiled-in
-   read-only PAT) → `compareVersions` → `available` / `upToDate`.
+2. **Check** → `checkFirmwareUpdateThunk`: `axios.get` the manifest (GitHub
+   Releases) → `compareVersions` → `available` / `upToDate`.
 3. **Confirm** (user taps Update) → app shows a precondition pre-warning (park, engine off, keep
    the app open, ~N min). The **dongle** enforces the real gate and refuses START if driving /
    weak rail.
@@ -1740,10 +1712,7 @@ that version's `firmware.bin`.
 
 ## 2. GitHub repo / release layout
 
-Design goal: works identically whether it's one vendor-owned repo with a compiled-in
-token, or each user's own private repo with a user-entered token (both models have been
-discussed on the app side) — the **layout convention** is what the app's fetch code
-depends on, not who owns the repo.
+The **layout convention** is what the app's fetch code depends on.
 
 ### 2.1 Use GitHub Releases, not the repo's file tree
 Binary assets belong on **Releases**, not committed into the git history (no bloat, no
@@ -1776,7 +1745,6 @@ string-match a filename pattern.
 ### 2.4 Fetch sequence (GitHub REST API)
 ```
 GET  https://api.github.com/repos/{owner}/{repo}/releases
-     Authorization: Bearer <token>
      Accept: application/vnd.github+json
 ```
 Returns an array; each entry has `tag_name` and `assets: [{ id, name, size, ... }]`.
@@ -1785,24 +1753,13 @@ Parse every `tag_name` → integer, pick the max, find that release's `manifest.
 
 ```
 GET  https://api.github.com/repos/{owner}/{repo}/releases/assets/{asset_id}
-     Authorization: Bearer <token>
      Accept: application/octet-stream
 ```
 Fetch `manifest.json`'s asset this way first (tiny, safe to buffer fully and `JSON.parse`),
 then `firmware.bin`'s asset the same way (streamed to disk).
 
-**The one real gotcha:** for a **private** repo, the plain `browser_download_url` field
-on each asset does **not** work with just an `Authorization` header the way you'd expect
-— it redirects to a signed S3-style URL that requires the *unauthenticated* request to
-have already been authorized upstream, and in practice this trips people up constantly.
-**Always use the `/releases/assets/{id}` endpoint with `Accept: application/octet-stream`
-and the bearer token**, never `browser_download_url`, for a private repo.
-
-### 2.5 Token scope
-A fine-grained PAT with **`Contents: read-only`** scoped to the one repo covers both the
-Releases-list and asset-download endpoints (GitHub's "Contents" permission explicitly
-includes releases). This is unaffected by whether the token is compiled into the app or
-user-entered — same scope requirement either way.
+Unauthenticated requests share GitHub's per-IP rate limit (60/hour), which a check-on-open
+flow stays well under.
 
 ---
 
@@ -2158,26 +2115,12 @@ middleware traffic low" concern the reviewer raised about the telemetry lane.
 
 ---
 
-## 4. The GitHub-PAT problem (and why I'd avoid it)
+## 4. No repository token
 
-**This app has no secure-storage library today** — there is no `expo-secure-store` and no
-`react-native-keychain` in `package.json`. Storing a GitHub PAT "in the Keychain/Keystore" (v4 §4)
-therefore means **adding a native dependency** — exactly the "new stuff that messes with core"
-you want to avoid, and a Keychain/Keystore addition touches native build config on both platforms.
-
-Two ways out, both better than adding secure storage:
-
-1. **Drop the PAT — host signed images on a public URL/CDN.** Your own trust model says the
-   channel is untrusted and the signature is the only thing that matters, so authenticated
-   distribution buys nothing. The app just `GET`s a public manifest + asset. **No secret to store,
-   no new dependency, no native change.** This is my recommendation.
-2. If per-user *private* firmware is a hard requirement: put the PAT (and the download) **on the
-   dongle** (Model B), not the app. Then the secret never touches the phone at all.
-
-Storing a PAT in MMKV/AsyncStorage/Redux-persist is **not acceptable** (plaintext at rest, and it
-would land in redux-persist). So the practical v1 answer is: **public signed artifact, no PAT, no
-new dependency.** HTTP is done with the already-present `axios` (`^1.7.7`); the blob is saved with
-the already-present `expo-file-system` (`~57`).
+The channel is untrusted and the signature is the only thing that matters, so distribution is a
+public signed artifact: the app `GET`s a public manifest + asset. No secret to store, no new
+dependency, no native change. HTTP is done with the already-present `axios`; the blob is saved
+with the already-present `expo-file-system`.
 
 ---
 
@@ -2346,9 +2289,8 @@ Points worth weighing:
    you actually have is cellular. I'd at least prototype dongle-side `GET`+verify+`esp_ota_write`
    over cellular; it may make BLE transfer a fallback rather than v1's core, and it shrinks the app
    to a trigger+status screen.
-2. **The PAT belongs off the phone.** This app has no secure storage; adding it for a GitHub PAT
-   is native-config churn for zero security gain (signature is the trust root). Prefer a public
-   signed artifact, or — if private — put the credential on the dongle.
+2. **No credential on the phone.** The signature is the trust root, so distribute a public
+   signed artifact.
 3. **`ecdsa.h` present / `ed25519.h` absent → ECDSA-P256 is the pragmatic pick.** Fine. Just make
    the signed message unambiguous (hash over image *plus* version+size metadata, so a valid
    signature can't be replayed against a different declared version) and keep the metadata inside
@@ -2447,19 +2389,7 @@ To be clear about what the earlier draft asked for and no longer does:
 
 ---
 
-## 4. One optional improvement, if you ever want it
-
-**Firmware distribution.** The app currently downloads dongle firmware from a private repository using a
-repository access token stored on developer phones. A backend-served manifest and binary — or short-lived
-pre-signed URLs for authorised users — would remove the need to distribute repository tokens at all. That token
-is a larger real-world exposure than anything happening over Bluetooth, since it grants read access to the
-repository from anywhere.
-
-Entirely optional, and unrelated to everything above.
-
----
-
-## 5. What we need back from you
+## 4. What we need back from you
 
 1. Confirmation on **C1** (signing key stability, and that you will notify us before rotating).
 2. Confirmation on **C2** (numeric fields are real JSON numbers in the signed payload) — ideally verified against

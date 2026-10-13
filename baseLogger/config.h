@@ -107,19 +107,13 @@
 /*
   Empty on purpose - no network credentials in the source tree.
 
-  These held a real office SSID and password. They were only a SEED: loadPreferences() (Helpers/misc.h)
-  reads the credentials from the NVS "network" namespace and, on a dongle where that key does not exist
-  yet, writes these values into it. So the runtime path is unchanged and is now the ONLY path - provision
-  NVS ("network" / "ssid", "password") on a dongle that needs WiFi, or pass -D WIFI_SSID=... at build
-  time for a one-off. With both empty, first run seeds empty strings and the radio simply will not
-  associate until something provisions them, which is the correct failure for a missing credential.
+  These are only a SEED: loadPreferences() (Helpers/misc.h) reads the credentials from the NVS
+  "network" namespace ("ssid", "password") and, on a dongle where that key does not exist yet, writes
+  these values into it when they are non-empty. Provision NVS on a dongle that needs WiFi, or pass
+  -D WIFI_SSID=... at build time for a one-off. With neither, the radio will not associate, which is
+  the correct failure for a missing credential.
 
-  Note what this does NOT fix: the old password is in git history from the first OBDLogger rewrite
-  onward, so anyone with the repo still has it. Deleting it here is hygiene; if that network is still
-  live the password has to be rotated.
-
-  Dormant either way at ENABLE_WIFI 0 - this whole block is inside the guard, so nothing was in the
-  shipped image. It was still in the source, which is enough.
+  Dormant at ENABLE_WIFI 0: this whole block is inside the guard.
 */
 #define WIFI_SSID ""
 #define WIFI_PASSWORD ""
