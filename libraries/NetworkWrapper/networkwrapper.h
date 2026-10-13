@@ -69,6 +69,12 @@ public:
   /* Close and reopen a kept-alive session idle longer than this instead of reusing it (0 = always reuse) */
   virtual void set_session_idle_max_ms(unsigned long ms) {}
 
+  /* Root CAs (DER PKCS#7) the server must chain to; the cellular transport refuses TLS without them */
+  virtual void set_server_roots(const uint8_t* p7b, size_t len) {}
+
+  /* The last connect() failed on certificate trust rather than the network (not a stale bearer) */
+  virtual bool trustRefused() { return false; }
+
   /* How the last connect() went (empty if the transport doesn't say) */
   virtual std::string lastOpenTrace() { return std::string(); }
 

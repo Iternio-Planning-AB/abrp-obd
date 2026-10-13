@@ -383,6 +383,7 @@ void bleDeinitForSleep();                      // Helpers/ble.h (no-op stub when
 void changeState(ActivityState new_state);     // Helpers/state_machine.h
 
 #include "Helpers/mems.h"
+#include "Helpers/server_roots.h" // data only: the trust bundle setup() hands the cellular transport
 #include "Helpers/clock_sync.h"
 #include "Helpers/telemetry_format.h"
 #include "Helpers/geo_backlog.h"
@@ -899,6 +900,7 @@ void setup() {
   }
 #elif ENABLE_CELL
   network.set_url(CELL_HOST);
+  network.set_server_roots(SERVER_ROOTS_P7B, SERVER_ROOTS_LEN); // see SERVER ROOTS in config.h
   network.set_session_idle_max_ms(SESSION_IDLE_MAX_MS);
 
   // Acquire UTC for the cellular path. Skipped entirely on a deep-sleep wake (the ESP32 RTC keeps running
@@ -1950,7 +1952,9 @@ void loop() {
             // dead link. The handoff flag is deliberately NOT consumed here, so the next cycle retries fast.
             g_last_http = 0;
             if (!car_awake) ++upload_fail_count;
-            g_http0_streak++;
+            // Except a refused certificate: the bearer is fine, and restarting or rebooting the modem cannot
+            // change the server's chain. The frames stay buffered for firmware that trusts it.
+            if (!network.trustRefused()) g_http0_streak++;
 #if ENABLE_LOGGING
             logEvent("UPLOAD open FAILED %s awake=%d streak=%d kept=%d",
               network.netDiag().c_str(), car_awake ? 1 : 0, g_http0_streak, (int)obd_result_vector.size());

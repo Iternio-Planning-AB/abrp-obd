@@ -149,6 +149,7 @@ order and share its globals. See [`AGENTS.md`](../AGENTS.md) before adding one.
 | `log_dump.h` | BLE log-retrieval protocol (ABD7). |
 | `ota_update.h` | BLE firmware-update engine (ABD5/ABD6): staging, ECDSA verify, rollback, the ABD5 info JSON. |
 | `ota_pubkey.h` | Embedded ECDSA public key for OTA image verification. |
+| `server_roots.h` | The root CAs the modem verifies the upload server against (generated). |
 | `auth_gate.h` | Access handshake (ABD8 nonce + HMAC) and the per-dongle secret. |
 | `auth_kex.h` | ECDH key agreement for provisioning that secret. |
 | `jws_verify.h` | RS256 JWS signature verification (mbedTLS) for signed profiles. |
@@ -164,6 +165,7 @@ order and share its globals. See [`AGENTS.md`](../AGENTS.md) before adding one.
 |---|---|
 | `tools/ota_keygen.py` | Generate a local OTA signing keypair, or write `ota_pubkey.h` from the KMS key (`--from-kms`). |
 | `tools/ota_sign.py` | Sign a firmware image for OTA (KMS in the release workflow, or a local PEM). |
+| `tools/server_roots.py` | Write `server_roots.h` from root CA PEMs. |
 | `tools/fw_version.py`, `tools/pio_version.py` | Release version naming and its injection into the build; also the `factory` target, a single merged image for esptool on a blank unit. |
 | `utils/serial_monitor.py`, `serial_to_file.py`, `file_to_serial.py`, `USB_Serial_Dump.py` | Serial helpers (e.g. capturing a `DUMP` to a file). |
 
@@ -225,6 +227,15 @@ The ABD8 HMAC handshake is **unconditional**: it is the only thing that grants a
 is no flag for it. `PROFILE_REQUIRE_SIGNATURE` stays `0` until the signed-profile path has been seen
 succeeding in the field.
 
+### Cellular TLS trust
+
+Cellular uploads go only to a server whose certificate chains to one of the roots bundled in
+`Helpers/server_roots.h`; without a verified chain nothing is sent and the frames stay in the backlog.
+The bench WiFi build (`ENABLE_WIFI`, off) does not verify the server. A server move to a CA outside the
+bundle needs firmware trusting the new root first. A dongle that stopped uploading because of a CA
+change logs an `UPLOAD open trace untrusted` line per boot (see `DUMP`) and recovers with a firmware
+update over BLE. The root list, the CA-change procedure and the modem's limits: `DONGLE_CONTEXT.md` §6a.
+
 ### OBD-alarm gate — per vehicle
 
 | Setting | Now | Meaning |
@@ -283,6 +294,7 @@ USB only: physical access by design. Type these into the serial monitor (115200 
 | `RADIO` | Dump the cellular modem's persisted radio configuration. |
 | `AT…` | Pass a raw AT command to the **cellular modem**. |
 | `CLKPROBE` | Check RTC drift and whether an HTTP `Date` header is reachable (blocks ~30–60 s). |
+| `TLSCHECK` | Open a fresh verified TLS session to the server (no data sent) and log the result. |
 | `BONDCLEAR` | Erase all BLE bonds. Phones must also "forget" the dongle. |
 | `AUTHCLEAR` | Erase the auth secret, revoking every phone. The next phone to connect provisions a new one. |
 | `OTARESET` | Clear the OTA anti-downgrade floor (after a bench flash to a lower version). |
@@ -325,6 +337,10 @@ Each release also carries `factory.bin` (bootloader, partitions and app in one i
 
 ## Known limits
 
+- **The modem checks the server's certificate chain, not its name or dates.** Anyone who can redirect
+  the dongle's DNS or traffic - including a fake 2G base station, since the modem is allowed to fall
+  back to GSM - can present a free AWS certificate for their own domain and receive the vehicle token
+  and positions. Expired certificates are accepted too. The SIM7070 has no option to check the name.
 - **One car per dongle.** The vehicle profile and token are provisioned per dongle.
 - **BLE telemetry is not MTU-aware.** `logData()` sends the frame without chunking, so on Android at
   the default 23-byte MTU a long frame gets truncated. Frames are kept short in practice.

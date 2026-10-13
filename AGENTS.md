@@ -262,3 +262,9 @@ wake gate (taper and charge-end reads), telemetry serialization, CSV columns, an
 ASan/UBSan. Add `--profiles /path/to/abrp/obd` to exercise actual Scenic/iX3 production/developer
 equations with the firmware parser. The runner extracts the current charging and logging code;
 filesystem and hardware are fakes, not on-device verification.
+
+## Cellular TLS trust checks
+
+Run `python3 tests/run_server_roots_checks.py` (add `--require-live` to fail rather than skip when
+`api.iternio.com` is unreachable) and `python3 tests/run_upload_checks.py tls-ca`. Neither proves what
+the modem accepts; that needs `TLSCHECK` on a dongle.

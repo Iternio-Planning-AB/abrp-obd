@@ -19,6 +19,14 @@
 #define XBEE_BAUDRATE 115200
 #define HTTP_CONN_TIMEOUT 5000
 
+// Root-CA install (HTTPClientSIM::ensureCa). Retries of a failed write per boot; and once CONVERT has
+// refused the same bundle twice, how many boots pass between attempts - about a day at the 30-minute
+// parked cadence - so a bundle the modem rejects does not rewrite its flash every wake.
+#define CA_INSTALL_TRIES 3
+#define CA_CONVERT_RETRY_WAKES 48
+// AT+CFSWFILE <input time>: 4.3 KB takes ~0.4 s at 115200; kept short because a missed prompt is waited out.
+#define CA_INPUT_MS 2000
+
 #define RECV_BUF_SIZE 512
 
 using HeaderVector = std::vector<std::pair<std::string, std::string>>;
@@ -134,10 +142,32 @@ public:
     // Outcome, step results and bearer state of the last open(); see open() for the fields.
     const char* openTrace() { return m_open_trace; }
     const HTTPTransferDiagnostics& transferDiagnostics() const { return m_transfer_diagnostics; }
+    // Root CAs (DER PKCS#7) the modem verifies port-443 servers against. Without them open() refuses
+    // TLS rather than connecting unverified. The bytes must outlive the client.
+    void setCaBundle(const uint8_t* p7b, size_t len);
+    // The last open() failed on trust (no or refused bundle, or a chain the roots refuse), not the network.
+    bool trustRefused() const { return m_trust_refused; }
 private:
+    enum CaState : uint8_t { CA_UNCHECKED, CA_READY, CA_FAILED };
     HTTPTransferDiagnostics m_transfer_diagnostics;
     int bearerState(char* out, size_t len);
+    bool writeCaFile(const char* ext, const uint8_t* data, size_t len);
+    bool ensureCa();
+    void dropCaMarker();
+    bool configureTls(const char* host);
+    const char* probeTls(const char* host);
     void recordOpenTrace(const char* fail_step, char req, const char* bo, const char* sh, unsigned long t0);
-    char m_open_trace[80] = {0};
+    char m_open_trace[128] = {0};
+    const uint8_t* m_ca = nullptr;
+    size_t m_ca_len = 0;
+    uint32_t m_ca_hash = 0;
+    CaState m_ca_state = CA_UNCHECKED;
+    uint8_t m_ca_tries = 0;
+    bool m_ca_dropped = false;
+    char m_ca_name[11] = {0};         // "rc" + 8 hex of the bundle; files are <name>.p7b and <name>.ok
+    const char* m_ca_trace = "none";  // this boot's install outcome, or the step that failed
+    const char* m_tls_verdict = nullptr;
+    bool m_trust_refused = false;
+    char m_probe_trace[20] = {0};
 };
 #endif

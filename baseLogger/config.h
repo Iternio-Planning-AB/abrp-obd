@@ -130,6 +130,11 @@
 #define ENABLE_CELL 1    // the product transport
 #define CELL_APN "hologram"
 #define CELL_HOST "api.iternio.com"
+/*
+  SERVER ROOTS: uploads go only over a chain that verifies against Helpers/server_roots.h, else nothing
+  is sent. A server moving to a new CA needs firmware trusting the new root shipped BEFORE the switch.
+  Which roots, the modem's limits and the procedure: DONGLE_CONTEXT.md §6a.
+*/
 #define API_PATH "/1/tlm/send"
 #define CELL_BULK_PATH "/1/tlm/bulk" // legacy v1 bulk endpoint - superseded by TLM_V2_PATH, kept for reference
 // The endpoint telemetry actually goes to. v2 takes a typed InputPointList (see bulkStringV2) and, unlike

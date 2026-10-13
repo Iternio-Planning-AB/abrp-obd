@@ -537,31 +537,184 @@ static char rvCode(const commandResponse& r) {
   return r.returnValue == 1 ? 'o' : r.returnValue == 2 ? 'e' : 't'; // OK / ERROR / timeout
 }
 
+// Deep sleep is a reboot: CONVERT refusals must survive it, counted for the bundle they were against.
+RTC_DATA_ATTR static uint32_t s_ca_refused_hash = 0;
+RTC_DATA_ATTR static uint8_t s_ca_refusals = 0;
+RTC_DATA_ATTR static uint8_t s_ca_held_wakes = 0;
+
+void HTTPClientSIM::setCaBundle(const uint8_t* p7b, size_t len) {
+  m_ca = p7b;
+  m_ca_len = p7b ? len : 0;
+  m_ca_state = CA_UNCHECKED;
+  m_ca_tries = 0;
+  uint32_t h = 2166136261u;  // FNV-1a: a changed bundle gets a new modem-side name and installs itself
+  for (size_t i = 0; i < m_ca_len; ++i) h = ( h ^ p7b[i] ) * 16777619u;
+  m_ca_hash = h;
+  snprintf(m_ca_name, sizeof(m_ca_name), "rc%08lx", (unsigned long)h);
+}
+
+// A prompt or ACK that comes late would leave the modem taking our next command as file bytes, so on
+// any miss wait out the (short) input window and purge before carrying on.
+bool HTTPClientSIM::writeCaFile(const char* ext, const uint8_t* data, size_t len) {
+  char cmd[64];
+  snprintf(cmd, sizeof(cmd), "AT+CFSWFILE=3,\"%s%s\",0,%u,%d\r", m_ca_name, ext, (unsigned)len, CA_INPUT_MS);
+  if (sendCommand(cmd, 3000, "DOWNLOAD")) {
+    m_device->xbWrite((const char*)data, len);
+    if (sendCommand(0, CA_INPUT_MS + 3000)) return true;
+  }
+  delay(CA_INPUT_MS + 500);
+  m_device->xbPurge();
+  return false;
+}
+
+// Puts the bundle into the modem's certificate store unless this exact bundle is already there. The
+// converted store and /customer/ persist in modem flash across CPOWD, so this writes once per bundle,
+// not per wake. <name>.ok is written only after CONVERT succeeds: a power cut mid-install leaves no
+// marker and the next attempt redoes it. A failed write is retried on later opens, CA_INSTALL_TRIES per
+// boot; a CONVERT refusal is deterministic, so it latches for the boot, and after two it is retried only
+// every CA_CONVERT_RETRY_WAKES boots rather than rewriting the modem's flash on every wake.
+bool HTTPClientSIM::ensureCa() {
+  if (m_ca_state != CA_UNCHECKED) return m_ca_state == CA_READY;
+  if (!m_ca_len) { m_ca_state = CA_FAILED; return false; }
+  if (s_ca_refused_hash != m_ca_hash) { s_ca_refused_hash = m_ca_hash; s_ca_refusals = 0; }
+  if (s_ca_refusals >= 2 && ++s_ca_held_wakes < CA_CONVERT_RETRY_WAKES) {
+    m_ca_state = CA_FAILED;
+    m_ca_trace = "FAIL:convert(held)";
+    return false;
+  }
+  s_ca_held_wakes = 0;
+  char cmd[64];
+  sendCommand("AT+CFSTERM\r"); // CFSINIT errors while an earlier buffer is still allocated
+  m_ca_trace = "FAIL:cfsinit";
+  if (sendCommand("AT+CFSINIT\r")) do {
+    snprintf(cmd, sizeof(cmd), "AT+CFSGFIS=3,\"%s.ok\"\r", m_ca_name);
+    const commandResponse marker = sendCommand(cmd);
+    if (marker && strstr(m_buffer, "+CFSGFIS:")) { m_ca_trace = "present"; break; }
+    m_ca_trace = "FAIL:gfis";
+    if (marker.returnValue != 1 && marker.returnValue != 2) break; // no answer is not "absent"
+    m_ca_trace = "FAIL:write";
+    if (!writeCaFile(".p7b", m_ca, m_ca_len)) break;
+    m_ca_trace = "FAIL:convert";
+    snprintf(cmd, sizeof(cmd), "AT+CSSLCFG=\"CONVERT\",2,\"%s.p7b\"\r", m_ca_name);
+    const commandResponse converted = sendCommand(cmd, 10000);
+    if (!converted) {
+      if (converted.returnValue != 2) m_ca_trace = "FAIL:convert_to"; // a slow modem is not a refusal
+      break;
+    }
+    s_ca_refusals = 0;
+    m_ca_trace = "FAIL:marker";
+    if (!writeCaFile(".ok", (const uint8_t*)"1", 1)) break;
+    m_ca_trace = "loaded";
+  } while (0);
+  sendCommand("AT+CFSTERM\r");
+  if (m_ca_trace[0] != 'F') {
+    m_ca_state = CA_READY;
+    return true;
+  }
+  if (!strcmp(m_ca_trace, "FAIL:convert")) {
+    if (s_ca_refusals < 255) s_ca_refusals++;
+    m_ca_state = CA_FAILED;
+  } else {
+    m_ca_state = ++m_ca_tries < CA_INSTALL_TRIES ? CA_UNCHECKED : CA_FAILED;
+  }
+  return false;
+}
+
+// The marker says installed but the modem refused or cannot find the roots (its certificate store
+// reset, a modem firmware update). Drop the marker so the next open reinstalls. Once per boot.
+void HTTPClientSIM::dropCaMarker() {
+  if (m_ca_dropped) return;
+  m_ca_dropped = true;
+  char cmd[64];
+  sendCommand("AT+CFSTERM\r");
+  sendCommand("AT+CFSINIT\r");
+  snprintf(cmd, sizeof(cmd), "AT+CFSDFILE=3,\"%s.ok\"\r", m_ca_name);
+  sendCommand(cmd);
+  sendCommand("AT+CFSTERM\r");
+  m_ca_state = CA_UNCHECKED;
+  m_ca_trace = "stale";
+}
+
+// The SSL context the SH session uses. The empty-CA form (AT+SHSSL=1,"") skips server verification;
+// it is never sent - no bundle means no TLS. A CA name the store does not hold is accepted here and
+// refused at SHCONN (measured), so a stale marker shows up as a refused open, not a silent downgrade.
+bool HTTPClientSIM::configureTls(const char* host) {
+  if (!ensureCa()) return false;
+  sprintf(m_buffer, "AT+SHSSL=1,\"%s.p7b\"\r", m_ca_name);
+  if (!sendCommand(m_buffer)) {
+    if (!strcmp(m_ca_trace, "present")) dropCaMarker();
+    return false;
+  }
+  // Validity dates are not checked, so an expired leaf is accepted. The modem judges them by its own RTC,
+  // which is right only once NITZ or our NTP sync has set it since power-up, and neither is guaranteed
+  // before the first upload (NITZ is absent on roaming SIMs; NTP is skipped while the ESP32 clock is
+  // fresh). The chain is verified; the certificate's name is not (the SIM7070 has no option for it).
+  sendCommand("AT+CSSLCFG=\"ignorertctime\",1,1\r");
+  sendCommand("AT+CSSLCFG=\"SSLVERSION\",1,3\r");
+  // Send SNI (Server Name Indication) with the TLS handshake. api.iternio.com is served behind a CDN /
+  // load-balancer that routes by SNI, so WITHOUT this the handshake can land on the wrong virtual host /
+  // certificate and fail intermittently.
+  sprintf(m_buffer, "AT+CSSLCFG=\"sni\",1,\"%s\"\r", host);
+  sendCommand(m_buffer);
+  return true;
+}
+
+// SHCONN only answers ERROR. Ask the CA (TCP) stack the same question in two halves - plain TCP, then
+// TLS against the same roots - so a refused chain is told apart from a network failure. Measured
+// +CAOPEN results: 27 for a chain that fails the roots, 1 when the named CA is not in the store, 0 for
+// plain TCP that connects. No application data is sent. Probes until one reaches a trust verdict; that
+// verdict then stands for the boot's later refusals, so they stay off the stale-bearer ladder.
+const char* HTTPClientSIM::probeTls(const char* host) {
+  if (m_tls_verdict) return m_tls_verdict;
+  auto caopen = [&](bool ssl) {
+    sprintf(m_buffer, "AT+CASSLCFG=0,\"SSL\",%d\r", ssl ? 1 : 0);
+    sendCommand(m_buffer);
+    if (ssl) {
+      sendCommand("AT+CASSLCFG=0,\"CRINDEX\",1\r");
+      sprintf(m_buffer, "AT+CASSLCFG=0,\"CACERT\",\"%s.p7b\"\r", m_ca_name);
+      sendCommand(m_buffer);
+    }
+    sprintf(m_buffer, "AT+CAOPEN=0,0,\"TCP\",\"%s\",443\r", host);
+    int result = -1;
+    if (sendCommand(m_buffer, 20000)) {
+      const char* p = strstr(m_buffer, "+CAOPEN: 0,");
+      if (p) result = atoi(p + 11);
+    }
+    sendCommand("AT+CACLOSE=0\r", 2000);
+    return result;
+  };
+  const int tcp = caopen(false);
+  const int tls = tcp == 0 ? caopen(true) : -1;
+  snprintf(m_probe_trace, sizeof(m_probe_trace), " tcp=%d tls=%d", tcp, tls);
+  if (tcp != 0 || tls == 0) return 0;  // the network, or a chain that verifies: not a trust verdict
+  if (tls < 0) return "tlsfail";       // no answer says nothing about the chain
+  m_tls_verdict = tls == 1 ? "noca" : "untrusted";
+  return m_tls_verdict;
+}
+
 bool HTTPClientSIM::open(const char* host, uint16_t port) {
   // Trace of this open() for the caller to log: activate-request result, bearer before SHCONF, each SHCONN
   // result, bearer at failure, duration. Kept for successes too, so failures have a baseline.
   unsigned long t0 = millis();
+  m_trust_refused = false;
+  sendCommand("AT+SHDISC\r", 2000); // never adopt a session left open by an earlier image or session
   char req = rvCode(sendCommand("AT+CNACT=0,1\r")); // ERROR here means context 0 was already active
   sendCommand("AT+CACID=0\r");
   // delay(5000);
 
 #if !0 //TESTING
   bool useSSL = ( port == 443 );
-  if (useSSL) {
-    sendCommand("AT+SHSSL=1,\"\"\r");
-    sendCommand("AT+CSSLCFG=\"ignorertctime\",1,1\r");
-    sendCommand("AT+CSSLCFG=\"SSLVERSION\",1,3\r");
-    // Send SNI (Server Name Indication) with the TLS handshake. api.iternio.com is served behind a CDN /
-    // load-balancer that routes by SNI, so WITHOUT this the handshake can land on the wrong virtual host /
-    // certificate and fail intermittently. The canonical Freematics CellHTTP::open() sets this for SIM7070;
-    // our port left it commented out. (Enabled per the reference library.)
-    sprintf(m_buffer, "AT+CSSLCFG=\"sni\",1,\"%s\"\r", host);
-    sendCommand(m_buffer);
-  }
-
   char bo[8];
   bearerState(bo, sizeof(bo));
   char sh[3] = "--";
+  if (useSSL && !configureTls(host)) {
+    m_state = HTTP_ERROR;
+    // A missing or refused bundle is a trust failure; a transient install step is left to the recovery ladder.
+    m_trust_refused = !m_ca_len || !strcmp(m_ca_trace, "FAIL:convert") ||
+      !strcmp(m_ca_trace, "FAIL:convert(held)");
+    recordOpenTrace("tls", req, bo, sh, t0);
+    return false;
+  }
   sprintf(m_buffer, "AT+SHCONF=\"URL\",\"%s://%s\"\r", useSSL ? "https" : "http", host);
   if (!sendCommand(m_buffer)) {
     recordOpenTrace("shconf", req, bo, sh, t0);
@@ -596,6 +749,13 @@ bool HTTPClientSIM::open(const char* host, uint16_t port) {
   checkGPS();
   Serial.println(m_buffer);
   m_state = HTTP_ERROR;
+  if (useSSL && sh[0] == 'e' && sh[1] == 'e') { // a refused chain reads ee; timeouts are the network
+    const char* verdict = probeTls(host);
+    if (verdict) sh_step = verdict;
+    m_trust_refused = verdict && strcmp(verdict, "tlsfail");
+    // Result 1 is the store missing the roots the marker vouches for; 27 is the server, not the store.
+    if (verdict && !strcmp(verdict, "noca") && !strcmp(m_ca_trace, "present")) dropCaMarker();
+  }
   recordOpenTrace(sh_step, req, bo, sh, t0);
 #endif
   return false;
@@ -613,8 +773,9 @@ void HTTPClientSIM::recordOpenTrace(const char* fail_step, char req, const char*
     else snprintf(verdict, sizeof(verdict), "%s (%s)", up == 0 ? "cnact" : "nores", fail_step);
     snprintf(bf, sizeof(bf), " bf=%s", b);
   }
-  snprintf(m_open_trace, sizeof(m_open_trace), "%s req=%c bo=%s sh=%s%s t=%.1fs",
-    verdict, req, bo, sh, bf, (millis() - t0) / 1000.0f);
+  snprintf(m_open_trace, sizeof(m_open_trace), "%s req=%c bo=%s sh=%s%s%s ca=%s t=%.1fs",
+    verdict, req, bo, sh, bf, m_probe_trace, m_ca_trace, (millis() - t0) / 1000.0f);
+  m_probe_trace[0] = 0;
 }
 
 void HTTPClientSIM::setHeaders(const HeaderVector& headers) {

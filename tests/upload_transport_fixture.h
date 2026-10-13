@@ -23,6 +23,7 @@ void delay(unsigned long ms) { fake_ms += ms; }
 struct SerialStub {
     std::string output;
     void printf(const char* text) { output += text; }
+    void println(const char* text) { output += text; output += '\n'; }
     template<typename... Args> void printf(const char* format, Args... args) {
         char text[2048]; std::snprintf(text, sizeof(text), format, args...); output += text;
     }
@@ -62,14 +63,41 @@ public:
     explicit CellSIMCOM(CFreematics* device = nullptr) : m_device(device) {}
     commandResponse sendCommand(const char* cmd, unsigned int timeout = 1000, const char* expected = nullptr);
 };
+#ifdef TLS_CHECKS
+#define HTTP_CONN_TIMEOUT 5000
+#define RTC_DATA_ATTR
+#include "tls_defines.inc"
+enum HTTP_STATES { HTTP_DISCONNECTED, HTTP_CONNECTED, HTTP_SENT, HTTP_ERROR };
+#endif
 class HTTPClientSIM : public CellSIMCOM {
 public:
     using CellSIMCOM::CellSIMCOM;
     commandResponse send(const char* api_page, const char* payload, const int payloadSize, const char* car_token);
+    void setCaBundle(const uint8_t* p7b, size_t len);
+    bool trustRefused() const;
 #include "upload_getter.inc"
+#ifdef TLS_CHECKS
+    bool open(const char* host = 0, uint16_t port = 0);
+    const char* openTrace() { return m_open_trace; }
+    bool writeCaFile(const char* ext, const uint8_t* data, size_t len);
+    bool ensureCa();
+    void dropCaMarker();
+    bool configureTls(const char* host);
+    const char* probeTls(const char* host);
+    int bearerState(char* out, size_t len);
+    void recordOpenTrace(const char* fail_step, char req, const char* bo, const char* sh, unsigned long t0);
+    void checkGPS() {}
+    HTTP_STATES m_state = HTTP_DISCONNECTED;
+    std::string m_host;
+#include "tls_members.inc"
+#endif
 private:
 #include "upload_member.inc"
 };
 #include "upload_command.inc"
 #include "upload_parse.inc"
 #include "upload_send.inc"
+#ifdef TLS_CHECKS
+bool HTTPClientSIM::trustRefused() const { return m_trust_refused; }
+#include "tls_open.inc"
+#endif

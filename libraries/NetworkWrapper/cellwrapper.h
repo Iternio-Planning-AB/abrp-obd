@@ -63,6 +63,8 @@ public:
   char registrationState() const { return m_registration; }
 
   void set_session_idle_max_ms(unsigned long ms) override { m_idle_max_ms = ms; }
+  void set_server_roots(const uint8_t* p7b, size_t len) override { net.setCaBundle(p7b, len); }
+  bool trustRefused() override { return net.trustRefused(); }
 
   /* net.openTrace() of the last connect(), "reused" if it kept a live session, prefixed "idle=Ns" if it
      closed one that had sat idle too long */

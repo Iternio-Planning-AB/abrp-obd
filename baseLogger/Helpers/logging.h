@@ -190,7 +190,7 @@ void handleLogCommands() {
   // replies) and CLEAR would delete the very segments the app is mid-way through reading.
   if ((g_ota_active || g_logdump_active) &&
       (cmd.equalsIgnoreCase("DUMP") || cmd.equalsIgnoreCase("CLEAR") ||
-       cmd.equalsIgnoreCase("RADIO") || cmd.equalsIgnoreCase("CLKPROBE") ||
+       cmd.equalsIgnoreCase("RADIO") || cmd.equalsIgnoreCase("CLKPROBE") || cmd.equalsIgnoreCase("TLSCHECK") ||
        cmd.substring(0, 2).equalsIgnoreCase("AT"))) {
     Serial.printf("BUSY: %s in progress - %s refused (try again when it finishes)\n",
       g_ota_active ? "firmware update" : "BLE log dump", cmd.c_str());
@@ -229,6 +229,12 @@ void handleLogCommands() {
     esp_task_wdt_delete(NULL);
     clockProbe();
     esp_task_wdt_add(NULL);
+  }
+  // Does the server's current certificate chain to the bundled roots? A fresh verified open, no data
+  // sent - the bench check around a server certificate change (DONGLE_CONTEXT.md §6a).
+  else if (cmd.equalsIgnoreCase("TLSCHECK")) {
+    network.disconnect(); // a reused session would prove nothing
+    logEvent("TLSCHECK %s %s", network.connect() ? "ok" : "FAILED", network.lastOpenTrace().c_str());
   }
 #endif
   // Bench-only: clear the persisted OTA anti-downgrade floor after version-number testing, so a
