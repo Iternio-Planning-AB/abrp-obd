@@ -15,12 +15,12 @@ static const char* gpsLocationSource();
 
 #if ENABLE_LOGGING
 // CSV column order for the data log. Legacy prefix, then optional GPS diagnostics. Must stay in sync with
-// buildLogLine() below.
+// buildLogLine() below. lat/lon are the selected position; raw receiver coordinates are never logged.
 const std::string LOG_HEADER =
   "millis,utc,boot,sleep,wake,state,batt12v,rail_v,free_heap,min_heap,max_block,free_psram,rssi,wifi,"
   "gps_fix,gps_sat,gps_hdop,gps_alt,obd_pids,up_http,up_status,reset,clean_sleep,note,"
   "soc,soh,voltage,current,power,kwh_charged,speed,ext_temp,is_parked,is_charging,lat,lon,"
-  "gps_read,gps_reply_bytes,gps_field,gps_date,gps_time,gps_time_age_ms,gps_speed_kmh,gps_lat,gps_lon,gps_source,"
+  "gps_read,gps_reply_bytes,gps_field,gps_date,gps_time,gps_time_age_ms,gps_speed_kmh,gps_source,"
   "soe,batt_temp,batt_temp_min,batt_temp_max";
 
 static const char* stateName(ActivityState s) {
@@ -110,10 +110,10 @@ std::string buildLogLine(const OBDVector& frame, int obd_count) {
   char age_text[24] = {};
   if (age != ULONG_MAX) snprintf(age_text, sizeof(age_text), "%lu", age);
   char gps_columns[160];
-  snprintf(gps_columns, sizeof(gps_columns), "%s,%u,%d,%lu,%lu,%s,%.2f,%.6f,%.6f,%s",
+  snprintf(gps_columns, sizeof(gps_columns), "%s,%u,%d,%lu,%lu,%s,%.2f,%s",
     gpsReadName(diagnostics.result), (unsigned)diagnostics.reply_bytes, (int)diagnostics.field,
     (unsigned long)(gd ? gd->date : 0), (unsigned long)(gd ? gd->time : 0), age_text,
-    gd ? gd->speed * 1.852f : 0, gd ? gd->lat : 0, gd ? gd->lng : 0, gpsLocationSource());
+    gd ? gd->speed * 1.852f : 0, gpsLocationSource());
   std::string line(head);
   const char* tcols[] = { "soc", "soh", "voltage", "current", "power", "kwh_charged",
                           "speed", "ext_temp", "is_parked", "is_charging", "lat", "lon" };

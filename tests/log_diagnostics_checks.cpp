@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cstdarg>
 #include <climits>
+#include <cmath>
 #include <cstdint>
 #include <ctime>
 #include <cstdio>
@@ -183,7 +184,20 @@ std::string column(const std::string& row, const std::string& name) {
   const auto header = split(LOG_HEADER), fields = split(row);
   check(header.size() == fields.size(), "CSV header and row widths agree");
   const auto position = std::find(header.begin(), header.end(), name);
+  check(position != header.end(), "known CSV column " + name);
   return position == header.end() ? "" : fields[position - header.begin()];
+}
+
+// True when no field reads as the receiver fix, in degrees at any precision or in micro-degrees.
+bool hasNoRawFix(const std::string& row, double lat, double lng) {
+  for (const auto& field : split(row)) {
+    char* end = nullptr;
+    const double v = std::strtod(field.c_str(), &end);
+    if (field.empty() || *end != '\0') continue;
+    for (const double raw : {lat, lng})
+      if (std::fabs(v - raw) < 0.05 || std::fabs(v - raw * 1e6) < 1e3) return false;
+  }
+  return true;
 }
 
 void loggingChecks() {
@@ -203,8 +217,7 @@ void loggingChecks() {
   check(column(row, "gps_reply_bytes") == "65" && column(row, "gps_field") == "-1", "read metadata is distinct from quality");
   check(column(row, "gps_source") == "frozen" && column(row, "lat") == "11.000", "actual frozen selection is recorded");
   check(column(row, "gps_date") == "71026" && column(row, "gps_time") == "4490300", "receiver timestamp is separate from telemetry UTC");
-  check(std::abs(std::stod(column(row, "gps_lat")) - gps_data.lat) < 0.000001,
-        "cached GNSS coordinates retain useful precision even when hidden by frozen position");
+  check(hasNoRawFix(row, gps_data.lat, gps_data.lng), "raw GNSS coordinates hidden by the frozen position are not logged");
   check(column(row, "gps_time_age_ms") == "0", "new receiver timestamp starts measured age");
   fake_ms += 10000;
   sys.diagnostics.result = GPSReadResult::RequiredFieldInvalid;
@@ -223,7 +236,9 @@ void loggingChecks() {
   is_currently_parked = false;
   OBDVector unchanged;
   addGpsData(unchanged);
-  check(column(buildLogLine(unchanged, 0), "gps_source") == "omitted", "unchanged position omission is accurately recorded");
+  const std::string omitted = buildLogLine(unchanged, 0);
+  check(column(omitted, "gps_source") == "omitted", "unchanged position omission is accurately recorded");
+  check(hasNoRawFix(omitted, gps_data.lat, gps_data.lng), "an omitted position does not fall back to the raw fix");
   gd = nullptr;
   g_gps_powered = false;
   gps_fix_seq = 0;
@@ -236,8 +251,6 @@ void loggingChecks() {
   g_gps_powered = true;
   gps_data.date = UINT32_MAX;
   gps_data.time = UINT32_MAX;
-  gps_data.lat = static_cast<float>(INT32_MAX) / 1000000;
-  gps_data.lng = static_cast<float>(INT32_MIN) / 1000000;
   gps_data.speed = static_cast<float>(INT32_MAX) / 100;
   fake_ms = ULONG_MAX - 15;
   gpsNoteFix();
@@ -247,7 +260,7 @@ void loggingChecks() {
   check(column(extreme, "gps_source") == "omitted", "extreme valid integer conversions do not truncate CSV columns");
   size_t added = 0;
   for (const auto* name : {"gps_read", "gps_reply_bytes", "gps_field", "gps_date", "gps_time", "gps_time_age_ms",
-                           "gps_speed_kmh", "gps_lat", "gps_lon", "gps_source"}) added += column(row, name).size() + 1;
+                           "gps_speed_kmh", "gps_source"}) added += column(row, name).size() + 1;
   std::cout << "GPS columns " << split(LOG_HEADER).size() << ", representative row " << row.size()
             << " bytes (+" << added << " diagnostic bytes)\n";
 }

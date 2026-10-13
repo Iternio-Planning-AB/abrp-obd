@@ -166,17 +166,18 @@ Python decompression/CRC/ISIZE checks, and fallback paths. ROM deflate, ROM CRC,
 these checks do not validate the real ROM output or modem transport.
 
 GPS CSV `gps_read=ok` means parsing accepted a reply, including replies with zero coordinates.
-`gps_fix` still means cached nonzero coordinates. Date/time, speed, and raw coordinates are the cached
-accepted record, not fields from a rejected reply. `gps_field` is 0=date, 1=time, 2=latitude,
-3=longitude, 4=altitude, 5=speed; -1 is not applicable. `gps_time_age_ms` measures elapsed time since
+`gps_fix` still means cached nonzero coordinates. Date/time and speed are the cached accepted record,
+not fields from a rejected reply. `gps_field` is 0=date, 1=time, 2=latitude, 3=longitude,
+4=altitude, 5=speed; -1 is not applicable. `gps_time_age_ms` measures elapsed time since
 receiver date/time changed, not proven position-observation age; blank means unknown. Reply bytes
 count only co-processor bytes, not direct UART bytes. `gps_source` records the GPS helper's actual
 coordinate selection (gnss/frozen/omitted), not final wire eligibility. The freshness serializer can
 subsequently omit selected coordinates when their observation time is unknown or invalid. Source
 selection does not itself establish that a location was uploaded.
-Raw coordinates intentionally include positions suppressed from uploads and increase sensitive data
-collection. Use this investigative build and private captures accordingly; the existing circular flash
-budget bounds storage size, not retention duration or at-rest encryption. GPS columns are an optional
+The log has no raw-fix columns: `lat`/`lon` (3 decimals) hold the position `gps_source` selected, which
+is the receiver fix itself when `gnss`, and `PARKED_LOC` events log the frozen average. Both are written
+before send-time freshness, so they include positions the uploader later omits; treat flash logs as
+private. Segments from older firmware keep their `gps_lat`/`gps_lon` until rotated out. GPS columns are an optional
 tail after the exact legacy CSV prefix. Rollback rows require the updated capture helper, which reports
 legacy-shaped rows and leaves absent diagnostics blank rather than guessing their origin or values.
 
@@ -202,8 +203,7 @@ shadow metadata only in the private backlog. Legacy/invalid geo provenance drops
 eligible battery/state. Actual RTC retention, cross-image resets, ROM gzip and modem behavior remain
 hardware gates. Server freshness/SSE ordering protection remains recommended before a broad firmware
 canary, but sender-only geo eligibility does not depend on an ingest deployment or a backend expired-geo
-exception. Existing backend clock-skew normalization is unchanged. Keep this investigative build and
-its raw-location logs private.
+exception. Existing backend clock-skew normalization is unchanged.
 
 ## Send-time geo expiry verification
 
