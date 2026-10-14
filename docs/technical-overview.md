@@ -140,7 +140,7 @@ order and share its globals. See [`AGENTS.md`](../AGENTS.md) before adding one.
 | `mems.h` | ICM-42627 motion sensor: movement detection and wake-on-motion. |
 | `icm42627_cal.h` | Accelerometer bias calibration and the WOM threshold. |
 | `gps_location.h` | GNSS position, the parked-location average, the movement-streak logic. |
-| `clock_sync.h` | Sets the RTC from GNSS / NITZ / NTP / the HTTP `Date` header. |
+| `clock_sync.h` | Sets the RTC from GNSS / NITZ / NTP / the HTTP `Date` header, and on each wake removes the drift deep sleep added, at a rate learned from NITZ/NTP resyncs. |
 | `telemetry_format.h` | Builds the ABRP telemetry frame (cellular body plus the trimmed BLE frame). |
 | `network_upload.h` | Cellular upload, bulk POST, the offline backlog. |
 | `gzip_body.h` | gzip for the POST body, using the ESP32 boot ROM's deflate. |

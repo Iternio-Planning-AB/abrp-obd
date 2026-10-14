@@ -461,6 +461,9 @@ void setup() {
   // re-locks - and the cellular NTP recovery is rate-limited and suppressed while a phone is connected,
   // which is exactly the state right after an update.
   if (wake_cause == ESP_SLEEP_WAKEUP_UNDEFINED && !otaIsTrialBoot()) rtc.setTime(0);
+  // Before anything reads the clock (the ATRV gate's heartbeat math, the first event stamps).
+  clockDriftRestore();
+  clockCompensateSleep(esp_reset_reason() == ESP_RST_DEEPSLEEP);
 #if FAKE_DATA
   rtc.setTime(1780663013); // ~2026-06-05 12:36 UTC; flash promptly so utc stays near real time (ABRP marks stale data "sleeping")
 #endif
@@ -569,6 +572,9 @@ void setup() {
   logEvent("WAKE reason=%s reset=%s clean_sleep=%d brownouts=%lu atrv=%.2f rail=%.2f boot=%lu sleeps=%lu",
     g_wake_reason, resetReasonStr(), clean_sleep ? 1 : 0, (unsigned long)brownout_count,
     g_last_voltage, g_last_io36, (unsigned long)bootCount, (unsigned long)sleepCount);
+  if (g_clock_slept_s)
+    logEvent("CLOCK wake slept %lus, adjusted %+ldms at %ld ppm%s", (unsigned long)g_clock_slept_s,
+      (long)(g_clock_comp_us / 1000), (long)clock_drift_ppm, clock_drift_learned ? "" : " (unlearned)");
   // Make every watchdog recovery visible in the dump (acceptance: a wedge shows a WDT event, never a silent
   // multi-minute gap). streak = consecutive wedged wakes; at >=2 the escalation below sleeps instead of retrying.
   if (g_wdt_wake) logEvent("WDT/PANIC reset recovered a wedged/crashed wake (streak=%lu)", (unsigned long)wdt_reset_count);
@@ -941,16 +947,15 @@ void setup() {
       }
     }
 #if ENABLE_LOGGING
-    // Log the CORRECTION, not just "set". The skew is the whole reason this runs, and it is invisible
-    // on the device - only the backend's registration delay showed it. With this line a dump says how
-    // far the oscillator had wandered since the last real source, which is also how the drift rate
-    // gets measured on a car other than the one it was found on.
+    // Log the CORRECTION, not just "set": the skew is invisible on the device. It is the residual left
+    // after the wake's drift compensation; the raw drift and the learned rate are in the CLOCK drift line.
     if (t && before && prev_sync) {
-      logEvent("NET clock resynced %+lds after %lds (drift ~%ld ppm)", (long)(t - before),
-        (long)(before - prev_sync),
-        before > prev_sync ? (long)((t - before) * -1000000L / (before - prev_sync)) : 0L);
+      logEvent("NET clock resynced %+lds after %lds (residual)", (long)(t - before), (long)(before - prev_sync));
+    } else if (t) {
+      logEvent("NET clock: set");
     } else {
-      logEvent("NET clock: %s", clockValid() ? "set" : "UNSET (retry in loop / await GPS)");
+      logEvent("NET clock resync FAILED (no NITZ/NTP) - %s, wake compensated %+ldms",
+        clockValid() ? "keeping RTC" : "UNSET (retry in loop / await GPS)", (long)(g_clock_comp_us / 1000));
     }
 #endif
   }
@@ -1106,6 +1111,14 @@ void loop() {
   alarmGateService();
 
 #if ENABLE_BLE
+  // A phone utc push set the clock without clockNoteRealSync(): the sleep counted so far no longer explains
+  // the clock's error, so restart the drift window rather than learn ~0 ppm from it.
+  static uint32_t seen_time_pushes = 0;
+  if (ble.timePushes() != seen_time_pushes) {
+    seen_time_pushes = ble.timePushes();
+    clock_slept_since_sync = 0;
+  }
+
   // Apply a BLE-pushed profile HERE, on the loop task, between poll cycles - never on the Bluedroid task
   // (see configCallback: applying there raced the in-flight readPIDs -> garbage/PANIC). Skip the OBD re-init
   // when the pushed profile matches what's already running (utc stripped first - it changes every push;

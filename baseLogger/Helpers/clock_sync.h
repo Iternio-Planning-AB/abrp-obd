@@ -2,10 +2,11 @@
 /*
   Clock/time helpers - the unified RTC clock and every time-source parser.
   Contains: the source-priority clock setter (setClock: GPS authoritative, HTTP/NITZ/NTP
-  fallbacks), validity check (clockValid), calendar->epoch conversion (utcToEpoch), and the
-  parsers for the modem AT+CCLK clock (parseCclk) and HTTP Date headers (parseHttpDate).
+  fallbacks), validity check (clockValid), deep-sleep drift compensation (clockCompensateSleep, learned
+  in clockNoteRealSync), calendar->epoch conversion (utcToEpoch), and the parsers for the modem
+  AT+CCLK clock (parseCclk) and HTTP Date headers (parseHttpDate).
 
-  Extracted verbatim from logger.ino (definitions moved, logic unchanged). This file is
+  This file is
   #included by logger.ino into the single sketch translation unit - it is NOT a standalone
   compilation unit - so it shares logger.ino's globals and the config.h feature flags.
 */
@@ -75,6 +76,32 @@ bool clockNeedsSync(uint64_t now) { return !clockValid(now) || clockStale(now); 
 
 bool clockNeedsSync() { return clockNeedsSync(rtc.getEpoch()); }
 
+/*
+  Deep-sleep drift compensation. Awake, the clock runs off the 40 MHz crystal; asleep it runs off the internal
+  RC (there is no 32 kHz crystal on this board), which resyncs show running a steady 5300-6500 ppm fast. So
+  each wake takes back the drift that sleep added, at a rate learned from the dongle's own resyncs: the error
+  a real source finds, divided by the sleep since the previous one. Rates are per second of sleep as the
+  drifting clock measured it, which is what the wake has to correct.
+*/
+RTC_DATA_ATTR int32_t clock_drift_ppm = 0;           // + = the sleep clock runs fast
+RTC_DATA_ATTR bool clock_drift_learned = false;      // a rate of exactly 0 is a real answer, so it gets a flag
+RTC_DATA_ATTR uint32_t clock_sleep_enter_epoch = 0;  // RTC epoch stamped entering deep sleep; 0 = none pending
+RTC_DATA_ATTR uint32_t clock_slept_since_sync = 0;   // sleep seconds since the last real sync
+
+int64_t clockDriftCorrectionUs(uint32_t slept, int32_t ppm) { return -(int64_t)slept * ppm; }
+
+// err = real - clock at a resync, over `slept` seconds of compensated sleep. The bound is on the rate the
+// window implies, not on the step: bounding the step would let one bad source park the rate somewhere every
+// honest window then looks too far from, and it would never come back.
+bool clockDriftLearn(int64_t err, uint32_t slept, int32_t& ppm, bool& learned) {
+  if (slept < CLOCK_DRIFT_MIN_SLEEP_S) return false;
+  const int64_t implied = (learned ? ppm : 0) - err * 1000000 / (int64_t)slept;
+  if (implied < -CLOCK_DRIFT_MAX_PPM || implied > CLOCK_DRIFT_MAX_PPM) return false;
+  ppm = learned ? (int32_t)(ppm + (implied - ppm) / CLOCK_DRIFT_GAIN) : (int32_t)implied;
+  learned = true;
+  return true;
+}
+
 // UTC calendar time -> Unix epoch seconds, with no timezone/library dependency (Howard Hinnant's
 // days_from_civil). Correct regardless of the runtime TZ, unlike mktime().
 time_t utcToEpoch(int year, int month, int day, int hour, int minute, int second) {
@@ -87,21 +114,88 @@ time_t utcToEpoch(int year, int month, int day, int hour, int minute, int second
   return (time_t)days * 86400L + hour * 3600L + minute * 60L + second;
 }
 
+// The learned rate survives deep sleep in RTC memory; NVS keeps it across a power cut (a re-plug), so the
+// dongle does not spend another night uncompensated.
+void clockDriftSave() {
+  preferences.begin("clock", false);
+  preferences.putInt("drift_ppm", clock_drift_ppm);
+  preferences.end();
+}
+
+void clockDriftRestore() {
+  if (clock_drift_learned) return;
+  preferences.begin("clock", false);
+  const int32_t ppm = preferences.getInt("drift_ppm", INT32_MIN);
+  preferences.end();
+  if (ppm < -CLOCK_DRIFT_MAX_PPM || ppm > CLOCK_DRIFT_MAX_PPM) return; // absent (INT32_MIN) or corrupt
+  clock_drift_ppm = ppm;
+  clock_drift_learned = true;
+}
+
+// Call before the clock is set from a real source: learn from how far off it was, then restart the window.
+// GPS restarts the window but never teaches: its record can be seconds old by the time it is applied.
+void clockNoteRealSync(time_t epoch, bool learn) {
+  const uint32_t before = rtc.getEpoch();
+  const int32_t was = clock_drift_ppm;
+  const bool was_learned = clock_drift_learned;
+  const uint32_t slept = clock_slept_since_sync;
+  const int64_t err = (int64_t)epoch - before;
+  if (learn && clockValid(before) && clockValid(last_clock_sync_epoch) &&
+      clockDriftLearn(err, slept, clock_drift_ppm, clock_drift_learned)) {
+    clockDriftSave();
+#if ENABLE_LOGGING
+    // raw = what the error would have been uncompensated; residual = what was left after compensation.
+    const int64_t raw = err + clockDriftCorrectionUs(slept, was_learned ? was : 0) / 1000000;
+    logEvent("CLOCK drift %+lds raw, %+lds residual over %lus asleep -> rate %ld ppm (was %s%ld)",
+      (long)raw, (long)err, (unsigned long)slept, (long)clock_drift_ppm,
+      was_learned ? "" : "unlearned ", (long)was);
+#endif
+  }
+  clock_slept_since_sync = 0;
+  last_clock_sync_epoch = epoch;
+}
+
+int64_t g_clock_comp_us = 0;   // what this boot's compensation actually applied, for the log
+uint32_t g_clock_slept_s = 0;  // the sleep it measured; 0 = not a compensable wake
+
+// Once per boot, before anything reads the clock: take back the drift the last deep sleep added. Only on a
+// deep-sleep wake - a reset that skipped enterDeepSleep() must not apply a stale stamp, so it is used once.
+void clockCompensateSleep(bool deep_sleep_wake) {
+  const uint32_t entered = clock_sleep_enter_epoch;
+  clock_sleep_enter_epoch = 0;
+  if (!deep_sleep_wake || !entered) return;
+  const uint32_t now = rtc.getEpoch();
+  if (!clockValid(now) || !clockValid(entered) || now < entered) return;
+  const uint32_t slept = now - entered;
+  clock_slept_since_sync += slept;
+  g_clock_slept_s = slept;
+  if (!clock_drift_learned) return;
+  const int64_t us = clockDriftCorrectionUs(slept, clock_drift_ppm);
+  // settimeofday, not rtc.setTime(): that zeroes the sub-second part, half a second of bias every wake.
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  const int64_t t = (int64_t)tv.tv_sec * 1000000 + tv.tv_usec + us;
+  tv.tv_sec = (time_t)(t / 1000000);
+  tv.tv_usec = (suseconds_t)(t % 1000000);
+  settimeofday(&tv, NULL);
+  g_clock_comp_us = us;
+}
+
 // Apply a time update from a source, honoring the priority above. epoch is UTC seconds.
 void setClock(ClockSource src, time_t epoch) {
   if ((unsigned long)epoch < 1000000000UL) return; // ignore garbage (pre-2001) times
   if (src == CLK_GPS) {
+    clockNoteRealSync(epoch, false);
     rtc.setTime((uint32_t)epoch);  // GPS is authoritative - always wins
     last_gps_sync = millis();
-    last_clock_sync_epoch = epoch;
     return;
   }
   bool gps_fresh = last_gps_sync && (millis() - last_gps_sync < GPS_STALE_MS);
   if (clockValid() && gps_fresh) return; // GPS is better and current - ignore the coarse source
-  rtc.setTime((uint32_t)epoch);
   // Recorded only on an update that was ACCEPTED - the early return above is a rejected coarse
   // source, and counting it would restart the staleness clock without correcting anything.
-  last_clock_sync_epoch = epoch;
+  clockNoteRealSync(epoch, true);
+  rtc.setTime((uint32_t)epoch);
 #if PRINT
   // Honest source label. (An earlier build printed "NITZ" for any non-HTTP source, which made an NTP-set
   // clock look like working NITZ and cost a debugging detour - keep the labels exact.)

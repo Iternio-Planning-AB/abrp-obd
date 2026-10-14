@@ -148,7 +148,9 @@ public:
   void set_tlm_push_token(std::string apikey) { tlm_push_token = apikey; }
   std::string get_tlm_push_token() { return tlm_push_token; } // getter not currently used
 
-  void setTime(unsigned long time) { rtc.setTime(time); }
+  // Counted so the loop task can tell the clock was set behind the drift-learning window's back.
+  void setTime(unsigned long time) { rtc.setTime(time); time_pushes = time_pushes + 1; }
+  uint32_t timePushes() const { return time_pushes; }
 
   /*
     OTA plumbing. This wrapper contains NO OTA logic on purpose: the two characteristics only forward raw
@@ -248,6 +250,7 @@ public:
 
 private:
   ESP32Time rtc;
+  volatile uint32_t time_pushes = 0;
 
   /*
     BLE Essentials

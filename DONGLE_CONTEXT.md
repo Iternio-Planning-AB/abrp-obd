@@ -392,7 +392,7 @@ bounded by `MAX_UPLOAD_BUFFER` (the oldest go first).
 | Who | Sees | Can do |
 |---|---|---|
 | Passive listener on the cellular path | TLS only | nothing |
-| Active MITM with any certificate under the bundled roots (name and dates are not checked) | uploads: positions, battery, the api key, keyid, signatures | read; replay an exact earlier request, at any later time (no `created`); swallow uploads by answering 200, so the frames are dropped; set the clock through unauthenticated NTP when a resync runs and GPS is stale (pre-existing; the HTTP `Date` header is not read on cellular); not forge a new request or learn the token |
+| Active MITM with any certificate under the bundled roots (name and dates are not checked) | uploads: positions, battery, the api key, keyid, signatures | read; replay an exact earlier request, at any later time (no `created`); swallow uploads by answering 200, so the frames are dropped; set the clock through unauthenticated NTP when a resync runs and GPS is stale (pre-existing; the HTTP `Date` header is not read on cellular), and if that resync ends an hour or more of sleep it also teaches a skewed drift rate (bounded by `CLOCK_DRIFT_MAX_PPM`, kept in NVS across a re-plug, halved toward the truth by each honest window after); not forge a new request or learn the token |
 | Anyone with the token | — | post as the car. The token reaches the dongle over BLE at pairing (ABD2 profile push; LESC Just Works: encrypted, not MITM-authenticated) and is held by the phone app; cellular signing does not change either |
 
 This assumes a high-entropy token (a UUIDv4, ~122 random bits): the keyid is an unsalted SHA-256 prefix
@@ -551,6 +551,11 @@ session.
   unplugging the dongle from the car. A full dump takes about 4 minutes; `DUMP n` streams only the
   newest `n` segments (about 25 s each), and `DUMP 3` usually covers the last drive. It is genuinely "the tool that made every other bug in this
   project findable".
+- **Clock lines.** The board has no 32 kHz crystal, so deep sleep keeps time on the internal RC, which runs
+  ~0.6 % fast. Each wake takes that back at a learned rate. `CLOCK drift <raw> raw, <residual> residual over
+  <s> asleep -> rate <ppm>` is a NITZ/NTP resync teaching the rate. `NET clock resynced ... (residual)` is
+  what compensation left over. `NET clock resync FAILED` means the wake runs on the compensated RTC. After each
+  deep-sleep `WAKE`, `CLOCK wake slept <s>, adjusted <ms> at <ppm>` says what that wake corrected.
 - **Log the *reason*, not just the outcome.** A subsystem that goes quiet with an empty log is the
   shape that gets misattributed to the cellular stack for weeks — this has happened more than once
   in this project (the transport-handoff bug; a stored hash claiming a profile that wasn't running).

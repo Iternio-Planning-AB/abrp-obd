@@ -324,6 +324,17 @@
 // NTP remains the fallback for SIMs whose visited networks push no NITZ; on those this cadence does cost
 // a ~1 s exchange per 15 min of awake time, which is still small against the 60 s upload cadence.
 #define CLOCK_RESYNC_SECONDS 900
+
+// Deep-sleep drift compensation (clock_sync.h).
+//   MIN_SLEEP: only learn from windows with at least this much sleep - NITZ and the RTC both have 1 s
+//              resolution, so an hour bounds one window's error at ~550 ppm.
+//   GAIN:      after the first window sets the rate outright, each later one moves it 1/GAIN of the way,
+//              so one noisy window cannot undo a night's worth of learning.
+//   MAX_PPM:   a window implying a rate past this is a bad time source, not an oscillator, and is ignored.
+//              About 2.5x the fastest rate measured (6500 ppm fast).
+#define CLOCK_DRIFT_MIN_SLEEP_S 3600
+#define CLOCK_DRIFT_GAIN 2
+#define CLOCK_DRIFT_MAX_PPM 15000
 #define CLOCK_MAX_EPOCH ((uint64_t)std::numeric_limits<time_t>::max() < UINT32_MAX ? \
                          (uint64_t)std::numeric_limits<time_t>::max() : (uint64_t)UINT32_MAX)
 

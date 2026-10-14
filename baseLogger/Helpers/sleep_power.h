@@ -225,6 +225,7 @@ void enterDeepSleep(bool modem_on) {
   clean_sleep_marker = true; // Test B: prove the NEXT boot came through our own sleep path, not a brownout
   Serial.flush();
   delay(100);
+  clock_sleep_enter_epoch = rtc.getEpoch(); // last: the wake measures the sleep from here (clockCompensateSleep)
   esp_deep_sleep_start();
   // Never reached.
 }

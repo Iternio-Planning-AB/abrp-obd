@@ -7,7 +7,7 @@ import tempfile
 
 root = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser()
-parser.add_argument("group", nargs="?", default="all", choices=["all", "formatter", "clock", "host"])
+parser.add_argument("group", nargs="?", default="all", choices=["all", "formatter", "clock", "host", "drift"])
 parser.add_argument("--target-cxx")
 args = parser.parse_args()
 clock = (root / "baseLogger/Helpers/clock_sync.h").read_text()
@@ -23,6 +23,7 @@ def section(text, first, last):
 with tempfile.TemporaryDirectory(prefix="obd-clock-range-checks-") as temporary:
     build = Path(temporary)
     (build / "clock_quality.inc").write_text(section(clock, "bool clockValid(", "// UTC calendar time"))
+    (build / "clock_live.inc").write_text(section(clock, "// The learned rate survives deep sleep", "// Parse a SIM modem"))
     (build / "upload_snapshot.inc").write_text(section(upload, "static double uploadSendUtc()", "bool logNetwork("))
     (build / "target_formatter.inc").write_text(formatter.replace("#pragma once\n", "", 1))
     executable = build / "clock_range_checks"

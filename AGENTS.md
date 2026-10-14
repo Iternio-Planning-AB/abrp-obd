@@ -256,6 +256,12 @@ INT32_MAX (2038-01-19T03:14:07Z) is inclusive; INT32_MAX+1 and UINT32_MAX are un
 hosts retain the uint32 ceiling. This patch does not upgrade existing time-source/GPS conversion or
 battery/calendar formatting for dates after 2038; that broader firmware limitation remains unsupported.
 
+The `drift` group covers deep-sleep drift compensation by driving the real `clockCompensateSleep`, `setClock`
+and NVS save/restore from `clock_sync.h` against a fake microsecond clock: a night of 30-minute wakes is
+learned from its morning NITZ resync, the next night stays within seconds, GPS syncs never teach, one bad
+source moves the rate only 1/`CLOCK_DRIFT_GAIN`, and a wrong stored rate converges back. The real RC rate,
+RTC retention and NVS across a re-plug need a dongle and a parked night (look for `CLOCK drift` in the dump).
+
 ## Energy and temperature host checks
 
 Run `python3 tests/run_energy_checks.py` for charge progress/corroboration, the `is_charging` verdict
