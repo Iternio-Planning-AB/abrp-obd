@@ -144,7 +144,7 @@ void DataLogger::end() {
   }
 }
 
-void DataLogger::dump(Stream& out) {
+void DataLogger::dump(Stream& out, int newest) {
   if (!mounted) { out.printf("[log] not mounted\n"); return; }
   invalidateReadCursor();
   // Reading the active append handle alongside writing is fragile, so close it, stream all segments
@@ -154,6 +154,13 @@ void DataLogger::dump(Stream& out) {
   if (active) active.close();
 
   int lo = lowestIndex(), hi = highestIndex();
+  // A full log is ~2.7 MB, about 4 minutes at 115200 baud; a drive usually fits in the newest two or three.
+  if (newest > 0 && lo >= 0) {
+    int start = hi + 1;
+    for (int kept = 0; start > lo && kept < newest;)
+      if (LittleFS.exists(pathFor(--start).c_str())) ++kept; // index gaps are normal after budget deletions
+    lo = start;
+  }
   for (int i = lo; i >= 0 && i <= hi; ++i) {
     std::string p = pathFor(i);
     if (!LittleFS.exists(p.c_str())) continue;

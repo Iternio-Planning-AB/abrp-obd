@@ -291,6 +291,17 @@ void schemaChecks() {
   const std::string combined(read.begin(), read.end());
   check(combined == LittleFS.files.at("/log0000.csv") + LittleFS.files.at("/log0001.csv"),
         "BLE byte stream and segment contents agree");
+  LittleFS.files["/log0003.csv"] = header + "\n53,1,2,accepted\n"; // a missing index must not count
+  auto segment = [](const std::string& p) {
+    return "===== " + p + " (" + std::to_string(LittleFS.files.at(p).size()) + " bytes) =====\n" + LittleFS.files.at(p);
+  };
+  Stream tail, all, full;
+  wake.dump(tail, 2);
+  check(tail.bytes == segment("/log0001.csv") + segment("/log0003.csv") + "===== end of dump =====\n",
+        "DUMP n streams exactly the newest n segments, oldest first, skipping index gaps");
+  wake.dump(full);
+  wake.dump(all, 99);
+  check(all.bytes == full.bytes, "DUMP n larger than the segment count streams everything");
 }
 
 void schemaFailureChecks() {

@@ -110,7 +110,8 @@ Hardware verification still requires a real dongle, and the loop is:
 1. Build.
 2. Flash, and reproduce on hardware — a bench supply and the desktop fake car cover the transport, but
    never the OBD profile, the power gates or anything GPS.
-3. Read the flash log (`DUMP` over serial, or the in-app log dump over ABD7). `logEvent` lines are the
+3. Read the flash log (`DUMP 3` over serial for the newest three segments, `DUMP` for all of it, or the
+   in-app log dump over ABD7). `logEvent` lines are the
    ground truth; `Serial.printf` is lost the moment the cable is out.
 4. **Only then commit.** Firmware changes stay in the working tree until they have run on a device.
 

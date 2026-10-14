@@ -548,7 +548,8 @@ session.
 ## 9. Diagnostics: how to actually find things
 
 - **`DUMP` over serial** is the primary tool, and the BLE log dump exists so you can get it without
-  unplugging the dongle from the car. It is genuinely "the tool that made every other bug in this
+  unplugging the dongle from the car. A full dump takes about 4 minutes; `DUMP n` streams only the
+  newest `n` segments (about 25 s each), and `DUMP 3` usually covers the last drive. It is genuinely "the tool that made every other bug in this
   project findable".
 - **Log the *reason*, not just the outcome.** A subsystem that goes quiet with an empty log is the
   shape that gets misattributed to the cellular stack for weeks — this has happened more than once

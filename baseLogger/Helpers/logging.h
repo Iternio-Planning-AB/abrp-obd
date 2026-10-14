@@ -164,7 +164,7 @@ void otaBenchReset();
 // JWSTEST branch below needs the declaration up here.
 void profileSigSelfTest();
 
-// Non-blocking-ish serial console for retrieving the flash log: DUMP (stream all), STAT (usage), CLEAR.
+// Non-blocking-ish serial console for retrieving the flash log: DUMP (stream all; DUMP n = newest n segments), STAT (usage), CLEAR.
 void handleLogCommands() {
   if (!Serial.available()) return;
   String cmd = Serial.readStringUntil('\n');
@@ -188,8 +188,10 @@ void handleLogCommands() {
   // esp_ota_write is using. STAT and RESUME are cheap and stay available.
   // A BLE log dump gets the same protection: serial DUMP would block the loop (starving the dump's window
   // replies) and CLEAR would delete the very segments the app is mid-way through reading.
+  const bool is_dump = cmd.equalsIgnoreCase("DUMP") ||
+                       (cmd.length() > 5 && cmd.substring(0, 5).equalsIgnoreCase("DUMP "));
   if ((g_ota_active || g_logdump_active) &&
-      (cmd.equalsIgnoreCase("DUMP") || cmd.equalsIgnoreCase("CLEAR") ||
+      (is_dump || cmd.equalsIgnoreCase("CLEAR") ||
        cmd.equalsIgnoreCase("RADIO") || cmd.equalsIgnoreCase("CLKPROBE") || cmd.equalsIgnoreCase("TLSCHECK") ||
        cmd.substring(0, 2).equalsIgnoreCase("AT"))) {
     Serial.printf("BUSY: %s in progress - %s refused (try again when it finishes)\n",
@@ -197,11 +199,14 @@ void handleLogCommands() {
     return;
   }
 
-  if (cmd.equalsIgnoreCase("DUMP")) {
+  if (is_dump) {
+    // toInt() is 0 for a typo, and 0 would mean everything: refuse it rather than start a 4-minute stream.
+    const int newest = cmd.length() > 4 ? cmd.substring(5).toInt() : 0;
+    if (cmd.length() > 4 && newest < 1) { Serial.printf("usage: DUMP [n>=1]\n"); return; }
     // Streaming a full log at 115200 baud can exceed WEDGE_WDT_TIMEOUT_S - unsubscribe for the (bench-only,
     // human-attended) dump so the wedge guard can't reset mid-transfer, then re-arm.
     esp_task_wdt_delete(NULL);
-    datalogger.dump(Serial);
+    datalogger.dump(Serial, newest);
     esp_task_wdt_add(NULL);
   }
   else if (cmd.equalsIgnoreCase("STAT")) datalogger.printStats(Serial);

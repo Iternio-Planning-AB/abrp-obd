@@ -31,7 +31,7 @@ public:
   void end();              // flush + close the active segment (call before deep sleep)
 
   // Serial maintenance/retrieval helpers (flash logs need an explicit way off the device).
-  void dump(Stream& out);  // stream every segment, oldest -> newest
+  void dump(Stream& out, int newest = 0);  // stream segments oldest -> newest; newest > 0 keeps only the last N
   void clearAll();         // delete all segments and start fresh
   void printStats(Stream& out);
 
