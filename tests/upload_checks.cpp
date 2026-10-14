@@ -4,7 +4,7 @@ void bodyAckRed() {
     CFreematics uart;
     uart.replies = {{1, ">"}, {2, "\r\nERROR\r\n"}, {1, "+SHREQ: \"POST\",200,0\r\n"}};
     HTTPClientSIM client(&uart);
-    const auto response = client.send("/2/app/tlm", "abc", 3, nullptr);
+    const auto response = client.send("/2/app/tlm", "abc", 3);
     check(response.returnValue == 200 && uart.writes.size() == 3, "real send still POSTs despite missing body ACK");
     check(client.transferDiagnostics().body_ack_result == 2, "real send records discarded body ACK ERROR (expected 2, got " + std::to_string(client.transferDiagnostics().body_ack_result) + ")");
 }
@@ -14,7 +14,7 @@ void stages() {
         CFreematics uart;
         uart.replies = {{prompt, "\r\nERROR\r\n"}};
         HTTPClientSIM client(&uart);
-        const auto response = client.send("/2/app/tlm", "abc", 3, nullptr);
+        const auto response = client.send("/2/app/tlm", "abc", 3);
         const auto d = client.transferDiagnostics();
         check(response.returnValue == 0 && std::string(response.buffer).empty(), "prompt refusal baseline result");
         check(uart.writes == std::vector<std::string>{"AT+SHBOD=3,10000\r"} && uart.purges == 1, "no POST or payload without prompt");
@@ -32,7 +32,7 @@ void stages() {
                 HTTPClientSIM client(&uart);
                 std::string payload(length, 'x');
                 for (size_t i = 0; i < length; ++i) payload[i] = static_cast<char>(i % 256);
-                const auto response = client.send("/2/app/tlm", payload.data(), payload.size(), nullptr);
+                const auto response = client.send("/2/app/tlm", payload.data(), payload.size());
                 const auto d = client.transferDiagnostics();
                 check(response.returnValue == code && std::string(response.buffer).empty(), "POST acceptance unchanged even without body ACK");
                 check(uart.writes == std::vector<std::string>{"AT+SHBOD=" + std::to_string(length) + ",10000\r", payload, "AT+SHREQ=\"/2/app/tlm\",\"3\"\r"}, "baseline exact AT sequence and binary payload at size boundary");
@@ -42,7 +42,7 @@ void stages() {
                 check(d.declared_response_length == (code ? 0 : -1) && d.captured_response_length == (code ? 0 : -1) &&
                       d.response_incomplete == (code ? 0 : -1), "measured empty response differs from unknown response");
                 uart.replies = {{0, ""}};
-                client.send("/2/app/tlm", "x", 1, nullptr);
+                client.send("/2/app/tlm", "x", 1);
                 const auto reset = client.transferDiagnostics();
                 check(reset.prompt_result == 0 && reset.body_ack_result == -1 && reset.declared_response_length == -1 && reset.response_incomplete == -1, "all diagnostics reset on next send");
             }
@@ -74,7 +74,7 @@ void responses() {
         uart.replies = {{1, ">"}, {0, ""}, {1, "+SHREQ: \"POST\",400," + std::to_string(c.declared) + "\r\n"}, {c.result, c.burst}};
         if (!c.tail.empty()) uart.replies.push_back({0, c.tail});
         HTTPClientSIM client(&uart);
-        const auto response = client.send("/2/app/tlm", "abc", 3, nullptr);
+        const auto response = client.send("/2/app/tlm", "abc", 3);
         const auto d = client.transferDiagnostics();
         check(response.returnValue == 400 && std::string(response.buffer) == c.expected, "baseline body extraction for " + c.burst.substr(0, 48) + " expected size=" + std::to_string(c.expected.size()) + " actual size=" + std::to_string(strlen(response.buffer)));
         check(d.declared_response_length == c.declared && d.shread_length == c.read_length && d.captured_response_length == (int)c.expected.size() && d.response_incomplete == c.cut, "declared SHREAD captured length and incomplete metadata");
@@ -85,8 +85,8 @@ void responses() {
     CFreematics uart;
     uart.replies = {{1, ">"}, {1, "\r\nOK"}, {1, "+SHREQ: \"POST\",200,"}, {1, "0\r\n"}};
     HTTPClientSIM client(&uart);
-    check(client.send("/2/app/tlm", "x", 1, "legacy").returnValue == 200, "split POST URC still topped up");
-    check(uart.writes.back() == "AT+SHREQ=\"/2/app/tlm?token=legacy\",\"3\"\r" && uart.timeouts.back() == 1000, "legacy path and topup unchanged");
+    check(client.send("/2/app/tlm", "x", 1).returnValue == 200, "split POST URC still topped up");
+    check(uart.writes.back() == "AT+SHREQ=\"/2/app/tlm\",\"3\"\r" && uart.timeouts.back() == 1000, "bare path, no token in the URL; topup unchanged");
     check(client.transferDiagnostics().declared_response_length == 0 && client.transferDiagnostics().response_incomplete == 0, "POST metadata captured after topup");
 }
 void unknownMetadata() {
@@ -98,7 +98,7 @@ void unknownMetadata() {
         CFreematics uart;
         uart.replies = {{1, ">"}, {1, "\r\nOK"}, {0, reply}};
         HTTPClientSIM client(&uart);
-        client.send("/2/app/tlm", "abc", 3, nullptr);
+        client.send("/2/app/tlm", "abc", 3);
         const auto d = client.transferDiagnostics();
         check(d.declared_response_length == -1 && d.captured_response_length == -1,
               "missing or invalid SHREQ metadata remains unknown, not measured empty");

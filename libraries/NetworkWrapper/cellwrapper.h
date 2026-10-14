@@ -22,8 +22,8 @@ public:
   /* True if connection established */
   bool connected() override;
 
-  /* Set headers for https packet */
-  void set_headers(const HeaderVector headers) override;
+  /* Set headers for https packet; false if the modem refused one */
+  bool set_headers(const HeaderVector headers) override;
 
   /* Close connection to network server */
   void disconnect() override;
@@ -40,10 +40,7 @@ public:
   /* Fetch current time from iternio API */
   HttpResponse getEpoch() override;
 
-  /* Send data over Iternio API */
-  HttpResponse sendData(std::string payload) override;
-
-  /* Send a pre-built /tlm/bulk body (token already embedded in the body) */
+  /* POST a pre-built body; the headers from set_headers() authenticate it */
   HttpResponse sendBulk(std::string payload) override;
 
   /* Set variable api_page */

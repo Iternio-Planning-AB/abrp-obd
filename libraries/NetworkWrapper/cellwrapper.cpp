@@ -352,8 +352,8 @@ HttpResponse CellWrapper::getEpoch() {
   return HttpResponse{ response.returnValue, std::string(response.buffer) };
 }
 
-void CellWrapper::set_headers(const HeaderVector headers) {
-  net.setHeaders(headers);
+bool CellWrapper::set_headers(const HeaderVector headers) {
+  return net.setHeaders(headers);
 }
 
 void CellWrapper::set_api_page(const char* new_api_page) {
@@ -540,23 +540,14 @@ std::pair<std::string, std::string> CellWrapper::initFailureDiag() {
   return { result, radio };
 }
 
-HttpResponse CellWrapper::sendData(std::string payload) {
-#if PRINT
-  Serial.printf("telemetry dump: \n%s\n", payload.c_str());
-#endif
-  auto response = net.send(api_page.c_str(), payload.c_str(), payload.size(), carToken.c_str());
-  m_last_use_ms = millis();
-  return HttpResponse{ response.returnValue, std::string(response.buffer) };
-}
-
 HttpResponse CellWrapper::sendBulk(std::string payload) {
-  // v2 (/2/app/tlm) authenticates with the X-TLM-TOKEN header that logNetwork sets, so no token goes in
-  // the URL - nullptr tells net.send to issue the path bare. The body may be gzip here, which is why it
-  // is passed with an explicit size and never treated as a C string: it contains NULs.
+  // The headers logNetwork set authenticate the request (a signature, no token), so the path goes up
+  // bare. The body may be gzip here, which is why it is passed with an explicit size and never treated
+  // as a C string: it contains NULs.
 #if PRINT
   Serial.printf("bulk body: %u bytes\n", (unsigned)payload.size());
 #endif
-  auto response = net.send(api_page.c_str(), payload.data(), payload.size(), nullptr);
+  auto response = net.send(api_page.c_str(), payload.data(), payload.size());
   m_last_use_ms = millis();
   return HttpResponse{ response.returnValue, std::string(response.buffer) };
 }

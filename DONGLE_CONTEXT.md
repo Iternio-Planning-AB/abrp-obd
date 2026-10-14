@@ -283,9 +283,9 @@ Buffered frames → `POST /2/app/tlm`, the v2 endpoint, as a **gzipped** typed `
 `ABRP_OTA` marks the dongle's own cellular uploads (the phone posts relayed BLE frames as `APP_OBD`); it
 is self-declared, not proof of origin. A backend whose provider enum lacks it answers every cellular
 POST with a 400.
-Auth is two headers: `X-TLM-TOKEN` (the vehicle's telemetry token, which is what routes the data) and
-`X-API-KEY` (`API_KEY`, which attributes the integration). HTTP 200 *is* the acceptance — v2 has no
-`status` field in the body.
+Auth is a request signature keyed by the vehicle's telemetry token (which is what routes the data; see
+*Signed uploads* below), plus `X-API-KEY` (`API_KEY`, which attributes the integration). The token
+itself is not sent. HTTP 200 *is* the acceptance — v2 has no `status` field in the body.
 
 Compression is the reason for v2: the SIM7070 refuses a request body over `SHCONF BODYLEN=1024`, so
 body bytes are what limit points per POST — measured, 1000 bytes holds 5 points raw and ~21 gzipped.
@@ -348,7 +348,8 @@ does not need cellular; the first failed open of each boot logs a trace starting
 - The certificate's name is not checked by the SH or the CA stack (an IP URL and a mismatching SNI
   both connect), and the AT interface has no option to enable it. So anyone able to redirect DNS or
   traffic - a fake 2G base station included, since `CNMP=51` allows GSM - can present a free ACM
-  certificate for their own domain and receive the token. `ignorertctime` stays 1, because the modem
+  certificate for their own domain and read the uploads (positions, battery). Signing keeps the token
+  itself off the wire (below), so such a listener cannot post as the car. `ignorertctime` stays 1, because the modem
   judges dates by its own RTC, which is not guaranteed set before the first upload; expired leaves are
   therefore accepted.
 - `AT+SHSSL` accepts a CA name the store does not hold; `SHCONN` then fails (it does not connect
@@ -372,6 +373,33 @@ deleted once per boot so the next open reinstalls - the recovery for a modem who
 reset. `untrusted` keeps it: the store has the roots and the server does not chain to them.
 Trust failures (no or refused bundle, `untrusted`, `noca`) do not count toward the stale-bearer restart
 and reboot ladder; transient install steps and `tlsfail` do.
+
+**Signed uploads** (`Helpers/tlm_signature.h`, used by `logNetworkAt`). The token signs each upload and
+is never sent: one fixed RFC 9421 / RFC 9530 profile, defined in that file's header comment and pinned
+byte for byte by the shared vector in `tests/upload_helpers_checks.cpp` (the backend hard-codes the same
+vector). The signature base, and why only the body is covered, are in that header comment.
+
+With no token nothing is sent (`UPLOAD not sent: no_token`). The modem sends at most
+`SIM7070_HEADER_BUDGET` bytes of headers (the measurement is in its `FreematicsNetwork.h` comment). `setHeaders()`
+sends only the caller's headers, checks every name (RFC 7230 token) and value (printable ASCII, no
+backslash) and the budget before sending anything, and fails the request (`UPLOAD not sent: hdr_fail`)
+on any refusal rather than POST it unsigned. `User-Agent: abrp-obd/<x.y.z>` (from `OTA_FW_VERSION`) is
+best-effort: added after the mandatory headers only if it still fits the budget, never a reason not to
+send. Quotes go out as `\"` inside the quoted AT value (measured
+to arrive as `"`; `\22` arrives literally). A batch not sent keeps its frames in the backlog, which is
+bounded by `MAX_UPLOAD_BUFFER` (the oldest go first).
+
+| Who | Sees | Can do |
+|---|---|---|
+| Passive listener on the cellular path | TLS only | nothing |
+| Active MITM with any certificate under the bundled roots (name and dates are not checked) | uploads: positions, battery, the api key, keyid, signatures | read; replay an exact earlier request, at any later time (no `created`); swallow uploads by answering 200, so the frames are dropped; set the clock through unauthenticated NTP when a resync runs and GPS is stale (pre-existing; the HTTP `Date` header is not read on cellular); not forge a new request or learn the token |
+| Anyone with the token | — | post as the car. The token reaches the dongle over BLE at pairing (ABD2 profile push; LESC Just Works: encrypted, not MITM-authenticated) and is held by the phone app; cellular signing does not change either |
+
+This assumes a high-entropy token (a UUIDv4, ~122 random bits): the keyid is an unsalted SHA-256 prefix
+of it, which only an unguessable token keeps from being reversed. The bench WiFi lane (off in this build)
+would sign the same way, over a TLS session that does not verify the server (`setInsecure()`); before
+it is turned back on it needs `https.end()` (or its headers cleared) per POST, because `addHeader()`
+accumulates.
 
 ---
 
@@ -528,6 +556,12 @@ session.
   Prefer one line per wake with the inputs *and* the verdict over transition-only logging.
 - **A happy path proves nothing about a gate.** Both the signature check and the HMAC gate were only
   believed after watching them *refuse*, which is why `JWSTEST` shipped as a permanent diagnostic.
+- **`UPLOAD not sent: <reason>`** (`no_token`, `sign_fail`, `hdr_fail`) is a batch that never left the
+  dongle. It keeps its frames and deliberately does not advance the http=0 streak that drives the
+  stale-bearer restart and reboot: the bearer is not what failed, and restarting the modem cannot fix
+  a missing token or an oversized header set. So a run of these never ends in `NET recover`. A session
+  that refuses `HEADERLEN` (open trace `hdrlen`) does count toward it; that ladder is bounded by
+  `net_reboot_count` (at most two reboots per outage).
 - **`tx_count`** on `OBDWrapper` counts co-processor commands — a **superset** of CAN frames, since
   most AT commands only configure the ELM locally. A nonzero delta is therefore not proof of bus
   traffic, but the counter must not advance while a gate says it's denying.

@@ -339,8 +339,10 @@ Each release also carries `factory.bin` (bootloader, partitions and app in one i
 
 - **The modem checks the server's certificate chain, not its name or dates.** Anyone who can redirect
   the dongle's DNS or traffic - including a fake 2G base station, since the modem is allowed to fall
-  back to GSM - can present a free AWS certificate for their own domain and receive the vehicle token
-  and positions. Expired certificates are accepted too. The SIM7070 has no option to check the name.
+  back to GSM - can present a free AWS certificate for their own domain and read the uploaded
+  positions and battery data. Expired certificates are accepted too. The SIM7070 has no option to check
+  the name. Uploads are signed with the vehicle token (HMAC, RFC 9421) instead of carrying it, so the
+  token itself never crosses the cellular link; it still reaches the dongle over BLE at pairing.
 - **One car per dongle.** The vehicle profile and token are provisioned per dongle.
 - **BLE telemetry is not MTU-aware.** `logData()` sends the frame without chunking, so on Android at
   the default 23-byte MTU a long frame gets truncated. Frames are kept short in practice.

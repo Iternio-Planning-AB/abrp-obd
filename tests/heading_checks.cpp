@@ -27,6 +27,7 @@
 using json = nlohmann::json;
 using OBDVector = std::vector<std::pair<std::string, double>>;
 using HeaderVector = std::vector<std::pair<std::string, std::string>>;
+#include "header_budget.inc"
 
 void check(bool condition, const std::string& message) {
   if (!condition) {
@@ -97,7 +98,7 @@ struct HttpResponse { int responseCode; std::string payload; };
 struct FakeNetwork {
   std::vector<json> received;
   int responseCode = 200;
-  void set_headers(const HeaderVector&) {}
+  bool set_headers(const HeaderVector&) { return true; }
   std::string getDateHeader() { return {}; }
   HttpResponse sendBulk(const std::string& payload) {
     auto points = json::parse(payload);
@@ -116,6 +117,7 @@ int logging_errors = 0, g_last_http = 0, g_http0_streak = 0;
 unsigned long g_last_post_ms = 0;
 std::string g_last_status, tlm_push_token = "test-token", api_key = "test-key";
 std::vector<OBDVector> obd_result_vector;
+#include "tlm_signature.h"
 #include "network_upload.h"
 #include "backlog_fs.h"
 #define MAX_UPLOAD_BUFFER 120

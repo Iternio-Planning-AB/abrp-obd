@@ -720,7 +720,12 @@ bool HTTPClientSIM::open(const char* host, uint16_t port) {
     recordOpenTrace("shconf", req, bo, sh, t0);
     return false;
   }
-  sendCommand("AT+SHCONF=\"HEADERLEN\",256\r");
+  // The modem's maximum (AT+SHCONF=? says 0-350), cumulative over all headers. The signed upload needs
+  // nearly all of it, so a session that did not take it is not one to send on.
+  if (!sendCommand("AT+SHCONF=\"HEADERLEN\",350\r")) {
+    recordOpenTrace("hdrlen", req, bo, sh, t0);
+    return false;
+  }
   sendCommand("AT+SHCONF=\"BODYLEN\",1024\r");
   // Two attempts: SHCONN can fail if a half-open session from a previous cycle hasn't fully cleared. If the
   // first attempt doesn't reach SHSTATE:1, force a clean SHDISC, settle briefly, and try once more. (This is
@@ -734,12 +739,6 @@ bool HTTPClientSIM::open(const char* host, uint16_t port) {
     if (sendCommand("AT+SHSTATE?\r") && strstr(m_buffer, "+SHSTATE: 1")) {
       m_state = HTTP_CONNECTED;
       m_host = host;
-      sendCommand("AT+SHCHEAD\r");
-      sendCommand("AT+SHAHEAD=\"User-Agent\",\"curl/7.47.0\"\r");
-      sendCommand("AT+SHAHEAD=\"Cache-control\",\"no-cache\"\r");
-      sendCommand("AT+SHAHEAD=\"Connection\",\"keep-alive\"\r");
-      sendCommand("AT+SHAHEAD=\"Accept\",\"*/*\"\r");
-      m_state = HTTP_CONNECTED;
       recordOpenTrace(0, req, bo, sh, t0);
       return true;
     }
@@ -778,29 +777,52 @@ void HTTPClientSIM::recordOpenTrace(const char* fail_step, char req, const char*
   m_probe_trace[0] = 0;
 }
 
-void HTTPClientSIM::setHeaders(const HeaderVector& headers) {
+// Only the caller's headers: the signed upload spends nearly all of the modem's header budget. Names,
+// values and the budget are checked before anything is sent, and a refused header fails the whole call, so
+// a request never goes up with part of its headers - unsigned in particular. The budget is enforced here,
+// not left to the modem, because it accepts a few bytes past what SHREQ can then send (see
+// SIM7070_HEADER_BUDGET).
+// Inside the quoted AT value a quote is sent as \" (measured to arrive as a real quote); a backslash has no
+// measured escape, so it is refused along with anything outside printable ASCII.
+static bool headerNameOk(const std::string& name) {
+  if (name.empty()) return false;
+  for (unsigned char c : name)
+    if (!c || ( !isalnum(c) && !strchr("!#$%&'*+-.^_`|~", c) )) return false; // RFC 7230 token
+  return true;
+}
+
+bool HTTPClientSIM::setHeaders(const HeaderVector& headers) {
 #if PRINT
   Serial.printf("Setting headers\n");
 #endif
-  sendCommand("AT+SHCHEAD\r");
-  sendCommand("AT+SHAHEAD=\"User-Agent\",\"curl/7.47.0\"\r");
-  sendCommand("AT+SHAHEAD=\"Cache-control\",\"no-cache\"\r");
-  sendCommand("AT+SHAHEAD=\"Connection\",\"keep-alive\"\r");
-  sendCommand("AT+SHAHEAD=\"Accept\",\"*/*\"\r");
-  for (auto header : headers) {
-    sprintf(m_buffer, "AT+SHAHEAD=\"%s\",\"%s\"\r", header.first.c_str(), header.second.c_str());
-    sendCommand(m_buffer);
+  for (const auto& header : headers) {
+    if (!headerNameOk(header.first)) return false;
+    for (unsigned char c : header.second)
+      if (c < 0x20 || c > 0x7e || c == '\\') return false;
   }
+  if (headerBytes(headers) > SIM7070_HEADER_BUDGET) return false;
+  if (!sendCommand("AT+SHCHEAD\r")) return false;
+  for (const auto& header : headers) {
+    std::string value;
+    for (char c : header.second) {
+      if (c == '"') value += '\\';
+      value += c;
+    }
+    const int n = snprintf(m_buffer, RECV_BUF_SIZE, "AT+SHAHEAD=\"%s\",\"%s\"\r", header.first.c_str(),
+      value.c_str());
+    if (n < 0 || n >= RECV_BUF_SIZE || !sendCommand(m_buffer)) return false;
+  }
+  return true;
 }
 
 bool HTTPClientSIM::close() {
   // Tear down the SH session with AT+SHDISC - the SH-stack disconnect that matches open()'s AT+SHCONN.
   // The old code sent AT+CHTTPSCLSE, which belongs to the SIM7070's *separate* CHTTPS HTTP application and
-  // does NOTHING to an SH session. Result: the keep-alive SH/TLS connection (open() sets Connection:
-  // keep-alive) was never actually closed, so it was reused across uploads until the server/NAT silently
-  // dropped it. AT+SHSTATE? then still reported "1" (connected) on the half-open socket, so the next SHREQ
-  // POST fired into a dead connection and hung the full 15s -> http=0 with an empty body. Closing cleanly
-  // each cycle makes the next open() build a genuinely fresh session, which is the fix for the http=0 storms.
+  // does NOTHING to an SH session. Result: the SH/TLS connection was never actually closed, so it was
+  // reused across uploads until the server/NAT silently dropped it. AT+SHSTATE? then still reported "1"
+  // (connected) on the half-open socket, so the next SHREQ POST fired into a dead connection and hung the
+  // full 15s -> http=0 with an empty body. Closing cleanly each cycle makes the next open() build a genuinely
+  // fresh session, which is the fix for the http=0 storms.
   m_state = HTTP_DISCONNECTED;
   return sendCommand("AT+SHDISC\r", 2000);
 }
@@ -873,7 +895,7 @@ commandResponse HTTPClientSIM::getEpoch(const char* api_page) {
   return { size.first, buf };
 }
 
-commandResponse HTTPClientSIM::send(const char* api_page, const char* payload, const int payloadSize, const char* car_token) {
+commandResponse HTTPClientSIM::send(const char* api_page, const char* payload, const int payloadSize) {
   m_transfer_diagnostics = {};
   // Start the transaction clean: leftovers from a previous exchange (a late URC, an unread body
   // tail) would otherwise satisfy this transaction's expected-string matches.
@@ -899,15 +921,9 @@ commandResponse HTTPClientSIM::send(const char* api_page, const char* payload, c
 
   // Issue the POST and wait for the unsolicited result line "+SHREQ: \"POST\",<code>,<len>". It arrives
   // AFTER the HTTP round-trip (not in AT+SHREAD=?, which only reports the readable range), so capture it
-  // directly here rather than from a later command's buffer.
-  // car_token == nullptr: the endpoint authenticates by HEADER, not by query string (v2 /2/app/tlm takes
-  // X-TLM-TOKEN), so the path goes up bare. Appending an empty ?token= would be harmless to the server
-  // but spends body-cap-adjacent URL bytes and puts a credential-shaped empty param in every access log.
-  if (car_token != nullptr && *car_token != '\0') {
-    sprintf(m_buffer, "AT+SHREQ=\"%s?token=%s\",\"3\"\r", api_page, car_token);
-  } else {
-    sprintf(m_buffer, "AT+SHREQ=\"%s\",\"3\"\r", api_page);
-  }
+  // directly here rather than from a later command's buffer. The headers authenticate the request, so
+  // the path goes up bare.
+  sprintf(m_buffer, "AT+SHREQ=\"%s\",\"3\"\r", api_page);
   auto req = sendCommand(m_buffer, 8000, "+SHREQ:");         // 8s (was 15s): a healthy POST answers in 1-2.5s;
                                                              // a frozen LTE-M stack never answers, so fail fast
                                                              // and let the recovery ladder run sooner

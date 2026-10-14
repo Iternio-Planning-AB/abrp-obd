@@ -392,6 +392,7 @@ void changeState(ActivityState new_state);     // Helpers/state_machine.h
 #include "Helpers/logging.h"
 // after logging.h (uses logEvent) and before network_upload.h (uses gzipBody)
 #include "Helpers/gzip_body.h"
+#include "Helpers/tlm_signature.h" // pure builder used by network_upload.h
 #include "Helpers/network_upload.h"
 #include "Helpers/gps_location.h"
 #include "Helpers/state_machine.h"
@@ -866,7 +867,6 @@ void setup() {
     }
 #endif
   }
-  network.set_car(tlm_push_token);
 #if ENABLE_WIFI
   network.set_url(WIFI_BULK_PATH); // batch upload: all buffered frames in one POST (see logNetwork)
 
@@ -1055,9 +1055,6 @@ void setup() {
 #endif
   }
   config_initialized = true;
-#if ENABLE_NETWORK
-  network.set_car(tlm_push_token);
-#endif
 
 #if ENABLE_NETWORK && ENABLE_LOGGING
   // Restore telemetry that couldn't be uploaded before the last sleep (wedged bearer / dead spot). Only
@@ -1127,9 +1124,6 @@ void loop() {
       json config = newConfig["configJson"];
       config.erase("utc"); // clock-set side channel, not a profile field; also breaks the identity compare
       tlm_push_token = newConfig.at("tlm_push_token").get<std::string>();
-#if ENABLE_NETWORK
-      network.set_car(tlm_push_token);
-#endif
       std::string profile_dump = config.dump();
       // A completed full push (either branch below) = a human actively drove the wizard at the car:
       // grant the bounded setup-session permit so the wizard's live PID test works while stationary
@@ -1926,7 +1920,9 @@ void loop() {
           } else {
             // http=0 = connection-level failure (bearer/PDP context dead); a 4xx/5xx means the server DID
             // respond, so the bearer is fine - only http=0 counts toward the stale-bearer recovery below.
-            if (g_last_http == 0) g_http0_streak++; else g_http0_streak = 0;
+            // A batch that never left the dongle (no token, signing or a refused header) says nothing about the
+            // bearer, and restarting or rebooting the modem would not change it.
+            if (!g_upload_local_fail) { if (g_last_http == 0) g_http0_streak++; else g_http0_streak = 0; }
             if (!car_awake && ++upload_fail_count >= MAX_UPLOAD_FAILS_PER_WAKE) {
               Serial.printf("Upload failed %d times this wake (asleep) - backing off until next wake\n",
                 upload_fail_count);
@@ -1971,7 +1967,6 @@ void loop() {
             logEvent("NET recover: %dx http=0 -> modem restart (stale bearer)", g_http0_streak);
 #endif
             network.restart();
-            network.set_car(tlm_push_token);
             g_http0_streak = 0;
             g_recovers_since_ok++;
 #if ENABLE_LOGGING

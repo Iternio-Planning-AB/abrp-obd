@@ -218,6 +218,32 @@ void openRefusesTls() {
           "a CONVERT timeout is left to the recovery ladder");
 }
 
+int g_http0_streak = 0;
+
+void openFailStreak(const HTTPClientSIM& network) {
+#include "open_streak.inc"
+}
+
+void openStreak() {
+    newBoot();
+    CFreematics uart;
+    push(uart, OPEN_HEAD);
+    push(uart, {BEARER});
+    HTTPClientSIM unbundled(&uart);
+    g_http0_streak = 2;
+    unbundled.open("api.iternio.com", 443);
+    openFailStreak(unbundled);
+    check(g_http0_streak == 2, "a refused certificate leaves the http=0 streak alone");
+
+    CFreematics flaky;
+    push(flaky, OPEN_HEAD);
+    push(flaky, {OK, ERR, OK, BEARER});
+    BUNDLED(transient, flaky);
+    transient.open("api.iternio.com", 443);
+    openFailStreak(transient);
+    check(g_http0_streak == 3, "any other failed open counts toward it");
+}
+
 void openVerified() {
     newBoot();
     CFreematics uart;
@@ -354,7 +380,84 @@ void probe() {
 }
 }
 
-int main() {
+void headers() {
+    // The real setHeaders(): only what the caller asked for, everything checked before anything is sent,
+    // quotes escaped, every reply checked.
+    CFreematics uart;
+    push(uart, {OK, OK, OK});
+    HTTPClientSIM client(&uart);
+    check(client.setHeaders({{"X-API-KEY", "k"}, {"Signature-Input", "s=(\"content-digest\");keyid=\"ab\""}}), "headers set");
+    check(uart.writes == std::vector<std::string>{"AT+SHCHEAD\r", "AT+SHAHEAD=\"X-API-KEY\",\"k\"\r",
+              "AT+SHAHEAD=\"Signature-Input\",\"s=(\\\"content-digest\\\");keyid=\\\"ab\\\"\"\r"},
+          "no cosmetic defaults; a quote goes out as \\\" (measured to arrive as a real quote)");
+
+    const auto refusedOutright = [](const HeaderVector& headers, const std::string& why) {
+        CFreematics none;
+        HTTPClientSIM c(&none);
+        check(!c.setHeaders(headers) && none.writes.empty(), why + ": refused with nothing sent");
+    };
+    for (const char* bad : {"a\\b", "a\rb", "a\nb", "a\x08" "b", "a\x7f" "b"})
+        refusedOutright({{"X-A", "ok"}, {"X-B", bad}}, "a value with a backslash or outside printable ASCII");
+    for (const char* bad : {"X\"B", "X B", "X:B", ""})
+        refusedOutright({{"X-A", "ok"}, {bad, "v"}}, "a name that is not an RFC 7230 token");
+
+    // The budget, counted as name: value CRLF, at the measured edge: 354 goes out, 355 does not.
+    {
+        CFreematics edge;
+        push(edge, {OK, OK});
+        HTTPClientSIM c(&edge);
+        check(SIM7070_HEADER_BUDGET == 354, "the measured budget");
+        check(c.setHeaders({{"X-F", std::string(354 - 7, 'f')}}) && edge.writes.size() == 2, "354 bytes of headers are sent");
+    }
+    refusedOutright({{"X-F", std::string(355 - 7, 'f')}}, "355 bytes of headers");
+    {
+        CFreematics full;
+        push(full, {OK});
+        HTTPClientSIM c(&full);
+        check(!c.setHeaders({{"X-Q", std::string(300, '"')}}) && full.writes.size() == 1,
+              "a value whose escaped command does not fit the buffer is refused");
+    }
+    {
+        CFreematics refused;
+        push(refused, {OK, OK, ERR, OK});
+        HTTPClientSIM c(&refused);
+        check(!c.setHeaders({{"X-A", "1"}, {"X-B", "2"}, {"X-C", "3"}}), "a refused SHAHEAD fails the call");
+        check(!any(refused.writes, "X-C"), "and stops there");
+        CFreematics cleared;
+        push(cleared, {ERR});
+        HTTPClientSIM d(&cleared);
+        check(!d.setHeaders({{"X-A", "1"}}) && cleared.writes.size() == 1, "a refused SHCHEAD fails the call");
+    }
+    {
+        newBoot();
+        CFreematics opened;
+        push(opened, OPEN_HEAD);
+        push(opened, MARKER_PRESENT);
+        push(opened, TLS_CONTEXT);
+        push(opened, SHCONF);
+        push(opened, {OK, CONNECTED});
+        BUNDLED(c, opened);
+        check(c.open("api.iternio.com", 443), "open");
+        check(any(opened.writes, "AT+SHCONF=\"HEADERLEN\",350\r"), "HEADERLEN is the modem's maximum, 350");
+        check(!any(opened.writes, "AT+SHAHEAD") && !any(opened.writes, "AT+SHCHEAD"), "open() adds no headers of its own");
+    }
+    {
+        newBoot();
+        CFreematics opened;
+        push(opened, OPEN_HEAD);
+        push(opened, MARKER_PRESENT);
+        push(opened, TLS_CONTEXT);
+        push(opened, {OK, ERR, BEARER}); // SHCONF URL ok, HEADERLEN refused
+        BUNDLED(c, opened);
+        check(!c.open("api.iternio.com", 443) && !any(opened.writes, "AT+SHCONN"), "a refused HEADERLEN fails the open");
+        check(std::string(c.openTrace()).rfind("hdrlen ", 0) == 0, "with its own trace step: " + std::string(c.openTrace()));
+    }
+}
+
+int main(int argc, char** argv) {
+    const std::string group = argc > 1 ? argv[1] : "all";
+    if (group == "signing") { headers(); std::cout << "PASS upload signing headers\n"; return 0; }
+    headers();
     naming();
     present();
     install();
@@ -362,6 +465,7 @@ int main() {
     convertBackoff();
     noBundle();
     openRefusesTls();
+    openStreak();
     openVerified();
     probe();
     std::cout << "PASS upload tls-ca\n";

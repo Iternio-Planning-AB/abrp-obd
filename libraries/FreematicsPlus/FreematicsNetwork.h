@@ -31,6 +31,18 @@
 
 using HeaderVector = std::vector<std::pair<std::string, std::string>>;
 
+// Request headers the SIM7070 can actually send, counted as `name: value\r\n`, cumulative over all of
+// them; setHeaders() refuses a set over it (nothing is sent). Measured on 1951B08SIM7070 at HEADERLEN 350
+// (its maximum): up to 354 goes out; 355-364 is accepted by every AT+SHAHEAD but the request then times
+// out as http=0; above that SHAHEAD itself refuses. Host and Content-Length, which the modem adds, do not
+// count. The User-Agent is added only if it still fits.
+#define SIM7070_HEADER_BUDGET 354
+inline size_t headerBytes(const HeaderVector& headers) {
+  size_t bytes = 0;
+  for (const auto& h : headers) bytes += h.first.size() + 2 + h.second.size() + 2; // name: value\r\n
+  return bytes;
+}
+
 typedef enum {
   METHOD_GET = 0,
   METHOD_POST,
@@ -133,10 +145,12 @@ public:
     bool setGPS(bool on);
     void gpsTest();
     bool open(const char* host = 0, uint16_t port = 0);
-    void setHeaders(const HeaderVector &headers);
+    // Clears the modem's request headers and adds these. False - with nothing added - if a name or value
+    // is not sendable or the set is over the budget; false if the modem refuses one or a command overflows.
+    bool setHeaders(const HeaderVector &headers);
     bool close();
     bool send(HTTP_METHOD method, const char* path, bool keepAlive, const char* payload = 0, int payloadSize = 0);
-    commandResponse send(const char* api_page, const char* payload, const int payloadSize, const char* car_token);
+    commandResponse send(const char* api_page, const char* payload, const int payloadSize);
     commandResponse getEpoch(const char* api_page);
     char* receive(int* pbytes = 0, unsigned int timeout = HTTP_CONN_TIMEOUT);
     // Outcome, step results and bearer state of the last open(); see open() for the fields.

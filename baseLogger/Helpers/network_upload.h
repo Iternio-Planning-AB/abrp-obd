@@ -13,7 +13,6 @@
 
 #if ENABLE_NETWORK
 #if ENABLE_LOGGING
-#include <mbedtls/sha256.h>
 #include <cmath>
 
 constexpr size_t UPLOAD_DIAGNOSTIC_MESSAGE_BYTES = 120;
@@ -58,11 +57,40 @@ const char* uploadErrorCategory(const std::string& body) {
   return "other";
 }
 #endif
+// "abrp-obd/<x.y.z>" from OTA_FW_VERSION (major * 1000000 + minor * 1000 + patch); 0.0.0 unversioned.
+std::string uploadUserAgent(unsigned long v = (unsigned long)OTA_FW_VERSION) {
+  char ua[32];
+  snprintf(ua, sizeof(ua), "abrp-obd/%lu.%lu.%lu", v / 1000000UL, v / 1000UL % 1000UL, v % 1000UL);
+  return ua;
+}
+
+// Best-effort: added only when it still fits SIM7070_HEADER_BUDGET after the headers the request cannot go
+// without, so it can never be the reason an upload is not sent.
+void appendUserAgent(HeaderVector& headers, const std::string& ua) {
+  headers.emplace_back("User-Agent", ua);
+  if (headerBytes(headers) > SIM7070_HEADER_BUDGET) headers.pop_back();
+}
+
+// The last logNetworkAt() failed before anything was sent - not a verdict on the bearer (see loop()).
+bool g_upload_local_fail = false;
+
+// A batch that was not POSTed: the frames stay for the next attempt, and the reason is the status.
+static bool uploadNotSent(const char* status) {
+  g_last_status = status;
+  g_last_http = 0;
+  g_upload_local_fail = true;
+#if ENABLE_LOGGING
+  logEvent("UPLOAD not sent: %s", status);
+#endif
+  return false;
+}
+
 /*
   Use the activated network to send data to Iternio API.
   Takes a vector of multiple OBDVectors, allows for temporary storage of data if connection is lost for shorter periods of time
 */
 static bool logNetworkAt(const std::vector<OBDVector>& obd_result_vector, double send_utc) {
+  g_upload_local_fail = false;
 #if PRINT
   Serial.printf("Logging via network (bulk)\n");
   Serial.printf("URL: %s\n", network.getUrl().c_str());
@@ -78,12 +106,9 @@ static bool logNetworkAt(const std::vector<OBDVector>& obd_result_vector, double
     return true;
   }
 
-  HeaderVector headers;
-  // v2 authenticates the WRITE with the vehicle's telemetry token and ATTRIBUTES it with the api key,
-  // both as headers - where v1 took the token as a ?token= query param and the key as Authorization.
-  headers.emplace_back("X-TLM-TOKEN", tlm_push_token);
-  headers.emplace_back("X-API-KEY", api_key);
-  headers.emplace_back("Content-Type", "application/json");
+  // The token signs the request; it is never sent (Helpers/tlm_signature.h). Without one there is nothing
+  // to sign with, so nothing goes up and the frames stay.
+  if (tlm_push_token.empty()) return uploadNotSent("no_token");
 
   // Compress if we can, send plain if we cannot. A body that goes up uncompressed is worse - it carries
   // fewer points under the modem's cap - but it is still a working upload, and losing telemetry because
@@ -91,23 +116,36 @@ static bool logNetworkAt(const std::vector<OBDVector>& obd_result_vector, double
   const size_t raw_bytes = payload.size();
   std::string gzipped;
   const bool gzip_used = gzipBody(payload, gzipped);
-  if (gzip_used) {
-    headers.emplace_back("Content-Encoding", "gzip");
-    payload.swap(gzipped);
-  }
-  network.set_headers(headers);
+  if (gzip_used) payload.swap(gzipped);
+
+  // Over the bytes exactly as sent - the gzip stream when compressed - for Content-Digest and the log
+  // fingerprint alike.
+  unsigned char wire_sha256[32];
+  TlmSignatureHeaders signature;
+  if (mbedtls_md(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), (const unsigned char*)payload.data(),
+        payload.size(), wire_sha256) != 0 ||
+      !tlmSignatureHeaders(tlm_push_token, wire_sha256, signature)) return uploadNotSent("sign_fail");
+
+  // The api key attributes the write; the signature authenticates it.
+  HeaderVector headers;
+  headers.emplace_back("X-API-KEY", api_key);
+  headers.emplace_back("Content-Type", "application/json");
+  if (gzip_used) headers.emplace_back("Content-Encoding", "gzip");
+  headers.emplace_back("Content-Digest", signature.content_digest);
+  headers.emplace_back("Signature-Input", signature.signature_input);
+  headers.emplace_back("Signature", signature.signature);
+  appendUserAgent(headers, uploadUserAgent());
+  // A header the modem refused would send the request unsigned or without its digest: don't send it.
+  if (!network.set_headers(headers)) return uploadNotSent("hdr_fail");
 #if ENABLE_LOGGING
   // Both sizes, every POST. The compressor lives in PSRAM and is allocated at runtime, so NOTHING in a
   // build or a boot log says whether compression is actually engaging - and the failure mode is silent
   // by design (an uncompressed body still uploads, just with fewer points under the modem's cap). raw
   // == wire in the dump means gzip is off; that is the line to look for on the first drive.
   const unsigned long request_id = ++g_upload_request_id;
-  unsigned char digest[32];
-  char fingerprint[UPLOAD_DIAGNOSTIC_SHA256_BYTES * 2 + 1] = "?";
-  if (mbedtls_sha256_ret((const unsigned char*)payload.data(), payload.size(), digest, 0) == 0) {
-    for (size_t i = 0; i < UPLOAD_DIAGNOSTIC_SHA256_BYTES; ++i)
-      snprintf(fingerprint + i * 2, 3, "%02x", digest[i]);
-  }
+  char fingerprint[UPLOAD_DIAGNOSTIC_SHA256_BYTES * 2 + 1];
+  for (size_t i = 0; i < UPLOAD_DIAGNOSTIC_SHA256_BYTES; ++i)
+    snprintf(fingerprint + i * 2, 3, "%02x", wire_sha256[i]);
   unsigned long source_first = 0, source_last = 0;
   for (const auto& frame : obd_result_vector) {
     for (const auto& res : frame) {

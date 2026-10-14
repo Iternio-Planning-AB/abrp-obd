@@ -27,9 +27,6 @@ public:
 
   virtual bool init(const bool retry = false) = 0;
 
-  virtual void set_car(const std::string new_token) {
-    carToken = new_token;
-  }
   virtual void set_apikey(const std::string new_api_key) {
     api_key = new_api_key;
   }
@@ -81,22 +78,20 @@ public:
   /* ms since connected() last became true, or -1 if it isn't / the transport doesn't track it */
   virtual long upForMs() { return -1; }
 
-  virtual void set_headers(const HeaderVector new_headers) = 0;
+  /* false if the transport refused a header: the request must not be sent */
+  virtual bool set_headers(const HeaderVector new_headers) = 0;
   virtual bool connect() = 0;
   virtual bool connected() = 0;
   virtual void disconnect() = 0;
 
   virtual HttpResponse getEpoch() = 0;
-  virtual HttpResponse sendData(std::string payload) = 0;
 
-  // Send a pre-built /tlm/bulk body verbatim. Unlike sendData(), the token is already embedded
-  // inside the body (per vehicle), so no per-call token mutation is applied. Default: not supported
-  // by this transport; overridden where implemented (WiFi).
+  // POST a pre-built body verbatim; the caller has set the headers that authenticate it. Default: not
+  // supported by this transport.
   virtual HttpResponse sendBulk(std::string payload) { return HttpResponse{ 0, std::string{} }; }
 
 protected:
   FreematicsESP32 sys;
-  std::string carToken{};
   std::string api_key{};
   std::string url;
   const int timeout{ 5000 };

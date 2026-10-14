@@ -1,5 +1,6 @@
 #pragma once
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cerrno>
 #include <climits>
@@ -64,6 +65,8 @@ public:
     commandResponse sendCommand(const char* cmd, unsigned int timeout = 1000, const char* expected = nullptr);
 };
 #ifdef TLS_CHECKS
+using HeaderVector = std::vector<std::pair<std::string, std::string>>;
+#include "header_budget.inc"
 #define HTTP_CONN_TIMEOUT 5000
 #define RTC_DATA_ATTR
 #include "tls_defines.inc"
@@ -72,13 +75,14 @@ enum HTTP_STATES { HTTP_DISCONNECTED, HTTP_CONNECTED, HTTP_SENT, HTTP_ERROR };
 class HTTPClientSIM : public CellSIMCOM {
 public:
     using CellSIMCOM::CellSIMCOM;
-    commandResponse send(const char* api_page, const char* payload, const int payloadSize, const char* car_token);
+    commandResponse send(const char* api_page, const char* payload, const int payloadSize);
     void setCaBundle(const uint8_t* p7b, size_t len);
     bool trustRefused() const;
 #include "upload_getter.inc"
 #ifdef TLS_CHECKS
     bool open(const char* host = 0, uint16_t port = 0);
     const char* openTrace() { return m_open_trace; }
+    bool setHeaders(const HeaderVector& headers);
     bool writeCaFile(const char* ext, const uint8_t* data, size_t len);
     bool ensureCa();
     void dropCaMarker();

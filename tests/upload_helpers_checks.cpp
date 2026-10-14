@@ -6,6 +6,7 @@
 #include <sstream>
 #include "networkwrapper.h"
 #include "cellwrapper.h"
+#include "header_budget.inc"
 
 #define ENABLE_NETWORK 1
 #ifndef ENABLE_LOGGING
@@ -93,12 +94,12 @@ struct FakeNetwork : NetworkWrapper {
     FakeNetwork() : NetworkWrapper(FreematicsESP32{}) {}
     bool init(bool) override { return true; }
     void restart() override {}
-    void set_headers(HeaderVector h) override { headers.push_back(h); }
+    bool headers_ok = true;
+    bool set_headers(HeaderVector h) override { headers.push_back(h); return headers_ok; }
     bool connect() override { return true; }
     bool connected() override { return true; }
     void disconnect() override {}
     HttpResponse getEpoch() override { return {0, ""}; }
-    HttpResponse sendData(std::string) override { return {0, ""}; }
     HttpResponse sendBulk(std::string payload) override {
         sent.push_back(payload);
         int status = code;
@@ -106,7 +107,7 @@ struct FakeNetwork : NetworkWrapper {
         uart.replies = {{1, ">"}, {ack, ack == 1 ? "\r\nOK" : "\r\nERROR"},
             {status ? 1 : 0, status ? "+SHREQ: \"POST\"," + std::to_string(status) + "," + std::to_string(body.size()) + "\r\n" : ""}};
         if (status && !body.empty()) uart.replies.push_back({1, "+SHREAD: " + std::to_string(std::min<size_t>(body.size(), 496)) + "\r\n" + body.substr(0, 496)});
-        auto response = client.send("/2/app/tlm", payload.data(), payload.size(), nullptr);
+        auto response = client.send("/2/app/tlm", payload.data(), payload.size());
         check(uart.writes[uart.writes.size() - (status && !body.empty() ? 3 : 2)] == payload, "actual helper final payload streamed unchanged");
         return {response.returnValue, response.buffer};
     }
@@ -120,6 +121,7 @@ int logging_errors = 0, g_last_http = 0, g_http0_streak = 0;
 unsigned long g_last_post_ms = 0;
 std::string g_last_status, tlm_push_token = "test-token-actual", api_key = "test-key-actual";
 std::vector<OBDVector> obd_result_vector;
+#include "tlm_signature.h"
 #include "network_upload.h"
 
 void reset() {
@@ -130,13 +132,19 @@ void reset() {
     LittleFS.files.clear(); LittleFS.fail_open = false;
     network.response_epochs.clear();
     network.sent.clear(); network.headers.clear(); network.codes.clear(); network.uart = CFreematics{};
-    network.code = 200; network.ack = 1; network.body = "{}"; network.unknown_diagnostics = false;
+    network.code = 200; network.ack = 1; network.body = "{}"; network.unknown_diagnostics = false; network.headers_ok = true;
+    tlm_push_token = "test-token-actual";
     datalogger.lines.clear(); Serial.output.clear(); gzip_calls = 0;
     gzip_enabled = force_oversized = false;
     logging_errors = g_last_http = g_http0_streak = 0; g_last_status.clear(); obd_result_vector.clear();
+    host_md_fail = 0;
 #if ENABLE_LOGGING
-    g_upload_request_id = 0; upload_hash_inputs.clear(); upload_hash_failure = false;
+    g_upload_request_id = 0;
 #endif
+}
+void sha256(const std::string& bytes, unsigned char digest[32]) {
+    check(mbedtls_md(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), reinterpret_cast<const unsigned char*>(bytes.data()),
+                     bytes.size(), digest) == 0, "host SHA256");
 }
 OBDVector frame(unsigned index) { return {{"utc", 1791112000 + index}, {"soc", 50 + index / 100.0}, {"voltage", 350}, {"current", 12}, {"speed", 50}}; }
 #if ENABLE_LOGGING
@@ -154,9 +162,7 @@ std::vector<std::string> events(const std::string& prefix) {
 }
 std::string digest12(const std::string& payload) {
     unsigned char digest[32];
-    const auto n = upload_hash_inputs.size();
-    check(mbedtls_sha256_ret(reinterpret_cast<const unsigned char*>(payload.data()), payload.size(), digest, 0) == 0, "host SHA256");
-    upload_hash_inputs.resize(n);
+    sha256(payload, digest);
     char text[13] = {};
     for (size_t i = 0; i < 6; ++i) std::snprintf(text + 2 * i, 3, "%02x", digest[i]);
     return text;
@@ -165,7 +171,7 @@ void fingerprint() {
     for (bool compressed : {false, true}) {
         reset(); gzip_enabled = compressed;
         check(logNetwork({{{"utc", 1791111990}, {"_private", 1}}}), "empty serialization success");
-        check(network.sent.empty() && g_upload_request_id == 0 && upload_hash_inputs.empty() && datalogger.lines.empty(), "no request ID hash or event for unsent empty serialization");
+        check(network.sent.empty() && g_upload_request_id == 0 && datalogger.lines.empty(), "no request ID hash or event for unsent empty serialization");
         const std::vector<OBDVector> frames = {frame(0), frame(10), {{"utc", 1791111990}, {"_private", 1}}};
         const auto raw = bulkStringV2(frames);
         network.code = 400; network.ack = 0; network.body = "{\"message\":\"gzip: invalid header\"}";
@@ -173,7 +179,7 @@ void fingerprint() {
         check(!logNetwork(frames), "identical retry still rejected");
         auto bodies = events("UPLOAD body raw="); auto results = events("UPLOAD id=");
         check(bodies.size() == 2 && results.size() == 2 && datalogger.lines.size() == 4, "exactly two diagnostic events per POST");
-        check(network.sent[0] == network.sent[1] && upload_hash_inputs == network.sent, "hashes only exact final sends including gzip binary NULs");
+        check(network.sent[0] == network.sent[1], "identical retry sends identical bytes, gzip binary NULs included");
         check(gzip_calls == 2 && network.headers.size() == 2, "no extra compression or header changes for diagnostics");
         for (size_t i = 0; i < 2; ++i) {
             check(bodies[i].find("id=" + std::to_string(i + 1)) != std::string::npos && results[i].find("id=" + std::to_string(i + 1)) != std::string::npos, "sequential final-send correlation");
@@ -185,14 +191,17 @@ void fingerprint() {
         check(g_last_http == 400 && g_last_status == "http_err" && logging_errors == 2 && g_last_post_ms > 0, "existing status accounting untouched");
         network.code = 200; network.body = "not JSON, no ACK and no acceptance-body parsing";
         check(logNetwork(frames) && logging_errors == 0 && g_last_status == "ok", "200 accepted regardless of response and body ACK");
-        const auto oracle_digest = digest12(network.sent[0]);
-        std::cout << "HASH " << oracle_digest << ' ';
-        for (unsigned char c : network.sent[0]) std::printf("%02x", c);
+        // The runner checks the fingerprint the firmware logged against Python's own hashlib of the bytes sent.
+        const auto logged = events("UPLOAD body raw=").back();
+        const auto at = logged.find("sha=") + 4;
+        std::cout << "HASH " << logged.substr(at, logged.find(' ', at) - at) << ' ';
+        for (unsigned char c : network.sent.back()) std::printf("%02x", c);
         std::cout << '\n';
     }
-    reset(); upload_hash_failure = true;
-    check(logNetwork({frame(0)}), "hash failure cannot change upload success");
-    check(events("UPLOAD body raw=")[0].find("sha=?") != std::string::npos, "failed hash explicitly unknown");
+    reset(); host_md_fail = 1;
+    check(!logNetwork({frame(0)}) && network.sent.empty() && g_last_status == "sign_fail",
+        "without the body digest nothing can be signed, so nothing is sent");
+    check(events("UPLOAD not sent: sign_fail").size() == 1, "the reason is logged");
     reset(); network.unknown_diagnostics = true;
     check(logNetwork({frame(0)}), "transport with default unknown getter works");
     check(events("UPLOAD id=")[0].find("p/a/r=-1/-1/-1 rx=-1/-1/-1 cut=-1 w=?") != std::string::npos, "default wrapper reports unknown, not fabricated modem stages");
@@ -247,7 +256,7 @@ void queue() {
     check(!uploadBuffered(true) && obd_result_vector == original && network.sent.size() == 1, "HTTP0 keeps entire FIFO and stops at first failure");
     check(gzip_calls > (int)network.sent.size(), "queue sizing compressions occur without requests");
 #if ENABLE_LOGGING
-    check(upload_hash_inputs.size() == network.sent.size() && g_upload_request_id == network.sent.size(), "sizing compressions have no request ID hash or diagnostic body");
+    check(g_upload_request_id == network.sent.size(), "sizing compressions have no request ID hash or diagnostic body");
 #endif
     const auto failed_body = network.sent[0];
     network.code = 400;
@@ -261,12 +270,12 @@ void queue() {
     const auto expected = json::parse(bulkStringV2(original));
     check(json(received) == expected, "all 120 frames delivered once and in FIFO order with battery intact");
 #if ENABLE_LOGGING
-    check(upload_hash_inputs == network.sent && events("UPLOAD body raw=").size() == network.sent.size() && events("UPLOAD id=").size() == network.sent.size(), "exactly one final fingerprint and paired events per real queue POST");
+    check(events("UPLOAD body raw=").size() == network.sent.size() && events("UPLOAD id=").size() == network.sent.size(), "exactly one final fingerprint and paired events per real queue POST");
 #endif
     reset(); gzip_enabled = true; force_oversized = true; obd_result_vector = {frame(0)};
     check(uploadBuffered(true) && obd_result_vector.empty() && network.sent.empty(), "existing oversized single-frame drop unchanged");
 #if ENABLE_LOGGING
-    check(upload_hash_inputs.empty() && g_upload_request_id == 0, "drop has no POST diagnostics");
+    check(g_upload_request_id == 0, "drop has no POST diagnostics");
 #endif
 }
 void geoExpiry() {
@@ -615,6 +624,102 @@ void geoSizing() {
         check(index == original.size(), "clock-quality batch transitions deliver every battery frame once");
     }
 }
+std::string hex(const std::string& bytes) {
+    std::string out;
+    char pair[3];
+    for (unsigned char c : bytes) { std::snprintf(pair, sizeof(pair), "%02x", c); out += pair; }
+    return out;
+}
+// The runner recomputes all three values from the token and the exact body bytes with Python's
+// hashlib/hmac/base64 and fails on any difference.
+void pythonRecomputes(const std::string& token, const std::string& wire, const std::string& digest,
+                      const std::string& input, const std::string& signature) {
+    std::cout << "SIGCHECK " << hex(token) << ' ' << hex(wire) << ' ' << hex(digest) << ' ' << hex(input) << ' '
+              << hex(signature) << std::endl;
+}
+std::string header(const HeaderVector& headers, const std::string& name) {
+    std::string value;
+    int count = 0;
+    for (const auto& h : headers) if (h.first == name) { value = h.second; ++count; }
+    check(count <= 1, "header " + name + " at most once");
+    return value;
+}
+const std::string VECTOR_UUID = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0";
+// loop()'s stale-bearer bookkeeping after a failed upload, extracted from logger.ino.
+void streakAfterFailedUpload() {
+#include "upload_streak.inc"
+}
+void signing() {
+    // The shared vector, byte for byte (the same strings are hard-coded in the backend's tests).
+    const std::string body = "[{\"utc\":1760360000,\"soc\":50}]";
+    unsigned char digest[32];
+    sha256(body, digest);
+    TlmSignatureHeaders h;
+    check(tlmSignatureHeaders(VECTOR_UUID, digest, h), "shared vector signs");
+    check(h.content_digest == "sha-256=:04AX1We39fbKv2dKjfojft1+HxpZdbfMK2oFVt8xWIQ=:", "vector Content-Digest: " + h.content_digest);
+    check(h.signature_input == "s=(\"content-digest\");keyid=\"40ed71cc50fb44c60cf82ea1061807ec\"",
+          "vector Signature-Input: " + h.signature_input);
+    check(h.signature == "s=:4f9JYu+fOS6wvT/Yn7ZhG1zEQjk0fDBzJvVEXXZ06cg=:", "vector Signature: " + h.signature);
+    pythonRecomputes(VECTOR_UUID, body, h.content_digest, h.signature_input, h.signature);
+    check(!tlmSignatureHeaders("", digest, h), "no token, no signature");
+    host_md_fail = 1;
+    check(!tlmSignatureHeaders(VECTOR_UUID, digest, h), "a crypto failure is reported, not signed");
+    host_md_fail = 0;
+
+    // What actually goes up: no token header, the signature covers the exact wire bytes, and the set fits
+    // the modem's budget with a production-length (36-character) api key.
+    const std::string saved_key = api_key;
+    for (bool compressed : {false, true}) {
+        reset(); gzip_enabled = compressed; tlm_push_token = VECTOR_UUID; api_key = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        check(logNetwork({frame(0), frame(5)}), "signed upload accepted");
+        check(network.sent.size() == 1 && network.headers.size() == 1, "one POST, one header set");
+        const auto& sent = network.headers[0];
+        for (const auto& x : sent) {
+            check(x.first != "X-TLM-TOKEN", "the token header is never sent");
+            check(x.second.find(VECTOR_UUID) == std::string::npos, "no header carries the token");
+        }
+        const size_t wire = headerBytes(sent);
+        check(header(sent, "User-Agent") == "abrp-obd/0.0.0", "best-effort User-Agent from OTA_FW_VERSION: " + header(sent, "User-Agent"));
+        check(wire <= SIM7070_HEADER_BUDGET, "headers within SIM7070_HEADER_BUDGET: " + std::to_string(wire));
+
+        // The boundary: a User-Agent that exactly fills the budget is sent, one byte more is left off and
+        // everything the request needs is still there.
+        const HeaderVector mandatory(sent.begin(), sent.end() - 1);
+        const std::string ua_line = "User-Agent: " + header(sent, "User-Agent") + "\r\n";
+        const size_t room = SIM7070_HEADER_BUDGET - (wire - ua_line.size()) - std::strlen("User-Agent: \r\n");
+        HeaderVector fits = mandatory, over = mandatory;
+        appendUserAgent(fits, std::string(room, 'u'));
+        appendUserAgent(over, std::string(room + 1, 'u'));
+        check(fits.size() == mandatory.size() + 1, "a User-Agent that exactly fills the budget is still sent");
+        check(over == mandatory, "one byte more is dropped, the signed headers untouched");
+        check(header(sent, "X-API-KEY") == api_key && header(sent, "Content-Type") == "application/json", "attribution headers kept");
+        check(header(sent, "Content-Encoding") == (compressed ? "gzip" : ""), "Content-Encoding only when compressed");
+        check((network.sent[0].compare(0, 2, "\x1f\x8b") == 0) == compressed, "and then the body sent is the gzip stream");
+        pythonRecomputes(VECTOR_UUID, network.sent[0], header(sent, "Content-Digest"), header(sent, "Signature-Input"),
+                         header(sent, "Signature"));
+    }
+    api_key = saved_key;
+    check(uploadUserAgent(1002003) == "abrp-obd/1.2.3" && uploadUserAgent(999999999) == "abrp-obd/999.999.999",
+          "User-Agent carries the release version the way OTA_FW_VERSION encodes it");
+
+    // Not sent: no token, or a header refused. The frames stay, and the stale-bearer ladder does not move.
+    reset(); tlm_push_token.clear(); g_http0_streak = 2;
+    check(!logNetwork({frame(0)}) && network.sent.empty() && g_last_status == "no_token", "empty token skips the POST");
+    streakAfterFailedUpload();
+    check(g_http0_streak == 2, "a local failure leaves the http=0 streak alone");
+    reset(); network.headers_ok = false; g_http0_streak = 2;
+    check(!logNetwork({frame(0)}) && network.sent.empty() && g_last_status == "hdr_fail", "refused headers abort the POST");
+    streakAfterFailedUpload();
+    check(g_http0_streak == 2, "a refused header leaves the http=0 streak alone");
+    reset(); network.code = 0; g_http0_streak = 2;
+    check(!logNetwork({frame(0)}) && network.sent.size() == 1, "a sent request that got no answer");
+    streakAfterFailedUpload();
+    check(g_http0_streak == 3, "an http=0 after sending still counts toward the restart");
+    reset(); network.code = 400; g_http0_streak = 2;
+    check(!logNetwork({frame(0)}), "a sent request the server rejected");
+    streakAfterFailedUpload();
+    check(g_http0_streak == 0, "an answer from the server clears the streak");
+}
 int main(int argc, char** argv) {
     const std::string group = argc > 1 ? argv[1] : "all";
 #if ENABLE_LOGGING
@@ -629,5 +734,6 @@ int main(int argc, char** argv) {
     if (group == "all" || group == "geo-retry") geoRetry();
 #endif
     if (group == "all" || group == "geo-sizing") geoSizing();
+    if (group == "all" || group == "signing") signing();
     std::cout << "PASS upload helpers " << group << " logging=" << ENABLE_LOGGING << '\n';
 }

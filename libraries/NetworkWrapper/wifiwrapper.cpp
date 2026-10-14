@@ -82,11 +82,14 @@ void WiFiWrapper::disconnect() {
   return https.end();
 }
 
-void WiFiWrapper::set_headers(HeaderVector headers) {
+bool WiFiWrapper::set_headers(HeaderVector headers) {
+  // addHeader() accumulates until https.end(), and connect() reuses a connected session: call https.end()
+  // per POST before re-enabling this lane, or every request carries every earlier request's signature.
   for (auto header : headers) {
     // Serial.printf("Adding header %s, %s\n", header.first.c_str(), header.second.c_str());
     https.addHeader(header.first.c_str(), header.second.c_str());
   }
+  return true;
 }
 
 void WiFiWrapper::set_credentials(std::string ssid, std::string password) {
@@ -101,20 +104,8 @@ void WiFiWrapper::restart() {
   connect();
 }
 
-HttpResponse WiFiWrapper::sendData(std::string data) {
-  data.pop_back();
-  data += R"(,"token":")" + carToken + R"("})";
-
-  Serial.printf("Sent data: \n%s\n", data.c_str());
-  // (a stale commented-out header carrying a real API key used to sit here)
-  int responseCode = https.POST(data.c_str());
-  std::string payload = https.getString().c_str();
-  last_date_header = https.header("Date").c_str();
-  return HttpResponse{ responseCode, payload };
-}
-
 HttpResponse WiFiWrapper::sendBulk(std::string payload) {
-  // The vehicle token travels as a header (X-TLM-TOKEN, set by logNetwork), so the body goes as-is.
+  // The headers logNetwork set authenticate the request, so the body goes as-is.
   // BY LENGTH, never as a C string: the body may be gzip, which contains NULs - c_str() would truncate
   // it at the first one and post a body the server cannot inflate. This lane is dormant (ENABLE_WIFI 0)
   // and would not have shown the fault until someone turned it back on.

@@ -161,7 +161,8 @@ also verifies a synthetic dump through the updated capture helper, including act
 `CXX="clang++ -DNDEBUG"` keeps assertions checked.
 
 Run `python3 tests/run_upload_checks.py` for real SIM7070 send/AT parsing and upload-helper checks with
-ASan/UBSan and NDEBUG. UART is fake. Python stdlib hashlib independently supplies SHA256 test results.
+ASan/UBSan and NDEBUG. UART is fake. Python hashlib/hmac/base64 independently verify the logged
+fingerprint and every signature, so the host mbedTLS shims are never their own oracle.
 Run `python3 tests/run_gzip_container_checks.py` for the actual gzip container wrapper, independent
 Python decompression/CRC/ISIZE checks, and fallback paths. ROM deflate, ROM CRC, and PSRAM are shims;
 these checks do not validate the real ROM output or modem transport.
@@ -268,3 +269,8 @@ filesystem and hardware are fakes, not on-device verification.
 Run `python3 tests/run_server_roots_checks.py` (add `--require-live` to fail rather than skip when
 `api.iternio.com` is unreachable) and `python3 tests/run_upload_checks.py tls-ca`. Neither proves what
 the modem accepts; that needs `TLSCHECK` on a dongle.
+
+`python3 tests/run_upload_checks.py signing` covers the signed upload: the shared RFC 9421 vector byte for
+byte, every signed POST recomputed by the runner from the captured wire bytes with Python's
+hashlib/hmac (gzip on and off), no `X-TLM-TOKEN`, and the real `setHeaders()` AT output (quote escaping,
+refused values, the header budget, abort on a refused `AT+SHAHEAD`) and the best-effort User-Agent.

@@ -27,7 +27,7 @@ public:
   void disconnect() override;
 
   /* Set headers of https packet  */
-  void set_headers(const HeaderVector headers) override;
+  bool set_headers(const HeaderVector headers) override;
 
   /* Set credentials for connecting to wifi accesspoint */
   void set_credentials(std::string ssid, std::string password);
@@ -40,10 +40,7 @@ public:
 
   /* Turn the WiFi radio off before deep sleep */
   void powerOff() override;
-  /* Send data to Iternio API */
-  HttpResponse sendData(const std::string payload) override;
-
-  /* Send a pre-built /tlm/bulk body verbatim (token already embedded in the body) */
+  /* POST a pre-built body verbatim; the headers from set_headers() authenticate it */
   HttpResponse sendBulk(const std::string payload) override;
 
   /* Fetch UTC epoch. Unused for WiFi (time comes from GPS); returns a failed response */

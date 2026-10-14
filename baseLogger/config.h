@@ -140,7 +140,7 @@
 // The endpoint telemetry actually goes to. v2 takes a typed InputPointList (see bulkStringV2) and, unlike
 // v1, its edge accepts a gzipped request body - which is the whole reason for the move: the SIM7070's
 // 1024-byte body cap is what limits points-per-POST, and gzip turns 5 points into ~21.
-// Auth is by header here (X-TLM-TOKEN + X-API-KEY), not the ?token= query v1 used.
+// Auth is by header: an HMAC signature keyed by the vehicle token (Helpers/tlm_signature.h) plus X-API-KEY.
 #define TLM_V2_PATH "/2/app/tlm"
 #endif
 
