@@ -37,8 +37,6 @@ const char* uploadErrorCategory(const std::string& body) {
   if (body.empty()) return "empty";
   if ((!tlm_push_token.empty() && body.find(tlm_push_token) != std::string::npos) ||
       (!api_key.empty() && body.find(api_key) != std::string::npos)) return "redacted";
-  for (const char* marker : {"token", "api_key", "api-key", "authorization", "bearer", "password", "secret"})
-    if (uploadErrorContains(body, marker)) return "redacted";
   size_t credential_run = 0;
   for (unsigned char c : body) {
     bool credential_char = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
@@ -46,6 +44,12 @@ const char* uploadErrorCategory(const std::string& body) {
     credential_run = credential_char ? credential_run + 1 : 0;
     if (credential_run >= 24) return "redacted";
   }
+  // Checked before the credential-word markers: a 400 naming the absent header ("X-TLM-TOKEN ... value is
+  // required but missing") contains "token", and logging it as "redacted" hid the only explanation for a
+  // whole drive of rejected uploads. The label carries no response text.
+  if (uploadErrorContains(body, "required but missing")) return "missing_header";
+  for (const char* marker : {"token", "api_key", "api-key", "authorization", "bearer", "password", "secret"})
+    if (uploadErrorContains(body, marker)) return "redacted";
   if (uploadErrorContains(body, "<html") || uploadErrorContains(body, "<!doctype")) return "html";
   if (uploadErrorContains(body, "invalid header")) return "gzip_header";
   if (uploadErrorContains(body, "checksum")) return "gzip_checksum";
