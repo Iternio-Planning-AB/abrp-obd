@@ -42,7 +42,8 @@ Commit messages generate the release notes, so use
 [Conventional Commits](https://www.conventionalcommits.org/): `type(scope): imperative summary`,
 describing the user-visible change, not just the implementation (scope optional). Only `feat`,
 `fix`, `perf`, `revert` and breaking changes reach the notes, via [`cliff.toml`](cliff.toml); `docs`,
-`ci`, `test`, `refactor` and `chore` are left out and do not bump the version. Mark a breaking change
+`ci`, `test`, `refactor` and `chore` are left out and do not bump the version, as is any type with
+the `ci` scope (`fix(ci): ...`). Mark a breaking change
 with `!` and a `BREAKING CHANGE:` footer that explains the impact and migration; a `!` on an
 otherwise excluded type still ships.
 
