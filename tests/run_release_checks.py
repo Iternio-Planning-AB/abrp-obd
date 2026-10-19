@@ -689,6 +689,17 @@ class ReleaseNotes(unittest.TestCase):
         self.repo.commit("test(gps): cover replays")
         self.assertEqual(cliff(self.repo.path, "--bumped-version").strip(), "v1.0.0")
 
+    def test_ci_changes_never_reach_the_notes(self):
+        self.repo.commit("feat: a")
+        self.repo.tag("v1.0.0")
+        self.repo.commit("ci(release): pin the build tools by hash")
+        self.repo.commit("fix(ci): retry the PyPI download")
+        self.repo.commit("feat(ci): publish a dry-run summary")
+        self.assertEqual(cliff(self.repo.path, "--bumped-version").strip(), "v1.0.0")
+        self.repo.commit("fix(upload): reopen idle sessions")
+        notes = cliff(self.repo.path, "--unreleased", "--tag", "v1.0.1", "--strip", "all")
+        self.assertEqual(notes.strip(), "### Bug Fixes\n\n- **upload:** Reopen idle sessions")
+
     def test_notes_group_the_whole_cycle_since_the_last_stable_release(self):
         self.repo.commit("feat: old")
         self.repo.tag("v1.0.0")
