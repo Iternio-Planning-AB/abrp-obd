@@ -4,7 +4,7 @@ Guidance for AI coding agents working in this repo. `CLAUDE.md` is a symlink to 
 
 This is the **short** entry point: how to build, and the handful of mechanical rules that will bite you
 before you get near the domain. The domain itself lives in [`DONGLE_CONTEXT.md`](DONGLE_CONTEXT.md) —
-4200 lines of it — which is deliberately *not* auto-loaded. Read §0 there first (thirty seconds), then
+over 4000 lines of it — which is deliberately *not* auto-loaded. Read §0 there first (thirty seconds), then
 the section you need. There is a map at the bottom of this file.
 
 ## What this is
@@ -108,8 +108,8 @@ release-notes group needs `git-cliff` (or set `GIT_CLIFF`); without it, it is sk
 Hardware verification still requires a real dongle, and the loop is:
 
 1. Build.
-2. Flash, and reproduce on hardware — a bench supply and the desktop fake car cover the transport, but
-   never the OBD profile, the power gates or anything GPS.
+2. Flash, and reproduce on hardware — a bench supply (and a fake car, an internal tool not in this repo)
+   covers the transport, but never the OBD profile, the power gates or anything GPS.
 3. Read the flash log (`DUMP 3` over serial for the newest three segments, `DUMP` for all of it, or the
    in-app log dump over ABD7). `logEvent` lines are the
    ground truth; `Serial.printf` is lost the moment the cable is out.
@@ -148,16 +148,17 @@ and upload cycle), `Helpers/state_machine.h` (activity states and cadences), `He
   (setup, step by step) and `docs/technical-overview.md` (code layout, settings, console). Keep the
   car table and the settings tables current when the code changes.
 - Check `git remote -v` before reaching for a forge CLI: `gh` only works if the remote is GitHub.
-- The app side lives in the ABRP app repository and has its own `AGENTS.md`. Protocol changes touch both repos
-  and land together; a firmware change that moves a wire format without the app is a broken pair.
+- The app side lives in the ABRP app repository (closed source) and has its own `AGENTS.md`. Protocol changes
+  touch both repos and land together; a firmware change that moves a wire format without the app is a broken pair.
+  From outside, describe the app-side change a PR needs in its description.
 
 ## Diagnostic host checks
 
 Run `python3 tests/run_log_diagnostics_checks.py` for actual DataLogger, CSV, and GPS-selection checks.
 The filesystem is in memory; tests cover schema rotation, failed opens, partial headers, serial dump,
 BLE byte-stream reading, cached GPS fields, native millis wrap, and that BLE write logging (`ble-write`)
-records keys, never values. `--capture-helper <absolute-script-path>`
-also verifies a synthetic dump through the updated capture helper, including actual historical
+records keys, never values. `--capture-helper <absolute-script-path>` (optional; the helper is an internal tool,
+not in this repo) also verifies a synthetic dump through it, including actual historical
 `eacc642` logger-begin and CSV-builder code simulating a firmware rollback; this does not open a device.
 `CXX="clang++ -DNDEBUG"` keeps assertions checked.
 
@@ -181,7 +182,7 @@ The log has no raw-fix columns: `lat`/`lon` (3 decimals) hold the position `gps_
 is the receiver fix itself when `gnss`, and `PARKED_LOC` events log the frozen average. Both are written
 before send-time freshness, so they include positions the uploader later omits; treat flash logs as
 private. Segments from older firmware keep their `gps_lat`/`gps_lon` until rotated out. GPS columns are an optional
-tail after the exact legacy CSV prefix. Rollback rows require the updated capture helper, which reports
+tail after the exact legacy CSV prefix. Rollback rows require the current capture helper, which reports
 legacy-shaped rows and leaves absent diagnostics blank rather than guessing their origin or values.
 
 Upload request IDs reset each wake. The 12-hex SHA256 is a truncated final-wire-payload fingerprint,
@@ -204,9 +205,8 @@ battery upload deliberately discards protected geo history. Queue power-loss ato
 `__geo_` is reserved, scrubbed from profile results and public serializers, and stored as numeric
 shadow metadata only in the private backlog. Legacy/invalid geo provenance drops geo, not otherwise
 eligible battery/state. Actual RTC retention, cross-image resets, ROM gzip and modem behavior remain
-hardware gates. Server freshness/SSE ordering protection remains recommended before a broad firmware
-canary, but sender-only geo eligibility does not depend on an ingest deployment or a backend expired-geo
-exception. Existing backend clock-skew normalization is unchanged.
+hardware gates. Sender-side geo eligibility does not depend on any server-side change; the backend's existing
+clock-skew normalization is unchanged.
 
 ## Send-time geo expiry verification
 
@@ -267,8 +267,8 @@ RTC retention and NVS across a re-plug need a dongle and a parked night (look fo
 Run `python3 tests/run_energy_checks.py` for charge progress/corroboration, the `is_charging` verdict
 and release latch (`signal`, `release`; replays field current sequences, no location data), the `setup()`
 wake gate (taper and charge-end reads), telemetry serialization, CSV columns, and schema-rotation checks under
-ASan/UBSan. Add `--profiles /path/to/abrp/obd` to exercise actual Scenic/iX3 production/developer
-equations with the firmware parser. The runner extracts the current charging and logging code;
+ASan/UBSan. Add `--profiles /path/to/profiles` to exercise actual Scenic/iX3 production/developer
+equations with the firmware parser (optional: the ABRP backend profiles are not public). The runner extracts the current charging and logging code;
 filesystem and hardware are fakes, not on-device verification.
 
 ## Cellular TLS trust checks

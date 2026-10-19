@@ -66,7 +66,7 @@ the ELM327 command set, and that rules some cars out entirely (BMW i3/iX3 among 
 
 **Why bonding and the handshake are now on:** the staging that kept them off existed to speak the
 *older* app protocol, which had no ABD8 handshake and no JWS. That app no longer exists — the dongle
-has no users outside the internal dev fleet — so the audit mode was removed outright rather than
+had no users outside the development fleet when it was retired — so the audit mode was removed outright rather than
 flipped, and `AUTH_ENFORCE` is gone as a concept. An ABD8 proof is now the only session grant.
 
 **Why `PROFILE_REQUIRE_SIGNATURE` is still 0:** different reason, and not back-compat. The gate has
@@ -422,7 +422,7 @@ emulation. Bench results (2026-09-24, each command sent raw to the co-processor)
 - **Monitor mode works.** Lines arrive as `$MON,<4 ID bytes, big-endian>,<DLC>,<data...>` (verified on
   an i3 by filtering on the ID). A request sent while in `ATM1` is processed and monitoring continues.
 
-**Backend profiles this hardware cannot run** (checked against all 50 in `abrp/obd` as of 2026-09-24):
+**Backend profiles this hardware cannot run** (checked against all 50 ABRP backend profiles, which are not public, as of 2026-09-24):
 
 | Profile | Why |
 |---|---|
@@ -506,7 +506,7 @@ value counts, never the frame's presence.
 ## 8. App side — the rules that matter
 
 The app is the ABRP React Native app (Redux Toolkit, redux-persist + MMKV, `react-native-ble-plx`) —
-a **separate repository** from this firmware. This dongle's code lives under `src/state/ble/abrpObd/`,
+a **separate, closed-source repository**; app paths in this document refer to it. This dongle's code lives under `src/state/ble/abrpObd/`,
 `src/state/firmwareUpdate/`, and the `ObdBleSetup` screen; the OBD-BLE test screens are behind
 developer options. Build/run is standard for that repo (`yarn`, its own README) — not covered here.
 Note the protocol level of the app you test against matters: the firmware requires the ABD8
@@ -516,8 +516,7 @@ session.
 - **`tlm_type: 'abrpobd'`** = this dongle. **`'obdble'`** = the older generic dongle lane.
   **Everything added for this dongle must be an add-on that leaves the obdble lane byte-identical.**
   This was verified repeatedly and is the single most important app-side rule.
-- **The vehicle↔dongle binding is server-side** (`POST /vehicles/obdble_device_paired` with
-  `vin_hash` + `obd_ble_device_id`). Consequence: a second phone signed into the same account syncs
+- **The vehicle↔dongle binding is server-side** (stored on the ABRP account). Consequence: a second phone signed into the same account syncs
   the binding and can connect **without ever opening the setup wizard**. Any per-vehicle setting that
   rides the account is therefore applied by phones that were never asked.
 - **The dongle secret is device-local by design** (no backend). That was a deliberate decision — the
@@ -534,14 +533,7 @@ session.
 - **Redux-vs-radio desync is a recurring bug class.** Several paths null `state.ble.deviceId` without
   calling `cancelDeviceConnection`; the next connect then decides from Redux that it should connect,
   against a device the radio still holds → `DeviceAlreadyConnected` until the OS drops the link.
-  One instance is fixed (the `OBD_BLE_GATED_IN_FLIGHT` sentinel + the bleSlice branch that preserves
-  the connection); **others remain open in `bleConnectThunk`** (rejecting after a successful connect
-  without cancelling) and in `listenerThunk`.
-- **Known open app-side bugs** (recorded, not fixed): `setupThunk`'s prologue guards use
-  `return reject(...)` where `reject` returns void, so those guards **fulfil** the thunk instead of
-  rejecting; `listenerThunk` has no silence handling, so a connected-but-silent dongle leaves it
-  pending forever with a live subscription; the wizard's countdown ref is shared across stages, so a
-  stale stage's `stopCountdown()` can disarm the current stage's only timeout.
+  Any path that drops the device from app state must also cancel the radio connection.
 
 ---
 
@@ -615,6 +607,7 @@ Everything below except `README.md` and `docs/` is embedded verbatim in **Part I
 > was lost to summarisation. They were written at different times — where one contradicts Part I or
 > the code, **the code wins, then Part I** (which is newer). Internal cross-references between these
 > documents (e.g. "see DEFERRED_POWER_WORK.md §1c") resolve to the matching appendix here.
+> App-side paths (`src/…`) refer to the closed-source ABRP app repository, not to this one.
 
 | Appendix | Document | Original filename |
 |---|---|---|
@@ -1054,7 +1047,7 @@ backend-stored-secret idea above):
 
 - **TOFU (trust on first use):** an unprovisioned dongle (empty `auth` NVS namespace) accepts the first
   secret written to ABD8 and locks to it. **No factory window / timeout** — dongles are claimed and
-  provisioned in the office before they ever reach a vehicle, so a countdown adds firmware complexity for
+  provisioned by their owner before they ever reach a vehicle, so a countdown adds firmware complexity for
   a parking-lot threat that cannot occur. Rescue from a lost/mismatched secret is the `AUTHCLEAR` serial
   command (physical access; already shipped; does not revoke a live session).
 - **One secret per dongle, no per-person slots** — slots mean chasing every holder down for rotation.
@@ -1109,7 +1102,7 @@ dongle: verify ECDSA-P256 over  "ABRPAUTH1" | dongle_id | nonce  → privileged 
 - Privileged flag is **RAM-only**, cleared on disconnect and after a timeout.
 - Enforcement: `log_dump.h` START gates on `ble.privileged()`.
 - App: new `src/state/ble/abrpObd/authorizeDongleThunk.ts`, called by `fetchDongleLogsThunk`; new endpoint
-  client next to the existing `obdble_device_paired` call, which is where the ownership record already lives.
+  client next to the existing pairing call, which is where the ownership record already lives.
 
 Backend: one endpoint, an ownership check, and private-key storage (KMS/HSM rather than a config file).
 
@@ -2152,7 +2145,7 @@ so switching to B later changes ~one file, not the UI/state.
 ## 2. Where it lives (navigation + UI)
 
 The advanced-OBD screens are registered in
-[`VehicleSettingsModalNavigator.tsx`](src/navigation/VehicleSettingsModalNavigator.tsx)
+`src/navigation/VehicleSettingsModalNavigator.tsx`
 (`ObdPidEditorScreen`, `ObdPidEditorTestScreen`, …). Add the feature exactly like those:
 
 - **New screen:** `src/screens/FirmwareUpdateScreen.tsx`, registered in
@@ -3991,8 +3984,8 @@ access gate instead of the device-local HMAC secret. Routing a safety-critical s
 account while access control deliberately avoids it is exactly the split that rots. Same discipline
 as the secret: stored on the device, authoritative locally, no round-trip.
 
-Note the vehicle *binding* is server-side — `save()` posts to `/vehicles/obdble_device_paired` with
-`vehicle_id`, `vin_hash`, `obd_ble_device_id`, and `updateLocalVehicle` only caches it. That is why
+Note the vehicle *binding* is server-side — `save()` stores it on the account and
+`updateLocalVehicle` only caches it. That is why
 the flag must **not** ride there: a second phone signed into the same account syncs `tlm_type` and
 `obd_ble_device_ids` and can connect and relay **without ever opening the save screen**. An
 account-carried flag would therefore be applied by phones that were never asked the question.
