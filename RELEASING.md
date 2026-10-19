@@ -93,7 +93,6 @@ yours on official ones; that is the point.
 
 - `platform = espressif32` in `platformio.ini` is unpinned, so two releases of the same commit can use different
   toolchains.
-- The pip installs pin versions but not hashes.
 - The publish job trusts what the build job built. It checks only the build tag and the embedded public key, so a
-  compromised PyPI or PlatformIO dependency can't reach the key but could still get a backdoored image signed.
-  Pinning the platform and hashing the pip installs narrows that.
+  compromised PlatformIO dependency can't reach the key but could still get a backdoored image signed. The PyPI tools
+  are pinned by hash (`.github/requirements/release.txt`); pinning the platform narrows the rest.

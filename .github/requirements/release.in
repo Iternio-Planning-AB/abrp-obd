@@ -1,0 +1,4 @@
+# Build tools for release.yml. Regenerate release.txt after changing a pin:
+#   uv pip compile --generate-hashes --universal --python-version 3.12 .github/requirements/release.in -o .github/requirements/release.txt
+platformio==6.1.18
+git-cliff==2.14.2

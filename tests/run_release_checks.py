@@ -490,6 +490,24 @@ class WorkflowGuards(unittest.TestCase):
         self.assertNotIn("secrets.", build)
         self.assertIn("contents: read", build)
 
+    def test_build_tools_install_only_by_hash(self):
+        # A hash-less install would let a republished PyPI version run with the release's checkout.
+        install = self.wf.run_script(self.wf.step("build", "Install tools"))
+        self.assertIn("--require-hashes", install)
+        self.assertIn("-r .github/requirements/release.txt", install)
+        lock = (ROOT / ".github/requirements/release.txt").read_text()
+        reqs = re.split(r"(?m)^(?=[a-z])", lock)[1:]
+        self.assertTrue(reqs)
+        for req in reqs:
+            with self.subTest(req=req.split()[0]):
+                self.assertRegex(req, r"^[a-z0-9_.-]+==[^\s]+")
+                self.assertIn("--hash=sha256:", req)
+        pins = re.findall(r"(?m)^([a-z0-9_.-]+==\S+)$", (ROOT / ".github/requirements/release.in").read_text())
+        self.assertTrue(pins)
+        for pin in pins:
+            self.assertIsNotNone(re.search(rf"(?m)^{re.escape(pin)} ", lock),
+                                 f"{pin} not in release.txt: regenerate it from release.in")
+
     def test_signing_job_runs_no_downloaded_build_tooling(self):
         publish = self.wf.jobs["publish"]
         self.assertIn("id-token: write", publish)
