@@ -262,6 +262,7 @@ during setup, and parked charge sampling is suppressed. The remaining limits for
 | `CHARGE_END_POLL_FLOOR` | `12.2` V | After a charge, a rail between this and 13.0 V gets one final read, so the charge end and final SoC reach ABRP. |
 | `CHARGE_STREAM_CONFIRM_SECONDS` / `CHARGE_DISCHARGE_AMPS` | `180` s / `2.0` A | While awake and polling continuously, a charging reading counts only after this long without a discharge sample, so regen at the start of a drive is not reported as charging. |
 | `CHARGE_SILENT_HOLD_POLLS` | `4` | Polls the car doesn't answer that keep the charging latch, so the end of a charge is still read when the rail drops. |
+| `PARK_RELOCATE_MIN_M` / `_MAX_HDOP` / `_MAX_SPREAD_M` | `500` m / `250` (HDOP 2.5) / `50` m | A parked car whose average of fresh, good (HDOP ≤ 2.5), tightly clustered (within 50 m) stationary GNSS fixes lies this far from its frozen spot, or has no frozen spot yet, is moved there: for a drive the GNSS never saw moving, or a cold boot. |
 | `IO36_LOCKOUT_LOW` / `_HIGH` | 8.0 / 11.0 V | Weak-battery band: suppress all polling so a recoverable 12 V isn't pushed over the edge. |
 
 `RAIL_AWAKE_VOLTS` was calibrated on one car with almost no margin: driving 13.25–15.2 V,

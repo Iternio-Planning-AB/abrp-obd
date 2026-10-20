@@ -595,6 +595,22 @@
 // came from using one sample, not from poor reception. Averaging N samples cuts random error by ~sqrt(N).
 #define PARK_ACC_MIN 12
 
+// Distance (m) between a parked wake's stationary average (PARK_ACC_MIN fresh fixes or more) and the frozen spot
+// beyond which the frozen spot moves there. Only a drive the GNSS never saw at GPS_MOVING_MIN_KMH needs it: no
+// park transition happens, so nothing re-freezes. FIELD (Ioniq 5, week of 2026-10-15): GNSS took 2.5-31 min to
+// lock, so 6 of 12 drives ended before any moving fix and the car kept reporting the previous spot; on 2026-10-17 it
+// locked on arrival with 12 satellites, which this uses. Far outside one spot's 22 m scatter and a
+// garage's multipath, so a parked car never wanders; any real trip is far beyond it.
+#define PARK_RELOCATE_MIN_M 500
+// Relocation evidence must be a good fix: HDOP at most this, in the co-processor's x100 units (12-satellite
+// parking fixes log 47-69). Moving fixes on the 2026-10-19 drives logged 66-209 with 4-12 satellites, so 250
+// keeps every real one and rejects multipath. Cold-start first fixes logged LOW values (1, 25 at 5-6 sats), so
+// HDOP alone cannot reject those; the cluster bound below and PARK_ACC_MIN do.
+#define PARK_RELOCATE_MAX_HDOP 250
+// ...and one tight cluster: a fix this far from the window's first sample restarts it. A stopped receiver
+// scatters under ~15 m from its mean; a 4 km/h crawl leaves 50 m in 9 polls, before PARK_ACC_MIN fills.
+#define PARK_RELOCATE_MAX_SPREAD_M 50
+
 // ---- IO36_BatDec true-rail voltage (12V sense ADC) ----
 // ATRV (batt12v) is the OBD ADAPTER's reported voltage - it reads ~5.3V on a sleeping Scenic, which may be
 // an adapter artifact rather than the true 12V rail. GPIO36 (IO36_BatDec) sits on a resistive divider off

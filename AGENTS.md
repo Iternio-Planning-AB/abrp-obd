@@ -91,15 +91,16 @@ Parser checks cover rejected/truncated replies preserving the accepted record, m
 32-bit-overflowing required integers, coordinate rejection/recovery and optional heading handling.
 Selected GNSS integration checks follow the real sampling/frame/unlatch order: the first moving fix
 emits live coordinates while still PARK, the next distinct moving fix unlatches DRIVE, replayed or
-rejected replies do not create fresh movement, and fresh zero-speed fixes still use the frozen parked
-position. Each group starts from a reset fixture. These are not full state-machine, OBD-profile,
-power-gate or GNSS-hardware tests. The synthetic in-memory queue test verifies all 120 points arrive
+rejected replies do not create fresh movement, fresh zero-speed fixes still use the frozen parked
+position, and `gps-relocate` moves that position only once `PARK_ACC_MIN` fresh stationary fixes average
+beyond `PARK_RELOCATE_MIN_M`. Each group starts from a reset fixture. These are not full state-machine,
+OBD-profile, power-gate or GNSS-hardware tests. The synthetic in-memory queue test verifies all 120 points arrive
 once, in order, with battery data intact; it does not exercise LittleFS restoration or the cellular
 modem.
 
 Pass a group name (`link-range`, `link-failures`, `link-truncated`, `link-required`, `link-atomic`,
-`link-valid`, `gps-replay`, `gps-rejected`, `gps-stationary`, `direct-missing`, `direct-range`, or
-`queue`) to run just that group.
+`link-valid`, `gps-replay`, `gps-rejected`, `gps-stationary`, `gps-relocate`, `direct-missing`,
+`direct-range`, or `queue`) to run just that group.
 
 Run `python3 tests/run_release_checks.py` for the release tooling: version naming and selection, build-tag
 resolution, signing through a fake `aws` with throwaway keys, and the workflow's safety properties. The
@@ -195,7 +196,7 @@ truncation metadata. The body-ACK outcome remains diagnostic; POST acceptance an
 
 ## Combined freshness verification and rollout
 
-The combined heading/GPS runner now has 30 groups; `upload-gate` covers which polls are buffered for upload. Run it normally and with `CXX='clang++ -DNDEBUG'`.
+The combined heading/GPS runner now has 31 groups; `upload-gate` covers which polls are buffered for upload. Run it normally and with `CXX='clang++ -DNDEBUG'`.
 It covers accepted-record observation UTC, strict calendars, independent location/heading times,
 frozen-average contributor times, and valid GPS clock seeding before a coordinate fix. The backlog
 oracle compiles the historical `eacc642` loader/serializer/resave path; it verifies numeric battery

@@ -1,4 +1,5 @@
 #include <cerrno>
+#include <functional>
 #include <cctype>
 #include <climits>
 #include <cmath>
@@ -551,6 +552,89 @@ void gpsStationary() {
         "fresh stationary receiver record is accepted and ages independently of published frozen location");
   check(!first.contains("heading") && !fresh.contains("heading") && !gpsMovingFresh(GPS_MOVING_MAX_AGE_MS) &&
         last_active == 0 && g_last_speed_ms == 0, "stationary fixes neither emit heading nor unlatch parked");
+}
+
+// Fresh zero-speed fixes in GNIFO 1e6 units, one receiver second apart from 11:08:00; lat_step walks them.
+int stationary_second = 0;
+void stationaryFixes(int count, long lat, long lng, const std::string& label, int hdop = 7,
+                     const std::string& date = "41026", long lat_step = 0) {
+  for (int i = 0; i < count; ++i) {
+    fake_ms += 5000;
+    const int second = stationary_second++;
+    acceptLink("$GNIFO," + date + "," + std::to_string(11080000 + second / 60 * 10000 + second % 60 * 100) + "," +
+               std::to_string(lat + i * lat_step) + "," + std::to_string(lng) + ",2500,0,9000,12," +
+               std::to_string(hdop) + "\r", label);
+    gpsFrame();
+  }
+}
+
+void gpsRelocate() {
+  const long far = 59338000, lng = 18060000;  // ~2 km north of parkedFixture's 59.32, 18.06
+  auto keepsFrozen = [](const std::string& label) {
+    checkLocation(checkState(gpsFrame(), true, label), 59.32, 18.06, label + ": frozen spot kept");
+  };
+  auto fresh = [](const std::function<void()>& setup) { resetFixture(); stationary_second = 0; setup(); };
+
+  fresh(parkedFixture);
+  stationaryFixes(PARK_ACC_MIN - 1, far, lng, "short far average");
+  keepsFrozen("fewer than PARK_ACC_MIN far fixes");
+  stationaryFixes(1, far, lng, "full far average");
+  auto point = checkState(gpsFrame(), true, "relocated parked spot");
+  checkLocation(point, 59.338, 18.06, "full stationary average 2 km away relocates the frozen spot");
+  check(point["location"]["time"] == "2026-10-04T11:08:11Z" && !point.contains("heading") &&
+        last_active == 0 && g_last_speed_ms == 0, "relocation keeps newest contributor UTC and does not unlatch");
+
+  fresh(parkedFixture);
+  stationaryFixes(5, far, lng, "far before bad date");
+  stationaryFixes(1, far, lng, "far bad date", 7, "310426");
+  stationaryFixes(6, far, lng, "far after bad date");
+  point = checkState(gpsFrame(), true, "relocated with unknown contributor time");
+  check(!point.contains("location") && point["soc"]["frac"] == 0.5,
+        "relocation with an unknown contributor time omits geo but keeps battery");
+
+  fresh(parkedFixture);
+  stationaryFixes(PARK_ACC_MIN * 2, 59320270, lng, "near average");
+  keepsFrozen("stationary average 30 m away");
+
+  fresh(parkedFixture);
+  stationaryFixes(1, far, lng, "replay seed");
+  const std::string replay = link.response;
+  for (int i = 0; i < PARK_ACC_MIN * 2; ++i) {
+    fake_ms += 5000;
+    acceptLink(replay, "replayed far fix");
+    gpsFrame();
+  }
+  keepsFrozen("one replayed far fix");
+
+  fresh(parkedFixture);
+  is_currently_parked = false;
+  stationaryFixes(PARK_ACC_MIN, far, lng, "unlatched far average");
+  is_currently_parked = true;
+  keepsFrozen("stops while unlatched are left to the park transition");
+
+  fresh(parkedFixture);
+  stationaryFixes(PARK_ACC_MIN * 2, far, lng, "poor-HDOP far average", PARK_RELOCATE_MAX_HDOP + 1);
+  keepsFrozen("far fixes with poor HDOP");
+
+  fresh(parkedFixture);
+  stationaryFixes(PARK_ACC_MIN * 2, far, lng, "HDOP 3.00 overflowing uint8_t", 300);
+  keepsFrozen("far fixes whose HDOP overflows the byte");
+
+  fresh(parkedFixture);
+  stationaryFixes(PARK_ACC_MIN * 2, far, lng, "4 km/h crawl", 7, "41026", 50);
+  keepsFrozen("zero-speed fixes crawling 5.6 m per 5 s poll");
+
+  fresh(parkedFixture);
+  stationaryFixes(PARK_ACC_MAX, 59324300, lng, "saturating average ~480 m away");
+  stationaryFixes(PARK_ACC_MIN, 59324700, lng, "next average ~520 m away");
+  checkLocation(checkState(gpsFrame(), true, "after saturation"), 59.3247, 18.06,
+                "a saturated parked average restarts and can still relocate");
+
+  fresh([] { g_gps_powered = is_currently_parked = true; });
+  stationaryFixes(PARK_ACC_MIN, far, lng, "cold-boot average");
+  point = checkState(gpsFrame(), true, "cold-boot average");
+  checkLocation(point, 59.338, 18.06, "cold boot freezes a full stopped average");
+  check(frozen_valid && std::string(gpsLocationSource()) == "frozen", "cold-boot average becomes the frozen spot");
 }
 
 void feedRmc(const std::string& course, const std::string& latitude = "5920.000") {
@@ -1250,6 +1334,7 @@ int main(int argc, char** argv) {
     {"link-range", linkRange}, {"link-failures", linkFailures}, {"link-truncated", linkTruncated},
     {"link-required", linkRequired}, {"link-atomic", linkAtomic}, {"link-valid", linkValid},
     {"gps-replay", gpsReplay}, {"gps-rejected", gpsRejected}, {"gps-stationary", gpsStationary},
+    {"gps-relocate", gpsRelocate},
     {"direct-missing", directMissing}, {"direct-range", directRange}, {"queue", serializerAndQueue},
     {"gps-diagnostics", gpsDiagnostics}, {"gps-direct-diagnostics", directGpsDiagnostics},
     {"geo-legacy", geoLegacy}, {"geo-times", geoTimes}, {"geo-privacy", geoPrivacy}, {"geo-accepted", geoAccepted},

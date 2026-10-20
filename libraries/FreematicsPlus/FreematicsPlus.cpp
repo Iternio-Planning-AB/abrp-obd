@@ -667,7 +667,8 @@ bool FreematicsESP32::gpsGetData(GPS_DATA** pgd) {
       if (!( s = strchr(s, ',') )) break;
       candidate.sat = atoi(++s);
       if (!( s = strchr(s, ',') )) break;
-      candidate.hdop = atoi(++s);
+      int hdop = atoi(++s);
+      candidate.hdop = hdop > 255 ? 255 : hdop < 0 ? 0 : hdop; // uint8_t: 300 must not wrap to a good 44
     } while (0);
     if (gpsData.lat || gpsData.lng) {
       // filter out invalid coordinates
