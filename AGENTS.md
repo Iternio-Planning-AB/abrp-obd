@@ -157,7 +157,8 @@ and upload cycle), `Helpers/state_machine.h` (activity states and cadences), `He
 Run `python3 tests/run_log_diagnostics_checks.py` for actual DataLogger, CSV, and GPS-selection checks.
 The filesystem is in memory; tests cover schema rotation, failed opens, partial headers, serial dump,
 BLE byte-stream reading, cached GPS fields, native millis wrap, and that BLE write logging (`ble-write`)
-records keys, never values. `--capture-helper <absolute-script-path>` (optional; the helper is an internal tool,
+records keys, never values, and (`motion`) the per-minute `MOTION` line aggregation: percentages, peak/mean,
+one line per minute, the partial-minute flush at sleep and uncounted OTA/log-dump windows. `--capture-helper <absolute-script-path>` (optional; the helper is an internal tool,
 not in this repo) also verifies a synthetic dump through it, including actual historical
 `eacc642` logger-begin and CSV-builder code simulating a firmware rollback; this does not open a device.
 `CXX="clang++ -DNDEBUG"` keeps assertions checked.

@@ -382,6 +382,7 @@ void saveUploadBacklog();                      // Helpers/network_upload.h
 void bleDeinitForSleep();                      // Helpers/ble.h (no-op stub when BLE is disabled)
 void changeState(ActivityState new_state);     // Helpers/state_machine.h
 
+#include "Helpers/motion_stats.h" // pure MOTION-line aggregation, used by mems.h
 #include "Helpers/mems.h"
 #include "Helpers/server_roots.h" // data only: the trust bundle setup() hands the cellular transport
 #include "Helpers/clock_sync.h"
@@ -1378,6 +1379,9 @@ void loop() {
 #endif
 #endif
     int obd_count = (int)current_frame.size(); // PIDs returned this reading (0 = car asleep / no answer)
+#if ENABLE_MEMS && ENABLE_LOGGING
+    if (obd_count > 0) motion_stats.obd = true;
+#endif
     g_last_voltage = obd.getVoltage(); // refresh the cached ATRV once per cycle (reused by row + events below)
     // NOTE: g_last_io36 is NOT refreshed here any more - it is taken at the top of the cycle, before
     // the alarm gate reads it. Re-reading here would only make the telemetry row's rail marginally

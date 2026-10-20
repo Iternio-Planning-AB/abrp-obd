@@ -548,6 +548,14 @@ session.
   <s> asleep -> rate <ppm>` is a NITZ/NTP resync teaching the rate. `NET clock resynced ... (residual)` is
   what compensation left over. `NET clock resync FAILED` means the wake runs on the compensated RTC. After each
   deep-sleep `WAKE`, `CLOCK wake slept <s>, adjusted <ms> at <ppm>` says what that wake corrected.
+- **`MOTION act=<%> n=<windows> s=<span> peak=<g> mean=<g> axmax=<g> obd parked chg`** is one line per awake
+  minute (and the partial minute before `SLEEP enter`; one in progress when an OTA reboots is lost). `act` is the
+  share of 500 ms `detectMovement` windows that saw motion; `axmax` is the largest single-axis value, which is what
+  that 0.1 g threshold compares; `peak` is the largest bias-removed |acc| and `mean` the mean of per-window peaks.
+  The bias is a short running average, so these show vibration, not sustained acceleration. `s` is the span the
+  windows cover: a blocking upload between windows stretches a "minute". Rail and time are on the EVT prefix.
+  Diagnostic only, gathered to judge accelerometer drive detection for cars with no OBD speed PID; nothing decides
+  on it, and OTA/log-dump windows (which bypass `detectMovement`) are not counted.
 - **Log the *reason*, not just the outcome.** A subsystem that goes quiet with an empty log is the
   shape that gets misattributed to the cellular stack for weeks — this has happened more than once
   in this project (the transport-handoff bug; a stored hash claiming a profile that wasn't running).

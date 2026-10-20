@@ -69,9 +69,10 @@ void calculateBias(Point3D new_acc) {
 
 //update mem_data
 
-void processMEMS() {
+// false when the read failed and mem_data still holds the previous sample
+bool processMEMS() {
   float temp;
-  if (!mems->read(mem_data.acc, mem_data.gyr, mem_data.mag, &temp)) return;
+  if (!mems->read(mem_data.acc, mem_data.gyr, mem_data.mag, &temp)) return false;
   mem_data.deviceTemp = (int)temp;
 
   calculateBias(Point3D(mem_data.acc));
@@ -102,6 +103,7 @@ void processMEMS() {
   mem_data.accSum[1] = 0;
   mem_data.accSum[2] = 0;
   mem_data.accCount = 0;
+  return true;
 }
 
 //Initial calibration
@@ -156,11 +158,20 @@ void softResetMEMS() {
 // Poll the accelerometer for up to `duration` ms and report whether motion was seen; refreshes
 // the awake leash (last_active) on the first movement. Used by handleActivityState() every loop.
 #if ENABLE_MEMS
+float motion_window_peak = 0;   // g, largest bias-removed |acc| this window; MOTION diagnostic only
+float motion_window_axmax = 0;  // g, largest single-axis value the 0.1 g threshold below compares
+
 bool detectMovement(unsigned long duration) {
   bool active = false;
+  motion_window_peak = 0;
+  motion_window_axmax = 0;
   auto start = millis();
   while (millis() - start < duration) {
-    processMEMS();
+    if (processMEMS()) {
+      if (mem_data.motion > motion_window_peak * motion_window_peak) motion_window_peak = sqrtf(mem_data.motion);
+      for (byte i = 0; i < 3; i++)
+        if (mem_data.acc[i] > motion_window_axmax) motion_window_axmax = mem_data.acc[i];
+    }
     if (mem_data.acc[0] > 0.1 || mem_data.acc[1] > 0.1 || mem_data.acc[2] > 0.1) {
       active = true;
       last_active = millis();
@@ -174,4 +185,26 @@ bool detectMovement(unsigned long duration) {
 #endif
   return active;
 }
+
+#if ENABLE_LOGGING
+MotionStats motion_stats;
+
+static void logMotionStats(const MotionStats& m) {
+  char line[120];
+  motionStatsLine(line, sizeof(line), m, is_currently_parked, recently_charging);
+  logEvent("%s", line);
+}
+
+// Called after every handleActivityState() window. Diagnostic only: no decision reads motion_stats.
+void noteMotionWindow(bool sampled, bool active) {
+  MotionStats done;
+  if (motionStatsWindow(motion_stats, sampled, active, motion_window_peak, motion_window_axmax, millis(), done)) logMotionStats(done);
+}
+
+// Before the SLEEP enter line, so a short wake still leaves its partial minute.
+void flushMotionStats() {
+  MotionStats done;
+  if (motionStatsTake(motion_stats, done)) logMotionStats(done);
+}
+#endif
 #endif

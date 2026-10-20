@@ -13,7 +13,7 @@ import tempfile
 root = Path(__file__).resolve().parents[1]
 compiler = shlex.split(os.environ.get("CXX", "clang++"))
 parser = argparse.ArgumentParser()
-parser.add_argument("group", nargs="?", default="all", choices=["all", "schema", "logging", "schema-failures", "ble-write"])
+parser.add_argument("group", nargs="?", default="all", choices=["all", "schema", "logging", "schema-failures", "ble-write", "motion"])
 parser.add_argument("--capture-helper", type=Path)
 arguments = parser.parse_args()
 # The ble-write group tests the summary; this keeps blewrapper.cpp using it. A log or print call that names a
