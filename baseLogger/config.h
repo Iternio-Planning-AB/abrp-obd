@@ -611,6 +611,9 @@
 // scatters under ~15 m from its mean; a 4 km/h crawl leaves 50 m in 9 polls, before PARK_ACC_MIN fills.
 #define PARK_RELOCATE_MAX_SPREAD_M 50
 
+// The GNSS jump filter's tunables (GPS_JUMP_*: margin, max speed, re-anchor run) live with gpsGetData in
+// libraries/FreematicsPlus/FreematicsPlus.cpp, which cannot include this file.
+
 // ---- IO36_BatDec true-rail voltage (12V sense ADC) ----
 // ATRV (batt12v) is the OBD ADAPTER's reported voltage - it reads ~5.3V on a sleeping Scenic, which may be
 // an adapter artifact rather than the true 12V rail. GPIO36 (IO36_BatDec) sits on a resistive divider off

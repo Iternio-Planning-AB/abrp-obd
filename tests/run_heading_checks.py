@@ -7,7 +7,9 @@ import tempfile
 
 root = Path(__file__).resolve().parents[1]
 source = (root / "libraries/FreematicsPlus/FreematicsPlus.cpp").read_text()
-start = source.index("bool FreematicsESP32::gpsGetData(GPS_DATA** pgd) {")
+start = source.index("// BEGIN gps-jump-filter")
+if source.index("// END gps-jump-filter", start) > source.index("bool FreematicsESP32::gpsGetData(GPS_DATA** pgd) {"):
+    raise RuntimeError("the gps-jump-filter block must sit immediately before gpsGetData")
 end = source.index("\nint FreematicsESP32::gpsGetNMEA(", start)
 header = (root / "libraries/FreematicsPlus/FreematicsPlus.h").read_text()
 diagnostics_api = next(line for line in header.splitlines() if "gpsReadDiagnostics() const" in line)

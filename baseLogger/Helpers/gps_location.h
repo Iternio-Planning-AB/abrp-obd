@@ -36,6 +36,11 @@ uint32_t gpsUtc(const GPS_DATA& fix) {
 
 bool pollGpsData() {
   bool accepted = sys.gpsGetData(&gd);
+#if ENABLE_LOGGING
+  const GPSReadDiagnostics& read = sys.gpsReadDiagnostics();
+  if (read.reanchored)   // no coordinates: the flash log is private, but the distance is enough
+    logEvent("GPS reanchor dist=%lum rejects=%u", (unsigned long)read.reanchor_dist_m, (unsigned)read.reanchor_rejects);
+#endif
   if (accepted) {
     geo_accepted = gd ? *gd : GPS_DATA{};
     geo_accepted_utc = gd && geoValidLocation(gd->lat, gd->lng) && gd->lat != 0 && gd->lng != 0 ? gpsUtc(*gd) : 0;

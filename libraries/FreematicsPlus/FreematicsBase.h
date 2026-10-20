@@ -75,6 +75,9 @@ struct GPSReadDiagnostics {
 	GPSReadResult result = GPSReadResult::NotAttempted;
 	uint16_t reply_bytes = 0;
 	int8_t field = -1;
+	bool reanchored = false;        // this read replaced a jump-filter anchor that was locking good fixes out
+	uint32_t reanchor_dist_m = 0;   // how far the new anchor is from the one it replaced
+	uint8_t reanchor_rejects = 0;   // consecutive fresh fixes rejected before it
 };
 
 class CLink
