@@ -258,6 +258,7 @@ private:
   BLEServer* pServer = NULL;
   BLEService* pService = NULL;
   BLECharacteristic* pTelemetryCharacteristic = NULL;
+  BLE2902* pTelemetryCccd = NULL;                       // ABD1's CCCD: is the direct notify wanted?
   BLECharacteristic* pStartupCharacteristic = NULL;
   BLECharacteristic* pDeveloperCharacteristic = NULL;
   BLECharacteristic* pErrorCharacteristic = NULL;

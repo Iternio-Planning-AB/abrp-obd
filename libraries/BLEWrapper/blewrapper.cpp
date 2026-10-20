@@ -2,6 +2,17 @@
 #include "ble_write_summary.h"
 #include <stdarg.h>
 
+// The GATT interface and connection for ABD1's direct notify, captured on connect. Runs on the Bluedroid
+// task, so two plain stores and nothing else.
+static volatile uint16_t s_gatts_if = ESP_GATT_IF_NONE;
+static volatile uint16_t s_conn_id = 0;
+static void captureGattsConnection(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
+                                   esp_ble_gatts_cb_param_t* param) {
+  if (event != ESP_GATTS_CONNECT_EVT) return;
+  s_conn_id = param->connect.conn_id;
+  s_gatts_if = gatts_if;
+}
+
 /*  
   Initialize all BLE essentials
 */
@@ -51,6 +62,7 @@ void BLEWrapper::init() {
   // 239-byte log chunks instead of 177, single-packet, ~35% faster. Idle Android connections that
   // never ask stay at 23 and keep the documented notify-then-read telemetry fallback.
   BLEDevice::setMTU(247);
+  BLEDevice::setCustomGattsHandler(captureGattsConnection);
   pServer = BLEDevice::createServer();
   pServer->setCallbacks(new ServerCallbacks(this));
   // 32 attribute handles, NOT the default 15. Cost: service declaration 1, each characteristic 2, each
@@ -224,7 +236,7 @@ void BLEWrapper::init() {
 
   // https://www.bluetooth.com/specifications/gatt/viewer?attributeXmlFile=org.bluetooth.descriptor.gatt.client_characteristic_configuration.xml
   // Create a BLE Descriptor
-  BLE2902* pTelemetryCccd = new BLE2902();
+  pTelemetryCccd = new BLE2902();
   pTelemetryCharacteristic->addDescriptor(pTelemetryCccd);
   BLE2902* pStartupCccd = new BLE2902();
   pStartupCharacteristic->addDescriptor(pStartupCccd);
@@ -306,6 +318,8 @@ void BLEWrapper::deinit() {
   pServer = NULL;             // pointers are stale after deinit; init() recreates the server/service/chars
   pService = NULL;
   pTelemetryCharacteristic = NULL;
+  pTelemetryCccd = NULL;
+  s_gatts_if = ESP_GATT_IF_NONE;
   pStartupCharacteristic = NULL;
   pDeveloperCharacteristic = NULL;
   pErrorCharacteristic = NULL;
@@ -425,18 +439,18 @@ bool BLEWrapper::logError(std::string error) {
 }
 
 /*
-  Send telemetry on ABD1. notify() sends the characteristic value, so the fitted frame is set for the
-  notify and the full frame restored for the app's follow-up read; the stack copies the notify bytes,
-  so restoring at once is safe. An empty notify_payload updates the readable value only.
+  Send telemetry on ABD1: the full frame becomes the readable value, and the fitted frame goes out as a
+  notify straight to the stack (which copies it). Never via setValue+notify(): the value must not be
+  swapped while a blob read is copying it on the Bluedroid task, which keeps its own read offset.
 */
 bool BLEWrapper::logData(const std::string& notify_payload, const std::string& read_value) {
 
   if (device_connected && get_authenticated()) {
-    if (!notify_payload.empty()) {
-      pTelemetryCharacteristic->setValue(notify_payload);
-      pTelemetryCharacteristic->notify();
+    pTelemetryCharacteristic->setValue(read_value);
+    if (pTelemetryCccd && pTelemetryCccd->getNotifications() && s_gatts_if != ESP_GATT_IF_NONE) {
+      esp_ble_gatts_send_indicate(s_gatts_if, s_conn_id, pTelemetryCharacteristic->getHandle(),
+        notify_payload.size(), (uint8_t*)notify_payload.data(), false);
     }
-    if (notify_payload != read_value) pTelemetryCharacteristic->setValue(read_value);
 #if PRINT 
     Serial.printf("New value notified: %s\n", notify_payload.c_str());
 #endif
@@ -769,7 +783,7 @@ void ServerCallbacks::onDisconnect(BLEServer* pServer, esp_ble_gatts_cb_param_t*
 }
 
 /*
-  Log the negotiated ATT MTU. Our ceiling is 517 (BLEDevice::setMTU); iOS settles at ~185 on its own, Android
+  Log the negotiated ATT MTU. Our ceiling is 247 (BLEDevice::setMTU); iOS settles at ~185 on its own, Android
   gets whatever the app requested (the transfer engines ask for 517). A NOTIFY can't exceed MTU-3 (no
   fragmentation), so the ABD1 notify is fitted to this value (bleTlmFrame); reads use long/blob reads and
   carry the full frame.
@@ -818,9 +832,9 @@ void DeveloperCallbacks::onWrite(BLECharacteristic* pDeveloperCharacteristic) {
 /*
   The app's notify-then-READ: after each ABD1 notification it issues a separate GATT read and parses that.
   logData()'s setValue() keeps ABD1's readable value = the latest {"tlm":{...}} frame, so the read here returns
-  current data with no work needed. Logging it confirms the app is exercising the read path (if this never
-  appears while connected, the app switched to parsing the notify payload directly - which is fine, our notify
-  already carries the full frame).
+  current data with no work needed. Logging it confirms the app is exercising the read path. If this never
+  appears while connected, the app parses the notify payload, which is the full frame only when it fits
+  MTU-3 (bleTlmFrame trims it otherwise).
 */
 void TelemetryCallbacks::onRead(BLECharacteristic* pTelemetryCharacteristic) {
   wrapper->logEvt("ABD1 read by app");

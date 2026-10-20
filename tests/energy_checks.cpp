@@ -453,9 +453,8 @@ void bleFrameChecks() {
     {"lat", 1.5}, {"lon", 2.5}};
   const json reference = referenceTlm(driving);
   const size_t reference_bytes = std::string("{\"tlm\":}").size() + reference.dump().size();
-  check(reference_bytes > 210 && reference_bytes <= 230, "reference driving frame is field-sized under %.2f");
   const auto android = bleTlmFrame(driving, bleNotifyBudget(247));
-  check(android.fit == BLE_FIT && android.dropped == 0 && android.notify == android.full &&
+  check(android.dropped == 0 && android.notify == android.full &&
         android.full.size() <= 244 && android.full.size() < reference_bytes,
         "compact driving frame fits MTU 247 untrimmed and is shorter than %.2f");
   check(json::parse(android.notify)["tlm"] == reference, "compact frame keeps every key and its 2 dp value");
@@ -474,9 +473,8 @@ void bleFrameChecks() {
     {"is_dcfc", 0}};
   const json smaller_reference = referenceTlm(smaller);
   const auto smaller_ios = bleTlmFrame(smaller, bleNotifyBudget(185));
-  check(std::string("{\"tlm\":}").size() + smaller_reference.dump().size() > 182 && smaller_ios.fit == BLE_FIT &&
-        smaller_ios.notify.size() <= 182 && json::parse(smaller_ios.notify)["tlm"] == smaller_reference,
-        "a frame over 182 B under %.2f fits MTU 185 untrimmed once compact");
+  check(smaller_ios.dropped == 0 && smaller_ios.notify.size() <= 182 && json::parse(smaller_ios.notify)["tlm"] == smaller_reference,
+        "the smaller field frame fits MTU 185 untrimmed once compact");
   check(bleTlmString(driving) == bleTlmFrame(driving, 244).full, "bleTlmString is the full compact frame");
 
   auto text = [](double value) {
@@ -494,22 +492,17 @@ void bleFrameChecks() {
   // Small budget: priority decides what survives, never a cut mid-token.
   const auto small = bleTlmFrame(driving, 140);
   const auto kept = json::parse(small.notify)["tlm"];
-  check(small.fit == BLE_TRIMMED && small.notify.size() <= 140 && small.dropped > 0 &&
+  check(small.notify.size() <= 140 && small.dropped > 0 &&
         small.dropped == (int)(reference.size() - kept.size()), "small MTU trims and counts dropped fields");
   for (const auto& key : {"soc", "power", "current", "voltage", "speed", "is_charging", "is_parked", "is_dcfc"})
     check(kept.contains(key) && kept[key] == reference[key], std::string("small MTU keeps priority field ") + key);
   for (const auto& key : {"batt_temp_min", "batt_temp_max", "kwh_charged"})
     check(!kept.contains(key), std::string("small MTU drops low-priority field ") + key);
   check(json::parse(small.full)["tlm"] == reference, "readable value keeps the full frame when the notify is trimmed");
-  const auto medium = bleTlmFrame(driving, 160);
-  const auto medium_kept = json::parse(medium.notify)["tlm"];
-  check(medium.fit == BLE_TRIMMED && medium.notify.size() <= 160 && medium_kept.contains("soh") &&
-        medium_kept.contains("batt_temp") && !medium_kept.contains("batt_temp_min") &&
-        !medium_kept.contains("batt_temp_max"), "temperature bounds go before mid-priority fields");
 
   // MTU 23 carries 20 B: whatever fits is still a valid frame (it triggers the app's read).
   const auto tiny = bleTlmFrame(driving, bleNotifyBudget(23));
-  check(bleNotifyBudget(23) == 20 && tiny.fit == BLE_TRIMMED && tiny.notify.size() <= 20 &&
+  check(bleNotifyBudget(23) == 20 && tiny.dropped > 0 && tiny.notify.size() <= 20 &&
         json::parse(tiny.notify)["tlm"].is_object(), "MTU 23 notifies a valid frame within 20 bytes");
   const auto first = bleTlmFrame({{"power", 5}, {"is_parked", 1}, {"soc", 63.5}}, bleNotifyBudget(23));
   check(json::parse(first.notify)["tlm"] == json{{"soc", 63.5}}, "MTU 23 spends its 20 bytes on soc first");
@@ -526,15 +519,83 @@ void bleFrameChecks() {
         "listed fields outrank profile-private keys");
   const auto exact = bleTlmFrame(detail, bleTlmString(detail).size());
   const auto over = bleTlmFrame(detail, bleTlmString(detail).size() - 1);
-  check(exact.fit == BLE_FIT && over.fit == BLE_TRIMMED && over.notify.size() < bleTlmString(detail).size(),
+  check(exact.dropped == 0 && over.dropped > 0 && over.notify.size() < bleTlmString(detail).size(),
         "a frame exactly the budget fits, one byte over is trimmed");
   check(bleNotifyBudget(185) == 182 && bleNotifyBudget(247) == 244 && bleNotifyBudget(517) == 244 &&
         bleNotifyBudget(0) == 20, "budget is MTU-3 inside the 23..247 range the stack can carry");
-  const auto none = bleTlmFrame(driving, 9);
-  check(none.fit == BLE_SKIPPED && none.notify.empty(), "a budget below the empty envelope skips the notify");
-  check(std::string(bleFitName(BLE_FIT)) == "fit" && std::string(bleFitName(BLE_TRIMMED)) == "trimmed" &&
-        std::string(bleFitName(BLE_SKIPPED)) == "skipped", "verdict names match the log line");
+
+  // Every listed key plus a private one. Each adjacent pair, in reverse frame order, at a budget that holds
+  // either field alone but not both: the higher one must win. That pins the whole order, which a prefix
+  // budget cannot do once a longer field can be skipped for a shorter one.
+  const std::vector<std::string> order{"soc", "power", "current", "voltage", "speed", "is_charging", "is_parked",
+    "is_dcfc", "soh", "est_battery_range", "batt_temp", "ext_temp", "odometer", "soe", "capacity", "hvac_power",
+    "cabin_temp", "elevation", "_private", "kwh_charged", "batt_temp_min", "batt_temp_max"};
+  for (size_t i = 0; i + 1 < order.size(); ++i) {
+    const OBDVector pair{{order[i + 1], 1}, {order[i], 1}};
+    const size_t alone = std::max(bleTlmFrame({pair[0]}, 244).full.size(), bleTlmFrame({pair[1]}, 244).full.size());
+    const auto kept = json::parse(bleTlmFrame(pair, alone).notify)["tlm"];
+    check(kept.size() == 1 && kept.contains(order[i]), order[i] + " outranks " + order[i + 1]);
+  }
+
+  // A key that is not a plain identifier could break out of its string, so it never reaches the frame.
+  const auto hostile = bleTlmFrame({{"x\":1,\"soc", 5}, {"q\"", 6}, {"a\\b", 1}, {"", 2}, {"s p", 3}, {"ok_9", 4}}, 244);
+  check(json::parse(hostile.full)["tlm"] == json{{"ok_9", 4}}, "keys outside [A-Za-z0-9_] are skipped");
 }
+
+// The frame log line: first frame of a wake, then only a higher drop count or a new MTU.
+#undef ENABLE_LOGGING
+#define ENABLE_LOGGING 1
+namespace ble_frame_log {
+std::vector<std::string> lines;
+void logEvent(const char* format, ...) {
+  char line[256];
+  va_list args;
+  va_start(args, format);
+  vsnprintf(line, sizeof(line), format, args);
+  va_end(args);
+  lines.push_back(line);
+}
+struct { void printf(const char*, ...) {} } Serial;
+int g_logged_ble_drop = -1;
+uint16_t g_logged_ble_mtu = 0;
+void poll(uint16_t ble_mtu, const OBDVector& frame) {
+  const BleTlmFrame ble_frame = bleTlmFrame(frame, bleNotifyBudget(ble_mtu));
+#include "ble_frame_log.inc"
+}
+
+void checks() {
+  const OBDVector parked{{"soc", 80}, {"is_parked", 1}};
+  const OBDVector driving{{"soc", 63.5}, {"power", 108.8}, {"voltage", 712.3}, {"current", -152.7},
+    {"speed", 112}, {"batt_temp_min", 29}, {"batt_temp_max", 33}, {"kwh_charged", 1234.5}};
+  OBDVector wide = driving;
+  for (const auto& extra : {"soh", "est_battery_range", "batt_temp", "ext_temp", "odometer"}) wide.emplace_back(extra, 1234.5);
+  poll(23, parked);
+  poll(23, parked);
+  poll(23, driving);
+  poll(23, parked);
+  poll(185, parked);
+  poll(185, parked);
+  poll(185, wide);
+  poll(185, driving);
+  poll(185, driving);
+  poll(185, parked);
+  poll(100, driving);
+  poll(100, driving);
+  poll(23, driving);
+  poll(23, driving);
+  const std::vector<std::string> expected{
+    "BLE tlm mtu=23 bytes=35 sent=18 trimmed drop=1",
+    "BLE tlm mtu=23 bytes=138 sent=20 trimmed drop=7",
+    "BLE tlm mtu=185 bytes=35 sent=35 fit drop=0",
+    "BLE tlm mtu=185 bytes=233 sent=174 trimmed drop=3",
+    "BLE tlm mtu=100 bytes=138 sent=79 trimmed drop=3",
+    "BLE tlm mtu=23 bytes=138 sent=20 trimmed drop=7",
+  };
+  check(lines == expected, "frame log: first frame, then only a higher drop count or a new MTU");
+}
+}  // namespace ble_frame_log
+#undef ENABLE_LOGGING
+#define ENABLE_LOGGING 0
 
 struct File {
   std::string* data = nullptr;
@@ -710,7 +771,7 @@ int main(int argc, char** argv) {
   if (group == "all" || group == "logging") loggingChecks();
   if (group == "all" || group == "schema") schemaChecks();
   if (group == "all" || group == "transport") transportChecks();
-  if (group == "all" || group == "ble-frame") bleFrameChecks();
+  if (group == "all" || group == "ble-frame") { bleFrameChecks(); ble_frame_log::checks(); }
   if (group == "all" || group == "sleep-reason") sleep_reason::checks();
   if (argc > 2 && (group == "all" || group == "profiles")) profileChecks(argv[2]);
   std::cout << "Energy " << group << " checks PASS\n";

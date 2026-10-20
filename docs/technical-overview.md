@@ -347,8 +347,9 @@ Each release also carries `factory.bin` (bootloader, partitions and app in one i
   the name. Uploads are signed with the vehicle token (HMAC, RFC 9421) instead of carrying it, so the
   token itself never crosses the cellular link; it still reaches the dongle over BLE at pairing.
 - **One car per dongle.** The vehicle profile and token are provisioned per dongle.
-- **BLE telemetry is not MTU-aware.** `logData()` sends the frame without chunking, so on Android at
-  the default 23-byte MTU a long frame gets truncated. Frames are kept short in practice.
+- **BLE telemetry notifies one packet.** The ABD1 notify is fitted to the negotiated MTU−3 and drops
+  low-priority fields when the frame is longer (temperature bounds first at iOS's ~185); at Android's
+  default 23 it carries almost nothing. The readable value is always the full frame.
 - **The co-processor is fixed.** Cars that need commands it doesn't implement cannot be supported by
   any change in this repo.
 - **The SIM7070 caps a request body at 1024 bytes.** Gzip fits about 21 points in that, and a POST

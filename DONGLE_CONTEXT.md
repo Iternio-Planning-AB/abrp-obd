@@ -114,7 +114,9 @@ handles silently breaks already-paired iPhones.
   last to go; `kwh_charged` and the battery temperature bounds first), so it always parses. The
   follow-up read is a long read, so an app that reads after the notify (idle Android at MTU 23) still
   gets every field. A real driving frame (~220 B at `%.2f`) is ~200 B compact: it fits 247, and at
-  iOS's 185 the notify loses the temperature bounds.
+  iOS's 185 the notify loses the temperature bounds. The notify goes straight to
+  `esp_ble_gatts_send_indicate`; the value is set once per poll and never swapped for the notify, since
+  the library's blob-read handler copies it without a lock. Keys outside `[A-Za-z0-9_]` are left out.
 - **The GATT attribute budget fails silently when exceeded.** The default is 15 handles; the table
   needed 18. The stack reported the overflow only in an event the Arduino core ignores, so two
   attributes were dropped with no error — which killed OTA and took days to find. The budget is now
@@ -573,11 +575,11 @@ session.
   Prefer one line per wake with the inputs *and* the verdict over transition-only logging.
 - **A happy path proves nothing about a gate.** Both the signature check and the HMAC gate were only
   believed after watching them *refuse*, which is why `JWSTEST` shipped as a permanent diagnostic.
-- **`BLE tlm mtu=<m> bytes=<full> sent=<n> fit|trimmed|skipped drop=<k>`** is the ABD1 frame against the
-  negotiated MTU: the first frame of a wake, then again only if a later one does worse. `trimmed` means
-  the notify left out `drop` fields (the readable value kept them); at `mtu=23` that is expected for an
-  idle Android connection. `skipped` (no notify, value still updated) needs a budget under the 10-byte
-  empty frame, which no legal MTU gives.
+- **`BLE tlm mtu=<m> bytes=<full> sent=<n> fit|trimmed drop=<k>`** is the ABD1 frame against the
+  negotiated MTU: the first frame of a wake, then again only when `drop` exceeds every line so far or the
+  MTU changes. `sent` is the fitted notify size handed to the stack, not a confirmed delivery. `trimmed`
+  means the notify left out `drop` fields (the readable value kept them); at `mtu=23` that is expected
+  for an idle Android connection, and `sent=10` is the bare `{"tlm":{}}` sent as the cue to read.
 - **`UPLOAD not sent: <reason>`** (`no_token`, `sign_fail`, `hdr_fail`) is a batch that never left the
   dongle. It keeps its frames and deliberately does not advance the http=0 streak that drives the
   stale-bearer restart and reboot: the bearer is not what failed, and restarting the modem cannot fix
