@@ -269,7 +269,7 @@ RTC retention and NVS across a re-plug need a dongle and a parked night (look fo
 
 Run `python3 tests/run_energy_checks.py` for charge progress/corroboration, the `is_charging` verdict
 and release latch (`signal`, `release`; replays field current sequences, no location data), the `setup()`
-wake gate (taper and charge-end reads), the `SLEEP enter` reason labels (`sleep-reason`), telemetry serialization, CSV columns, and schema-rotation checks under
+wake gate (taper and charge-end reads), the `SLEEP enter` reason labels (`sleep-reason`), the ABD1 frame fitted to MTU−3 (`ble-frame`: compact 2 dp numbers, priority trimming, MTU 23), telemetry serialization, CSV columns, and schema-rotation checks under
 ASan/UBSan. Add `--profiles /path/to/profiles` to exercise actual Scenic/iX3 production/developer
 equations with the firmware parser (optional: the ABRP backend profiles are not public). The runner extracts the current charging and logging code;
 filesystem and hardware are fakes, not on-device verification.

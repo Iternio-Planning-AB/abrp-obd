@@ -429,6 +429,113 @@ void transportChecks() {
   check(legacy["chargingEnergyAdded"]["wh"] == 123456, "legacy profiles retain kWh-to-Wh conversion");
 }
 
+// Today's wire text for one number, the 2 dp contract the compact frame must reproduce exactly.
+json referenceTlm(const OBDVector& frame) {
+  json tlm = json::object();
+  for (const auto& field : frame) {
+    if (field.first == "utc" || field.first == "lat" || field.first == "lon" || field.first == "heading") continue;
+    if (field.first == "is_parked" || field.first == "is_charging" || field.first == "is_dcfc") {
+      tlm[field.first] = field.second != 0.0;
+    } else {
+      char text[24];
+      snprintf(text, sizeof(text), "%.2f", field.second);
+      tlm[field.first] = json::parse(text);
+    }
+  }
+  return tlm;
+}
+
+void bleFrameChecks() {
+  // Synthetic driving frame the size of the field overflow (201-222 B under %.2f).
+  const OBDVector driving{{"utc", 1791192686}, {"soc", 63.5}, {"soh", 100}, {"voltage", 712.3},
+    {"current", -152.7}, {"power", 108.8}, {"speed", 112}, {"batt_temp", 31.5}, {"batt_temp_min", 29},
+    {"batt_temp_max", 33}, {"kwh_charged", 1234.5}, {"is_parked", 0}, {"is_charging", 0}, {"is_dcfc", 0},
+    {"lat", 1.5}, {"lon", 2.5}};
+  const json reference = referenceTlm(driving);
+  const size_t reference_bytes = std::string("{\"tlm\":}").size() + reference.dump().size();
+  check(reference_bytes > 210 && reference_bytes <= 230, "reference driving frame is field-sized under %.2f");
+  const auto android = bleTlmFrame(driving, bleNotifyBudget(247));
+  check(android.fit == BLE_FIT && android.dropped == 0 && android.notify == android.full &&
+        android.full.size() <= 244 && android.full.size() < reference_bytes,
+        "compact driving frame fits MTU 247 untrimmed and is shorter than %.2f");
+  check(json::parse(android.notify)["tlm"] == reference, "compact frame keeps every key and its 2 dp value");
+  const auto ios = bleTlmFrame(driving, bleNotifyBudget(185));
+  const auto ios_kept = json::parse(ios.notify)["tlm"];
+  check(ios.notify.size() <= 182 && json::parse(ios.full)["tlm"] == reference, "MTU 185 notify fits, full frame intact");
+  for (const auto& field : reference.items()) {
+    const std::string key = field.key();
+    const bool low = key == "batt_temp_min" || key == "batt_temp_max" || key == "kwh_charged";
+    check(low || (ios_kept.contains(key) && ios_kept[key] == field.value()),
+          "MTU 185 drops only the lowest-priority fields, kept " + key);
+  }
+  // The smaller field frame (~200 B under %.2f) needs only the compact numbers to fit iOS.
+  const OBDVector smaller{{"soc", 64}, {"soh", 100}, {"voltage", 712.3}, {"current", -152.7}, {"power", 108.8},
+    {"speed", 112}, {"batt_temp_min", 29}, {"batt_temp_max", 33}, {"is_parked", 0}, {"is_charging", 0},
+    {"is_dcfc", 0}};
+  const json smaller_reference = referenceTlm(smaller);
+  const auto smaller_ios = bleTlmFrame(smaller, bleNotifyBudget(185));
+  check(std::string("{\"tlm\":}").size() + smaller_reference.dump().size() > 182 && smaller_ios.fit == BLE_FIT &&
+        smaller_ios.notify.size() <= 182 && json::parse(smaller_ios.notify)["tlm"] == smaller_reference,
+        "a frame over 182 B under %.2f fits MTU 185 untrimmed once compact");
+  check(bleTlmString(driving) == bleTlmFrame(driving, 244).full, "bleTlmString is the full compact frame");
+
+  auto text = [](double value) {
+    const auto frame = bleTlmFrame({{"soc", value}}, 244);
+    return frame.full.substr(14, frame.full.size() - 16);
+  };
+  check(text(100) == "100" && text(0) == "0" && text(0.5) == "0.5" && text(49.11) == "49.11" &&
+        text(-51.2) == "-51.2" && text(42111) == "42111" && text(10.10) == "10.1",
+        "trailing zeros and a bare decimal point are dropped");
+  check(text(1.23456) == "1.23" && text(0.001) == "0" && text(-0.004) == "0" && text(0.005001) == "0.01",
+        "never more precision than %.2f, and negative zero is plain zero");
+  const auto non_finite = bleTlmFrame({{"soc", NAN}, {"power", INFINITY}, {"current", -INFINITY}, {"speed", 3}}, 244);
+  check(json::parse(non_finite.full)["tlm"] == json{{"speed", 3}}, "non-finite values are omitted, frame stays valid JSON");
+
+  // Small budget: priority decides what survives, never a cut mid-token.
+  const auto small = bleTlmFrame(driving, 140);
+  const auto kept = json::parse(small.notify)["tlm"];
+  check(small.fit == BLE_TRIMMED && small.notify.size() <= 140 && small.dropped > 0 &&
+        small.dropped == (int)(reference.size() - kept.size()), "small MTU trims and counts dropped fields");
+  for (const auto& key : {"soc", "power", "current", "voltage", "speed", "is_charging", "is_parked", "is_dcfc"})
+    check(kept.contains(key) && kept[key] == reference[key], std::string("small MTU keeps priority field ") + key);
+  for (const auto& key : {"batt_temp_min", "batt_temp_max", "kwh_charged"})
+    check(!kept.contains(key), std::string("small MTU drops low-priority field ") + key);
+  check(json::parse(small.full)["tlm"] == reference, "readable value keeps the full frame when the notify is trimmed");
+  const auto medium = bleTlmFrame(driving, 160);
+  const auto medium_kept = json::parse(medium.notify)["tlm"];
+  check(medium.fit == BLE_TRIMMED && medium.notify.size() <= 160 && medium_kept.contains("soh") &&
+        medium_kept.contains("batt_temp") && !medium_kept.contains("batt_temp_min") &&
+        !medium_kept.contains("batt_temp_max"), "temperature bounds go before mid-priority fields");
+
+  // MTU 23 carries 20 B: whatever fits is still a valid frame (it triggers the app's read).
+  const auto tiny = bleTlmFrame(driving, bleNotifyBudget(23));
+  check(bleNotifyBudget(23) == 20 && tiny.fit == BLE_TRIMMED && tiny.notify.size() <= 20 &&
+        json::parse(tiny.notify)["tlm"].is_object(), "MTU 23 notifies a valid frame within 20 bytes");
+  const auto first = bleTlmFrame({{"power", 5}, {"is_parked", 1}, {"soc", 63.5}}, bleNotifyBudget(23));
+  check(json::parse(first.notify)["tlm"] == json{{"soc", 63.5}}, "MTU 23 spends its 20 bytes on soc first");
+  const auto greedy = bleTlmFrame({{"soc", 63.5}, {"voltage", 712.34}, {"speed", 0}}, 30);
+  check(json::parse(greedy.notify)["tlm"] == json({{"soc", 63.5}, {"speed", 0}}),
+        "a field too long to fit does not block a shorter lower-priority one");
+  const OBDVector detail{{"soc", 63.5}, {"batt_temp_min", 29}, {"_bms_soc", 64.1}, {"kwh_charged", 1234.5},
+    {"batt_temp_max", 33}};
+  const auto profile_first = bleTlmFrame(detail, 39);
+  check(json::parse(profile_first.notify)["tlm"] == json({{"soc", 63.5}, {"_bms_soc", 64.1}}),
+        "profile-private keys outrank the temperature bounds and kWh counter");
+  const auto listed_first = bleTlmFrame({{"_bms_soc", 64.1}, {"soc", 63.5}, {"power", 108.8}}, 36);
+  check(json::parse(listed_first.notify)["tlm"] == json({{"soc", 63.5}, {"power", 108.8}}),
+        "listed fields outrank profile-private keys");
+  const auto exact = bleTlmFrame(detail, bleTlmString(detail).size());
+  const auto over = bleTlmFrame(detail, bleTlmString(detail).size() - 1);
+  check(exact.fit == BLE_FIT && over.fit == BLE_TRIMMED && over.notify.size() < bleTlmString(detail).size(),
+        "a frame exactly the budget fits, one byte over is trimmed");
+  check(bleNotifyBudget(185) == 182 && bleNotifyBudget(247) == 244 && bleNotifyBudget(517) == 244 &&
+        bleNotifyBudget(0) == 20, "budget is MTU-3 inside the 23..247 range the stack can carry");
+  const auto none = bleTlmFrame(driving, 9);
+  check(none.fit == BLE_SKIPPED && none.notify.empty(), "a budget below the empty envelope skips the notify");
+  check(std::string(bleFitName(BLE_FIT)) == "fit" && std::string(bleFitName(BLE_TRIMMED)) == "trimmed" &&
+        std::string(bleFitName(BLE_SKIPPED)) == "skipped", "verdict names match the log line");
+}
+
 struct File {
   std::string* data = nullptr;
   size_t position = 0;
@@ -589,7 +696,7 @@ int main(int argc, char** argv) {
   const std::string group = argc > 1 ? argv[1] : "all";
   check(group == "all" || group == "progress" || group == "signal" || group == "release" ||
         group == "corroboration" || group == "wake-gate" ||
-        group == "logging" || group == "transport" || group == "sleep-reason" || group == "profiles" || group == "schema", "known test group");
+        group == "logging" || group == "transport" || group == "sleep-reason" || group == "profiles" || group == "schema" || group == "ble-frame", "known test group");
   if (group == "all" || group == "progress") progressChecks();
   if (group == "all" || group == "signal") signalChecks();
   if (group == "all" || group == "release") {
@@ -603,6 +710,7 @@ int main(int argc, char** argv) {
   if (group == "all" || group == "logging") loggingChecks();
   if (group == "all" || group == "schema") schemaChecks();
   if (group == "all" || group == "transport") transportChecks();
+  if (group == "all" || group == "ble-frame") bleFrameChecks();
   if (group == "all" || group == "sleep-reason") sleep_reason::checks();
   if (argc > 2 && (group == "all" || group == "profiles")) profileChecks(argv[2]);
   std::cout << "Energy " << group << " checks PASS\n";

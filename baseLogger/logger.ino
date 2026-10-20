@@ -221,9 +221,9 @@ bool g_gps_powered = false;
 // GPS), so this gates the pre-sleep teardown - we never deinit a stack we didn't init. Per-wake (a deep-sleep
 // reboot clears it).
 bool g_ble_up = false;
-// One-shot per wake: log the actual BLE telemetry frame + its byte size once, to confirm it fits the app's
-// single ~185B MTU read on real data (the frame-size check) without flooding the log every poll.
-bool g_logged_ble_frame = false;
+// Worst BLE frame verdict logged this wake (-1 = none yet): the first frame is logged, then again only when
+// the verdict gets worse, since a wake's first frame is often a small parked one. At most three lines.
+int g_logged_ble_fit = -1;
 // Cross-task-safe BLE event logging: the wrapper's callbacks run in the Bluedroid task, so they can't write
 // the LittleFS log directly (that would race the loop task). They enqueue here; loop() drains + writes.
 QueueHandle_t bleLogQueue = nullptr;
@@ -1825,13 +1825,16 @@ void loop() {
     datalogger.writeLine(buildLogLine(current_frame, obd_count));
 #endif
 #if ENABLE_BLE
-    std::string ble_frame = bleTlmString(current_frame); // trimmed <185B frame for ABD1 (see bleTlmString)
-    if (ble.logData(ble_frame)) {
-      if (!g_logged_ble_frame) { // once per wake: confirm the real frame fits one ~185B MTU read
-        g_logged_ble_frame = true;
-        Serial.printf("BLE frame (%d B, limit ~185): %s\n", (int)ble_frame.size(), ble_frame.c_str());
+    const uint16_t ble_mtu = ble.mtu();
+    const BleTlmFrame ble_frame = bleTlmFrame(current_frame, bleNotifyBudget(ble_mtu));
+    if (ble.logData(ble_frame.notify, ble_frame.full)) {
+      if ((int)ble_frame.fit > g_logged_ble_fit) {
+        g_logged_ble_fit = (int)ble_frame.fit;
+        Serial.printf("BLE frame (%d B, mtu %u): %s\n", (int)ble_frame.full.size(), (unsigned)ble_mtu,
+          ble_frame.notify.c_str());
 #if ENABLE_LOGGING
-        logEvent("BLE tlm bytes=%d (limit ~185) ok", (int)ble_frame.size());
+        logEvent("BLE tlm mtu=%u bytes=%u sent=%u %s drop=%d", (unsigned)ble_mtu, (unsigned)ble_frame.full.size(),
+          (unsigned)ble_frame.notify.size(), bleFitName(ble_frame.fit), ble_frame.dropped);
 #endif
       }
       if (!logging_message_printed) {

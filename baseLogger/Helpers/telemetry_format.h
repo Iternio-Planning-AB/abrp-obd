@@ -1,8 +1,8 @@
 #pragma once
 /*
   Telemetry payload formatting - serializers from OBDVector frames to the wire formats.
-  Contains: logString (single-frame {"tlm":...} for the API), bleTlmString (trimmed <185B
-  frame for the BLE ABD1 characteristic), bulkString (the legacy v1 /1/tlm/bulk body) and
+  Contains: logString (single-frame {"tlm":...} for the API), bleTlmFrame/bleTlmString (the
+  BLE ABD1 frame, fitted to the notify size), bulkString (the legacy v1 /1/tlm/bulk body) and
   bulkStringV2 (the v2 /2/app/tlm InputPointList, which is what actually goes out - see
   TLM_V2_PATH in config.h).
 
@@ -15,7 +15,10 @@
   Convert vector of PID results to suitable form for iternio telemetry API
 */
 
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 
 bool isGeoMetaKey(const std::string& key) { return key.compare(0, 6, "__geo_") == 0; }
 
@@ -55,32 +58,122 @@ std::string logString(OBDVector vec) {
   return ss.str();
 }
 
-// BLE telemetry frame for characteristic ABD1. Deliberately NOT logString(): the app pulls the whole frame in
-// ONE ~185B MTU read with no reassembly, so it must stay under that. logString's frame (lat/lon/utc + nlohmann
-// float noise) runs ~200-220B and would truncate -> the app's JSON.parse fails. So: measurements only (the app
-// adds utc + location itself), fixed 2dp numbers (compact, no float-noise), and is_charging/is_parked/is_dcfc
-// as real JSON booleans (the contract shows `false`, not 1.0). Result ~150B. Keys align to the app's
-// VehicleJsonTelemetryKeys; unknown keys (lat/lon/utc) are dropped.
-std::string bleTlmString(const OBDVector& vec) {
-  std::stringstream ss;
-  ss << "{\"tlm\":{";
-  bool first = true;
+// BLE telemetry frame for characteristic ABD1, {"tlm":{...}}. Measurements only: the phone supplies
+// utc, location and heading itself. Keys align to the app's VehicleJsonTelemetryKeys; is_charging/
+// is_parked/is_dcfc are JSON booleans. Numbers are %.2f with trailing zeros dropped: the app's
+// effective 2 dp contract, same value, shorter text. A non-finite value is omitted (it is not JSON).
+//
+// A notify carries at most MTU-3 bytes and the stack truncates the rest, which the app sees as broken
+// JSON. So the notify gets a frame trimmed to fit, by the priority below, and the readable value stays
+// the full frame: idle Android sits at MTU 23 and reads (a long read, not MTU-bound) after each notify.
+enum BleFit { BLE_FIT, BLE_TRIMMED, BLE_SKIPPED };
+
+struct BleTlmFrame {
+  std::string full;   // readable value of ABD1
+  std::string notify; // fits the budget; empty when BLE_SKIPPED
+  BleFit fit;
+  int dropped;        // fields left out of notify
+};
+
+const char* bleFitName(BleFit fit) {
+  return fit == BLE_FIT ? "fit" : fit == BLE_TRIMMED ? "trimmed" : "skipped";
+}
+
+// MTU-3, inside 23 (unnegotiated) .. 247 (our setMTU ceiling: larger notifications are lost).
+size_t bleNotifyBudget(uint16_t mtu) {
+  return (size_t)std::min<uint16_t>(std::max<uint16_t>(mtu, 23), 247) - 3;
+}
+
+static bool bleTlmNumber(double value, char* out, size_t size) {
+  if (!std::isfinite(value)) return false;
+  const int n = snprintf(out, size, "%.2f", value);
+  if (n < 0 || (size_t)n >= size) return false;
+  char* end = out + n - 1;
+  while (*end == '0') *end-- = '\0';
+  if (*end == '.') *end = '\0';
+  if (strcmp(out, "-0") == 0) strcpy(out, "0");
+  return true;
+}
+
+// Notify priority, highest first. Unlisted (profile-private) keys rank after the table, and the last
+// list goes before them: the app has the first ones on screen, the rest are detail.
+static int bleTlmRank(const std::string& key) {
+  static const char* const order[] = {
+    "soc", "power", "current", "voltage", "speed", "is_charging", "is_parked", "is_dcfc",
+    "soh", "est_battery_range", "batt_temp", "ext_temp", "odometer", "soe", "capacity",
+    "hvac_power", "cabin_temp", "elevation",
+  };
+  static const char* const last[] = { "kwh_charged", "batt_temp_min", "batt_temp_max" };
+  const int listed = sizeof(order) / sizeof(order[0]);
+  for (int i = 0; i < listed; ++i)
+    if (key == order[i]) return i;
+  for (int i = 0; i < (int)(sizeof(last) / sizeof(last[0])); ++i)
+    if (key == last[i]) return listed + 1 + i;
+  return listed;
+}
+
+BleTlmFrame bleTlmFrame(const OBDVector& vec, size_t budget) {
+  static const size_t ENVELOPE = 10; // {"tlm":{}}
+  std::vector<std::string> fields;
+  std::vector<int> ranks;
   for (const auto& res : vec) {
     const std::string& k = res.first;
-    if (isGeoMetaKey(k) || isGeoValueKey(k) || k == "utc") continue; // phone supplies location/heading/utc itself
-    if (!first) ss << ",";
-    first = false;
-    ss << "\"" << k << "\":";
-    if (k == "is_charging" || k == "is_parked" || k == "is_dcfc") {
-      ss << (res.second != 0.0 ? "true" : "false");
-    } else {
-      char num[24];
-      snprintf(num, sizeof(num), "%.2f", res.second);
-      ss << num;
-    }
+    if (isGeoMetaKey(k) || isGeoValueKey(k) || k == "utc") continue;
+    char num[32];
+    if (k == "is_charging" || k == "is_parked" || k == "is_dcfc") strcpy(num, res.second != 0.0 ? "true" : "false");
+    else if (!bleTlmNumber(res.second, num, sizeof(num))) continue;
+    fields.push_back("\"" + k + "\":" + num);
+    ranks.push_back(bleTlmRank(k));
   }
-  ss << "}}";
-  return ss.str();
+
+  auto join = [&](const std::vector<bool>& keep) {
+    std::string out = "{\"tlm\":{";
+    bool first = true;
+    for (size_t i = 0; i < fields.size(); ++i) {
+      if (!keep[i]) continue;
+      if (!first) out += ",";
+      first = false;
+      out += fields[i];
+    }
+    return out + "}}";
+  };
+
+  BleTlmFrame frame;
+  std::vector<bool> keep(fields.size(), true);
+  frame.full = join(keep);
+  frame.fit = BLE_FIT;
+  frame.dropped = 0;
+  if (frame.full.size() <= budget) {
+    frame.notify = frame.full;
+    return frame;
+  }
+  if (budget < ENVELOPE) {
+    frame.fit = BLE_SKIPPED;
+    frame.dropped = (int)fields.size();
+    return frame;
+  }
+
+  // Greedy by priority: a field that does not fit is skipped and a smaller, lower one may still go.
+  std::vector<size_t> by_rank(fields.size());
+  for (size_t i = 0; i < by_rank.size(); ++i) by_rank[i] = i;
+  std::stable_sort(by_rank.begin(), by_rank.end(), [&](size_t a, size_t b) { return ranks[a] < ranks[b]; });
+  std::fill(keep.begin(), keep.end(), false);
+  size_t used = ENVELOPE, kept = 0;
+  for (size_t i : by_rank) {
+    const size_t cost = fields[i].size() + (kept ? 1 : 0);
+    if (used + cost > budget) continue;
+    keep[i] = true;
+    used += cost;
+    ++kept;
+  }
+  frame.notify = join(keep);
+  frame.fit = BLE_TRIMMED;
+  frame.dropped = (int)(fields.size() - kept);
+  return frame;
+}
+
+std::string bleTlmString(const OBDVector& vec) {
+  return bleTlmFrame(vec, SIZE_MAX).full;
 }
 
 /*

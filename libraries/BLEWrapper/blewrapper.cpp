@@ -424,16 +424,21 @@ bool BLEWrapper::logError(std::string error) {
   return false;
 }
 
-/*  
-  Send telemetry on telemetry characteristic
+/*
+  Send telemetry on ABD1. notify() sends the characteristic value, so the fitted frame is set for the
+  notify and the full frame restored for the app's follow-up read; the stack copies the notify bytes,
+  so restoring at once is safe. An empty notify_payload updates the readable value only.
 */
-bool BLEWrapper::logData(std::string payload) {
+bool BLEWrapper::logData(const std::string& notify_payload, const std::string& read_value) {
 
   if (device_connected && get_authenticated()) {
-    pTelemetryCharacteristic->setValue(payload);
-    pTelemetryCharacteristic->notify();
+    if (!notify_payload.empty()) {
+      pTelemetryCharacteristic->setValue(notify_payload);
+      pTelemetryCharacteristic->notify();
+    }
+    if (notify_payload != read_value) pTelemetryCharacteristic->setValue(read_value);
 #if PRINT 
-    Serial.printf("New value notified: %s\n", payload.c_str());
+    Serial.printf("New value notified: %s\n", notify_payload.c_str());
 #endif
     return true;
   }
@@ -765,10 +770,9 @@ void ServerCallbacks::onDisconnect(BLEServer* pServer, esp_ble_gatts_cb_param_t*
 
 /*
   Log the negotiated ATT MTU. Our ceiling is 517 (BLEDevice::setMTU); iOS settles at ~185 on its own, Android
-  gets whatever the app requested (the transfer engines ask for 517). This matters for the app's notify path:
-  a NOTIFY can't exceed MTU-3 (no fragmentation), so at the 23-byte default our ~150B telemetry frame would be
-  truncated in the notification. (Reads are unaffected - they use long/blob reads - but if the app parses the
-  notify payload directly, the MTU must fit the frame.)
+  gets whatever the app requested (the transfer engines ask for 517). A NOTIFY can't exceed MTU-3 (no
+  fragmentation), so the ABD1 notify is fitted to this value (bleTlmFrame); reads use long/blob reads and
+  carry the full frame.
 */
 void ServerCallbacks::onMtuChanged(BLEServer* pServer, esp_ble_gatts_cb_param_t* param) {
   wrapper->set_mtu(param->mtu.mtu); // the log-dump chunk size is derived from this (notify max = MTU-3)
