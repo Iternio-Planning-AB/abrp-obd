@@ -550,7 +550,8 @@ session.
   deep-sleep `WAKE`, `CLOCK wake slept <s>, adjusted <ms> at <ppm>` says what that wake corrected.
 - **`MOTION act=<%> n=<windows> s=<span> peak=<g> mean=<g> axmax=<g> obd parked chg`** is one line per awake
   minute (and the partial minute before `SLEEP enter`; one in progress when an OTA reboots is lost). `act` is the
-  share of 500 ms `detectMovement` windows that saw motion; `axmax` is the largest single-axis value, which is what
+  share of observed time whose `detectMovement` window saw motion: each window stands for the time
+  since the previous one, capped at 2 s, because a moving window ends on its first sample; `axmax` is the largest single-axis value, which is what
   that 0.1 g threshold compares; `peak` is the largest bias-removed |acc| and `mean` the mean of per-window peaks.
   The bias is a short running average, so these show vibration, not sustained acceleration. `s` is the span the
   windows cover: a blocking upload between windows stretches a "minute". Rail and time are on the EVT prefix.

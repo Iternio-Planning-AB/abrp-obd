@@ -160,6 +160,7 @@ void softResetMEMS() {
 #if ENABLE_MEMS
 float motion_window_peak = 0;   // g, largest bias-removed |acc| this window; MOTION diagnostic only
 float motion_window_axmax = 0;  // g, largest single-axis value the 0.1 g threshold below compares
+uint32_t motion_window_ms = 0;  // how long this window actually sampled (it ends early on motion)
 
 bool detectMovement(unsigned long duration) {
   bool active = false;
@@ -183,6 +184,7 @@ bool detectMovement(unsigned long duration) {
   Serial.printf("[GYR] %.2f/%.2f/%.2f\n", mem_data.gyr[0], mem_data.gyr[1], mem_data.gyr[2]);
   Serial.printf("[Motion] %.2f\n", mem_data.motion);
 #endif
+  motion_window_ms = millis() - start;
   return active;
 }
 
@@ -198,7 +200,8 @@ static void logMotionStats(const MotionStats& m) {
 // Called after every handleActivityState() window. Diagnostic only: no decision reads motion_stats.
 void noteMotionWindow(bool sampled, bool active) {
   MotionStats done;
-  if (motionStatsWindow(motion_stats, sampled, active, motion_window_peak, motion_window_axmax, millis(), done)) logMotionStats(done);
+  if (motionStatsWindow(motion_stats, sampled, active, motion_window_ms, motion_window_peak, motion_window_axmax, millis(),
+                        done)) logMotionStats(done);
 }
 
 // Before the SLEEP enter line, so a short wake still leaves its partial minute.
