@@ -138,6 +138,9 @@ void handleActivityState() {
   } else {
     active = detectMovement(500);
   }
+#if ENABLE_MEMS && ENABLE_LOGGING
+  noteMotionWindow(!g_ota_active && !g_logdump_active && current_state != UNINITIALIZED, active);
+#endif
   auto now = millis();
 
   // Safety net: if the console latched maintenance_mode but RESUME was never sent (e.g. the puller dropped

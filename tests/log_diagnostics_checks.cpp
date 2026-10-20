@@ -10,6 +10,7 @@
 #include <iostream>
 #include <map>
 #include "ble_write_summary.h"
+#include "motion_stats.h"
 #include <memory>
 #include <set>
 #include <sstream>
@@ -387,13 +388,81 @@ void bleWriteChecks() {
         std::string(bleKeyForLog("a\nEVT")) == "?", "a logged key is named only when identifier-shaped");
 }
 
+
+std::string motionLine(const MotionStats& m, bool parked = true, bool chg = false) {
+  char buf[160];
+  motionStatsLine(buf, sizeof(buf), m, parked, chg);
+  return buf;
+}
+
+void motionChecks() {
+  MotionStats m, out;
+  unsigned long now = 1000;
+  for (int i = 0; i < 120; ++i, now += 500)
+    check(!motionStatsWindow(m, true, true, 500, 0.2f, 0.12f, now, out), "windows inside the minute emit nothing");
+  check(motionStatsWindow(m, true, false, 500, 0.01f, 0.0f, now, out), "the first window past 60 s rolls the minute over");
+  check(motionLine(out) == "MOTION act=100 n=120 s=59 peak=0.200 mean=0.200 axmax=0.120 obd=0 parked=1 chg=0",
+        "all-motion minute: " + motionLine(out));
+  check(m.n == 1 && m.active_ms == 0, "the rollover window starts the next minute");
+
+  m = MotionStats{};
+  now = 2000;
+  for (int i = 0; i < 100; ++i) motionStatsWindow(m, true, true, 0, 0.3f, 0.2f, now += 150, out);
+  check(motionStatsTake(m, out) && motionLine(out).rfind("MOTION act=100 ", 0) == 0,
+        "an all-motion minute of 0 ms windows is act=100: " + motionLine(out));
+
+  m = MotionStats{};
+  now = 3000;
+  motionStatsWindow(m, true, false, 500, 0.01f, 0.0f, now, out);
+  motionStatsWindow(m, true, false, 500, 0.01f, 0.0f, now += 500, out);
+  motionStatsWindow(m, true, true, 0, 0.3f, 0.2f, now += 20000, out);  // a 20 s blocking upload before it
+  check(motionStatsTake(m, out) && out.total_ms == 3000 && out.active_ms == 2000,
+        "a long gap counts only up to the cap: " + motionLine(out));
+  motionStatsWindow(m, true, true, 0, 0.3f, 0.2f, now += 150, out);
+  check(motionStatsTake(m, out) && motionLine(out).rfind("MOTION act=100 n=1 ", 0) == 0,
+        "a lone 0 ms moving window is act=100: " + motionLine(out));
+
+  m = MotionStats{};
+  now = 5000;
+  const float peaks[] = {0.05f, 0.30f, 0.15f}, axes[] = {-0.04f, 0.25f, 0.12f};
+  const uint32_t lens[] = {500, 1, 0};  // a moving window ends on its first sample
+  for (int i = 0; i < 3; ++i, now += 500)
+    motionStatsWindow(m, true, axes[i] > 0.1f, lens[i], peaks[i], axes[i], now, out);
+  m.obd = true;
+  check(motionStatsTake(m, out), "a partial minute is flushed at sleep");
+  check(motionLine(out, false, true) ==
+        "MOTION act=67 n=3 s=1 peak=0.300 mean=0.167 axmax=0.250 obd=1 parked=0 chg=1",
+        "mixed minute: " + motionLine(out, false, true));
+  check(!motionStatsTake(m, out), "a flushed minute is emitted once");
+
+  m = MotionStats{};
+  now = 9000;
+  // Field shape: ~150 ms loops; half the minute moving, each moving window 0-1 ms long.
+  for (int i = 0; i < 400; ++i) motionStatsWindow(m, true, i >= 200, i >= 200 ? i % 2 : 500, 0.2f, 0.15f, now += 150, out);
+  check(motionStatsTake(m, out) && motionLine(out).rfind("MOTION act=50 n=400 ", 0) == 0,
+        "0-1 ms moving windows count by wall time: " + motionLine(out));
+
+  m = MotionStats{};
+  int lines = 0;
+  now = 0;
+  for (int i = 0; i < 3 * 120 + 1; ++i, now += 500) lines += motionStatsWindow(m, true, false, 500, 0.01f, 0.0f, now, out);
+  check(lines == 3 && out.n == 120, "rollover emits exactly one line per minute");
+
+  m = MotionStats{};
+  now = 0;
+  for (int i = 0; i < 240; ++i, now += 500)
+    check(!motionStatsWindow(m, false, true, 500, 0.5f, 0.5f, now, out), "a bypassed window never emits");
+  check(m.n == 0 && !motionStatsTake(m, out), "OTA/log-dump bypass windows are not counted");
+}
+
 int main(int argc, char** argv) {
   const std::string group = argc > 1 ? argv[1] : "all";
   if (group == "dump") { emitDump(); return 0; }
-  check(group == "all" || group == "schema" || group == "logging" || group == "schema-failures" || group == "ble-write",
-        "known group");
+  check(group == "all" || group == "schema" || group == "logging" || group == "schema-failures" || group == "ble-write" ||
+        group == "motion", "known group");
   if (group == "all" || group == "schema") { schemaChecks(); std::cout << "PASS schema\n"; }
   if (group == "all" || group == "logging") { loggingChecks(); std::cout << "PASS logging\n"; }
   if (group == "all" || group == "schema-failures") { schemaFailureChecks(); std::cout << "PASS schema-failures\n"; }
   if (group == "all" || group == "ble-write") { bleWriteChecks(); std::cout << "PASS ble-write\n"; }
+  if (group == "all" || group == "motion") { motionChecks(); std::cout << "PASS motion\n"; }
 }

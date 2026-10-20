@@ -168,6 +168,9 @@ void enterDeepSleep(bool modem_on) {
   // Last line before the radios/peripherals go dark and RAM is wiped. Pairs with the next wake's WAKE line;
   // the gap between them is genuine deep sleep (controller + sensor only). Documents the power-down intent
   // so the timeline shows the modem+GPS were commanded off - confirm the actual draw with an ammeter.
+#if ENABLE_MEMS && ENABLE_LOGGING
+  flushMotionStats();
+#endif
 #if ENABLE_PERIODIC_WAKE
   // Log the chosen cadence + why, so the adaptive behavior is auditable: timer tightens during a charge and
   // relaxes when parked. (g_next_wake_minutes == WAKE_CHARGING_MINUTES => we observed an active charge.)
