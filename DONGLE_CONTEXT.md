@@ -557,6 +557,9 @@ session.
   windows cover: a blocking upload between windows stretches a "minute". Rail and time are on the EVT prefix.
   Diagnostic only, gathered to judge accelerometer drive detection for cars with no OBD speed PID; nothing decides
   on it, and OTA/log-dump windows (which bypass `detectMovement`) are not counted.
+- **`SLEEP enter ... reason=<r>`** names why the dongle slept. `dc-charge`, `charging` and `parked` are the
+  cadence tiers, read back from the armed timer (1, 3, 30 min). `net-recover` is the modem-recovery
+  reboot (1 min), `wdt-streak` the WDT-streak escalation, `backstop` the parked MAX_AWAKE ceiling.
 - **Log the *reason*, not just the outcome.** A subsystem that goes quiet with an empty log is the
   shape that gets misattributed to the cellular stack for weeks — this has happened more than once
   in this project (the transport-handoff bug; a stored hash claiming a profile that wasn't running).
