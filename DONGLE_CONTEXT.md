@@ -309,6 +309,22 @@ come from GNSS. Note `bleTlmString()` **trims `lat`/`lon`/`utc`/`heading` from t
 phone supplies its own position — so a BLE frame is smaller than the cellular body, and a frame that is
 *only* position (no PID answered) serialises to `{"tlm":{"is_parked":…,"is_charging":…}}`.
 
+**A location or heading goes up once per GPS observation** (#14). `bulkStringV2` omits a `location` equal to
+the last one sent — same `lat`, `lon` and observation time, the whole tuple, since the single-fix fallback
+can move coordinates without moving their time — and a `heading` equal in degrees and observation time.
+"Last sent" is first the accepted mark, then each earlier point of the same body, so frames must stay in FIFO
+order. The marks (`g_geo_accepted`, `RTC_DATA_ATTR` in `network_upload.h`) move only on an HTTP 200, never on
+a sizing pass, `ok_empty`, a body that was not sent or an HTTP error. A deep-sleep wake keeps them;
+every other boot (power-on, OTA, rollback, watchdog, panic) clears them, costing at most one resend and never
+depending on another image's RTC layout. The poll gate asks the same question against the marks as of the
+newest buffered frame (`g_geo_queued`; after a backlog restore it is recomputed over the restored frames at the first poll with a
+trusted clock, since the restore itself runs before NITZ/NTP), so a geo-only
+poll is buffered once while its fix is unsent, not once per poll, and not at all once accepted. Frames and the backlog are untouched, so rolling back to
+older firmware just resends as before. There is deliberately no periodic refresh: a parked car whose spot
+the backend has aged out stays off the map until it relocates, drives or reboots. A 200 whose location the
+backend silently dropped counts as sent until then too. `UPLOAD body` logs `loc=` (locations in the body) and
+`ldup=` (suppressed repeats).
+
 **Where the PID list / vehicle profile comes from:** the app fetches it from the ABRP backend by
 `typecode` (`getObdBlePids`), gets back `{ obdPids, jws }`, and pushes it to the dongle over ABD2.
 The `obdPids` is the per-model map of PIDs → CAN commands + equations that `OBDWrapper` evaluates; the

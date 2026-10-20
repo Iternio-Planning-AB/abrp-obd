@@ -146,6 +146,8 @@ void resetFixture() {
   geo_accepted_utc = park_acc_utc = frozen_geo_utc = 0;
   park_acc_unknown_utc = false;
   frozen_geo_lat = frozen_geo_lon = 0;
+  g_geo_accepted = g_geo_queued = {};
+  g_geo_queued_seeded = true;
   last_active = g_last_speed_ms = 0;
   gps = HostGPS{};
   gpsData = last_gd = GPS_DATA{};
@@ -1401,8 +1403,22 @@ void uploadGate() {
   OBDVector frozen{{"utc", T}};
   addGpsData(frozen);
   check(v2HasTelemetry(frozen, T), "eligible frozen location serializes with a send clock");
+  network.responseCode = 503;
+  for (int poll = 0; poll < 5; ++poll) {
+    bufferPoll(frozen);
+    check(!uploadBuffered(true), "uploads keep failing");
+  }
+  check(obd_result_vector.size() == 1, "a frozen fix the server has not accepted is buffered once, not once per poll");
+  OBDVector moved{{"utc", T}, {"lat", 59.33}, {"lon", 18.06}, {"__geo_loc_utc", T}};
+  bufferPoll(moved);
+  check(obd_result_vector.size() == 2, "a new location behind an unsent one is still buffered");
+  bufferPoll(moved);
+  check(obd_result_vector.size() == 2, "and only once");
+  obd_result_vector.pop_back(); // the rest of this check runs against the frozen fix alone
+  network.responseCode = 200;
+  check(uploadBuffered(true) && obd_result_vector.empty() && network.received.back().contains("location"), "and goes up");
   bufferPoll(frozen);
-  check(obd_result_vector.empty(), "parked poll carrying only the frozen fix is not buffered");
+  check(obd_result_vector.empty(), "once accepted, a parked poll carrying only the frozen fix is not buffered");
   OBDVector parked{{"utc", T}, {"soc", 50}};
   addGpsData(parked);
   bufferPoll(parked);
@@ -1430,6 +1446,24 @@ void uploadGate() {
   const auto marker = json::parse(bulkStringV2({obd_result_vector.back()}, T));
   check(marker.size() == 1 && marker[0].size() == 2 && marker[0]["drivingState"]["state"] == "PARK",
         "trip-end marker serializes to a PARK point");
+  obd_result_vector = {parked};
+  g_geo_accepted = g_geo_queued = {};
+  saveUploadBacklog();
+  obd_result_vector.clear();
+  loadUploadBacklog();
+  bufferPoll(frozen);
+  check(obd_result_vector.size() == 1, "a fix already in the restored backlog is not buffered again");
+  // A backlog exists because coverage was missing, so the restore usually runs before any clock is trusted.
+  g_geo_accepted = g_geo_queued = {};
+  saveUploadBacklog();
+  obd_result_vector.clear();
+  last_clock_sync_epoch = 0;
+  loadUploadBacklog();
+  bufferPoll(frozen);
+  check(obd_result_vector.size() == 1, "an untrusted poll after the restore buffers nothing new");
+  setClock(CLK_HTTP, T);
+  bufferPoll(frozen);
+  check(obd_result_vector.size() == 1, "a fix restored under an untrusted clock is not buffered again once it is trusted");
   obd_result_vector.clear();
 }
 

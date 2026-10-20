@@ -41,7 +41,7 @@ with tempfile.TemporaryDirectory(prefix="obd-heading-checks-") as temporary:
     frame_start = logger.index("    scrubGeoMetadata(current_frame);")
     frame_end = logger.index("    if (rtc.getEpoch() > 1e9)", frame_start)
     (build / "gps_frame.inc").write_text(logger[frame_start:frame_end])
-    gate_start = logger.index("#if ENABLE_NETWORK\n    bool frame_has_data")
+    gate_start = logger.index("#if ENABLE_NETWORK\n    const double poll_utc")
     gate_end = logger.index("\n", logger.index('    current_frame.emplace_back("is_parked"', gate_start)) + 1
     (build / "upload_gate.inc").write_text(logger[gate_start:gate_end])
     buffer_start = logger.index("    if (frame_has_data) {")

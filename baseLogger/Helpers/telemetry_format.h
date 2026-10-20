@@ -143,8 +143,21 @@ static std::string v2Time(time_t utc) {
   return std::string(buf);
 }
 
-std::string bulkStringV2(const std::vector<OBDVector>& frames, double send_utc = 0) {
+// The last location and heading put in a body, keyed on the whole observation: the single-fix fallback can
+// move the coordinates without moving their time. {} means none: a zero utc is never eligible.
+struct GeoMark { double lat, lon, utc; };
+struct HeadingMark { double degrees, utc; };
+struct GeoMarks { GeoMark location; HeadingMark heading; };
+
+// A location or heading equal to *marks (the last one sent, then each earlier frame of this batch) is omitted,
+// so a parked car's fix goes up once and not on every point. Frames must stay in FIFO order for that to mean
+// "last". On return *marks holds the marks as of the end of the body; *location_dups counts the omissions.
+std::string bulkStringV2(const std::vector<OBDVector>& frames, double send_utc = 0, GeoMarks* marks = nullptr,
+                         unsigned* location_dups = nullptr) {
   json points = json::array();
+  GeoMarks none{};
+  GeoMarks& last = marks ? *marks : none;
+  if (location_dups) *location_dups = 0;
 
   for (const auto& frame : frames) {
     // Pull the point's own timestamp first - every value in the point is stamped with it. A frame with
@@ -209,7 +222,10 @@ std::string bulkStringV2(const std::vector<OBDVector>& frames, double send_utc =
       // the uint16 wrap of a negative angle and GPS_HEADING_INVALID) drops just the heading.
       else if (k == "heading")            {
         if (geoEligibleAtSend(head_utc, utc, send_utc) && v >= 0 && v <= 360) {
-          put("heading", "degrees", v == 360 ? 0 : v);
+          const double degrees = v == 360 ? 0 : v;
+          if (last.heading.degrees == degrees && last.heading.utc == head_utc) continue;
+          last.heading = {degrees, head_utc};
+          put("heading", "degrees", degrees);
           p["heading"]["time"] = v2Time((time_t)head_utc);
         }
       }
@@ -250,11 +266,16 @@ std::string bulkStringV2(const std::vector<OBDVector>& frames, double send_utc =
     // Coordinates travel as one value, and the schema requires BOTH halves - a frame carrying only one
     // is a GNSS fix mid-acquisition, so it is dropped rather than sent as a half position.
     if (have_lat && have_lon && geoValidLocation(lat, lon) && geoEligibleAtSend(loc_utc, utc, send_utc)) {
-      json v = json::object();
-      v["time"] = v2Time((time_t)loc_utc);
-      v["lat"] = lat;
-      v["long"] = lon; // "long", not "lon" - v2 spells it out
-      p["location"] = v;
+      if (last.location.lat == lat && last.location.lon == lon && last.location.utc == loc_utc) {
+        if (location_dups) ++*location_dups;
+      } else {
+        last.location = {lat, lon, loc_utc};
+        json v = json::object();
+        v["time"] = v2Time((time_t)loc_utc);
+        v["lat"] = lat;
+        v["long"] = lon; // "long", not "lon" - v2 spells it out
+        p["location"] = v;
+      }
     }
 
     // provider alone is not a telemetry point. Frames that reduce to nothing (every key unmapped, or a
@@ -267,6 +288,7 @@ std::string bulkStringV2(const std::vector<OBDVector>& frames, double send_utc =
 }
 
 // Would this frame produce a v2 point? Asked before is_parked is added, so drivingState cannot count.
-bool v2HasTelemetry(const OBDVector& frame, double send_utc) {
-  return bulkStringV2({ frame }, send_utc) != "[]";
+// A location or heading equal to *marks is not news; *marks then includes this frame's.
+bool v2HasTelemetry(const OBDVector& frame, double send_utc, GeoMarks* marks = nullptr) {
+  return bulkStringV2({ frame }, send_utc, marks) != "[]";
 }

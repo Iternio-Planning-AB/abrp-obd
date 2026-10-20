@@ -75,6 +75,20 @@ void appendUserAgent(HeaderVector& headers, const std::string& ua) {
   if (headerBytes(headers) > SIM7070_HEADER_BUDGET) headers.pop_back();
 }
 
+// The last location and heading a 200 accepted. Kept across deep sleep so a parked car's unchanged fix is not
+// re-sent every wake; any other boot clears it, which costs at most one resend and never depends on another
+// image's RTC layout.
+RTC_DATA_ATTR GeoMarks g_geo_accepted = {};
+void resetGeoAccepted(bool deep_sleep) {
+  if (!deep_sleep) g_geo_accepted = {};
+}
+// The marks as of the newest buffered frame, so an unsent fix is buffered once, not once per poll. Only meaningful
+// while the buffer is non-empty; an empty buffer starts again from g_geo_accepted.
+GeoMarks g_geo_queued = {};
+// False after a backlog restore until a trusted clock lets seedGeoQueued() see the restored fixes. The restore
+// itself usually runs untrusted: a backlog exists because coverage, and with it NITZ/NTP, was missing.
+bool g_geo_queued_seeded = true;
+
 // The last logNetworkAt() failed before anything was sent - not a verdict on the bearer (see loop()).
 bool g_upload_local_fail = false;
 
@@ -102,7 +116,9 @@ static bool logNetworkAt(const std::vector<OBDVector>& obd_result_vector, double
 
   // All buffered frames go up in a single POST, instead of one request per frame. Far fewer requests ->
   // less data/airtime, which is the whole point of buffering.
-  std::string payload = bulkStringV2(obd_result_vector, send_utc);
+  GeoMarks sent_geo = g_geo_accepted;
+  unsigned location_dups = 0;
+  std::string payload = bulkStringV2(obd_result_vector, send_utc, &sent_geo, &location_dups);
   if (payload == "[]") {
     // Nothing in this batch survived the v2 mapping (every key unmapped, or no usable utc). Report
     // success so the caller clears the frames - re-sending them would fail the same way forever.
@@ -160,13 +176,19 @@ static bool logNetworkAt(const std::vector<OBDVector>& obd_result_vector, double
     }
   }
   const std::string& raw = gzip_used ? gzipped : payload;
-  unsigned points = 0;
+  unsigned points = 0, locations = 0;
   for (size_t pos = 0; (pos = raw.find("\"provider\":", pos)) != std::string::npos; ++pos) ++points;
+  for (size_t pos = 0; (pos = raw.find("\"location\":", pos)) != std::string::npos; ++pos) ++locations;
   char diagnostic[UPLOAD_DIAGNOSTIC_MESSAGE_BYTES];
-  snprintf(diagnostic, sizeof(diagnostic),
+  const int body_len = snprintf(diagnostic, sizeof(diagnostic),
     "UPLOAD body raw=%uB wire=%uB id=%lu enc=%c sha=%s src=%u pts=%u sutc=%lu..%lu",
     (unsigned)raw_bytes, (unsigned)payload.size(), request_id, gzip_used ? 'g' : 'j', fingerprint,
     (unsigned)obd_result_vector.size(), points, source_first, source_last);
+  // Appended whole or not at all: at the extremes of the other fields a clipped digit would be a wrong count.
+  char counts[32];
+  const int counts_len = snprintf(counts, sizeof(counts), " loc=%u ldup=%u", locations, location_dups);
+  if (body_len >= 0 && counts_len >= 0 && (size_t)body_len + counts_len < sizeof(diagnostic))
+    memcpy(diagnostic + body_len, counts, counts_len + 1);
   logEvent("%s", diagnostic);
 #endif
 
@@ -221,7 +243,16 @@ static bool logNetworkAt(const std::vector<OBDVector>& obd_result_vector, double
   */
   logging_errors = 0;
   g_last_status = "ok";
+  g_geo_accepted = sent_geo;
   return true;
+}
+
+// One frame at a time, so a 120-frame backlog never builds one JSON tree.
+void seedGeoQueued(double send_utc) {
+  if (g_geo_queued_seeded || !send_utc) return;
+  g_geo_queued = g_geo_accepted;
+  for (const auto& frame : obd_result_vector) bulkStringV2({ frame }, send_utc, &g_geo_queued);
+  g_geo_queued_seeded = true;
 }
 
 static double uploadSendUtc() {
@@ -268,7 +299,8 @@ bool uploadBuffered(bool drain) {
     // Compression is not free (a ~300 KB PSRAM compressor pass per call), so this shrinks by a ratio
     // estimate first and only then verifies, instead of compressing once per popped frame.
     auto wireSize = [send_utc](const std::vector<OBDVector>& b) {
-      std::string body = bulkStringV2(b, send_utc);
+      GeoMarks marks = g_geo_accepted;
+      std::string body = bulkStringV2(b, send_utc, &marks);
       std::string gz;
       return gzipBody(body, gz) ? gz.size() : body.size();
     };
@@ -354,6 +386,7 @@ void loadUploadBacklog() {
   }
   f.close();
   LittleFS.remove(UPLOAD_BACKLOG_PATH);
+  g_geo_queued_seeded = false;
   if (n) {
     Serial.printf("Backlog: restored %d frame(s) from flash for upload\n", n);
     logEvent("BACKLOG restored %d frame(s) from flash", n);

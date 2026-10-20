@@ -2,6 +2,7 @@
 #include "upload_transport_fixture.h"
 #include <cstdarg>
 #include <ctime>
+#include <algorithm>
 #include <limits>
 #include <sstream>
 #include "networkwrapper.h"
@@ -59,6 +60,9 @@ void esp_task_wdt_reset() {}
 enum ClockSource { CLK_HTTP };
 time_t parseHttpDate(const char* value) { return std::strtoll(value, nullptr, 10); }
 void setClock(ClockSource, time_t value) { rtc.epoch = value; last_clock_sync_epoch = value; }
+enum ResetReason { ESP_RST_POWERON, ESP_RST_DEEPSLEEP };
+ResetReason reset_reason = ESP_RST_POWERON;
+ResetReason esp_reset_reason() { return reset_reason; }
 #include "telemetry_format.h"
 #include "geo_backlog.h"
 int gzip_calls = 0;
@@ -138,6 +142,7 @@ void reset() {
     gzip_enabled = force_oversized = false;
     logging_errors = g_last_http = g_http0_streak = 0; g_last_status.clear(); obd_result_vector.clear();
     host_md_fail = 0;
+    g_geo_accepted = g_geo_queued = {}; reset_reason = ESP_RST_POWERON;
 #if ENABLE_LOGGING
     g_upload_request_id = 0;
 #endif
@@ -248,6 +253,9 @@ void safeErrors() {
     check(events("UPLOAD body raw=")[0].find("sutc=1791112000..1791112000") != std::string::npos &&
         events("UPLOAD id=")[0].find("cut=0 w=?") != std::string::npos,
         "full source span and transfer fields still fit at maximum ESP32 request id");
+    check(events("UPLOAD body raw=")[0].find(" loc=") == std::string::npos, "counts that do not fit whole are left out, never clipped");
+    reset(); g_upload_request_id = 41;
+    check(logNetwork({frame(0)}) && events("UPLOAD body raw=")[0].find(" loc=0 ldup=0") != std::string::npos, "counts that fit are logged");
 }
 #endif
 void queue() {
@@ -591,7 +599,15 @@ void geoSizing() {
     check(uploadBuffered(true) && network.sent.size() == 1 && network.sent[0] == bulkStringV2({rich}, now) && network.sent[0].size() <= CELL_MAX_POST_BYTES,
         "backward clock change during sizing cannot expand final payload past cap");
     reset();
-    for (unsigned i = 0; i < MAX_FRAMES_PER_POST + 1; ++i) obd_result_vector.push_back(geoFrame(now + i, now - GEO_MAX_SEND_AGE_SECONDS, now - GEO_MAX_SEND_AGE_SECONDS));
+    // A distinct fix per frame, so send-once never hides each batch's own clock.
+    for (unsigned i = 0; i < MAX_FRAMES_PER_POST + 1; ++i) {
+        auto source = geoFrame(now + i, now - GEO_MAX_SEND_AGE_SECONDS, now - GEO_MAX_SEND_AGE_SECONDS);
+        for (auto& value : source) {
+            if (value.first == "heading") value.second = 10 + i;
+            if (value.first == "lat") value.second = 59.32 + i * 0.001;
+        }
+        obd_result_vector.push_back(source);
+    }
     const auto original = obd_result_vector;
     network.response_epochs.push_back(now + 1);
     check(uploadBuffered(true) && obd_result_vector.empty() && network.sent.size() > 1, "multiple bounded batches drain with server clock correction");
@@ -625,6 +641,117 @@ void geoSizing() {
         }
         check(index == original.size(), "clock-quality batch transitions deliver every battery frame once");
     }
+}
+// A location or heading goes up once per new GPS observation, and counts as sent only on a 200.
+OBDVector dedupFix(double utc, double loc_utc, double head_utc, double lat = 59.32, double lon = 18.06, double heading = 90) {
+    return {{"utc", utc}, {"soc", 60}, {"is_parked", 1}, {"lat", lat}, {"lon", lon}, {"heading", heading},
+        {"__geo_loc_utc", loc_utc}, {"__geo_head_utc", head_utc}};
+}
+json lastPoint() { return json::parse(network.sent.back())[0]; }
+void geoResetFromSetup() {
+#include "geo_reset.inc"
+}
+void geoDedup() {
+    const double now = 1791112000, seen = now - 60;
+    reset();
+    const std::vector<OBDVector> same = {dedupFix(now - 2, seen, seen), dedupFix(now - 1, seen, seen), dedupFix(now, seen, seen)};
+    const auto points = json::parse(bulkStringV2(same, now));
+    check(points.size() == 3, "every frame of a repeated fix keeps its point");
+    for (size_t i = 0; i < points.size(); ++i) {
+        check(points[i].contains("location") == (i == 0) && points[i].contains("heading") == (i == 0),
+            "a fix repeated within one batch is sent on its first point only");
+        check(points[i]["soc"]["time"] == v2Time(now - 2 + i) && points[i]["drivingState"]["state"] == "PARK",
+            "battery and state stay on every point");
+    }
+    check(points[0]["location"]["time"] == v2Time(seen) && points[0]["location"]["lat"] == 59.32 &&
+        points[0]["heading"]["time"] == v2Time(seen), "the one location and heading keep their observation times");
+    check(logNetwork(same), "repeated-fix batch accepted");
+#if ENABLE_LOGGING
+    check(events("UPLOAD body raw=").back().find(" loc=1 ldup=2") != std::string::npos, "UPLOAD body counts sent and suppressed locations");
+#endif
+    check(logNetwork({dedupFix(now + 1, seen, seen)}), "next batch accepted");
+    check(!lastPoint().contains("location") && !lastPoint().contains("heading") && lastPoint()["soc"]["frac"] == 0.6,
+        "an accepted location and heading are not sent again, the battery is");
+#if ENABLE_LOGGING
+    check(events("UPLOAD body raw=").back().find(" loc=0 ldup=1") != std::string::npos, "a suppressed resend is counted");
+#endif
+
+    reset(); obd_result_vector = {dedupFix(now, seen, seen)}; network.code = 503;
+    check(!uploadBuffered(true) && lastPoint().contains("location"), "first buffered attempt carries the fix");
+    check(!uploadBuffered(true) && lastPoint().contains("location") && lastPoint().contains("heading"),
+        "neither the sizing pass nor a failed POST marks the fix sent");
+    network.code = 200;
+    check(uploadBuffered(true) && lastPoint().contains("location") && lastPoint().contains("heading"), "the retry carries it");
+    obd_result_vector = {dedupFix(now + 1, seen, seen)};
+    check(uploadBuffered(true) && !lastPoint().contains("location") && !lastPoint().contains("heading"), "and once accepted, it is not sent again");
+
+    reset(); network.code = 0;
+    check(!logNetwork({dedupFix(now, seen, seen)}), "unanswered upload fails");
+    network.code = 200;
+    check(logNetwork({dedupFix(now, seen, seen)}) && lastPoint().contains("location") && lastPoint().contains("heading"),
+        "an unanswered upload leaves the fix owed");
+    // No ok_empty check: an empty body emitted nothing, so its marks equal the accepted ones by construction.
+    reset(); last_clock_sync_epoch = 0;
+    check(logNetwork({dedupFix(now, seen, seen)}) && !lastPoint().contains("location") && lastPoint().contains("soc"),
+        "an untrusted clock sends the battery without the fix");
+    setClock(CLK_HTTP, now);
+    check(logNetwork({dedupFix(now + 1, seen, seen)}) && lastPoint().contains("location") && lastPoint().contains("heading"),
+        "the withheld fix is sent once the clock is trusted");
+    check(logNetwork({dedupFix(now + 2, seen, seen)}) && !lastPoint().contains("location"), "and only once");
+
+    reset();
+    check(logNetwork({dedupFix(now, seen, seen)}), "fix accepted");
+    check(logNetwork({dedupFix(now + 1, seen + 1, seen)}) && lastPoint()["location"]["time"] == v2Time(seen + 1) &&
+        !lastPoint().contains("heading"), "a new location observation time is sent, the old heading is not");
+    check(logNetwork({dedupFix(now + 2, seen + 1, seen, 59.33)}) && lastPoint()["location"]["lat"] == 59.33,
+        "new coordinates with an unchanged observation time are sent");
+    check(logNetwork({dedupFix(now + 3, seen + 1, seen, 59.33)}) && !lastPoint().contains("location"), "then not again");
+    check(logNetwork({dedupFix(now + 4, seen + 1, seen + 5, 59.33)}) && lastPoint()["heading"]["time"] == v2Time(seen + 5) &&
+        !lastPoint().contains("location"), "a new heading observation time is sent");
+    check(logNetwork({dedupFix(now + 5, seen + 1, seen + 5, 59.33, 18.06, 180)}) && lastPoint()["heading"]["degrees"] == 180,
+        "a new heading with an unchanged observation time is sent");
+    check(logNetwork({dedupFix(now + 6, seen + 1, seen + 5, 59.33, 18.06, 180)}) && !lastPoint().contains("heading"), "then not again");
+
+    reset(); g_http0_streak = 1; // three-frame probe batches
+    obd_result_vector = {dedupFix(now - 4, seen, seen), dedupFix(now - 3, seen, seen), dedupFix(now - 2, seen, seen),
+        dedupFix(now - 1, seen, seen), dedupFix(now, seen + 30, seen + 30)};
+    network.codes = {200, 503};
+    check(!uploadBuffered(true) && obd_result_vector.size() == 2 && network.sent.size() == 2, "batch 1 accepted, batch 2 failed");
+    auto second = json::parse(network.sent[1]);
+    check(json::parse(network.sent[0])[0].contains("location") && !second[0].contains("location") && !second[0].contains("heading") &&
+        second[1]["location"]["time"] == v2Time(seen + 30), "batch 2 omits the fix batch 1 delivered and carries the new one");
+    check(uploadBuffered(true) && obd_result_vector.empty() && network.sent[2] == network.sent[1],
+        "the retry does not resend batch 1's fix and still carries the unaccepted one");
+
+    reset();
+    const auto accepted_fix = dedupFix(seen, seen, seen);
+    check(logNetwork({accepted_fix}), "fix accepted");
+    auto big = dedupFix(now, seen, seen);
+    bool straddles = false;
+    for (int extra = 0; extra < 40 && !straddles; ++extra) {
+        big.emplace_back("_pad" + std::to_string(extra), 1);
+        big.emplace_back(extra % 2 ? "cabin_temp" : "batt_temp_min", 20 + extra);
+        for (const char* field : {"soh", "soe", "capacity", "kwh_charged", "power", "hvac_power", "voltage", "batt_temp",
+                "batt_temp_max", "ext_temp", "odometer", "est_battery_range", "speed", "elevation"}) {
+            if (std::none_of(big.begin(), big.end(), [&](const auto& v) { return v.first == field; })) { big.emplace_back(field, 23); break; }
+        }
+        GeoMarks marks = g_geo_accepted;
+        straddles = bulkStringV2({big}, now).size() > CELL_MAX_POST_BYTES &&
+            bulkStringV2({big}, now, &marks).size() <= CELL_MAX_POST_BYTES;
+    }
+    check(straddles, "fixture is oversized only because of an already-accepted fix");
+    obd_result_vector = {big};
+    check(uploadBuffered(true) && network.sent.size() == 2 && !lastPoint().contains("location"),
+        "sizing uses the accepted mark, so the frame is sent, not dropped as oversized");
+
+    reset();
+    check(logNetwork({dedupFix(now, seen, seen)}), "fix accepted");
+    reset_reason = ESP_RST_DEEPSLEEP; geoResetFromSetup();
+    check(logNetwork({dedupFix(now + 1, seen, seen)}) && !lastPoint().contains("location") && !lastPoint().contains("heading"),
+        "a deep-sleep wake keeps the accepted mark");
+    reset_reason = ESP_RST_POWERON; geoResetFromSetup();
+    check(logNetwork({dedupFix(now + 2, seen, seen)}) && lastPoint().contains("location") && lastPoint().contains("heading"),
+        "any other boot sends the fix once more");
 }
 std::string hex(const std::string& bytes) {
     std::string out;
@@ -736,6 +863,7 @@ int main(int argc, char** argv) {
     if (group == "all" || group == "geo-retry") geoRetry();
 #endif
     if (group == "all" || group == "geo-sizing") geoSizing();
+    if (group == "all" || group == "geo-dedup") geoDedup();
     if (group == "all" || group == "signing") signing();
     std::cout << "PASS upload helpers " << group << " logging=" << ENABLE_LOGGING << '\n';
 }
