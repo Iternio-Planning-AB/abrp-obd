@@ -299,6 +299,9 @@ RTC_DATA_ATTR double prev_parked_soe = -1.0;
 RTC_DATA_ATTR char last_good_220105_reply[513] = {};
 RTC_DATA_ATTR uint8_t obd_anomaly_logs = 0;
 RTC_DATA_ATTR uint64_t obd_anomaly_last_us = 0;
+// skipped_prefix has its own budget so recoveries never use up the raw captures above.
+RTC_DATA_ATTR uint8_t obd_skip_logs = 0;
+RTC_DATA_ATTR uint64_t obd_skip_last_us = 0;
 // Consecutive polls with no charge evidence while the charge latch was still set (CHARGE_RELEASE_POLLS).
 RTC_DATA_ATTR uint8_t charge_release_polls = 0;
 // Consecutive latched polls the car did not answer, held off the release up to CHARGE_SILENT_HOLD_POLLS.
@@ -1419,6 +1422,15 @@ void loop() {
         logRaw("bad", obd.anomalous_220105_reply.data(), obd.anomalous_220105_reply.size());
         obd_anomaly_last_us = now_us;
         obd_anomaly_logs++;
+      }
+      // A reply recovered by dropping lines ahead of it: same cap and spacing, own budget, no bytes logged.
+      if (!obd.skipped_prefix_pid.empty() && obd_skip_logs < 3 &&
+          (!obd_skip_last_us || now_us < obd_skip_last_us ||
+           now_us - obd_skip_last_us >= 15ULL * 60ULL * 1000000ULL)) {
+        logEvent("OBD%s reason=skipped_prefix lines=%u", obd.skipped_prefix_pid.c_str(),
+          obd.skipped_prefix_lines);
+        obd_skip_last_us = now_us;
+        obd_skip_logs++;
       }
       if (!obd.good_220105_reply.empty()) {
         size_t n = obd.good_220105_reply.size();

@@ -306,6 +306,14 @@ ASan/UBSan. Add `--profiles /path/to/profiles` to exercise actual Scenic/iX3 pro
 equations with the firmware parser (optional: the ABRP backend profiles are not public). The runner extracts the current charging and logging code;
 filesystem and hardware are fakes, not on-device verification.
 
+## OBD reply checks
+
+Run `python3 tests/run_obd_reply_checks.py` for the real `genericProtocol()` on protocol-6 `22xxxx`
+replies, extracted from `obdwrapper.cpp`: a clean reply decodes to fixed bytes, stray, blank and short lines
+ahead of a single or first frame are dropped, a re-segmented reply under a foreign header and a wrong DID
+are refused, replies with no anchor line and non-`22xxxx` requests are left to the plain parser, and
+truncated replies decode their partial bytes. Fixtures are scrubbed co-processor replies; the co-processor itself is not exercised.
+
 ## Cellular TLS trust checks
 
 Run `python3 tests/run_server_roots_checks.py` (add `--require-live` to fail rather than skip when
