@@ -271,6 +271,27 @@ awake.** Polling a sleeping EV wakes its ECUs, which then stay awake on the *car
   car before trusting anything that keys on it.
 - **Wake sources:** wake-on-motion (ICM-42627 interrupt, threshold ~0.158 g) and a timer
   (`WAKE_PARKED_MINUTES 30` / `WAKE_CHARGING_MINUTES 3`).
+- **Following a charge on a car that answers intermittently** (issue #7). Every extra poll is bounded, and
+  a low-rail read needs proven charging. Three rules cover it:
+  - A latched charge that goes silent at a rail ≥ `RAIL_AWAKE_VOLTS` never releases. After
+    `CHARGE_SILENT_HOLD_POLLS` it waits at the parked cadence with the latch up, and the rail drop
+    still gets its one charge-end read. The hold, a release at a sample poke, the gate's give-up and a
+    skip wake all keep the charge's fast-cadence budget, cap and corroboration until the last charge
+    evidence is `CHARGE_STALE_RESET_MINUTES` (6 h) old. So a stuck current that answers between
+    silences, or at every 12 V top-up, still relaxes. A drive (a streaming wake) always resets.
+  - When a charge latch clears on a stationary wake, one follow-up is armed. The first silent
+    rail-high poke after it comes back in 3 min instead of 30. It is spent there, and cleared by
+    motion (a power-on zeroes it with the rest, below).
+  - The post-drive window (`POST_DRIVE_WINDOW_MINUTES 15`, at most `POST_DRIVE_MAX_POLLS 5`) is
+    opened at the awake-ladder end only, with a fresh rail read that is high, and never over a
+    latched or capped charge. A NET-recovery reboot opens it too, keeping its 1-min timer. A silent rail-high poke
+    inside it comes back in 3 min, so a DC charge started right after parking is not missed for a
+    parked cadence. It is timed on the RTC microsecond clock from the last motion. OBD answers play
+    no part, because a drive may have none.
+  - The follow-up and the window only shorten the cadence after a rail-high poll that happens anyway.
+    None of the three apply to a car with the alarm flag set (§7).
+  - The follow-up, window and last-evidence RTC state is zeroed on any boot that is not a deep-sleep
+    wake.
 - **BLE must come up early** — right after the gate, before the ~12 s cellular init — so the dongle
   advertises within ~2 s of wake. Behind cellular it took ~14 s and blew the app's 5 s reconnect
   window, churning every post-sleep reconnect.
@@ -584,7 +605,10 @@ session.
   on it, and OTA/log-dump windows (which bypass `detectMovement`) are not counted.
 - **`SLEEP enter ... reason=<r>`** names why the dongle slept. `dc-charge`, `charging` and `parked` are the
   cadence tiers, read back from the armed timer (1, 3, 30 min). `net-recover` is the modem-recovery
-  reboot (1 min), `wdt-streak` the WDT-streak escalation, `backstop` the parked MAX_AWAKE ceiling.
+  reboot (1 min), `wdt-streak` the WDT-streak escalation, `backstop` the parked MAX_AWAKE ceiling. Charge
+  cadence decisions the timer can't tell apart name themselves: `parked-held`, `parked-cap`,
+  `parked-uncorroborated`, `pdw` and `followup` (below). An explicit sleep reason wins over a cadence
+  label, which wins over the timer.
 - **Log the *reason*, not just the outcome.** A subsystem that goes quiet with an empty log is the
   shape that gets misattributed to the cellular stack for weeks — this has happened more than once
   in this project (the transport-handoff bug; a stored hash claiming a profile that wasn't running).
@@ -602,6 +626,23 @@ session.
   a missing token or an oversized header set. So a run of these never ends in `NET recover`. A session
   that refuses `HEADERLEN` (open trace `hdrlen`) does count toward it; that ladder is bounded by
   `net_reboot_count` (at most two reboots per outage).
+- **Charge cadence lines.**
+  - The `SLEEP enter` cadence labels: `parked-held` is latched and silent at a high rail, `parked-cap`
+    has spent `WAKE_CHARGING_MAX_MINUTES`, `pdw` is the post-drive window, and `followup` the one
+    follow-up after a charge.
+  - `logEvent` keeps 119 characters of a message, so new fields go on short lines; the energy runner
+    checks `SAMPLE_POLL` and `ATRVGATE` at worst-case values.
+  - `SAMPLE_POLL pids is_charging prog rel taper stall rail=<before>-><after> hold sil fu pdw`:
+    - `hold=1` is a latched silent poll at a high rail;
+    - `sil` is the silent-hold count;
+    - `fu=1` means a follow-up is armed;
+    - `pdw` is the minutes left in the post-drive window.
+    The running poll tallies are gone: count the lines, and `pids=0` for the unanswered ones.
+  - `ATRVGATE atrv rail <verdict> <action> since_poll skips polls rc <ENFORCE|observe>`. `rc` is the
+    charge latch after the gate. `rail_awake` and `weak_rail` follow from `rail`.
+  - The events are `FOLLOWUP armed|spent`, `FOLLOWUP cleared reason=motion`,
+    `POSTDRIVE window opened|closed wake=<wake reason>` at the ladder end, and
+    `POSTDRIVE window closed reason=answered|expired|spent` from a poll.
 - **`tx_count`** on `OBDWrapper` counts co-processor commands — a **superset** of CAN frames, since
   most AT commands only configure the ELM locally. A nonzero delta is therefore not proof of bus
   traffic, but the counter must not advance while a gate says it's denying.

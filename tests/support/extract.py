@@ -20,8 +20,10 @@ def block(text, opener, what="source"):
             return text[start:i] + "\n"
 
 
-def wake_gate(logger, what="logger.ino"):
-    """The setup() poll decision, from the weak-rail test through should_poll."""
+def wake_gate(logger, what="logger.ino", through="heartbeat_due);\n"):
+    """The setup() poll decision, from the weak-rail test through `through` (default: should_poll), to the end of its line."""
     start = find(logger, "    bool weak_rail = (rail >= IO36_LOCKOUT_LOW", what=what)
-    end = find(logger, "heartbeat_due);\n", start, what) + len("heartbeat_due);\n")
+    end = find(logger, through, start, what) + len(through)
+    if not through.endswith("\n"):
+        end = find(logger, "\n", end, what) + 1
     return logger[start:end]

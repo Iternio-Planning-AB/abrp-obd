@@ -231,10 +231,10 @@ QueueHandle_t bleLogQueue = nullptr;
 
 // Test C instrumentation: rail captured at the gate (BEFORE a heartbeat poll), compared to a fresh reading a
 // few seconds AFTER the poll - if the poll woke the car, rail climbs toward charging voltage; if it did
-// nothing, rail stays flat. Running tallies (RTC) make "N polls, N no_obd, rail flat" readable at a glance.
+// nothing, rail stays flat.
+// Also a control input: a silent sample poke at a rail >= RAIL_AWAKE_VOLTS holds the charge latch
+// (CHARGE_SILENT_HOLD_POLLS) and may shorten the cadence (charge_followup, POST_DRIVE_*).
 float g_rail_before_poke = 0.0f;
-RTC_DATA_ATTR uint32_t heartbeat_polls_total = 0;
-RTC_DATA_ATTR uint32_t heartbeat_polls_noobd = 0;
 // Per-power-session tallies (evidence the modem is rarely powered): cheap skip wakes vs poll wakes.
 RTC_DATA_ATTR uint32_t skips_count = 0;
 RTC_DATA_ATTR uint32_t polls_count = 0;
@@ -303,6 +303,35 @@ RTC_DATA_ATTR uint64_t obd_anomaly_last_us = 0;
 RTC_DATA_ATTR uint8_t charge_release_polls = 0;
 // Consecutive latched polls the car did not answer, held off the release up to CHARGE_SILENT_HOLD_POLLS.
 RTC_DATA_ATTR uint8_t charge_silent_polls = 0;
+// One WAKE_CHARGING_MINUTES follow-up after a charge: armed when the latch clears on a stationary wake,
+// spent by the first silent high-rail sample poke, cleared by motion or a cold boot. 0/1 only.
+RTC_DATA_ATTR uint8_t charge_followup = 0;
+// Post-drive window (POST_DRIVE_WINDOW_MINUTES), opened at the awake-ladder end with the rail high and timed
+// on the RTC microsecond clock from the last motion, never the wall clock: it may be untrusted.
+RTC_DATA_ATTR uint8_t pdw_open = 0;
+RTC_DATA_ATTR uint64_t pdw_open_us = 0;
+RTC_DATA_ATTR uint8_t pdw_polls = 0;
+// RTC microseconds of the last poll with charge evidence: a hold or a rail-high release keeps the charge's
+// budget, cap and corroboration until this is CHARGE_STALE_RESET_MINUTES old.
+RTC_DATA_ATTR uint64_t charge_last_evidence_us = 0;
+bool g_pdw_ladder_done = false;          // pdwOpenWindow() decides once per wake
+const char* g_cadence_reason = nullptr;  // names an ambiguous cadence for SLEEP enter; null = derive from minutes
+static const uint64_t POST_DRIVE_WINDOW_US = (uint64_t)POST_DRIVE_WINDOW_MINUTES * 60000000ULL;
+bool pdwActive(uint64_t now_us) {
+  return pdw_open && now_us >= pdw_open_us && now_us - pdw_open_us < POST_DRIVE_WINDOW_US &&
+    pdw_polls < (uint8_t)POST_DRIVE_MAX_POLLS;
+}
+// A pause inside one session keeps the charge's budget, cap and corroboration; only this old is it dropped.
+bool chargeStateStale(uint64_t now_us) {
+  return now_us < charge_last_evidence_us ||
+    now_us - charge_last_evidence_us >= (uint64_t)CHARGE_STALE_RESET_MINUTES * 60000000ULL;
+}
+// Other images can lay RTC memory out differently, so only a deep-sleep wake trusts these.
+void chargeWakeStateSanitize(bool deep_sleep) {
+  if (deep_sleep) return;
+  charge_followup = pdw_open = pdw_polls = 0;
+  pdw_open_us = charge_last_evidence_us = 0;
+}
 
 // Test B (brownout vs clean sleep): set true immediately before esp_deep_sleep_start(); checked on the next
 // boot. If we wake and it's NOT set, we did NOT go through our own sleep path -> an uncommanded reset
@@ -438,6 +467,7 @@ void setup() {
 #if ENABLE_NETWORK
   resetGeoAccepted(esp_reset_reason() == ESP_RST_DEEPSLEEP);
 #endif
+  chargeWakeStateSanitize(esp_reset_reason() == ESP_RST_DEEPSLEEP);
 #if PRINT
   // Only stall on a true power-on, so a serial monitor can attach in time to see boot output. Skip it on
   // every deep-sleep wake - periodic, motion, and especially the WiFi RF-flush recovery - so those reboots
@@ -711,10 +741,23 @@ void setup() {
         if (charge_end_poll) charge_end_polled = true;
         recently_charging = false;       // give up: rail too low, or too many SoC-stalled confirm-polls
         taper_confirm_wakes = 0;
-        resetChargeCorroboration();
+        if (chargeStateStale(esp_rtc_get_time_us())) resetChargeCorroboration();
+        if (!is_motion) {
+          charge_followup = 1;
+#if ENABLE_LOGGING
+          logEvent("FOLLOWUP armed (latch cleared at rail=%.2f)", rail);
+#endif
+        }
       }
     }
     g_taper_confirm = taper_bridge;      // tell the loop this poll is a taper confirm (for the SoC-stall test)
+    // Somebody is at the car: the charge the follow-up was for is not the one that matters now.
+    if (is_motion && charge_followup) {
+      charge_followup = 0;
+#if ENABLE_LOGGING
+      logEvent("FOLLOWUP cleared reason=motion");
+#endif
+    }
 
     // Decide whether to poll. A plain TIMER wake on a PARKED car (rail ~12.6) does NOT poll - polling a parked
     // Scenic returns nothing useful and only costs a voltage sag. We poll only for a real reason, never on a
@@ -758,9 +801,10 @@ void setup() {
     Serial.printf("ATRVGATE: atrv=%.2f rail=%.2f -> %s, %s %s\n",
       v, rail, verdict, action, ATRV_GATE_ENFORCE ? "[ENFORCE]" : "[observe]");
 #if ENABLE_LOGGING
-    logEvent("ATRVGATE atrv=%.2f rail=%.2f %s %s rail_awake=%d weak_rail=%d since_poll=%lds skips=%lu polls=%lu %s",
-      v, rail, verdict, action, rail_awake ? 1 : 0, weak_rail ? 1 : 0, since_poll,
-      (unsigned long)skips_count, (unsigned long)polls_count, ATRV_GATE_ENFORCE ? "ENFORCE" : "observe");
+    // rail_awake and weak_rail follow from rail; logEvent keeps 119 characters.
+    logEvent("ATRVGATE atrv=%.2f rail=%.2f %s %s since_poll=%lds skips=%lu polls=%lu rc=%d %s",
+      v, rail, verdict, action, since_poll, (unsigned long)skips_count, (unsigned long)polls_count,
+      recently_charging ? 1 : 0, ATRV_GATE_ENFORCE ? "ENFORCE" : "observe");
 #endif
     // NOTE: last_poll_epoch is stamped AFTER NITZ (below), not here - on a cold boot the clock isn't valid
     // yet at this point, which is exactly why the heartbeat never fired before.
@@ -792,9 +836,14 @@ void setup() {
       logEvent("ATRVGATE skip -> deep sleep (%s, modem never powered)", weak_rail ? "WEAK RAIL" : "asleep");
 #endif
       g_next_wake_minutes = WAKE_PARKED_MINUTES; // skip = parked: long cadence
-      charging_fast_minutes = 0;                 // a charge that ended via a skip wake resets the fast-cadence budget
-      charging_cap_latched = false;              // ...and clears the cap latch (car not charging at a skip)
-      resetChargeCorroboration();
+      g_cadence_reason = nullptr;
+      // A charge that ended via a skip wake resets the fast-cadence budget and the cap latch - once stale: a
+      // 12 V top-up every few hours must not hand a stuck current a fresh budget each time.
+      if (chargeStateStale(esp_rtc_get_time_us())) {
+        charging_fast_minutes = 0;
+        charging_cap_latched = false;
+        resetChargeCorroboration();
+      }
       enterDeepSleep(false); // modem_on=false: never powered it this wake - never returns
     }
 #endif
@@ -1693,17 +1742,29 @@ void loop() {
     // set the latch.
     const bool silent_hold = was_recently_charging && obd_count == 0 &&
       charge_silent_polls < (uint8_t)CHARGE_SILENT_HOLD_POLLS;
+    // Silence with the DC-DC on is the car, not the charge ending: it never releases, so the rail drop still
+    // gets its read. Past the hold it waits at the parked cadence (high_rail_held, below).
+    const bool high_rail_unanswered = g_sample_poke && g_rail_before_poke >= RAIL_AWAKE_VOLTS && obd_count == 0;
+    const bool high_rail_silent = was_recently_charging && high_rail_unanswered;
+    const bool high_rail_held = high_rail_silent && !silent_hold;
     if (obd_count > 0) charge_silent_polls = 0;
     else if (silent_hold) charge_silent_polls++;
     if (charge_evidence || unconfirmed_charging) {
       charge_release_polls = 0;
-    } else if (was_recently_charging && !silent_hold && charge_release_polls < 255) {
+    } else if (was_recently_charging && !silent_hold && !high_rail_silent && charge_release_polls < 255) {
       charge_release_polls++;
     }
     // Still "charging" for cadence purposes while the release is unconfirmed. Also the taper latch: the gate
     // reads this next wake to decide whether a low-rail wake is worth a confirm-poll.
     recently_charging = charge_evidence ||
       (was_recently_charging && charge_release_polls < (uint8_t)CHARGE_RELEASE_POLLS);
+    if (charge_evidence) charge_last_evidence_us = esp_rtc_get_time_us();
+    if (was_recently_charging && !recently_charging && g_sample_poke) {
+      charge_followup = 1;
+#if ENABLE_LOGGING
+      logEvent("FOLLOWUP armed (latch released)");
+#endif
+    }
 
     if (charge_evidence) {
       // Taper-bridge budget is bound on SoC STALL, not confirm-count: a rising SoC resets it (a real taper
@@ -1761,23 +1822,66 @@ void loop() {
     }
     const bool uncorroborated = charge_uncorroborated_s >= (uint32_t)CHARGE_CORROBORATE_MINUTES * 60;
     const uint64_t now_us = esp_rtc_get_time_us();
+    // An answer ends the post-drive window: from here the charge evidence decides.
+    if (pdw_open && (obd_count > 0 || !pdwActive(now_us))) {
+#if ENABLE_LOGGING
+      logEvent("POSTDRIVE window closed reason=%s polls=%u", obd_count > 0 ? "answered"
+        : pdw_polls >= (uint8_t)POST_DRIVE_MAX_POLLS ? "spent" : "expired", (unsigned)pdw_polls);
+#endif
+      pdw_open = 0;
+    }
+    // A hold, or a release at a sample poke (a pause in the session), keeps the charge's budget, cap and
+    // corroboration until its last evidence is stale; a stuck current must not get a fresh budget each time.
+    // A streaming wake (a drive) always resets.
+    const bool charge_state_stale = chargeStateStale(now_us);
+    g_cadence_reason = nullptr;
     if (!cadence_charging) {
       // Not charging -> long cadence, and clear BOTH the budget and the cap latch (the charge genuinely
-      // ended / rail dropped). This is the only place the latch clears, so the cap holds until then.
+      // ended / rail dropped). Only here and in the high-rail hold below does the cap latch clear.
       g_next_wake_minutes = WAKE_PARKED_MINUTES;
-      charging_fast_minutes = 0;
-      charging_cap_latched = false;
-      resetChargeCorroboration();
+      if (!g_sample_poke || charge_state_stale) {
+        charging_fast_minutes = 0;
+        charging_cap_latched = false;
+        resetChargeCorroboration();
+      }
+      // A silent car at a high rail may be charging without saying so. Look again soon, a bounded number of
+      // times: inside the post-drive window (POST_DRIVE_*), else once after a charge (charge_followup).
+      if (high_rail_unanswered && pdwActive(now_us)) {
+        pdw_polls++;
+        g_next_wake_minutes = WAKE_CHARGING_MINUTES;
+        g_cadence_reason = "pdw";
+      } else if (high_rail_unanswered && charge_followup) {
+        charge_followup = 0;
+        g_next_wake_minutes = WAKE_CHARGING_MINUTES;
+        g_cadence_reason = "followup";
+#if ENABLE_LOGGING
+        logEvent("FOLLOWUP spent rail=%.2f -> %dmin", g_rail_before_poke, WAKE_CHARGING_MINUTES);
+#endif
+      }
+    } else if (high_rail_held) {
+      // Latched, silent past the hold, rail still high: wait at the parked cadence so the car can sleep
+      // between polls. No budget accrues; once stale, a car whose rail never drops leaves no budget, cap or
+      // high-water mark for the next charge.
+      g_next_wake_minutes = WAKE_PARKED_MINUTES;
+      g_cadence_reason = "parked-held";
+      if (charge_state_stale) {
+        charging_fast_minutes = 0;
+        charging_cap_latched = false;
+        resetChargeCorroboration();
+        prev_charge_soc = 0.0;
+      }
     } else if (charging_cap_latched ||
                charging_fast_minutes >= (uint32_t)WAKE_CHARGING_MAX_MINUTES) {
       // Charging, but we've spent the cumulative fast-cadence budget -> latch slow and STAY slow (don't
       // reset the budget here - that's what previously let it bounce straight back to fast).
       charging_cap_latched = true;
       g_next_wake_minutes = WAKE_PARKED_MINUTES;
+      g_cadence_reason = "parked-cap";
     } else if (uncorroborated) {
       // Current says charging, counters say not. Slow, not latched: a later counter rise resets the
       // count above and restores fast cadence.
       g_next_wake_minutes = WAKE_PARKED_MINUTES;
+      g_cadence_reason = "parked-uncorroborated";
       charge_corr_last_us = now_us;
     } else {
       // Charging within budget -> dense sampling, denser still on DC.
@@ -2021,6 +2125,7 @@ void loop() {
               logEvent("NET recover exhausted -> reboot via deep sleep (#%lu, %d frames to backlog)",
                 (unsigned long)net_reboot_count, (int)obd_result_vector.size());
 #endif
+              pdwOpenWindow(); // the reboot ends this awake period
               g_next_wake_minutes = 1;
               enterDeepSleep(true, "net-recover"); // never returns - fresh boot restores the backlog and re-inits everything
             }
@@ -2054,8 +2159,6 @@ void loop() {
     }
 
     if (g_sample_poke && !maintenance_mode) {
-      heartbeat_polls_total++;
-      if (obd_count == 0) heartbeat_polls_noobd++;
 #if ENABLE_IO36_RAIL
       delay(5000);                       // give ECUs time to power up IF the poll woke the car
       float rail_after = readIO36Rail(); // local only - do NOT overwrite g_last_io36, or the SLEEP-enter log
@@ -2070,11 +2173,15 @@ void loop() {
       // prog/rel are what make the two charge signals separable in a field log: prog=1 is_charging=0 is the
       // exact case this exists for (counters moving, current sample says otherwise), and rel counts down the
       // unconfirmed-release window, so a cadence that relaxed can be traced to which signal gave up when.
-      logEvent("SAMPLE_POLL pids=%d is_charging=%d prog=%d rel=%u taper=%d stall=%lu rail_before=%.2f rail_after=%.2f total=%lu noobd=%lu",
+      // No running tallies: logEvent keeps 119 characters, and the dump counts these lines and pids=0 itself.
+      // Fields: DONGLE_CONTEXT §9.
+      const uint64_t pdw_now_us = esp_rtc_get_time_us();
+      const unsigned pdw_left = pdwActive(pdw_now_us)
+        ? (unsigned)((POST_DRIVE_WINDOW_US - (pdw_now_us - pdw_open_us) + 59999999ULL) / 60000000ULL) : 0;
+      logEvent("SAMPLE_POLL pids=%d is_charging=%d prog=%d rel=%u taper=%d stall=%lu rail=%.2f->%.2f hold=%d sil=%u fu=%u pdw=%u",
         obd_count, is_charging ? 1 : 0, charge_progress ? 1 : 0, (unsigned)charge_release_polls,
-        g_taper_confirm ? 1 : 0, (unsigned long)taper_confirm_wakes,
-        g_rail_before_poke, rail_after,
-        (unsigned long)heartbeat_polls_total, (unsigned long)heartbeat_polls_noobd);
+        g_taper_confirm ? 1 : 0, (unsigned long)taper_confirm_wakes, g_rail_before_poke, rail_after,
+        high_rail_silent ? 1 : 0, (unsigned)charge_silent_polls, (unsigned)charge_followup, pdw_left);
 #endif
       enterDeepSleep(true); // modem was powered this wake; flush + sleep
     }

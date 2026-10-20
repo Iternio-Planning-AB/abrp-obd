@@ -28,13 +28,23 @@ state_machine = (root / "baseLogger/Helpers/state_machine.h").read_text()
 
 
 compiler = shlex.split(os.environ.get("CXX", "clang++"))
+# logEvent() formats into char msg[120]: a longer line loses its tail, which is where fields get added.
+WORST_EVENT_ARGS = {
+    "SAMPLE_POLL ": (99, 1, 1, 255, 1, 99, 15.99, 15.99, 1, 255, 1, 15),
+    "ATRVGATE atrv=": (15.99, 15.99, "ASLEEP", "poll(taper-confirm)", 9999999, 999999, 999999, 1, "ENFORCE"),
+}
+for prefix, values in WORST_EVENT_ARGS.items():
+    start = logger.index('logEvent("' + prefix) + len('logEvent("')
+    message = logger[start:logger.index('"', start)] % values
+    if len(message) > 119:
+        raise SystemExit(f"FAIL: {len(message)} > 119 characters, logEvent cuts: {message}")
 with tempfile.TemporaryDirectory(prefix="obd-energy-checks-") as temporary:
     build = Path(temporary)
     (build / "charge_config.inc").write_text("\n".join(re.findall(
         r"^#define (?:CHARGE_PROGRESS_\w+|CHARGING_CURRENT_THRESHOLD|CHARGE_DISCHARGE_AMPS|CHARGE_STREAM_CONFIRM_SECONDS|"
-        r"CHARGE_RELEASE_POLLS|CHARGE_SILENT_HOLD_POLLS|CHARGE_CORROBORATE_MINUTES|WAKE_PARKED_MINUTES|"
+        r"CHARGE_RELEASE_POLLS|CHARGE_SILENT_HOLD_POLLS|CHARGE_STALE_RESET_MINUTES|CHARGE_CORROBORATE_MINUTES|WAKE_PARKED_MINUTES|"
         r"WAKE_CHARGING_MINUTES|WAKE_DC_CHARGING_MINUTES|WAKE_CHARGING_MAX_MINUTES|CLOCK_MAX_EPOCH|GEO_MAX_SEND_AGE_SECONDS|RAIL_AWAKE_VOLTS|RAIL_TAPER_FLOOR|"
-        r"CHARGE_END_POLL_FLOOR|MAX_AWAKE_MINUTES|TAPER_CONFIRM_MAX_WAKES|IO36_LOCKOUT_\w+)\b.*(?:\n[ \t]+.*)*",
+        r"CHARGE_END_POLL_FLOOR|MAX_AWAKE_MINUTES|TAPER_CONFIRM_MAX_WAKES|IO36_LOCKOUT_\w+|POST_DRIVE_\w+|OBD_ALARM_GATE|ENABLE_IO36_RAIL|DC_CHARGING_MIN_KW)\b.*(?:\n[ \t]+.*)*",
         config, re.MULTILINE)))
     start = logger.index("    // Feature A - is_charging")
     end = logger.index("\n    /*\n      CHARGE PROGRESS", start)
@@ -45,10 +55,30 @@ with tempfile.TemporaryDirectory(prefix="obd-energy-checks-") as temporary:
     start = logger.index("    auto chargeCounterRose =")
     end = logger.index("\n    /*\n      DC or AC", start)
     (build / "charge_progress.inc").write_text(logger[start:end])
+    start = logger.index("    bool is_dcfc = false;")
+    end = logger.index("\n    // NOTE: power is deliberately NOT derived", start)
+    (build / "charge_dcfc.inc").write_text(logger[start:end])
     start = logger.index("    bool has_charge_counter = false;")
     end = logger.index("\n    const bool uncorroborated =", start)
     (build / "charge_corroboration.inc").write_text(logger[start:end])
-    (build / "wake_gate.inc").write_text(wake_gate(logger))
+    (build / "wake_gate.inc").write_text(wake_gate(logger, through="    if (g_sample_poke) g_rail_before_poke = rail;"))
+    start = logger.index("static const uint64_t POST_DRIVE_WINDOW_US")
+    end = logger.index("\n}\n", logger.index("void chargeWakeStateSanitize(", start)) + 3
+    (build / "charge_wake_state.inc").write_text(logger[start:end])
+    start = logger.index("bool chargeStateStale(uint64_t now_us) {")
+    end = logger.index("\n}\n", start) + 3
+    (build / "charge_stale.inc").write_text(logger[start:end])
+    start = logger.index("      g_next_wake_minutes = WAKE_PARKED_MINUTES; // skip = parked")
+    end = logger.index("      enterDeepSleep(false);", start)
+    (build / "gate_skip.inc").write_text(logger[start:end])
+    machine = state_machine
+    ladder = machine[machine.index("void handleActivityState() {"):]
+    sleeps = re.findall(r"(\S+)\s*\n?\s*enterDeepSleep\(true(?:, \"[^\"]*\")?\);", ladder)
+    if sleeps != ["pdwArmAtLadderEnd();"] * 2:
+        raise SystemExit(f"FAIL: both ladder sleeps must follow pdwArmAtLadderEnd(): {sleeps}")
+    start = machine.index("bool pdwOpenWindow() {")
+    end = machine.index("\n}\n", machine.index("void pdwArmAtLadderEnd() {")) + 3
+    (build / "pdw_ladder.inc").write_text(machine[start:end])
     start = logger.index("void resetChargeCorroboration() {") + len("void resetChargeCorroboration() {")
     end = logger.index("\n}", start)
     (build / "reset_corroboration.inc").write_text(logger[start:end])
