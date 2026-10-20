@@ -815,7 +815,7 @@ void setup() {
       (unsigned long)wdt_reset_count, WAKE_PARKED_MINUTES);
 #endif
     g_next_wake_minutes = WAKE_PARKED_MINUTES;
-    enterDeepSleep(true); // never returns
+    enterDeepSleep(true, "wdt-streak"); // never returns
   }
 #endif
 
@@ -2009,7 +2009,7 @@ void loop() {
                 (unsigned long)net_reboot_count, (int)obd_result_vector.size());
 #endif
               g_next_wake_minutes = 1;
-              enterDeepSleep(true); // never returns - fresh boot restores the backlog and re-inits everything
+              enterDeepSleep(true, "net-recover"); // never returns - fresh boot restores the backlog and re-inits everything
             }
           }
         }

@@ -169,7 +169,7 @@ void handleActivityState() {
     logEvent("AWAKE_BACKSTOP awake=%lus parked -> force deep sleep (ceiling=%dmin)",
       millis() / 1000UL, MAX_AWAKE_MINUTES);
 #endif
-    enterDeepSleep(true);
+    enterDeepSleep(true, "backstop");
   }
 #endif
 

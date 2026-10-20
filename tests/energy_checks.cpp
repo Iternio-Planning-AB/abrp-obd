@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <climits>
+#include <cstdarg>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -245,6 +246,69 @@ void releaseChecks() {
   for (int i = 0; i < CHARGE_RELEASE_POLLS; ++i) answered.poll({{"current", 0.4}});
   check(!answered.recently_charging, "answered polls with no evidence still release after CHARGE_RELEASE_POLLS");
 }
+
+// The real SLEEP enter line and the two escalation sleeps that name their own reason.
+#define ENABLE_LOGGING 1
+namespace sleep_reason {
+#define WOM_THRESHOLD_G 0.1582f
+std::string last_log;
+void logEvent(const char* format, ...) {
+  char line[256];
+  va_list args;
+  va_start(args, format);
+  vsnprintf(line, sizeof(line), format, args);
+  va_end(args);
+  last_log = line;
+}
+int g_next_wake_minutes = WAKE_PARKED_MINUTES, g_recovers_since_ok = 0;
+unsigned long net_reboot_count = 0, wdt_reset_count = 0;
+bool g_wdt_wake = false;
+float g_last_io36 = 12.6f;
+std::vector<OBDVector> obd_result_vector;
+std::string slept;
+void logSleep(bool modem_on, const char* reason) {
+#include "sleep_log.inc"
+}
+void enterDeepSleep(bool modem_on, const char* reason = nullptr) {
+  logSleep(modem_on, reason);
+  slept = last_log;
+}
+void recoverSleep() {
+#include "net_recover_sleep.inc"
+}
+void wdtSleep() {
+#include "wdt_streak_sleep.inc"
+}
+bool maintenance_mode = false, g_ota_active = false, g_logdump_active = false, is_currently_parked = true;
+enum { UNINITIALIZED, STANDBY } current_state = STANDBY;
+unsigned long millis() { return (MAX_AWAKE_MINUTES + 1) * 60UL * 1000UL; }
+struct { void printf(const char*, ...) {} } Serial;
+void backstopSleep() {
+#include "backstop_sleep.inc"
+}
+bool has(const std::string& text) { return slept.find(text) != std::string::npos; }
+
+void checks() {
+  g_recovers_since_ok = 2;
+  recoverSleep();
+  check(has("timer=1min reason=net-recover "), "the modem-recovery reboot logs its own reason, not dc-charge");
+  g_wdt_wake = true;
+  wdt_reset_count = 2;
+  wdtSleep();
+  check(has("reason=wdt-streak "), "the WDT-streak escalation logs its own reason");
+  slept.clear();
+  backstopSleep();
+  check(has("reason=backstop "), "the parked MAX_AWAKE backstop logs its own reason");
+  g_next_wake_minutes = WAKE_DC_CHARGING_MINUTES;
+  enterDeepSleep(true);
+  check(has("reason=dc-charge "), "a cadence sleep still names its tier from the armed timer");
+  g_next_wake_minutes = WAKE_CHARGING_MINUTES;
+  enterDeepSleep(true);
+  check(has("reason=charging "), "an AC-charge cadence sleep still logs charging");
+}
+}  // namespace sleep_reason
+#undef WOM_THRESHOLD_G
+#undef ENABLE_LOGGING
 
 #define ENABLE_LOGGING 0
 
@@ -525,7 +589,7 @@ int main(int argc, char** argv) {
   const std::string group = argc > 1 ? argv[1] : "all";
   check(group == "all" || group == "progress" || group == "signal" || group == "release" ||
         group == "corroboration" || group == "wake-gate" ||
-        group == "logging" || group == "transport" || group == "profiles" || group == "schema", "known test group");
+        group == "logging" || group == "transport" || group == "sleep-reason" || group == "profiles" || group == "schema", "known test group");
   if (group == "all" || group == "progress") progressChecks();
   if (group == "all" || group == "signal") signalChecks();
   if (group == "all" || group == "release") {
@@ -539,6 +603,7 @@ int main(int argc, char** argv) {
   if (group == "all" || group == "logging") loggingChecks();
   if (group == "all" || group == "schema") schemaChecks();
   if (group == "all" || group == "transport") transportChecks();
+  if (group == "all" || group == "sleep-reason") sleep_reason::checks();
   if (argc > 2 && (group == "all" || group == "profiles")) profileChecks(argv[2]);
   std::cout << "Energy " << group << " checks PASS\n";
 }

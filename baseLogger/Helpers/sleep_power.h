@@ -71,7 +71,7 @@ static const char* resetReasonStr() {
 // down). false on a cheap ATRV-gate SKIP, where we decided the car is asleep BEFORE ever powering the modem
 // - so there's nothing to flush and we must NOT call powerOff() (it would PWRKEY-toggle an already-off modem
 // back ON). GPS is powered before the gate either way, so it's always shut down here.
-void enterDeepSleep(bool modem_on) {
+void enterDeepSleep(bool modem_on, const char* reason = nullptr) {
   // HARD BLOCK while a firmware update is transferring. This single guard covers EVERY sleep path in the
   // firmware (the ATRV gate skip, the max-awake backstop, the STANDBY transition, the WDT-streak escalation,
   // the sample-poke fast path and the modem-recovery reboot), which is why it lives at the very top of the
@@ -176,10 +176,12 @@ void enterDeepSleep(bool modem_on) {
   // relaxes when parked. (g_next_wake_minutes == WAKE_CHARGING_MINUTES => we observed an active charge.)
   // Three tiers now, so the reason has to name which: dc-charge (1 min), charging (3), parked (30).
   // Reading the cadence back out like this keeps one source of truth - the value that was actually
-  // armed - rather than a second copy of the decision that could disagree with it.
+  // armed - rather than a second copy of the decision that could disagree with it. A sleep that is not a
+  // cadence tier passes its own reason: the recovery reboot's 1 min would otherwise read as dc-charge.
   logEvent("SLEEP enter -> %s+GPS off, timer=%dmin reason=%s rail=%.2f (WOM %.3fg)",
     modem_on ? "modem" : "(modem already off)", g_next_wake_minutes,
-    (g_next_wake_minutes == WAKE_DC_CHARGING_MINUTES) ? "dc-charge"
+    reason ? reason
+      : (g_next_wake_minutes == WAKE_DC_CHARGING_MINUTES) ? "dc-charge"
       : (g_next_wake_minutes == WAKE_CHARGING_MINUTES) ? "charging" : "parked",
     g_last_io36, WOM_THRESHOLD_G);
 #else
