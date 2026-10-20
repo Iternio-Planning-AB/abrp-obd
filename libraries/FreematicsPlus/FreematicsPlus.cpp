@@ -597,6 +597,38 @@ bool FreematicsESP32::gpsBegin() {
   return false;
 }
 
+// BEGIN gps-jump-filter (tests/run_heading_checks.py extracts this block with gpsGetData)
+/*
+  Link-path jump filter; tunables here because this library TU cannot include config.h (pointer there).
+  A candidate is accepted within GPS_JUMP_MARGIN_M plus GPS_JUMP_MAX_MPS for every second since the anchor's
+  receiver date/time last changed - co-processor re-echoes in a tunnel must not restart that clock.
+  FIELD (Ioniq 5, 2026-10-16): the old fixed 0.1-degree box anchored on a bad 5-satellite cold-start fix and
+  rejected every good fix for 17 min of driving. So GPS_JUMP_REANCHOR consecutive fresh rejected fixes, each
+  plausible from the one before and at most GPS_JUMP_RUN_GAP_MS apart, replace the anchor.
+*/
+// Cold-start and multipath error. 2000 still rejects gross junk, and at 2.35 km per 5 s stays far stricter
+// than the old box over short gaps; the host fixtures also make instant 1-2 km moves.
+static constexpr float GPS_JUMP_MARGIN_M = 2000;
+static constexpr float GPS_JUMP_MAX_MPS = 70;         // 252 km/h: faster than any road car
+static constexpr uint8_t GPS_JUMP_REANCHOR = 3;       // one spike, or a replayed one, never re-anchors
+static constexpr uint32_t GPS_JUMP_RUN_GAP_MS = 60000;
+static uint32_t gps_anchor_date = 0, gps_anchor_time = 0;
+static unsigned long gps_anchor_ms = 0;
+static GPS_DATA gps_run_last{};
+static unsigned long gps_run_ms = 0;
+static uint8_t gps_run_n = 0;
+
+// Only a real position anchors: (0,0), partial-zero and out-of-range records never do.
+static bool gpsJumpAnchor(float lat, float lng) {
+  return lat != 0 && lng != 0 && lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180;
+}
+
+static bool gpsJumpPlausible(float lat1, float lng1, float lat2, float lng2, uint32_t elapsed_ms) {
+  return TinyGPS::distance_between(lat1, lng1, lat2, lng2) <=
+    GPS_JUMP_MARGIN_M + GPS_JUMP_MAX_MPS * (elapsed_ms / 1000.0f);
+}
+// END gps-jump-filter
+
 bool FreematicsESP32::gpsGetData(GPS_DATA** pgd) {
   m_gps_read_diagnostics = GPSReadDiagnostics{};
   if (pgd) *pgd = &gpsData;
@@ -667,14 +699,38 @@ bool FreematicsESP32::gpsGetData(GPS_DATA** pgd) {
       if (!( s = strchr(s, ',') )) break;
       candidate.sat = atoi(++s);
       if (!( s = strchr(s, ',') )) break;
-      candidate.hdop = atoi(++s);
+      int hdop = atoi(++s);
+      candidate.hdop = hdop > 255 ? 255 : hdop < 0 ? 0 : hdop; // uint8_t: 300 must not wrap to a good 44
     } while (0);
-    if (gpsData.lat || gpsData.lng) {
-      // filter out invalid coordinates
-      if (!( abs(lat * 1000000 - gpsData.lat * 1000000) < 100000 && abs(lng * 1000000 - gpsData.lng * 1000000) < 100000 )) {
-        m_gps_read_diagnostics.result = GPSReadResult::CoordinateRejected;
-        return false;
+    const unsigned long now = millis();
+    if (gpsJumpAnchor(gpsData.lat, gpsData.lng)) {
+      const bool usable = gpsJumpAnchor(lat, lng);
+      if (!usable || !gpsJumpPlausible(gpsData.lat, gpsData.lng, lat, lng, (uint32_t)(now - gps_anchor_ms))) {
+        // A replay (same date/time as the run's last fix) neither advances nor resets the run.
+        if (candidate.date != gps_run_last.date || candidate.time != gps_run_last.time) {
+          const bool extends = usable && gps_run_n && (uint32_t)(now - gps_run_ms) <= GPS_JUMP_RUN_GAP_MS &&
+            gpsJumpPlausible(gps_run_last.lat, gps_run_last.lng, lat, lng, (uint32_t)(now - gps_run_ms));
+          gps_run_n = extends ? gps_run_n + 1 : usable ? 1 : 0;
+          gps_run_last = candidate;
+          gps_run_last.lat = lat;
+          gps_run_last.lng = lng;
+          gps_run_ms = now;
+        }
+        if (gps_run_n < GPS_JUMP_REANCHOR) {
+          m_gps_read_diagnostics.result = GPSReadResult::CoordinateRejected;
+          return false;
+        }
+        m_gps_read_diagnostics.reanchored = true;
+        m_gps_read_diagnostics.reanchor_dist_m = (uint32_t)TinyGPS::distance_between(gpsData.lat, gpsData.lng, lat, lng);
+        m_gps_read_diagnostics.reanchor_rejects = gps_run_n - 1;
       }
+    }
+    gps_run_n = 0;
+    gps_run_last = GPS_DATA{};
+    if (candidate.date != gps_anchor_date || candidate.time != gps_anchor_time) {
+      gps_anchor_date = candidate.date;
+      gps_anchor_time = candidate.time;
+      gps_anchor_ms = now;
     }
     candidate.lat = lat;
     candidate.lng = lng;

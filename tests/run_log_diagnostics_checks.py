@@ -64,7 +64,8 @@ with tempfile.TemporaryDirectory(prefix="obd-log-diagnostics-") as temporary:
         "-I", str(root / "libraries/nlohmann"),
         "-I", str(root / "libraries/BLEWrapper"),
         "-I", str(root / "baseLogger/Helpers"), "-I", str(build),
-        str(root / "tests/log_diagnostics_checks.cpp"), "-o", str(executable),
+        str(root / "tests/log_diagnostics_checks.cpp"),
+        str(root / "libraries/FreematicsPlus/FreematicsGPS.cpp"), "-o", str(executable),
     ], check=True)
     environment = dict(os.environ)
     environment["UBSAN_OPTIONS"] = environment.get("UBSAN_OPTIONS", "") + ":halt_on_error=1"

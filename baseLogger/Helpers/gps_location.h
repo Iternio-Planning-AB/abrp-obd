@@ -9,6 +9,7 @@
   #included by logger.ino into the single sketch translation unit - it is NOT a standalone
   compilation unit - so it shares logger.ino's globals and the config.h feature flags.
 */
+#include "FreematicsGPS.h"   // TinyGPS::distance_between
 
 /*
   Set the RTC from the GNSS date/time fields (the u-blox reports these in UTC). Returns true when a
@@ -35,6 +36,11 @@ uint32_t gpsUtc(const GPS_DATA& fix) {
 
 bool pollGpsData() {
   bool accepted = sys.gpsGetData(&gd);
+#if ENABLE_LOGGING
+  const GPSReadDiagnostics& read = sys.gpsReadDiagnostics();
+  if (read.reanchored)   // no coordinates: the flash log is private, but the distance is enough
+    logEvent("GPS reanchor dist=%lum rejects=%u", (unsigned long)read.reanchor_dist_m, (unsigned)read.reanchor_rejects);
+#endif
   if (accepted) {
     geo_accepted = gd ? *gd : GPS_DATA{};
     geo_accepted_utc = gd && geoValidLocation(gd->lat, gd->lng) && gd->lat != 0 && gd->lng != 0 ? gpsUtc(*gd) : 0;
@@ -155,6 +161,49 @@ static const uint8_t GPS_MOVING_CONFIRM = 2;
   only advances when the sentence's own date/time changes, which is the real thing.
 */
 static uint32_t park_last_ts = 0;
+static float park_anchor_lat = 0, park_anchor_lon = 0;   // first sample of a parked window
+
+static void resetParkAccum() {
+  park_acc_lat = park_acc_lon = 0.0;
+  park_acc_n = 0;
+  park_acc_utc = 0;
+  park_acc_unknown_utc = false;
+}
+
+static void setFrozenLocation(double lat, double lon, uint32_t utc) {
+  frozen_lat = lat;
+  frozen_lon = lon;
+  frozen_valid = true;
+  frozen_geo_utc = utc;
+  frozen_geo_lat = frozen_lat;
+  frozen_geo_lon = frozen_lon;
+}
+
+// The mean of the stationary samples, stamped with its newest contributor's time (0 if any was unknown).
+static void freezeAtParkMean() {
+  setFrozenLocation(park_acc_lat / (double)park_acc_n, park_acc_lon / (double)park_acc_n,
+    park_acc_unknown_utc ? 0 : park_acc_utc);
+}
+
+// Parked, with a full good cluster far from the frozen spot (or none yet): the car moved without the GNSS
+// seeing it move. Accepted risk: a GNSS spoofer can move the parked spot; the alarm gate does not use it.
+static void relocateParkedLocation() {
+  if (!is_currently_parked || park_acc_n < PARK_ACC_MIN) return;
+  float dist = frozen_valid ? TinyGPS::distance_between(frozen_lat, frozen_lon,
+    park_acc_lat / park_acc_n, park_acc_lon / park_acc_n) : INFINITY;
+  if (!(dist > PARK_RELOCATE_MIN_M)) return;
+#if ENABLE_LOGGING
+  const bool first = !frozen_valid;
+#endif
+  freezeAtParkMean();
+#if ENABLE_LOGGING
+  char moved[16] = "new";  // no frozen spot yet (cold boot): there is no distance to report
+  if (!first) snprintf(moved, sizeof(moved), "%.0fm", dist);
+  logEvent("PARKED_LOC relocated %s lat=%.6f lon=%.6f avg_of=%u hdop=%d",
+    moved, frozen_lat, frozen_lon, (unsigned)park_acc_n, gd->hdop);
+#endif
+  resetParkAccum();
+}
 
 static void parkAccumSample() {
   gpsNoteFix(); // before the fix check: a wake with no fix still has to age
@@ -163,13 +212,21 @@ static void parkAccumSample() {
   park_last_ts = gps_fix_seq;
   if (gpsIsMoving()) {            // moving -> this is the approach, not the parking spot
     if (gps_moving_streak < 255) gps_moving_streak++;
-    park_acc_lat = park_acc_lon = 0.0;
-    park_acc_n = 0;
-    park_acc_utc = 0;
-    park_acc_unknown_utc = false;
+    resetParkAccum();
     return;
   }
   gps_moving_streak = 0;
+  if (is_currently_parked) {
+    // Relocation evidence only: a good fix inside one tight cluster.
+    if (gd->hdop == 0 || gd->hdop > PARK_RELOCATE_MAX_HDOP) return;
+    if (park_acc_n >= PARK_ACC_MAX || (park_acc_n &&
+        TinyGPS::distance_between(park_anchor_lat, park_anchor_lon, gd->lat, gd->lng) > PARK_RELOCATE_MAX_SPREAD_M))
+      resetParkAccum();
+    if (!park_acc_n) {
+      park_anchor_lat = gd->lat;
+      park_anchor_lon = gd->lng;
+    }
+  }
   if (park_acc_n >= PARK_ACC_MAX) return;
   park_acc_lat += gd->lat;
   park_acc_lon += gd->lng;
@@ -177,6 +234,7 @@ static void parkAccumSample() {
   uint32_t epoch = gpsLocationUtc();
   if (!epoch) park_acc_unknown_utc = true;
   if (epoch > park_acc_utc) park_acc_utc = epoch;
+  relocateParkedLocation();
 }
 
 /* Debounced "the GNSS is sure we are moving" - drives the is_parked latch and the awake leash. */
@@ -216,23 +274,13 @@ static bool gpsMovingFresh(unsigned long max_age_ms) {
 // fix with garbage (keeps the previous one if there is no fix at all).
 void freezeParkedLocation() {
   if (park_acc_n >= PARK_ACC_MIN) {
-    frozen_lat = park_acc_lat / (double)park_acc_n;
-    frozen_lon = park_acc_lon / (double)park_acc_n;
-    frozen_valid = true;
-    frozen_geo_utc = park_acc_unknown_utc ? 0 : park_acc_utc;
-    frozen_geo_lat = frozen_lat;
-    frozen_geo_lon = frozen_lon;
+    freezeAtParkMean();
 #if ENABLE_LOGGING
     logEvent("PARKED_LOC frozen lat=%.6f lon=%.6f avg_of=%u hdop=%d",
       frozen_lat, frozen_lon, (unsigned)park_acc_n, gd ? gd->hdop : 0);
 #endif
   } else if (gpsHasFix()) {
-    frozen_lat = gd->lat;
-    frozen_lon = gd->lng;
-    frozen_valid = true;
-    frozen_geo_utc = gpsLocationUtc();
-    frozen_geo_lat = frozen_lat;
-    frozen_geo_lon = frozen_lon;
+    setFrozenLocation(gd->lat, gd->lng, gpsLocationUtc());
 #if ENABLE_LOGGING
     logEvent("PARKED_LOC frozen lat=%.6f lon=%.6f single (only %u stationary sample(s)) hdop=%d",
       gd->lat, gd->lng, (unsigned)park_acc_n, gd->hdop);
@@ -242,10 +290,7 @@ void freezeParkedLocation() {
     logEvent("PARKED_LOC kept previous (no valid fix this drive)");
 #endif
   }
-  park_acc_lat = park_acc_lon = 0.0;   // start a fresh average for the next stop
-  park_acc_n = 0;
-  park_acc_utc = 0;
-  park_acc_unknown_utc = false;
+  resetParkAccum();   // start a fresh average for the next stop
 }
 
 static const char* gps_location_source = "omitted";

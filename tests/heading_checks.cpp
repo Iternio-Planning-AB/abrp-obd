@@ -1,4 +1,5 @@
 #include <cerrno>
+#include <functional>
 #include <cctype>
 #include <climits>
 #include <cmath>
@@ -156,6 +157,10 @@ void resetFixture() {
   link.commandCalls = 0;
   g_gps_powered = is_currently_parked = frozen_valid = false;
   frozen_lat = frozen_lon = 0;
+  gps_anchor_date = gps_anchor_time = 0;
+  gps_anchor_ms = gps_run_ms = 0;
+  gps_run_last = GPS_DATA{};
+  gps_run_n = 0;
   gps_fix_date = gps_fix_time = gps_fix_seq = 0;
   gps_fix_changed_ms = park_last_ts = 0;
   park_acc_lat = park_acc_lon = 0;
@@ -551,6 +556,190 @@ void gpsStationary() {
         "fresh stationary receiver record is accepted and ages independently of published frozen location");
   check(!first.contains("heading") && !fresh.contains("heading") && !gpsMovingFresh(GPS_MOVING_MAX_AGE_MS) &&
         last_active == 0 && g_last_speed_ms == 0, "stationary fixes neither emit heading nor unlatch parked");
+}
+
+// Fresh zero-speed fixes in GNIFO 1e6 units, one receiver second apart from 11:08:00; lat_step walks them.
+int stationary_second = 0;
+void stationaryFixes(int count, long lat, long lng, const std::string& label, int hdop = 7,
+                     const std::string& date = "41026", long lat_step = 0) {
+  for (int i = 0; i < count; ++i) {
+    fake_ms += 5000;
+    const int second = stationary_second++;
+    acceptLink("$GNIFO," + date + "," + std::to_string(11080000 + second / 60 * 10000 + second % 60 * 100) + "," +
+               std::to_string(lat + i * lat_step) + "," + std::to_string(lng) + ",2500,0,9000,12," +
+               std::to_string(hdop) + "\r", label);
+    gpsFrame();
+  }
+}
+
+void gpsRelocate() {
+  const long far = 59338000, lng = 18060000;  // ~2 km north of parkedFixture's 59.32, 18.06
+  auto keepsFrozen = [](const std::string& label) {
+    checkLocation(checkState(gpsFrame(), true, label), 59.32, 18.06, label + ": frozen spot kept");
+  };
+  auto fresh = [](const std::function<void()>& setup) { resetFixture(); stationary_second = 0; setup(); };
+
+  fresh(parkedFixture);
+  stationaryFixes(PARK_ACC_MIN - 1, far, lng, "short far average");
+  keepsFrozen("fewer than PARK_ACC_MIN far fixes");
+  stationaryFixes(1, far, lng, "full far average");
+  auto point = checkState(gpsFrame(), true, "relocated parked spot");
+  checkLocation(point, 59.338, 18.06, "full stationary average 2 km away relocates the frozen spot");
+  check(point["location"]["time"] == "2026-10-04T11:08:11Z" && !point.contains("heading") &&
+        last_active == 0 && g_last_speed_ms == 0, "relocation keeps newest contributor UTC and does not unlatch");
+
+  fresh(parkedFixture);
+  stationaryFixes(5, far, lng, "far before bad date");
+  stationaryFixes(1, far, lng, "far bad date", 7, "310426");
+  stationaryFixes(6, far, lng, "far after bad date");
+  point = checkState(gpsFrame(), true, "relocated with unknown contributor time");
+  check(!point.contains("location") && point["soc"]["frac"] == 0.5,
+        "relocation with an unknown contributor time omits geo but keeps battery");
+
+  fresh(parkedFixture);
+  stationaryFixes(PARK_ACC_MIN * 2, 59320270, lng, "near average");
+  keepsFrozen("stationary average 30 m away");
+
+  fresh(parkedFixture);
+  stationaryFixes(1, far, lng, "replay seed");
+  const std::string replay = link.response;
+  for (int i = 0; i < PARK_ACC_MIN * 2; ++i) {
+    fake_ms += 5000;
+    acceptLink(replay, "replayed far fix");
+    gpsFrame();
+  }
+  keepsFrozen("one replayed far fix");
+
+  fresh(parkedFixture);
+  is_currently_parked = false;
+  stationaryFixes(PARK_ACC_MIN, far, lng, "unlatched far average");
+  is_currently_parked = true;
+  keepsFrozen("stops while unlatched are left to the park transition");
+
+  fresh(parkedFixture);
+  stationaryFixes(PARK_ACC_MIN * 2, far, lng, "poor-HDOP far average", PARK_RELOCATE_MAX_HDOP + 1);
+  keepsFrozen("far fixes with poor HDOP");
+
+  fresh(parkedFixture);
+  stationaryFixes(PARK_ACC_MIN * 2, far, lng, "HDOP 3.00 overflowing uint8_t", 300);
+  keepsFrozen("far fixes whose HDOP overflows the byte");
+
+  fresh(parkedFixture);
+  stationaryFixes(PARK_ACC_MIN * 2, far, lng, "4 km/h crawl", 7, "41026", 50);
+  keepsFrozen("zero-speed fixes crawling 5.6 m per 5 s poll");
+
+  fresh(parkedFixture);
+  stationaryFixes(PARK_ACC_MAX, 59324300, lng, "saturating average ~480 m away");
+  stationaryFixes(PARK_ACC_MIN, 59324700, lng, "next average ~520 m away");
+  checkLocation(checkState(gpsFrame(), true, "after saturation"), 59.3247, 18.06,
+                "a saturated parked average restarts and can still relocate");
+
+  fresh([] { g_gps_powered = is_currently_parked = true; });
+  stationaryFixes(PARK_ACC_MIN, far, lng, "cold-boot average");
+  point = checkState(gpsFrame(), true, "cold-boot average");
+  checkLocation(point, 59.338, 18.06, "cold boot freezes a full stopped average");
+  check(frozen_valid && std::string(gpsLocationSource()) == "frozen", "cold-boot average becomes the frozen spot");
+}
+
+// A moving GNIFO record `second` receiver seconds after 11:10:00, coordinates in 1e6 units.
+std::string jumpFix(int second, long lat, long lng) {
+  const int t = 11100000 + second / 60 * 10000 + second % 60 * 100;
+  return "$GNIFO,41026," + std::to_string(t) + "," + std::to_string(lat) + "," + std::to_string(lng) +
+         ",2500,2000,9000,12,7\r";
+}
+
+int jumpReanchors = 0;
+GPS_DATA jumpAccept(const std::string& reply, const std::string& label) {
+  const auto fix = acceptLink(reply, label);
+  checkDiagnostics(GPSReadResult::Accepted, reply.size(), -1, label);
+  jumpReanchors += sys.gpsReadDiagnostics().reanchored;
+  return fix;
+}
+
+void jumpReject(const std::string& reply, const GPS_DATA& lastGood, const std::string& label) {
+  rejectLink(reply, lastGood, label);
+  checkDiagnostics(GPSReadResult::CoordinateRejected, reply.size(), -1, label);
+  check(!sys.gpsReadDiagnostics().reanchored, label + " does not re-anchor");
+}
+
+void gpsJump() {
+  const long lng = 18069000, step = 1350;   // ~150 m north per 5 s poll
+  auto fresh = [] { resetFixture(); jumpReanchors = 0; };
+
+  fresh();
+  const auto bad = jumpAccept(jumpFix(0, 55738990, lng), "cold-start anchor ~400 km off");
+  for (int k = 1; k <= 2; ++k) {
+    fake_ms += 5000;
+    jumpReject(jumpFix(5 * k, 59330000 + step * k, lng), bad, "good fix behind a bad anchor");
+  }
+  fake_ms += 5000;
+  jumpAccept(jumpFix(15, 59330000 + step * 3, lng), "third consistent fresh fix");
+  check(sys.gpsReadDiagnostics().reanchored && sys.gpsReadDiagnostics().reanchor_rejects == 2 &&
+        sys.gpsReadDiagnostics().reanchor_dist_m > 390000, "third consistent fix re-anchors and reports why");
+  for (int k = 4; k <= 8; ++k) {
+    fake_ms += 5000;
+    jumpAccept(jumpFix(5 * k, 59330000 + step * k, lng), "stream after re-anchor");
+  }
+  check(jumpReanchors == 1, "a bad cold-start anchor re-anchors exactly once");
+
+  fresh();
+  GPS_DATA last = jumpAccept(jumpFix(0, 59330000, lng), "good anchor");
+  for (int k = 1; k <= 3; ++k) {
+    fake_ms += 5000;
+    last = jumpAccept(jumpFix(5 * k, 59330000 + step * k, lng), "good stream");
+  }
+  fake_ms += 5000;
+  jumpReject(jumpFix(20, 59780000, lng), last, "single fresh spike 50 km off");
+  fake_ms += 5000;
+  jumpAccept(jumpFix(25, 59330000 + step * 5, lng), "on-track fix after a spike");
+  check(jumpReanchors == 0, "a single spike never re-anchors");
+
+  fresh();
+  last = jumpAccept(jumpFix(0, 59330000, lng), "good anchor");
+  for (int k = 1; k <= 5; ++k) {
+    fake_ms += 5000;
+    jumpReject(jumpFix(5, 55738990, lng), last, "replayed far reply");
+  }
+  check(jumpReanchors == 0, "a replayed far reply never re-anchors");
+
+  fresh();
+  const std::string tunnel = jumpFix(0, 59330000, lng);
+  jumpAccept(tunnel, "anchor before a tunnel");
+  for (int k = 0; k < 120; ++k) {
+    fake_ms += 5000;
+    jumpAccept(tunnel, "co-processor re-echo in a tunnel");
+  }
+  fake_ms += 5000;
+  jumpAccept(jumpFix(605, 59330000, 18209500), "fresh fix 8 km east after 10 min of echoes");
+  check(jumpReanchors == 0, "the tunnel exit is accepted on distance, not by re-anchoring");
+
+  fresh();
+  last = jumpAccept(jumpFix(0, 59330000, lng), "good anchor");
+  for (int k = 1; k <= 3; ++k) {
+    fake_ms += 61000;
+    jumpReject(jumpFix(61 * k, 55738990 + 900 * k, lng), last, "sparse self-consistent far fix");
+  }
+  check(jumpReanchors == 0, "fresh far fixes more than 60 s apart never re-anchor");
+
+  fresh();
+  last = jumpAccept(jumpFix(0, 59330000, lng), "good anchor");
+  for (int k = 1; k <= 3; ++k) {
+    fake_ms += 5000;
+    jumpReject(jumpFix(5 * k, 55738990 + 450000 * k, lng), last, "scattered fresh far fix");
+  }
+  check(jumpReanchors == 0, "fresh far fixes 50 km apart from each other never re-anchor");
+
+  fresh();
+  last = jumpAccept(jumpFix(0, 59330000, lng), "good anchor");
+  fake_ms += 5000;
+  jumpReject(jumpFix(5, 55738990, lng), last, "far spike");
+  fake_ms += 5000;
+  last = jumpAccept(jumpFix(10, 59330000 + step, lng), "on-track fix between spikes");
+  for (int k = 3; k <= 4; ++k) {
+    fake_ms += 5000;
+    jumpReject(jumpFix(5 * k, 55738990, lng), last, "spike consistent with the first");
+  }
+  check(jumpReanchors == 0, "an accepted fix restarts the re-anchor run");
 }
 
 void feedRmc(const std::string& course, const std::string& latitude = "5920.000") {
@@ -1250,6 +1439,7 @@ int main(int argc, char** argv) {
     {"link-range", linkRange}, {"link-failures", linkFailures}, {"link-truncated", linkTruncated},
     {"link-required", linkRequired}, {"link-atomic", linkAtomic}, {"link-valid", linkValid},
     {"gps-replay", gpsReplay}, {"gps-rejected", gpsRejected}, {"gps-stationary", gpsStationary},
+    {"gps-relocate", gpsRelocate}, {"gps-jump", gpsJump},
     {"direct-missing", directMissing}, {"direct-range", directRange}, {"queue", serializerAndQueue},
     {"gps-diagnostics", gpsDiagnostics}, {"gps-direct-diagnostics", directGpsDiagnostics},
     {"geo-legacy", geoLegacy}, {"geo-times", geoTimes}, {"geo-privacy", geoPrivacy}, {"geo-accepted", geoAccepted},
