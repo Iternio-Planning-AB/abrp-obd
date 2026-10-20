@@ -192,10 +192,15 @@ static void relocateParkedLocation() {
   float dist = frozen_valid ? TinyGPS::distance_between(frozen_lat, frozen_lon,
     park_acc_lat / park_acc_n, park_acc_lon / park_acc_n) : INFINITY;
   if (!(dist > PARK_RELOCATE_MIN_M)) return;
+#if ENABLE_LOGGING
+  const bool first = !frozen_valid;
+#endif
   freezeAtParkMean();
 #if ENABLE_LOGGING
-  logEvent("PARKED_LOC relocated %.0fm lat=%.6f lon=%.6f avg_of=%u hdop=%d",
-    dist, frozen_lat, frozen_lon, (unsigned)park_acc_n, gd->hdop);
+  char moved[16] = "new";  // no frozen spot yet (cold boot): there is no distance to report
+  if (!first) snprintf(moved, sizeof(moved), "%.0fm", dist);
+  logEvent("PARKED_LOC relocated %s lat=%.6f lon=%.6f avg_of=%u hdop=%d",
+    moved, frozen_lat, frozen_lon, (unsigned)park_acc_n, gd->hdop);
 #endif
   resetParkAccum();
 }
