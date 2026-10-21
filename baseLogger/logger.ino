@@ -90,6 +90,7 @@ bool logging_message_printed = false; // print message once
 // Latched state behind the is_parked telemetry parameter. Defaults to parked on every boot/wake;
 // unlatched to driving by speed > 0 in loop() and re-latched by the activity state machine once
 // motion has stopped (see changeState). This is the IMU "smart cheat" - there is no real gear PID.
+// Written only by the drive region (Helpers/drive_state.h), as are g_last_speed_ms and park_marker_owed.
 bool is_currently_parked = true;
 // Set when a DRIVE frame enters the upload buffer, cleared when the pre-sleep PARK marker is queued: the
 // server has been told DRIVE and not yet PARK. RTC so a trip end that straddles a reboot (the mid-drive
@@ -416,6 +417,7 @@ void bleDeinitForSleep();                      // Helpers/ble.h (no-op stub when
 void changeState(ActivityState new_state);     // Helpers/state_machine.h
 
 #include "Helpers/motion_stats.h" // pure MOTION-line aggregation, used by mems.h
+#include "Helpers/drive_state.h"  // park/drive region: the only writer of the latch globals above
 #include "Helpers/mems.h"
 #include "Helpers/server_roots.h" // data only: the trust bundle setup() hands the cellular transport
 #include "Helpers/clock_sync.h"
@@ -1554,15 +1556,7 @@ void loop() {
         // smooth-road fix: on glassy asphalt detectMovement() sees no accel spikes, so last_active would go
         // stale and the state machine would sleep mid-drive (and changeState() would then mislabel the frame
         // is_parked:1). Feeding speed into the leash holds us awake as long as the car reports motion.
-        if (is_currently_parked) {
-          Serial.printf("LEASH: speed=%.1f -> driving (unlatch parked, hold awake)\n", res.second);
-#if ENABLE_LOGGING
-          logEvent("LEASH driving speed=%.1f -> unlatch parked + hold awake (smooth-road guard)", res.second);
-#endif
-        }
-        is_currently_parked = false;
-        last_active = millis();
-        g_last_speed_ms = millis();
+        driveSpeed(res.second);
         // Feed the OBD-alarm gate's speed-hold: a genuine road speed is independent proof the car is
         // in transit, and it carries an already-granted driving permit through a GNSS outage (tunnel,
         // multi-storey). Continuation only - reaching this line at all means a poll was permitted.
@@ -1587,15 +1581,7 @@ void loop() {
     // next slept. Requiring a recent fix makes the unlatch expire on its own when fixes stop, and
     // then the 5-minute re-latch does what it was written to do.
     if (gpsMovingFresh(GPS_MOVING_MAX_AGE_MS)) {
-      if (is_currently_parked) {
-        Serial.printf("LEASH: GNSS %.1f km/h -> driving (unlatch parked, hold awake)\n", gd->speed * 1.852f);
-#if ENABLE_LOGGING
-        logEvent("LEASH driving gnss=%.1fkm/h -> unlatch parked (no OBD speed needed)", gd->speed * 1.852f);
-#endif
-      }
-      is_currently_parked = false;
-      last_active = millis();
-      g_last_speed_ms = millis();
+      driveGnss(gd->speed * 1.852f);
     }
 #endif
     // TIME-BASED parked re-latch (state-machine independent). The changeState re-latch can't fire while a
@@ -1604,14 +1590,8 @@ void loop() {
     // machine (no reported speed for ACTIVE_TIMER -> parked), just not blocked by the BLE hold. With the
     // latch restored, a forgotten connected phone is genuinely bounded by MAX_AWAKE_MINUTES, and plugging in
     // at a charger with the phone connected still detects is_charging.
-    if (!is_currently_parked && ( millis() - g_last_speed_ms ) > (unsigned long)ACTIVE_TIMER) {
-      freezeParkedLocation(); // 0->1 transition: capture the stabilized last-driving fix, as changeState does
-      is_currently_parked = true;
-#if ENABLE_LOGGING
-      logEvent("LEASH no speed for %lus -> re-latch parked (time-based; BLE-hold safe)",
-        (unsigned long)(ACTIVE_TIMER / 1000UL));
-#endif
-    }
+    // The 0->1 transition freezes the stabilized last-driving fix, as changeState does.
+    drivePollEnd();
     // Before is_parked is appended: a frame whose only v2 field would be drivingState is not worth a POST.
     // utc is always present, so this asks the serializer. A location or heading already accepted, or already
     // buffered behind an unsent one, is not news; any other, frozen or live, is.
@@ -1930,7 +1910,7 @@ void loop() {
 #if ENABLE_NETWORK
       g_geo_queued = poll_geo;
 #endif
-      if (!is_currently_parked) park_marker_owed = true;
+      driveFrameBuffered();
       // Bound the RAM upload buffer so a long offline stretch can't grow it without limit (-> OOM). The
       // full history is already in flash; for live telemetry the freshest frames matter most, so drop the
       // oldest when over the cap.
