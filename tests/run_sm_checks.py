@@ -1,0 +1,181 @@
+"""Differential checks for the park/drive decision (state machine #23, step 0a #28).
+
+The drive code is extracted from two places with the same anchors: OLD from the pinned commit (git show),
+CUR from the working tree. tests/sm_checks.cpp compiles each into its own namespace around the same harness
+(tests/sm/adapter_*.inc) and runs identical event sequences through both, asserting equal outputs after
+every event: the latch, the leash and hold times, the marker debt, published is_parked, buffered frames,
+alarm speed notes, freezes, and the exact logEvent and Serial sequences. It also checks the weak-rail gate
+and the max-awake backstop properties. Groups: enumerate (exhaustive, --depth, default 5), random (fixed seeds),
+scenarios (named field cases), or all.
+
+The pin. SM_PIN is the main commit a refactor step is measured against. The step 1 (#24) and step 2 (#6)
+branches use the same pin: the code they move is unchanged there. Re-pin only when a behaviour change to
+the extracted code lands on main between steps, to the merge-base of the step being measured; merges into
+main are merge commits, so the pin stays reachable. A clone without it fails with a message, never a skip.
+
+What it cannot prove: 32-bit millis() wrap (the host unsigned long is 64-bit); any feature-flag set other
+than the config.h defaults with PRINT 0 (lines under #if PRINT and other branches are not compiled); code
+outside the extracted blocks (the rest of handleActivityState, the modem, detectMovement timing, RTC
+retention, hardware). Energy and wake surfaces, the fast-minutes and alarm properties and a trace format
+are step 0b.
+"""
+
+import os
+from pathlib import Path
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+import time
+
+SM_PIN = "6457b2a1a355a43b57ae877d40bae2481afad49c"
+# Headers the CUR side includes ahead of its extracted blocks (inside namespace sm_cur).
+CUR_HEADERS = []
+
+root = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(root / "tests/support"))
+from extract import block, find, wake_gate  # noqa: E402
+if subprocess.run(["git", "merge-base", "--is-ancestor", SM_PIN, "HEAD"], cwd=root).returncode != 0:
+    sys.exit(f"FAIL: SM_PIN {SM_PIN} is not an ancestor of HEAD: fetch main, or re-pin (see this file's header)")
+
+
+def pinned(path):
+    return subprocess.check_output(["git", "show", f"{SM_PIN}:{path}"], cwd=root, text=True)
+
+
+def tree(path):
+    return (root / path).read_text()
+
+
+def line(text, prefix, what):
+    found = [l for l in text.splitlines() if l.startswith(prefix)]
+    if len(found) != 1:
+        sys.exit(f"FAIL: expected one line starting {prefix!r} in {what}, found {len(found)}")
+    return found[0] + "\n"
+
+
+PATHS = {"logger": "baseLogger/logger.ino", "machine": "baseLogger/Helpers/state_machine.h",
+         "sleep": "baseLogger/Helpers/sleep_power.h", "logging": "baseLogger/Helpers/logging.h",
+         "config": "baseLogger/config.h"}
+
+
+# Code anchors only (never comment text), each failing with its own text when the code it names has moved.
+DRIVE_START = ('    for (const auto& res : current_frame) {\n'
+               '      if (( res.first == "speed" || res.first == "vehicle_reported_speed" )')
+DRIVE_END = "#if ENABLE_NETWORK\n    const double poll_utc = uploadSendUtc();"
+
+
+def recipe(src, side):
+    logger, machine = src["logger"], src["machine"]
+    where = {k: f"{PATHS[k]} ({side})" for k in PATHS}
+    start = find(logger, DRIVE_START, what=where["logger"])
+    return {
+        "enum": block(logger, "enum ActivityState {", where["logger"]).rstrip() + ";\n",
+        "buffer_cap": line(logger, "const size_t MAX_UPLOAD_BUFFER = ", where["logger"]),
+        "state_name": block(src["logging"], "static const char* stateName(ActivityState s) {", where["logging"]),
+        "delays": block(machine, "unsigned long getTransmissionDelay(", where["machine"]) +
+                  block(machine, "unsigned long getPollingDelay(", where["machine"]),
+        "change_state": block(machine, "void changeState(ActivityState new_state) {", where["machine"]),
+        "drive": logger[start:find(logger, DRIVE_END, start, where["logger"])],
+        "emplace": line(logger, '    current_frame.emplace_back("is_parked"', where["logger"]),
+        "buffer": block(logger, "    if (frame_has_data) {", where["logger"]),
+        "marker": block(src["sleep"], "  if (rtc.getEpoch() > 1e9 && is_currently_parked", where["sleep"]),
+        "session": block(machine, "if (g_ota_active || g_logdump_active) {", where["machine"]),
+        "backstop": block(machine, "if (!maintenance_mode && !g_ota_active && !g_logdump_active", where["machine"]),
+        "gate": wake_gate(logger, where["logger"]),
+    }
+
+
+SIDE = """{enum}
+{buffer_cap}
+#include "adapter_pre.inc"
+{headers}
+{state_name}
+{delays}
+{change_state}
+void sm_drive_poll(OBDVector& current_frame) {{
+{drive}}}
+void sm_emplace(OBDVector& current_frame) {{
+{emplace}}}
+void sm_buffer(OBDVector& current_frame, bool frame_has_data) {{
+  int g_geo_queued = 0, poll_geo = 0;
+  (void)g_geo_queued;
+{buffer}}}
+void sm_marker() {{
+{marker}}}
+void sm_session() {{
+{session}}}
+void sm_backstop() {{
+{backstop}}}
+bool sm_gate(float rail, bool is_cold, bool is_motion, bool awake, bool heartbeat_due) {{
+{gate}  return should_poll;
+}}
+#include "adapter_post.inc"
+"""
+
+old_src = {k: pinned(p) for k, p in PATHS.items()}
+cur_src = {k: tree(p) for k, p in PATHS.items()}
+old, cur = recipe(old_src, "SM_PIN"), recipe(cur_src, "tree")
+
+# OLD must never pull a project header into its namespace: #pragma once would hand it CUR's copy.
+for name, text in old.items():
+    if '#include "' in text:
+        sys.exit(f"FAIL: OLD extraction {name} includes a project header; isolate it first (step 0b)")
+
+
+def defines(config):
+    found = {}
+    for m in re.finditer(r"^#define (\w+)\b.*(?:\\\n.*)*", config, re.M):
+        found.setdefault(m.group(1), m.group(0))
+    return found
+
+
+# Both sides compile against the tree's config.h, so every macro OLD uses must be byte-identical at the pin.
+old_defines, cur_defines = defines(old_src["config"]), defines(cur_src["config"])
+NAME = r"\b[A-Z][A-Z0-9_]{2,}\b"
+used, pending = set(), set(re.findall(NAME, "".join(old.values())))
+while pending:  # through the macros' own bodies: ENABLE_NETWORK is ENABLE_CELL || ENABLE_WIFI
+    macro = pending.pop()
+    if macro in used or macro not in cur_defines:
+        continue
+    used.add(macro)
+    pending |= set(re.findall(NAME, re.sub(r"^#define \w+", "", cur_defines[macro])))
+for macro in sorted(used):
+    if old_defines.get(macro) != cur_defines[macro]:
+        sys.exit(f"FAIL: config.h {macro} differs between SM_PIN and the tree; the OLD side would run with the new value")
+
+# The harness resets each firmware global to a literal; that literal must be the firmware's initialiser.
+adapter = tree("tests/sm/adapter_pre.inc")
+for region, prefix in (("SM_RAM", ""), ("SM_RTC", "RTC_DATA_ATTR ")):
+    body = re.search(rf"^#define {region}\(X\) \\\n((?:.*\\\n)*.*)", adapter, re.M).group(1)
+    for type_, name, value in re.findall(r"X\(([\w ]+), (\w+), ([^)]+)\)", body):
+        pattern = rf"^{prefix}(?:volatile )?{re.escape(type_)} {name} = {re.escape(value)};"
+        for label, src in (("SM_PIN", old_src), ("tree", cur_src)):
+            if not re.search(pattern, src["logger"], re.M):
+                sys.exit(f"FAIL: {region} {name} = {value} does not match its definition in logger.ino ({label})")
+
+energy = tree("tests/energy_checks.cpp")
+field = "".join(block(energy, f"const std::vector<Sample> {n} = ", "tests/energy_checks.cpp").rstrip() + ";\n" for n in ("DRIVE_0930", "DRIVE_1012"))
+
+compiler = shlex.split(os.environ.get("CXX", "clang++"))
+with tempfile.TemporaryDirectory(prefix="obd-sm-checks-") as temporary:
+    build = Path(temporary)
+    (build / "old_side.inc").write_text(SIDE.format(headers="", **old))
+    cur_headers = "".join(f'#include "{h}"\n' for h in CUR_HEADERS)
+    (build / "cur_side.inc").write_text(SIDE.format(headers=cur_headers, **cur))
+    (build / "field.inc").write_text(field)
+    executable = build / "sm_checks"
+    subprocess.run([
+        *compiler, "-std=c++17", "-O1", "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
+        "-Wall", "-Wextra", "-Wno-unused-parameter", "-Wno-unused-variable", "-Wno-unused-function",
+        "-Wno-unused-but-set-variable",
+        "-I", str(root / "tests/sm"), "-I", str(root / "baseLogger/Helpers"), "-I", str(build),
+        str(root / "tests/sm_checks.cpp"), "-o", str(executable),
+    ], check=True)
+    environment = dict(os.environ)
+    environment["UBSAN_OPTIONS"] = environment.get("UBSAN_OPTIONS", "") + ":halt_on_error=1"
+    started = time.monotonic()
+    result = subprocess.run([str(executable), *sys.argv[1:]], env=environment)
+    print(f"sm_checks: {time.monotonic() - started:.1f}s")
+    sys.exit(result.returncode)

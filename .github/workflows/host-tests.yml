@@ -1,0 +1,68 @@
+# Every host runner (tests/run_*.py) on each pull request and on main, normally and with NDEBUG. Host checks
+# only: clang++ and Python, no firmware build, no hardware, no secrets. See AGENTS.md (Testing).
+name: Host tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: host-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  host-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        cxx: ["clang++", "clang++ -DNDEBUG"]
+    env:
+      CXX: ${{ matrix.cxx }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0              # the runners git show pinned commits (eacc642, SM_PIN)
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      # run_release_checks.py fails without git-cliff when CI is set, by design. Install exactly the release
+      # pin (version and hashes) from release.txt, and nothing else from it: no platformio here.
+      - name: Install git-cliff
+        run: |
+          python3 - <<'EOF'
+          import re
+          text = open(".github/requirements/release.txt").read()
+          block = re.search(r"^git-cliff==\S+ \\\n(?:    --hash=\S+(?: \\)?\n)+", text, re.M)
+          if not block:
+              raise SystemExit("git-cliff is not pinned in .github/requirements/release.txt")
+          open("/tmp/git-cliff.txt", "w").write(block.group(0))
+          EOF
+          python3 -m pip install --disable-pip-version-check --require-hashes --only-binary :all: --no-deps -r /tmp/git-cliff.txt
+
+      - name: Toolchain
+        run: |
+          clang++ --version
+          git-cliff --version
+
+      - name: Run every host runner
+        run: |
+          failed=()
+          for runner in tests/run_*.py; do
+            echo "::group::$runner ($CXX)"
+            python3 "$runner" || failed+=("$runner")
+            echo "::endgroup::"
+          done
+          if [ ${#failed[@]} -ne 0 ]; then
+            printf 'FAILED (%s): %s\n' "$CXX" "${failed[@]}"
+            exit 1
+          fi
