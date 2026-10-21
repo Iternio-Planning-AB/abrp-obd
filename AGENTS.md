@@ -41,8 +41,9 @@ Flash and watch with `pio run -e esp32dev -t upload -t monitor` (115200 baud).
 A clean build prints two pre-existing `"PRINT" redefined` warnings, from `FreematicsOBD.cpp` and
 `mathparser/parser.cpp`. They are not yours; anything else probably is.
 
-**There is no CI; host regressions cover GPS parsing, selected GNSS freshness/parking paths and
-heading/telemetry handling.** A green build proves it compiles and nothing more. See *Testing* below,
+**CI runs the host checks only.** `.github/workflows/host-tests.yml` runs every `tests/run_*.py` on each
+pull request and on `main`, normally and with `CXX='clang++ -DNDEBUG'`. Nothing in CI builds the firmware
+or touches a device, so a green PR proves the host checks and nothing more. See *Testing* below,
 because that gap is the single biggest difference from a normal repo.
 
 ## The rules that bite first
