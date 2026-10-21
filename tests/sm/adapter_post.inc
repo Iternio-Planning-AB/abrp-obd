@@ -46,7 +46,6 @@ void wake(const SmEvent& e) {
   SM_RAM(SM_RESET)
   sm_now = 0;
   sm_asleep = false;
-  g_ota_active = g_logdump_active = false;
   recently_charging = e.charge_latched;  // the charge latch is an input here; 0a models no charge poll
   sm_gate_weak = e.rail >= IO36_LOCKOUT_LOW && e.rail < IO36_LOCKOUT_HIGH;
   sm_gate_open = sm_gate(e.rail, e.cause == SM_COLD, e.cause == SM_MOTION, e.awake, false);
@@ -71,8 +70,9 @@ void powerOn(const SmEvent& e) {
 void poll(const SmEvent& e) {
   sm_polls++;
   OBDVector current_frame{{"soc", 50}};
-  if (e.key == SM_SPEED) current_frame.emplace_back("speed", e.speed);
+  if (e.key == SM_SPEED || e.key == SM_BOTH) current_frame.emplace_back("speed", e.speed);
   if (e.key == SM_VRS) current_frame.emplace_back("vehicle_reported_speed", e.speed);
+  if (e.key == SM_BOTH) current_frame.emplace_back("vehicle_reported_speed", e.speed2);
   sm_gnss_fresh = e.gnss;
   sm_gps.speed = (float)(e.gnss_kmh / 1.852);
   sm_clock_ok = e.clock_ok;
@@ -83,10 +83,11 @@ void poll(const SmEvent& e) {
 }
 
 void ladder(const SmEvent& e) {
-  g_ota_active = e.k == SmKind::HOLD;
+  g_ota_active = e.k == SmKind::HOLD && !e.dump;
+  g_logdump_active = e.k == SmKind::HOLD && e.dump;
   sm_session();
   sm_backstop();
-  g_ota_active = false;
+  g_ota_active = g_logdump_active = false;
   if (sm_asleep || e.k == SmKind::HOLD) return;
   switch (e.to) {
   case SmTo::ACTIVE: changeState(ACTIVE); break;
@@ -105,6 +106,7 @@ void step(const SmEvent& e) {
   if (sm_asleep) return;  // nothing runs between a sleep and the next wake
   switch (e.k) {
   case SmKind::POLL: poll(e); break;
+  case SmKind::MAINT: maintenance_mode = e.on; break;
   case SmKind::LADDER: case SmKind::HOLD: ladder(e); break;
   case SmKind::SLEEP:
     sm_clock_ok = e.clock_ok;

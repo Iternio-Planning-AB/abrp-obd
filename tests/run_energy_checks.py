@@ -4,6 +4,7 @@ from pathlib import Path
 import re
 import shlex
 import subprocess
+import sys
 import tempfile
 
 arguments = argparse.ArgumentParser()
@@ -14,6 +15,8 @@ args = arguments.parse_args()
 if args.group == "profiles" and args.profiles is None:
     arguments.error("profiles checks require --profiles /path/to/abrp/obd")
 root = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(root / "tests/support"))
+from extract import block, wake_gate  # noqa: E402
 logger = (root / "baseLogger/logger.ino").read_text()
 config = (root / "baseLogger/config.h").read_text()
 logging = (root / "baseLogger/Helpers/logging.h").read_text()
@@ -22,14 +25,6 @@ sleep = (root / "baseLogger/Helpers/sleep_power.h").read_text()
 state_machine = (root / "baseLogger/Helpers/state_machine.h").read_text()
 
 
-def block(text, opener):
-    start = text.index(opener)
-    depth, i = 0, text.index("{", start)
-    while True:
-        depth += {"{": 1, "}": -1}.get(text[i], 0)
-        i += 1
-        if depth == 0:
-            return text[start:i] + "\n"
 
 
 compiler = shlex.split(os.environ.get("CXX", "clang++"))
@@ -53,9 +48,7 @@ with tempfile.TemporaryDirectory(prefix="obd-energy-checks-") as temporary:
     start = logger.index("    bool has_charge_counter = false;")
     end = logger.index("\n    const bool uncorroborated =", start)
     (build / "charge_corroboration.inc").write_text(logger[start:end])
-    start = logger.index("    bool weak_rail = (rail >= IO36_LOCKOUT_LOW")
-    end = logger.index("heartbeat_due);\n", start) + len("heartbeat_due);\n")
-    (build / "wake_gate.inc").write_text(logger[start:end])
+    (build / "wake_gate.inc").write_text(wake_gate(logger))
     start = logger.index("void resetChargeCorroboration() {") + len("void resetChargeCorroboration() {")
     end = logger.index("\n}", start)
     (build / "reset_corroboration.inc").write_text(logger[start:end])

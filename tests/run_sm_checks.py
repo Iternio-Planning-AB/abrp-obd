@@ -5,7 +5,7 @@ CUR from the working tree. tests/sm_checks.cpp compiles each into its own namesp
 (tests/sm/adapter_*.inc) and runs identical event sequences through both, asserting equal outputs after
 every event: the latch, the leash and hold times, the marker debt, published is_parked, buffered frames,
 alarm speed notes, freezes, and the exact logEvent and Serial sequences. It also checks the weak-rail gate
-and the max-awake backstop properties. Groups: enumerate (exhaustive, --depth), random (fixed seeds),
+and the max-awake backstop properties. Groups: enumerate (exhaustive, --depth, default 5), random (fixed seeds),
 scenarios (named field cases), or all.
 
 The pin. SM_PIN is the main commit a refactor step is measured against. The step 1 (#24) and step 2 (#6)
@@ -34,6 +34,8 @@ SM_PIN = "6457b2a1a355a43b57ae877d40bae2481afad49c"
 CUR_HEADERS = []
 
 root = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(root / "tests/support"))
+from extract import block, find, wake_gate  # noqa: E402
 if subprocess.run(["git", "merge-base", "--is-ancestor", SM_PIN, "HEAD"], cwd=root).returncode != 0:
     sys.exit(f"FAIL: SM_PIN {SM_PIN} is not an ancestor of HEAD: fetch main, or re-pin (see this file's header)")
 
@@ -46,18 +48,11 @@ def tree(path):
     return (root / path).read_text()
 
 
-def block(text, opener):
-    start = text.index(opener)
-    depth, i = 0, text.index("{", start)
-    while True:
-        depth += {"{": 1, "}": -1}.get(text[i], 0)
-        i += 1
-        if depth == 0:
-            return text[start:i] + "\n"
-
-
-def line(text, prefix):
-    return next(l for l in text.splitlines() if l.startswith(prefix)) + "\n"
+def line(text, prefix, what):
+    found = [l for l in text.splitlines() if l.startswith(prefix)]
+    if len(found) != 1:
+        sys.exit(f"FAIL: expected one line starting {prefix!r} in {what}, found {len(found)}")
+    return found[0] + "\n"
 
 
 PATHS = {"logger": "baseLogger/logger.ino", "machine": "baseLogger/Helpers/state_machine.h",
@@ -65,29 +60,35 @@ PATHS = {"logger": "baseLogger/logger.ino", "machine": "baseLogger/Helpers/state
          "config": "baseLogger/config.h"}
 
 
-def recipe(src):
+# Code anchors only (never comment text), each failing with its own text when the code it names has moved.
+DRIVE_START = ('    for (const auto& res : current_frame) {\n'
+               '      if (( res.first == "speed" || res.first == "vehicle_reported_speed" )')
+DRIVE_END = "#if ENABLE_NETWORK\n    const double poll_utc = uploadSendUtc();"
+
+
+def recipe(src, side):
     logger, machine = src["logger"], src["machine"]
-    start = next(m.start() for m in re.finditer(r"^.*// is_parked: any reported speed > 0 means we are driving",
-                                                logger, re.M))
-    drive = logger[start:logger.index("    // Before is_parked is appended", start)]
-    gate_start = logger.index("    bool weak_rail = (rail >= IO36_LOCKOUT_LOW")
-    gate = logger[gate_start:logger.index("heartbeat_due);\n", gate_start) + len("heartbeat_due);\n")]
+    where = {k: f"{PATHS[k]} ({side})" for k in PATHS}
+    start = find(logger, DRIVE_START, what=where["logger"])
     return {
-        "enum": block(logger, "enum ActivityState {").rstrip() + ";\n",
-        "state_name": block(src["logging"], "static const char* stateName(ActivityState s) {"),
-        "delays": block(machine, "unsigned long getTransmissionDelay(") + block(machine, "unsigned long getPollingDelay("),
-        "change_state": block(machine, "void changeState(ActivityState new_state) {"),
-        "drive": drive,
-        "emplace": line(logger, '    current_frame.emplace_back("is_parked"'),
-        "buffer": block(logger, "    if (frame_has_data) {"),
-        "marker": block(src["sleep"], "  if (rtc.getEpoch() > 1e9 && is_currently_parked"),
-        "session": block(machine, "if (g_ota_active || g_logdump_active) {"),
-        "backstop": block(machine, "if (!maintenance_mode && !g_ota_active && !g_logdump_active"),
-        "gate": gate,
+        "enum": block(logger, "enum ActivityState {", where["logger"]).rstrip() + ";\n",
+        "buffer_cap": line(logger, "const size_t MAX_UPLOAD_BUFFER = ", where["logger"]),
+        "state_name": block(src["logging"], "static const char* stateName(ActivityState s) {", where["logging"]),
+        "delays": block(machine, "unsigned long getTransmissionDelay(", where["machine"]) +
+                  block(machine, "unsigned long getPollingDelay(", where["machine"]),
+        "change_state": block(machine, "void changeState(ActivityState new_state) {", where["machine"]),
+        "drive": logger[start:find(logger, DRIVE_END, start, where["logger"])],
+        "emplace": line(logger, '    current_frame.emplace_back("is_parked"', where["logger"]),
+        "buffer": block(logger, "    if (frame_has_data) {", where["logger"]),
+        "marker": block(src["sleep"], "  if (rtc.getEpoch() > 1e9 && is_currently_parked", where["sleep"]),
+        "session": block(machine, "if (g_ota_active || g_logdump_active) {", where["machine"]),
+        "backstop": block(machine, "if (!maintenance_mode && !g_ota_active && !g_logdump_active", where["machine"]),
+        "gate": wake_gate(logger, where["logger"]),
     }
 
 
 SIDE = """{enum}
+{buffer_cap}
 #include "adapter_pre.inc"
 {headers}
 {state_name}
@@ -115,7 +116,7 @@ bool sm_gate(float rail, bool is_cold, bool is_motion, bool awake, bool heartbea
 
 old_src = {k: pinned(p) for k, p in PATHS.items()}
 cur_src = {k: tree(p) for k, p in PATHS.items()}
-old, cur = recipe(old_src), recipe(cur_src)
+old, cur = recipe(old_src, "SM_PIN"), recipe(cur_src, "tree")
 
 # OLD must never pull a project header into its namespace: #pragma once would hand it CUR's copy.
 for name, text in old.items():
@@ -132,8 +133,15 @@ def defines(config):
 
 # Both sides compile against the tree's config.h, so every macro OLD uses must be byte-identical at the pin.
 old_defines, cur_defines = defines(old_src["config"]), defines(cur_src["config"])
-used = set(re.findall(r"\b[A-Z][A-Z0-9_]{2,}\b", "".join(old.values())))
-for macro in sorted(used & set(cur_defines)):
+NAME = r"\b[A-Z][A-Z0-9_]{2,}\b"
+used, pending = set(), set(re.findall(NAME, "".join(old.values())))
+while pending:  # through the macros' own bodies: ENABLE_NETWORK is ENABLE_CELL || ENABLE_WIFI
+    macro = pending.pop()
+    if macro in used or macro not in cur_defines:
+        continue
+    used.add(macro)
+    pending |= set(re.findall(NAME, re.sub(r"^#define \w+", "", cur_defines[macro])))
+for macro in sorted(used):
     if old_defines.get(macro) != cur_defines[macro]:
         sys.exit(f"FAIL: config.h {macro} differs between SM_PIN and the tree; the OLD side would run with the new value")
 
@@ -146,12 +154,9 @@ for region, prefix in (("SM_RAM", ""), ("SM_RTC", "RTC_DATA_ATTR ")):
         for label, src in (("SM_PIN", old_src), ("tree", cur_src)):
             if not re.search(pattern, src["logger"], re.M):
                 sys.exit(f"FAIL: {region} {name} = {value} does not match its definition in logger.ino ({label})")
-for label, src in (("SM_PIN", old_src), ("tree", cur_src)):
-    if "const size_t MAX_UPLOAD_BUFFER = 120;" not in src["logger"]:
-        sys.exit(f"FAIL: MAX_UPLOAD_BUFFER is no longer 120 in logger.ino ({label}); update adapter_pre.inc")
 
 energy = tree("tests/energy_checks.cpp")
-field = "".join(block(energy, f"const std::vector<Sample> {n} = ").rstrip() + ";\n" for n in ("DRIVE_0930", "DRIVE_1012"))
+field = "".join(block(energy, f"const std::vector<Sample> {n} = ", "tests/energy_checks.cpp").rstrip() + ";\n" for n in ("DRIVE_0930", "DRIVE_1012"))
 
 compiler = shlex.split(os.environ.get("CXX", "clang++"))
 with tempfile.TemporaryDirectory(prefix="obd-sm-checks-") as temporary:

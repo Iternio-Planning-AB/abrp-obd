@@ -19,9 +19,9 @@
 
 using OBDVector = std::vector<std::pair<std::string, double>>;
 
-enum class SmKind { POLL, ADVANCE, LADDER, HOLD, SLEEP, WAKE };
+enum class SmKind { POLL, ADVANCE, LADDER, HOLD, SLEEP, WAKE, MAINT };
 enum class SmTo { ACTIVE, BLE, CHARGING, STANDBY };
-enum { SM_NONE, SM_SPEED, SM_VRS };      // which speed key the poll carries
+enum { SM_NONE, SM_SPEED, SM_VRS, SM_BOTH };  // which speed keys the poll carries (BOTH: speed, then vrs)
 enum { SM_TIMER, SM_MOTION, SM_COLD };   // wake cause
 
 struct SmEvent {
@@ -29,6 +29,7 @@ struct SmEvent {
   std::string name;
   int key = SM_NONE;
   double speed = 0;
+  double speed2 = 0;  // vehicle_reported_speed when key is SM_BOTH
   bool gnss = false;
   double gnss_kmh = 0;
   bool has_data = true;
@@ -41,18 +42,21 @@ struct SmEvent {
   float rail = 12.6f;
   bool awake = true;
   bool charge_latched = false;
+  bool dump = false;  // HOLD: the log dump rather than an OTA update
+  bool on = false;    // MAINT: the console's maintenance_mode
 };
 
-SmEvent Poll(int key, double speed, bool gnss = false, double kmh = 0, bool has_data = true) {
+SmEvent Poll(int key, double speed, bool gnss = false, double kmh = 0, bool has_data = true, double speed2 = 0) {
   SmEvent e{SmKind::POLL, ""};
   std::ostringstream name;
-  name << "POLL(" << (key == SM_SPEED ? "speed=" : key == SM_VRS ? "vrs=" : "none") ;
+  name << "POLL(" << (key == SM_SPEED || key == SM_BOTH ? "speed=" : key == SM_VRS ? "vrs=" : "none") ;
   if (key != SM_NONE) name << speed;
+  if (key == SM_BOTH) name << ",vrs=" << speed2;
   if (gnss) name << ",gnss=" << kmh;
   if (!has_data) name << ",nodata";
   name << ")";
   e.name = name.str();
-  e.key = key, e.speed = speed, e.gnss = gnss, e.gnss_kmh = kmh, e.has_data = has_data;
+  e.key = key, e.speed = speed, e.speed2 = speed2, e.gnss = gnss, e.gnss_kmh = kmh, e.has_data = has_data;
   return e;
 }
 SmEvent Advance(unsigned long ms) {
@@ -66,7 +70,16 @@ SmEvent Ladder(SmTo to) {
   e.to = to;
   return e;
 }
-SmEvent Hold() { return SmEvent{SmKind::HOLD, "HOLD"}; }
+SmEvent Hold(bool dump = false) {
+  SmEvent e{SmKind::HOLD, dump ? "HOLD(dump)" : "HOLD(ota)"};
+  e.dump = dump;
+  return e;
+}
+SmEvent Maint(bool on) {
+  SmEvent e{SmKind::MAINT, on ? "MAINT(on)" : "MAINT(off)"};
+  e.on = on;
+  return e;
+}
 SmEvent Sleep(bool modem_on = true, bool clock_ok = true, const char* reason = nullptr) {
   SmEvent e{SmKind::SLEEP, std::string("SLEEP(") + (modem_on ? "modem" : "nomodem") + (clock_ok ? "" : ",noclock") + ")"};
   e.modem_on = modem_on, e.clock_ok = clock_ok, e.reason = reason;
@@ -122,7 +135,14 @@ std::string difference(const sm_old::Snap& a, const sm_cur::Snap& b) {
   SM_RAM(SM_CMP) SM_RTC(SM_CMP) SM_STUB(SM_CMP)
 #undef SM_CMP
   if (a.gps_speed != b.gps_speed) return "gps speed";
-  if (a.frames != b.frames) return "buffered frames: OLD " + std::to_string(a.frames.size()) + " | CUR " +
+  auto value = [](double x, double y) { return x == y || (std::isnan(x) && std::isnan(y)); };
+  bool frames = a.frames.size() == b.frames.size();
+  for (size_t i = 0; frames && i < a.frames.size(); ++i) {
+    frames = a.frames[i].size() == b.frames[i].size();
+    for (size_t j = 0; frames && j < a.frames[i].size(); ++j)
+      frames = a.frames[i][j].first == b.frames[i][j].first && value(a.frames[i][j].second, b.frames[i][j].second);
+  }
+  if (!frames) return "buffered frames: OLD " + std::to_string(a.frames.size()) + " | CUR " +
                                    std::to_string(b.frames.size());
   if (a.log != b.log) return firstLineDiff("logEvent", a.log, b.log);
   if (a.serial != b.serial) return firstLineDiff("Serial", a.serial, b.serial);
@@ -184,17 +204,19 @@ SmEvent randomEvent(std::mt19937& rng) {
   };
   switch (std::uniform_int_distribution<int>(0, 9)(rng)) {
   case 0: case 1: case 2: {
-    const int key = (int)pick({SM_NONE, SM_SPEED, SM_SPEED, SM_VRS});
-    const double speed = pick({0, 0.05, 0.15, 0.25, 0.95, 12.35, 129.95, -1, 1e-9});
+    const int key = (int)pick({SM_NONE, SM_SPEED, SM_SPEED, SM_VRS, SM_BOTH});
+    const double speeds[] = {0, 0.05, 0.15, 0.25, 0.95, 12.35, 129.95, -1, 1e-9, NAN};
+    auto speed = [&] { return speeds[std::uniform_int_distribution<int>(0, 9)(rng)]; };
+    const double first = speed(), second = speed();
     const bool gnss = pick({0, 1}) != 0;
-    return Poll(key, speed, gnss, pick({5.0, 7.25, 88.85}), pick({0, 1, 1, 1}) != 0);
+    return Poll(key, first, gnss, pick({5.0, 7.25, 88.85}), pick({0, 1, 1, 1}) != 0, second);
   }
   case 3: case 4:
     return Advance((unsigned long)pick({1, 4999, 5000, (double)(AT - 1), (double)AT, (double)(AT + 1),
                                         (double)GPS_MOVING_MAX_AGE_MS, (double)MAX_AWAKE_MS,
                                         (double)std::uniform_int_distribution<unsigned long>(0, 400000)(rng)}));
   case 5: return Ladder((SmTo)std::uniform_int_distribution<int>(0, 3)(rng));
-  case 6: return Hold();
+  case 6: return pick({0, 1}) != 0 ? Hold(pick({0, 1}) != 0) : Maint(pick({0, 1}) != 0);
   case 7: return Sleep(pick({0, 1, 1}) != 0, pick({0, 1, 1}) != 0);
   default: {
     const int cause = (int)pick({SM_TIMER, SM_MOTION, SM_COLD});
@@ -240,6 +262,14 @@ void scenarios() {
         "vehicle_reported_speed unlatches and feeds the alarm", t);
   check(sm_log.back() == "LEASH driving speed=0.1 -> unlatch parked + hold awake (smooth-road guard)",
         "LEASH speed line text, double formatting", t);
+
+  // Both keys: the first one above 0.0 decides; a NaN speed is not above it.
+  start(t);
+  play(Poll(SM_BOTH, NAN, false, 0, true, 0), t);
+  check(is_currently_parked && sm_alarm_calls == 0, "a NaN speed and a zero vehicle_reported_speed keep parked", t);
+  play(Poll(SM_BOTH, 0, false, 0, true, 5.0), t);
+  check(!is_currently_parked && sm_alarm_calls == 1 && sm_alarm_last == 5.0,
+        "speed 0 then vehicle_reported_speed 5 unlatches on the second key", t);
 
   // Smooth-road leash: speed alone holds driving and the awake leash past ACTIVE_TIMER.
   start(t);
@@ -295,7 +325,22 @@ void scenarios() {
   play(Poll(SM_SPEED, 50), t);
   for (unsigned long elapsed = 0; elapsed < 2 * AT; elapsed += 5000) { play(Advance(5000), t); play(Hold(), t); }
   play(Poll(SM_NONE, 0), t);
-  check(!is_currently_parked && sm_freezes == 0, "the OTA/dump hold keeps a drive through the transfer", t);
+  check(!is_currently_parked && sm_freezes == 0, "the OTA hold keeps a drive through the transfer", t);
+  start(t);
+  play(Poll(SM_SPEED, 50), t);
+  for (unsigned long elapsed = 0; elapsed < 2 * AT; elapsed += 5000) { play(Advance(5000), t); play(Hold(true), t); }
+  play(Poll(SM_NONE, 0), t);
+  check(!is_currently_parked && sm_freezes == 0, "the log-dump hold keeps a drive through the dump", t);
+
+  // Maintenance mode (a console session) holds off the backstop; releasing it lets the next tick sleep.
+  start(t);
+  play(Maint(true), t);
+  play(Advance(MAX_AWAKE_MS + 1), t);
+  play(Ladder(SmTo::ACTIVE), t);
+  check(!sm_asleep, "no backstop sleep during a console session", t);
+  play(Maint(false), t);
+  play(Ladder(SmTo::ACTIVE), t);
+  check(sm_asleep && sm_sleep_reason == "backstop", "the backstop sleeps once the session ends", t);
 
   // Speed and GNSS in the same cycle: one LEASH line (speed wins), one alarm note.
   start(t);
@@ -334,7 +379,7 @@ void scenarios() {
 
 int main(int argc, char** argv) {
   std::string group = "all";
-  int depth = 6;
+  int depth = 5;  // caught every harness mutant that depth 6 did, in ~3 s; --depth 6 runs the 11 M sequences
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "--depth" && i + 1 < argc) depth = std::atoi(argv[++i]);

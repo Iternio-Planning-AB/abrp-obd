@@ -29,6 +29,7 @@
   X(bool, g_ota_active, false) \
   X(bool, g_logdump_active, false) \
   X(bool, sm_gnss_fresh, false) \
+  X(unsigned long, sm_gnss_age, 0) \
   X(bool, sm_clock_ok, true) \
   X(unsigned, sm_alarm_calls, 0) \
   X(double, sm_alarm_last, 0) \
@@ -52,9 +53,11 @@ struct SmGps { float speed = 0; } sm_gps;  // knots, as GPS_DATA
 SmGps* gd = &sm_gps;
 std::vector<OBDVector> obd_result_vector;
 std::vector<std::string> sm_log, sm_serial;
-const size_t MAX_UPLOAD_BUFFER = 120;
 
 unsigned long millis() { return sm_now; }
+// Logging and the freeze take real time on the device (UART, flash), so each moves the clock: a reordering of
+// a clock read against a log line shows up as a different timestamp.
+const unsigned long SM_IO_MS = 1;
 struct { uint32_t getEpoch() const { return sm_clock_ok ? 1791500000u : 0u; } } rtc;
 
 void logEvent(const char* fmt, ...) {
@@ -64,6 +67,7 @@ void logEvent(const char* fmt, ...) {
   vsnprintf(text, sizeof(text), fmt, args);
   va_end(args);
   sm_log.emplace_back(text);
+  sm_now += SM_IO_MS;
 }
 struct {
   void printf(const char* fmt, ...) {
@@ -73,12 +77,20 @@ struct {
     vsnprintf(text, sizeof(text), fmt, args);
     va_end(args);
     sm_serial.emplace_back(text);
+    sm_now += SM_IO_MS;
   }
 } Serial;
 
-bool gpsMovingFresh(unsigned long) { return sm_gnss_fresh; }
+bool gpsMovingFresh(unsigned long max_age_ms) {
+  sm_gnss_age = max_age_ms;  // compared across sides: the age bound is part of the decision
+  return sm_gnss_fresh;
+}
 // Into the logEvent stream, so the order of the freeze against the LEASH lines is compared too.
-void freezeParkedLocation() { sm_freezes++; logEvent("PARKED_LOC (harness)"); }
+void freezeParkedLocation() {
+  sm_freezes++;
+  sm_now += SM_IO_MS;
+  logEvent("PARKED_LOC (harness)");
+}
 void alarmNoteSpeed(double kmh) { sm_alarm_calls++; sm_alarm_last = kmh; }
 void resetChargeCorroboration() { sm_corr_resets++; }
 void enterDeepSleep(bool modem_on, const char* reason = nullptr);
