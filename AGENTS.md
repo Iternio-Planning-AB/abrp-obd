@@ -43,7 +43,8 @@ A clean build prints two pre-existing `"PRINT" redefined` warnings, from `Freema
 
 **CI runs the host checks only.** `.github/workflows/host-tests.yml` runs every `tests/run_*.py` on each
 pull request and on `main`, normally and with `CXX='clang++ -DNDEBUG'`. Nothing in CI builds the firmware
-or touches a device, so a green PR proves the host checks and nothing more. See *Testing* below,
+or touches a device, so a green PR proves the host checks and nothing more. Merging needs its `ci` job,
+the one check the `main` ruleset requires: a new job goes in that job's `needs`. See *Testing* below,
 because that gap is the single biggest difference from a normal repo.
 
 ## The rules that bite first
