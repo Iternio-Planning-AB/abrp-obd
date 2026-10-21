@@ -434,6 +434,9 @@ extern "C" bool verifyRollbackLater() { return true; }
 void setup() {
   esp_sleep_wakeup_cause_t wake_cause = esp_sleep_get_wakeup_cause();
   resetFrozenGpsProvenance(esp_reset_reason() == ESP_RST_DEEPSLEEP);
+#if ENABLE_NETWORK
+  resetGeoAccepted(esp_reset_reason() == ESP_RST_DEEPSLEEP);
+#endif
 #if PRINT
   // Only stall on a true power-on, so a serial monitor can attach in time to see boot output. Skip it on
   // every deep-sleep wake - periodic, motion, and especially the WiFi RF-flush recovery - so those reboots
@@ -1548,11 +1551,13 @@ void loop() {
 #endif
     }
     // Before is_parked is appended: a frame whose only v2 field would be drivingState is not worth a POST.
-    // utc is always present, so this asks the serializer. The frozen fix is not news either; a live fix still
-    // latched PARK (the first moving sample, the cold-boot fallback) is.
+    // utc is always present, so this asks the serializer. A location or heading already accepted, or already
+    // buffered behind an unsent one, is not news; any other, frozen or live, is.
 #if ENABLE_NETWORK
-    bool frame_has_data = v2HasTelemetry(current_frame,
-      strcmp(gpsLocationSource(), "frozen") == 0 ? 0 : uploadSendUtc());
+    const double poll_utc = uploadSendUtc();
+    seedGeoQueued(poll_utc);
+    GeoMarks poll_geo = obd_result_vector.empty() ? g_geo_accepted : g_geo_queued;
+    bool frame_has_data = v2HasTelemetry(current_frame, poll_utc, &poll_geo);
 #else
     bool frame_has_data = !current_frame.empty();
 #endif
@@ -1805,6 +1810,9 @@ void loop() {
 
     if (frame_has_data) { // skip frames that would carry only drivingState so we never POST a meaningless tlm
       obd_result_vector.push_back(current_frame); // store multiple frames to send at the same time, lowers cellular usage
+#if ENABLE_NETWORK
+      g_geo_queued = poll_geo;
+#endif
       if (!is_currently_parked) park_marker_owed = true;
       // Bound the RAM upload buffer so a long offline stretch can't grow it without limit (-> OOM). The
       // full history is already in flash; for live telemetry the freshest frames matter most, so drop the

@@ -15,6 +15,7 @@ logging = (root / "baseLogger/Helpers/logging.h").read_text()
 clock = (root / "baseLogger/Helpers/clock_sync.h").read_text()
 logger = (root / "baseLogger/logger.ino").read_text()
 streak_line = next(line for line in logger.splitlines() if "if (!g_upload_local_fail)" in line)
+geo_reset_line = next(line for line in logger.splitlines() if "resetGeoAccepted(" in line)
 open_streak_line = next(line for line in logger.splitlines() if "if (!network.trustRefused())" in line)
 
 def section(text, first, last):
@@ -24,7 +25,7 @@ def section(text, first, last):
 compiler = shlex.split(os.environ.get("CXX", "clang++"))
 print(subprocess.check_output([*compiler, "--version"], text=True).splitlines()[0], flush=True)
 group = sys.argv[1] if len(sys.argv) > 1 else "all"
-if group not in {"all", "body-ack", "stages", "responses", "unknown", "fingerprint", "errors", "queue", "geo-expiry", "geo-retry", "geo-sizing", "logging-off", "tls-ca", "signing"}:
+if group not in {"all", "body-ack", "stages", "responses", "unknown", "fingerprint", "errors", "queue", "geo-expiry", "geo-retry", "geo-sizing", "geo-dedup", "logging-off", "tls-ca", "signing"}:
     sys.exit("Unknown upload test group: " + group)
 environment = dict(os.environ)
 environment["UBSAN_OPTIONS"] = environment.get("UBSAN_OPTIONS", "") + ":halt_on_error=1"
@@ -37,6 +38,7 @@ with tempfile.TemporaryDirectory(prefix="obd-upload-checks-") as temporary:
     (build / "upload_parse.inc").write_text(section(source, "std::pair<int, int> handlePair", "commandResponse HTTPClientSIM::getEpoch"))
     (build / "header_budget.inc").write_text(section(header, "// Request headers the SIM7070", "typedef enum {"))
     (build / "upload_streak.inc").write_text(streak_line + "\n")
+    (build / "geo_reset.inc").write_text(geo_reset_line + "\n")
     (build / "open_streak.inc").write_text(open_streak_line + "\n")
     (build / "tls_defines.inc").write_text(section(header, "// Root-CA install (HTTPClientSIM::ensureCa)", "#define RECV_BUF_SIZE"))
     (build / "tls_members.inc").write_text(section(header, "    enum CaState", "    HTTPTransferDiagnostics m_transfer_diagnostics;") +
@@ -55,7 +57,7 @@ with tempfile.TemporaryDirectory(prefix="obd-upload-checks-") as temporary:
     targets = []
     if group in {"all", "body-ack", "stages", "responses"}:
         targets.append(("upload_checks", "upload_checks.cpp", [], group))
-    if group in {"all", "fingerprint", "errors", "queue", "geo-expiry", "geo-retry", "geo-sizing", "signing"}:
+    if group in {"all", "fingerprint", "errors", "queue", "geo-expiry", "geo-retry", "geo-sizing", "geo-dedup", "signing"}:
         targets.append(("upload_helpers_checks", "upload_helpers_checks.cpp", [], group))
     if group in {"all", "tls-ca", "signing"}:
         targets.append(("tls_ca_checks", "tls_ca_checks.cpp", [], group))

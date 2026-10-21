@@ -190,7 +190,8 @@ legacy-shaped rows and leaves absent diagnostics blank rather than guessing thei
 
 Upload request IDs reset each wake. The 12-hex SHA256 is a truncated final-wire-payload fingerprint,
 not an authentication or exactly-once guarantee. `src` counts source frames, `pts` serialized points,
-and `sutc` spans source frame UTCs, including frames omitted by serialization. `p/a/r` is the observed
+and `sutc` spans source frame UTCs, including frames omitted by serialization. `loc`/`ldup` count locations sent
+and omitted as already sent, appended only when both fit whole. `p/a/r` is the observed
 prompt/body-ACK/POST result; `rx` is declared/SHREAD/captured response length. `w=?` explicitly means
 UART-written length is unknown. `cut=-1` means response completeness is unknown, 0 measured complete,
 and 1 measured incomplete. Raw server bodies are not recorded: only fixed categories and length/
@@ -249,6 +250,15 @@ no-POST rule. Future-relative-to-corrected-send-clock normalization remains the 
 policy. Both host runners extract the production clock-quality predicates instead of faking them;
 UART, clocks, compression, and filesystems remain fakes. Real RTC retention, clock acquisition,
 modem timing, ROM gzip and hardware remain unverified; no device was flashed by these checks.
+
+## Send-once geo verification
+
+A location or heading goes up once per new GPS observation; the design is in `DONGLE_CONTEXT.md` §6a.
+Upload group `geo-dedup` covers repeats within a batch, accepted/failed/unanswered outcomes, new times or
+coordinates, multi-batch partial failure, sizing against the mark, boot clearing and untrusted clocks; the
+heading `upload-gate` group covers a geo-only poll buffered once while unaccepted, never again after, and
+not again behind a restored backlog. RTC retention across deep sleep and what the backend shows between
+sends need a parked night.
 
 Run `python3 tests/run_clock_range_checks.py` normally and with `CXX='clang++ -DNDEBUG'` for extracted
 production predicates, sender snapshots, and formatter checks under both host-native `time_t` and a
