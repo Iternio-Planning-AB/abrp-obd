@@ -154,6 +154,20 @@ and upload cycle), `Helpers/state_machine.h` (activity states and cadences), `He
   touch both repos and land together; a firmware change that moves a wire format without the app is a broken pair.
   From outside, describe the app-side change a PR needs in its description.
 
+## State-machine differential harness
+
+Run `python3 tests/run_sm_checks.py` (groups `scenarios`, `random`, `enumerate`; `--depth N`, default 6) for
+the park/drive decision. It extracts the same drive blocks from the pinned `main` commit (`SM_PIN`, via
+`git show`) and from the working tree, compiles each into its own namespace around one harness
+(`tests/sm/`), and runs identical event sequences through both: every sequence of 6 events over a
+15-symbol alphabet (about 11 M, under a minute), 5000 fixed-seed sequences of 30, and named field cases
+(garage latch, smooth-road leash, re-latch boundary, OTA hold, trip-end marker, the two no-speed-PID
+drives). After every event the latch, leash, hold time, marker debt, published `is_parked`, buffered
+frames, freezes and the exact `logEvent` and Serial sequences must be equal; the weak-rail gate and the
+max-awake backstop are checked as properties. The pin rule and what the harness cannot prove (32-bit
+`millis()` wrap, other flag sets, code outside the extracted blocks) are in the runner's header. Energy and
+wake surfaces come in step 0b (#28).
+
 ## Diagnostic host checks
 
 Run `python3 tests/run_log_diagnostics_checks.py` for actual DataLogger, CSV, and GPS-selection checks.
