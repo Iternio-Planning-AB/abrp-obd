@@ -125,6 +125,9 @@ const char* propertyBroken(const Snap& pre, const SmEvent& e) {
       pre.current_state != UNINITIALIZED && sm_now > (unsigned long)MAX_AWAKE_MINUTES * 60UL * 1000UL &&
       !(sm_asleep && sm_sleep_reason == "backstop"))
     return "awake past MAX_AWAKE_MINUTES while parked, and the next ladder tick did not take the backstop sleep";
+  // The backstop is shared context but reads the latch: it must never take a driving car to sleep.
+  if (e.k == SmKind::LADDER && !pre.sm_asleep && !pre.is_currently_parked && sm_asleep && sm_sleep_reason == "backstop")
+    return "the backstop slept while driving";
   size_t unlatch_lines = 0;
   for (size_t i = pre.log.size(); i < sm_log.size(); ++i) {
     if (sm_log[i].size() > 119) return "a logEvent line is longer than the 119 characters logEvent keeps";

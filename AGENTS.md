@@ -159,9 +159,10 @@ and upload cycle), `Helpers/state_machine.h` (activity states and cadences), `He
 
 Run `python3 tests/run_sm_checks.py` (groups `scenarios`, `random`, `enumerate`; `--depth N`, default 5) for
 the park/drive decision. The differential covers the drive region; shared context comes from the working
-tree. The drive writers come from the pinned `main` commit (`SM_PIN`, via `git show`) for OLD and from the
-working tree for CUR; the code around them (the wake gate, the backstop, the rest of `changeState` and the
-buffer block) comes from the working tree for both, so a deliberate change there does not fail it. Each
+tree. The blocks that write drive state (the poll-time unlatch and re-latch, the `is_parked` publish, the
+OTA/dump hold, `changeState`, the buffer block and the pre-sleep marker) come from the pinned `main` commit
+(`SM_PIN`, via `git show`) for OLD and from the working tree for CUR; the context around them (the wake
+gate, the backstop) comes from the working tree for both, so a deliberate change there does not fail it. Each
 side compiles into its own namespace around one harness (`tests/sm/`), and identical event sequences run
 through both: every sequence of 5 events over a
 15-symbol alphabet (about 760 k, a few seconds; `--depth 6` runs about 11 M in under a minute), 5000
