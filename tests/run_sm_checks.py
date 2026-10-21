@@ -1,16 +1,21 @@
 """Differential checks for the park/drive decision (state machine #23, step 0a #28).
 
-The drive code is extracted from two places with the same anchors: OLD from the pinned commit (git show),
-CUR from the working tree. tests/sm_checks.cpp compiles each into its own namespace around the same harness
+The differential covers the drive region; shared context comes from the working tree. The drive writers
+(the speed loop, the GNSS branch and the time re-latch, the is_parked publish, the OTA/dump hold, the
+changeState re-latch, the marker-debt lines and the pre-sleep marker) are extracted with the same anchors
+from two places: OLD from the pinned commit (git show), CUR from the working tree. Everything around them
+(the setup() wake gate, the backstop, the rest of changeState and the buffer block, the delays) comes from
+the working tree for both sides, so a deliberate change there cannot fail the differential.
+tests/sm_checks.cpp compiles each side into its own namespace around the same harness
 (tests/sm/adapter_*.inc) and runs identical event sequences through both, asserting equal outputs after
 every event: the latch, the leash and hold times, the marker debt, published is_parked, buffered frames,
 alarm speed notes, freezes, and the exact logEvent and Serial sequences. It also checks the weak-rail gate
-and the max-awake backstop properties. Groups: enumerate (exhaustive, --depth, default 5), random (fixed seeds),
+and the max-awake backstop properties, on the working tree's gate and backstop. Groups: enumerate (exhaustive, --depth, default 5), random (fixed seeds),
 scenarios (named field cases), or all.
 
 The pin. SM_PIN is the main commit a refactor step is measured against. The step 1 (#24) and step 2 (#6)
 branches use the same pin: the code they move is unchanged there. Re-pin only when a behaviour change to
-the extracted code lands on main between steps, to the merge-base of the step being measured; merges into
+the drive writers lands on main between steps, to the merge-base of the step being measured; merges into
 main are merge commits, so the pin stays reachable. A clone without it fails with a message, never a skip.
 
 What it cannot prove: 32-bit millis() wrap (the host unsigned long is 64-bit); any feature-flag set other
@@ -60,6 +65,15 @@ PATHS = {"logger": "baseLogger/logger.ino", "machine": "baseLogger/Helpers/state
          "config": "baseLogger/config.h"}
 
 
+def owe_lines(buffer, what):
+    """The contiguous lines of the buffer block that touch the marker debt: the drive region's part of it."""
+    lines = buffer.splitlines(keepends=True)
+    hits = [i for i, l in enumerate(lines) if re.search(r"\bpark_marker_owed\b|\bdrive[A-Z]\w*\s*\(", l.split("//")[0])]
+    if not hits or hits != list(range(hits[0], hits[-1] + 1)):
+        sys.exit(f"FAIL: expected one run of marker-debt lines in the frame_has_data block of {what}")
+    return "".join(lines[hits[0]:hits[-1] + 1])
+
+
 # Code anchors only (never comment text), each failing with its own text when the code it names has moved.
 DRIVE_START = ('    for (const auto& res : current_frame) {\n'
                '      if (( res.first == "speed" || res.first == "vehicle_reported_speed" )')
@@ -77,9 +91,11 @@ def recipe(src, side):
         "delays": block(machine, "unsigned long getTransmissionDelay(", where["machine"]) +
                   block(machine, "unsigned long getPollingDelay(", where["machine"]),
         "change_state": block(machine, "void changeState(ActivityState new_state) {", where["machine"]),
+        "relatch": block(machine, "  if (new_state == CHARGING || new_state == STANDBY) {", where["machine"]).rstrip("\n"),
         "drive": logger[start:find(logger, DRIVE_END, start, where["logger"])],
         "emplace": line(logger, '    current_frame.emplace_back("is_parked"', where["logger"]),
         "buffer": block(logger, "    if (frame_has_data) {", where["logger"]),
+        "owe": owe_lines(block(logger, "    if (frame_has_data) {", where["logger"]), where["logger"]),
         "marker": block(src["sleep"], "  if (rtc.getEpoch() > 1e9 && is_currently_parked", where["sleep"]),
         "session": block(machine, "if (g_ota_active || g_logdump_active) {", where["machine"]),
         "backstop": block(machine, "if (!maintenance_mode && !g_ota_active && !g_logdump_active", where["machine"]),
@@ -116,10 +132,31 @@ bool sm_gate(float rail, bool is_cold, bool is_motion, bool awake, bool heartbea
 
 old_src = {k: pinned(p) for k, p in PATHS.items()}
 cur_src = {k: tree(p) for k, p in PATHS.items()}
-old, cur = recipe(old_src, "SM_PIN"), recipe(cur_src, "tree")
+pin, cur = recipe(old_src, "SM_PIN"), recipe(cur_src, "tree")
+
+# The differential covers the drive region only. OLD takes the drive writers from SM_PIN - the speed loop, the
+# GNSS branch and the time re-latch, the is_parked publish, the OTA/dump hold, the pre-sleep marker, and inside
+# shared blocks the changeState re-latch and the marker-debt lines - and everything else (the wake gate, the
+# backstop, the rest of changeState and the buffer block, the delays) from the working tree, as CUR does. A
+# deliberate change to that shared context is then identical on both sides and cannot fail the differential.
+DRIVE_BLOCKS = ("drive", "emplace", "session", "marker")
+old = dict(cur)
+for name in DRIVE_BLOCKS:
+    old[name] = pin[name]
+
+
+def swap(text, ours, theirs, what):
+    if text.count(ours) != 1:
+        sys.exit(f"FAIL: cannot place SM_PIN's {what} into the working tree's block")
+    return text.replace(ours, theirs)
+
+
+old["change_state"] = swap(cur["change_state"], cur["relatch"], pin["relatch"], "changeState re-latch")
+old["buffer"] = swap(cur["buffer"], cur["owe"], pin["owe"], "marker-debt lines")
+old_drive = [pin[name] for name in (*DRIVE_BLOCKS, "relatch", "owe")]
 
 # OLD must never pull a project header into its namespace: #pragma once would hand it CUR's copy.
-for name, text in old.items():
+for name, text in zip((*DRIVE_BLOCKS, "relatch", "owe"), old_drive):
     if '#include "' in text:
         sys.exit(f"FAIL: OLD extraction {name} includes a project header; isolate it first (step 0b)")
 
@@ -134,7 +171,7 @@ def defines(config):
 # Both sides compile against the tree's config.h, so every macro OLD uses must be byte-identical at the pin.
 old_defines, cur_defines = defines(old_src["config"]), defines(cur_src["config"])
 NAME = r"\b[A-Z][A-Z0-9_]{2,}\b"
-used, pending = set(), set(re.findall(NAME, "".join(old.values())))
+used, pending = set(), set(re.findall(NAME, "".join(old_drive)))
 while pending:  # through the macros' own bodies: ENABLE_NETWORK is ENABLE_CELL || ENABLE_WIFI
     macro = pending.pop()
     if macro in used or macro not in cur_defines:
@@ -145,13 +182,17 @@ for macro in sorted(used):
     if old_defines.get(macro) != cur_defines[macro]:
         sys.exit(f"FAIL: config.h {macro} differs between SM_PIN and the tree; the OLD side would run with the new value")
 
-# The harness resets each firmware global to a literal; that literal must be the firmware's initialiser.
+# The harness resets each firmware global to a literal; that literal must be the firmware's initialiser: in
+# the tree for all of them, and at SM_PIN too for the drive storage, which the OLD drive writers start from.
+DRIVE_GLOBALS = {"is_currently_parked", "g_last_speed_ms", "last_active", "park_marker_owed"}
 adapter = tree("tests/sm/adapter_pre.inc")
 for region, prefix in (("SM_RAM", ""), ("SM_RTC", "RTC_DATA_ATTR ")):
     body = re.search(rf"^#define {region}\(X\) \\\n((?:.*\\\n)*.*)", adapter, re.M).group(1)
     for type_, name, value in re.findall(r"X\(([\w ]+), (\w+), ([^)]+)\)", body):
         pattern = rf"^{prefix}(?:volatile )?{re.escape(type_)} {name} = {re.escape(value)};"
         for label, src in (("SM_PIN", old_src), ("tree", cur_src)):
+            if label == "SM_PIN" and name not in DRIVE_GLOBALS:
+                continue
             if not re.search(pattern, src["logger"], re.M):
                 sys.exit(f"FAIL: {region} {name} = {value} does not match its definition in logger.ino ({label})")
 

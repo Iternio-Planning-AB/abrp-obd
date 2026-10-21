@@ -158,16 +158,19 @@ and upload cycle), `Helpers/state_machine.h` (activity states and cadences), `He
 ## State-machine differential harness
 
 Run `python3 tests/run_sm_checks.py` (groups `scenarios`, `random`, `enumerate`; `--depth N`, default 5) for
-the park/drive decision. It extracts the same drive blocks from the pinned `main` commit (`SM_PIN`, via
-`git show`) and from the working tree, compiles each into its own namespace around one harness
-(`tests/sm/`), and runs identical event sequences through both: every sequence of 5 events over a
+the park/drive decision. The differential covers the drive region; shared context comes from the working
+tree. The drive writers come from the pinned `main` commit (`SM_PIN`, via `git show`) for OLD and from the
+working tree for CUR; the code around them (the wake gate, the backstop, the rest of `changeState` and the
+buffer block) comes from the working tree for both, so a deliberate change there does not fail it. Each
+side compiles into its own namespace around one harness (`tests/sm/`), and identical event sequences run
+through both: every sequence of 5 events over a
 15-symbol alphabet (about 760 k, a few seconds; `--depth 6` runs about 11 M in under a minute), 5000
 fixed-seed sequences of 30, and named field cases (garage latch, smooth-road leash, re-latch boundary,
 OTA and log-dump holds, a console session, both speed keys and a NaN speed, trip-end marker, the two
 no-speed-PID drives). The fake clock advances inside every log line and freeze, as the device's does.
 After every event the latch, leash, hold time, marker debt, published `is_parked`, buffered frames,
 freezes, the GNSS age bound asked for, and the exact `logEvent` and Serial sequences must be equal; the
-weak-rail gate and the max-awake backstop are checked as properties. The pin rule and what the harness
+weak-rail gate and the max-awake backstop are checked as properties, on the working tree's code. The pin rule and what the harness
 cannot prove (32-bit `millis()` wrap, other flag sets, code outside the extracted blocks) are in the
 runner's header. Energy and wake surfaces come in step 0b (#28).
 

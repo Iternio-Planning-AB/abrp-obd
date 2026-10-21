@@ -26,6 +26,7 @@
 // Harness-only state: the trace's inputs and what the stubs recorded. Not firmware globals, so not checked.
 #define SM_STUB(X) \
   X(unsigned long, sm_now, 0) \
+  X(uint8_t, charge_followup, 0) \
   X(bool, g_ota_active, false) \
   X(bool, g_logdump_active, false) \
   X(bool, sm_gnss_fresh, false) \
@@ -93,4 +94,9 @@ void freezeParkedLocation() {
 }
 void alarmNoteSpeed(double kmh) { sm_alarm_calls++; sm_alarm_last = kmh; }
 void resetChargeCorroboration() { sm_corr_resets++; }
+// The wake gate and the awake ladder reach the post-charge follow-up and the post-drive window; the harness
+// models neither (no stale charge evidence, no window), so both sides see the same inert stubs.
+uint64_t esp_rtc_get_time_us() { return (uint64_t)sm_now * 1000ULL; }
+bool chargeStateStale(uint64_t) { return false; }
+void pdwArmAtLadderEnd() {}
 void enterDeepSleep(bool modem_on, const char* reason = nullptr);
