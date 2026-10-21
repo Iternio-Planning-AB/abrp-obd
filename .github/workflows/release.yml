@@ -51,7 +51,9 @@ jobs:
       # No build cache: the released image must come from a clean toolchain, not whatever a previous run left.
       # Every package, dependencies included, is pinned by hash in release.txt (regenerate it from release.in).
       - name: Install tools
-        run: python -m pip install --disable-pip-version-check --require-hashes --only-binary :all: -r .github/requirements/release.txt
+        run: >-
+          python -m pip install --disable-pip-version-check --require-hashes
+          --only-binary :all: -r .github/requirements/release.txt
 
       - name: Check release tooling
         run: python3 tests/run_release_checks.py
