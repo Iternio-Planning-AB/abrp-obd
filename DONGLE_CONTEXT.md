@@ -90,7 +90,7 @@ handles silently breaks already-paired iPhones.
 | UUID | Purpose |
 |---|---|
 | `ABD0` | The service |
-| `ABD1` | Telemetry (notify) — the live frame |
+| `ABD1` | Telemetry (notify + read) — the live frame |
 | `ABD2` | Setup/config: token handshake, profile push, `obd_alarm` flag |
 | `ABD3` | Developer |
 | `ABD4` | Error |
@@ -108,6 +108,15 @@ handles silently breaks already-paired iPhones.
 - **A notify carries at most MTU−3 bytes and is never fragmented.** Chunk sizes are derived from the
   negotiated MTU for this reason.
 - **Android stays at MTU 23** until the app calls `requestMTU`. iOS negotiates ~185 itself.
+- **ABD1's notify is fitted to MTU−3; its readable value is the full frame.** Numbers are `%.2f` with
+  trailing zeros dropped (same value as the 2 dp contract, shorter text). If the frame is still too
+  long, the notify drops fields by `bleTlmRank` (SoC, power/current/voltage, speed and the three flags
+  last to go; `kwh_charged` and the battery temperature bounds first), so it always parses. The
+  follow-up read is a long read, so an app that reads after the notify (idle Android at MTU 23) still
+  gets every field. A real driving frame (~220 B at `%.2f`) is ~200 B compact: it fits 247, and at
+  iOS's 185 the notify loses the temperature bounds. The notify goes straight to
+  `esp_ble_gatts_send_indicate`; the value is set once per poll and never swapped for the notify, since
+  the library's blob-read handler copies it without a lock. Keys outside `[A-Za-z0-9_]` are left out.
 - **The GATT attribute budget fails silently when exceeded.** The default is 15 handles; the table
   needed 18. The stack reported the overflow only in an event the Arduino core ignores, so two
   attributes were dropped with no error — which killed OTA and took days to find. The budget is now
@@ -582,6 +591,11 @@ session.
   Prefer one line per wake with the inputs *and* the verdict over transition-only logging.
 - **A happy path proves nothing about a gate.** Both the signature check and the HMAC gate were only
   believed after watching them *refuse*, which is why `JWSTEST` shipped as a permanent diagnostic.
+- **`BLE tlm mtu=<m> bytes=<full> sent=<n> fit|trimmed drop=<k>`** is the ABD1 frame against the
+  negotiated MTU: the first frame of a wake, then again only when `drop` exceeds every line so far or the
+  MTU changes. `sent` is the fitted notify size handed to the stack, not a confirmed delivery. `trimmed`
+  means the notify left out `drop` fields (the readable value kept them); at `mtu=23` that is expected
+  for an idle Android connection, and `sent=10` is the bare `{"tlm":{}}` sent as the cue to read.
 - **`UPLOAD not sent: <reason>`** (`no_token`, `sign_fail`, `hdr_fail`) is a batch that never left the
   dongle. It keeps its frames and deliberately does not advance the http=0 streak that drives the
   stale-bearer restart and reboot: the bearer is not what failed, and restarting the modem cannot fix

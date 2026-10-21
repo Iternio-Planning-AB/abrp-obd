@@ -123,10 +123,7 @@ void logDumpService() {
     logEvent("LOGDUMP start");
     datalogger.flush();
     logdump_total = datalogger.totalSize();
-    uint16_t mtu = ble.mtu();
-    if (mtu < 23) mtu = 23;
-    if (mtu > 247) mtu = 247; // single-radio-packet ceiling; larger notifications are lost (measured)
-    logdump_chunk = (size_t)mtu - 3 /*ATT header*/ - 5 /*chunk frame header*/;
+    logdump_chunk = bleNotifyBudget(ble.mtu()) - 5 /*chunk frame header*/;
     logdump_window_chunks = LOGDUMP_WINDOW_BYTES / logdump_chunk; // >=34 at 239, >=46 at 177
     g_logdump_active = true;
     logdump_last_ms = millis();

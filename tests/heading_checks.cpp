@@ -1329,9 +1329,9 @@ void geoPrivacy() {
     check(!value.contains("lat") && !value.contains("lon") && !value.contains("heading") && value["_soh"] == 98,
           "legacy formats omit geo without altering other private fields");
   const auto ble = json::parse(bleTlmString(frame))["tlm"];
-  check(bleTlmString(frame).size() <= 185 && ble["is_parked"] == true && ble["is_charging"] == true &&
+  check(ble["is_parked"] == true && ble["is_charging"] == true &&
         ble["is_dcfc"] == false && !ble.contains("lat") && !ble.contains("heading") && !ble.contains("utc"),
-        "BLE phone geo, booleans and 185 byte contract unchanged");
+        "BLE phone geo and booleans unchanged");
 }
 
 void geoTimes() {

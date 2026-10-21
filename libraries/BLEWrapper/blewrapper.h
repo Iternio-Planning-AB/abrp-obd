@@ -78,7 +78,7 @@ public:
   void deinit();
   void clean();
   bool logError(std::string error);
-  bool logData(std::string payload);
+  bool logData(const std::string& notify_payload, const std::string& read_value);
   // Optional flash-logging hook: routes handshake/connection events to the sketch's DUMP (logEvent), not just
   // Serial, so a BLE session in the car is debuggable from the log. null = Serial only. logEvt() fans to both.
   void set_log_callback(void (*cb)(const char*)) { log_cb = cb; }
@@ -258,6 +258,7 @@ private:
   BLEServer* pServer = NULL;
   BLEService* pService = NULL;
   BLECharacteristic* pTelemetryCharacteristic = NULL;
+  BLE2902* pTelemetryCccd = NULL;                       // ABD1's CCCD: is the direct notify wanted?
   BLECharacteristic* pStartupCharacteristic = NULL;
   BLECharacteristic* pDeveloperCharacteristic = NULL;
   BLECharacteristic* pErrorCharacteristic = NULL;
