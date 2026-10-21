@@ -1,16 +1,22 @@
 """Differential checks for the park/drive decision (state machine #23, step 0a #28).
 
-The drive code is extracted from two places with the same anchors: OLD from the pinned commit (git show),
-CUR from the working tree. tests/sm_checks.cpp compiles each into its own namespace around the same harness
+The differential covers the drive region; shared context comes from the working tree. The blocks that write
+drive state (the speed loop, the GNSS branch and the time re-latch, the is_parked publish, the OTA/dump
+hold, changeState, the frame_has_data buffer block and the pre-sleep marker) are extracted with the same
+anchors from two places: OLD from the pinned commit (git show), CUR from the working tree. The context
+around them (the setup() wake gate, the backstop, the delays) comes from the working tree for both sides,
+so a deliberate change there cannot fail the differential; a property checks that the shared backstop
+never sleeps a driving car.
+tests/sm_checks.cpp compiles each side into its own namespace around the same harness
 (tests/sm/adapter_*.inc) and runs identical event sequences through both, asserting equal outputs after
 every event: the latch, the leash and hold times, the marker debt, published is_parked, buffered frames,
 alarm speed notes, freezes, and the exact logEvent and Serial sequences. It also checks the weak-rail gate
-and the max-awake backstop properties. Groups: enumerate (exhaustive, --depth, default 5), random (fixed seeds),
+and the max-awake backstop properties, on the working tree's gate and backstop. Groups: enumerate (exhaustive, --depth, default 5), random (fixed seeds),
 scenarios (named field cases), or all.
 
 The pin. SM_PIN is the main commit a refactor step is measured against. The step 1 (#24) and step 2 (#6)
 branches use the same pin: the code they move is unchanged there. Re-pin only when a behaviour change to
-the extracted code lands on main between steps, to the merge-base of the step being measured; merges into
+the drive writers lands on main between steps, to the merge-base of the step being measured; merges into
 main are merge commits, so the pin stays reachable. A clone without it fails with a message, never a skip.
 
 What it cannot prove: 32-bit millis() wrap (the host unsigned long is 64-bit); any feature-flag set other
@@ -116,10 +122,21 @@ bool sm_gate(float rail, bool is_cold, bool is_motion, bool awake, bool heartbea
 
 old_src = {k: pinned(p) for k, p in PATHS.items()}
 cur_src = {k: tree(p) for k, p in PATHS.items()}
-old, cur = recipe(old_src, "SM_PIN"), recipe(cur_src, "tree")
+pin, cur = recipe(old_src, "SM_PIN"), recipe(cur_src, "tree")
+
+# The differential covers the drive region only. OLD takes the blocks that write drive state from SM_PIN - the
+# speed loop, the GNSS branch and the time re-latch, the is_parked publish, the OTA/dump hold, changeState, the
+# frame_has_data buffer block and the pre-sleep marker - and the rest (the wake gate, the backstop, the
+# delays) from the working tree, as CUR does. A deliberate change to that shared context is then identical
+# on both sides and cannot fail the differential.
+DRIVE_BLOCKS = ("drive", "emplace", "session", "marker", "change_state", "buffer")
+old = dict(cur)
+for name in DRIVE_BLOCKS:
+    old[name] = pin[name]
+old_drive = [pin[name] for name in DRIVE_BLOCKS]
 
 # OLD must never pull a project header into its namespace: #pragma once would hand it CUR's copy.
-for name, text in old.items():
+for name, text in zip(DRIVE_BLOCKS, old_drive):
     if '#include "' in text:
         sys.exit(f"FAIL: OLD extraction {name} includes a project header; isolate it first (step 0b)")
 
@@ -134,7 +151,7 @@ def defines(config):
 # Both sides compile against the tree's config.h, so every macro OLD uses must be byte-identical at the pin.
 old_defines, cur_defines = defines(old_src["config"]), defines(cur_src["config"])
 NAME = r"\b[A-Z][A-Z0-9_]{2,}\b"
-used, pending = set(), set(re.findall(NAME, "".join(old.values())))
+used, pending = set(), set(re.findall(NAME, "".join(old_drive)))
 while pending:  # through the macros' own bodies: ENABLE_NETWORK is ENABLE_CELL || ENABLE_WIFI
     macro = pending.pop()
     if macro in used or macro not in cur_defines:
@@ -145,13 +162,17 @@ for macro in sorted(used):
     if old_defines.get(macro) != cur_defines[macro]:
         sys.exit(f"FAIL: config.h {macro} differs between SM_PIN and the tree; the OLD side would run with the new value")
 
-# The harness resets each firmware global to a literal; that literal must be the firmware's initialiser.
+# The harness resets each firmware global to a literal; that literal must be the firmware's initialiser: in
+# the tree for all of them, and at SM_PIN too except for those only the shared context reads.
+CONTEXT_GLOBALS = {"recently_charging", "taper_confirm_wakes", "charge_end_polled", "g_taper_confirm", "maintenance_mode"}
 adapter = tree("tests/sm/adapter_pre.inc")
 for region, prefix in (("SM_RAM", ""), ("SM_RTC", "RTC_DATA_ATTR ")):
     body = re.search(rf"^#define {region}\(X\) \\\n((?:.*\\\n)*.*)", adapter, re.M).group(1)
     for type_, name, value in re.findall(r"X\(([\w ]+), (\w+), ([^)]+)\)", body):
         pattern = rf"^{prefix}(?:volatile )?{re.escape(type_)} {name} = {re.escape(value)};"
         for label, src in (("SM_PIN", old_src), ("tree", cur_src)):
+            if label == "SM_PIN" and name in CONTEXT_GLOBALS:
+                continue
             if not re.search(pattern, src["logger"], re.M):
                 sys.exit(f"FAIL: {region} {name} = {value} does not match its definition in logger.ino ({label})")
 
