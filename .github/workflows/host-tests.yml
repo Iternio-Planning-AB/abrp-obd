@@ -66,3 +66,21 @@ jobs:
             printf 'FAILED (%s): %s\n' "$CXX" "${failed[@]}"
             exit 1
           fi
+
+  # The one check the main ruleset requires (cloudops tf/abrp-obd), so a new job joins `needs` here and the ruleset
+  # stays as it is. always(): a skipped required check counts as passed, so this must run, and fail, when a need fails.
+  ci:
+    if: always()
+    needs: [host-tests]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Every needed job passed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "needs: $RESULTS"
+          for result in $RESULTS; do
+            [ "$result" = success ] || exit 1
+          done
