@@ -1,0 +1,11 @@
+# esptool's own dependencies, which tool-esptoolpy's package-postinstall.py pip-installs into the package's _contrib
+# while the release job installs PlatformIO's packages. Copied verbatim from its `esptool_deps` for
+# platformio/tool-esptoolpy@2.41100.260830; on a bump, copy the new package's list here and regenerate esptool.txt:
+#   uv pip compile --generate-hashes --universal --python-version 3.12 .github/requirements/esptool.in -o .github/requirements/esptool.txt
+# release.yml downloads only these, by hash, gives PlatformIO's pip no index, and checks that the hook installed
+# exactly this lock (baseLogger/tools/check_esptool_deps.py).
+cryptography ~= 46.0.0
+ecdsa ~= 0.19.1
+bitstring ~= 4.3.1
+reedsolo ~= 1.7.0
+intelhex ~= 2.3.0
