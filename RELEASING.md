@@ -95,4 +95,9 @@ yours on official ones; that is the point.
   toolchains.
 - The publish job trusts what the build job built. It checks only the build tag and the embedded public key, so a
   compromised PlatformIO dependency can't reach the key but could still get a backdoored image signed. The PyPI tools
-  are pinned by hash (`.github/requirements/release.txt`); pinning the platform narrows the rest.
+  are pinned by hash (`.github/requirements/release.txt`), except starlette, which only `pio home` needs (see
+  `release.in`); pinning the platform narrows the rest.
+- The lock covers only the tools the workflow installs. During the Build step, PlatformIO's `tool-esptoolpy` package
+  runs a post-install script that pip-installs esptool's own dependencies (cryptography, ecdsa, bitstring, reedsolo,
+  intelhex) by version range, without hashes, into the package's `_contrib` directory, where `pip check` doesn't
+  look (#46).
