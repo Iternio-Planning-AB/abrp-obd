@@ -78,6 +78,10 @@ public:
   std::string anomalous_220105_reply;
   std::string anomalous_220105_reason;
   std::string good_220105_reply;
+  /* First 22xxxx command this poll whose reply decoded only after dropping lines ahead of it (see
+     genericProtocol), and how many lines. Hex-only by construction, safe to log. */
+  std::string skipped_prefix_pid;
+  unsigned skipped_prefix_lines{ 0 };
 
   /* Generate fake values from above */
   OBDVector getFakeReading() const;

@@ -87,11 +87,41 @@ struct UnexpectedPidResponse : std::runtime_error {
   UnexpectedPidResponse() : std::runtime_error("unexpected PID response") {}
 };
 
-std::vector<int> genericProtocol(std::string data, std::string protocol, const std::string& requested) {
+// Protocol 6, 22xxxx: the co-processor sometimes puts a stray tail ahead of a clean reply. Drops the
+// whole lines before the first single or first frame (HHH 0N / HHH 1N NN, spaces ignored) answering
+// 62<DID> and returns how many non-blank lines that was; with no such line the DID check refuses the
+// reply. Headers off (ATH0) and 29-bit headers are not handled.
+static int dropLinesBeforeUdsReply(std::string& data, const std::string& requested) {
+  const std::string expect = "62" + requested.substr(2);
+  int dropped = 0;
+  for (size_t at = 0; at < data.size(); ) {
+    size_t eol = data.find_first_of("\r\n", at);
+    if (eol == std::string::npos) eol = data.size();
+    std::string line;
+    for (size_t i = at; i < eol; ++i) if (data[i] != ' ') line += data[i];
+    if (line.size() >= 4 && (line[3] == '0' || line[3] == '1')) {
+      size_t payload = line[3] == '0' ? 5 : 7;
+      if (line.size() >= payload + expect.size() && line.compare(payload, expect.size(), expect) == 0) {
+        if (dropped) data.erase(0, at);
+        return dropped;
+      }
+    }
+    if (!line.empty()) dropped++;
+    at = eol + 1;
+  }
+  return 0;
+}
+
+std::vector<int> genericProtocol(std::string data, std::string protocol, const std::string& requested,
+                                 int& skipped_lines) {
 #if PRINT
   Serial.printf("Buffer in: %s\n", data.c_str());
   Serial.printf("Buffer len: %d\n", data.length());
 #endif
+  skipped_lines = 0;
+  if (protocol == "6" && requested.size() == 6 && requested.compare(0, 2, "22") == 0 &&
+      std::all_of(requested.begin() + 2, requested.end(), [](char c) { return isxdigit((unsigned char)c); }))
+    skipped_lines = dropLinesBeforeUdsReply(data, requested);
 
   std::vector<int> obdVariables{};
   data.erase(remove_if(data.begin(), data.end(), isspace), data.end());
@@ -249,6 +279,8 @@ OBDVector OBDWrapper::readPIDs(bool print) {
   anomalous_220105_reason.clear();
   good_220105_reply.clear();
   raw_220105_reply.clear();
+  skipped_prefix_pid.clear();
+  skipped_prefix_lines = 0;
   // A profile without a string obd_protocol can't be polled; throwing here would reboot the dongle.
   if (!vehicle_commands.contains("obd_protocol") || !vehicle_commands["obd_protocol"].is_string()) return results;
   std::string protocol = vehicle_commands["obd_protocol"].get<std::string>();
@@ -297,8 +329,13 @@ OBDVector OBDWrapper::readPIDs(bool print) {
     // Decode once for all fields. genericProtocol throws on replies readBuffer lets through ("?",
     // "STOPPED", "CAN ERROR", short frames); uncaught, that is a reboot.
     std::vector<int> variables{};
+    int skipped = 0;
     try {
-      variables = genericProtocol(buffer, protocol, pid_string);
+      variables = genericProtocol(buffer, protocol, pid_string, skipped);
+      if (skipped > 0 && skipped_prefix_pid.empty()) {
+        skipped_prefix_pid = pid_string;
+        skipped_prefix_lines = (unsigned)skipped;
+      }
     }
     catch (const UnexpectedPidResponse&) {
       if (pid_string == "220105") {
@@ -368,7 +405,7 @@ OBDVector OBDWrapper::readPIDs(bool print) {
       if (low_soc && soh_bad) {
         anomalous_220105_reason = "soc0.5_soh_drop";
         anomalous_220105_reply = raw_220105_reply;
-      } else if (have_soc && have_soh) {
+      } else if (have_soc && have_soh && !skipped) {  // the baseline must not carry the stray tail
         good_220105_reply = raw_220105_reply;
       }
     }
