@@ -58,11 +58,15 @@ bool DataLogger::openSegment(int index) {
   }
   activeIndex = index;
   activeSize = active.size();
-  if (activeSize == 0 && header_.size()) { // brand-new (empty) segment -> write the CSV header first
-    active.print(header_.c_str());
-    active.print("\n");
-    active.flush();
-    activeSize = active.size();
+  if (activeSize == 0) {
+    if (header_.size()) { // brand-new (empty) segment -> write the CSV header first
+      active.print(header_.c_str());
+      active.print("\n");
+      active.flush();
+      activeSize = active.size();
+    }
+    // Re-enters writeLine, which cannot rotate a segment this empty and keeps activeSize itself.
+    if (newSegmentHook) newSegmentHook();
   }
   return true;
 }

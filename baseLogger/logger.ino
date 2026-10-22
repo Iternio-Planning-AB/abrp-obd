@@ -424,6 +424,7 @@ void changeState(ActivityState new_state);     // Helpers/state_machine.h
 #include "Helpers/sleep_power.h"
 #include "Helpers/ble.h"
 #include "Helpers/logging.h"
+#include "Helpers/fw_build_log.h" // FW event: uses logEvent
 // after logging.h (uses logEvent) and before network_upload.h (uses gzipBody)
 #include "Helpers/gzip_body.h"
 #include "Helpers/tlm_signature.h" // pure builder used by network_upload.h
@@ -549,6 +550,7 @@ void setup() {
 #if ENABLE_LOGGING
   // Mount the flash log filesystem and open/continue the active segment. Done early so even setup-phase
   // failures could be logged later; survives across the deep-sleep reboots above.
+  datalogger.onNewSegment(logFwBuild); // every segment names the build, so rotation never loses it
   datalogger.begin(LOG_HEADER);
 #endif
 
@@ -610,6 +612,10 @@ void setup() {
   logEvent("WAKE reason=%s reset=%s clean_sleep=%d brownouts=%lu atrv=%.2f rail=%.2f boot=%lu sleeps=%lu",
     g_wake_reason, resetReasonStr(), clean_sleep ? 1 : 0, (unsigned long)brownout_count,
     g_last_voltage, g_last_io36, (unsigned long)bootCount, (unsigned long)sleepCount);
+  // A deep-sleep wake cannot change the image: a new one is confirmed (otaHandlePendingVerify) before
+  // anything can sleep. A boot that also opened a segment logs it twice; harmless, and it keeps the rule
+  // "no FW line after a non-deep-sleep WAKE = older firmware" (DONGLE_CONTEXT.md §5).
+  if (esp_reset_reason() != ESP_RST_DEEPSLEEP) logFwBuild();
   if (g_clock_slept_s)
     logEvent("CLOCK wake slept %lus, adjusted %+ldms at %ld ppm%s", (unsigned long)g_clock_slept_s,
       (long)(g_clock_comp_us / 1000), (long)clock_drift_ppm, clock_drift_learned ? "" : " (unlearned)");

@@ -127,6 +127,8 @@ File File::openNextFile() {
 #define ENABLE_MEMS 0
 #define ENABLE_WIFI 0
 #define PRINT 0
+#define FW_BUILD_TAG "v1.4.0-rc.2+12.gabc1234.dirty"
+#define OTA_FW_VERSION 1004000
 #include "../baseLogger/config.h"
 
 #define RTC_DATA_ATTR
@@ -166,6 +168,7 @@ enum ClockSource { CLK_GPS };
 time_t utcToEpoch(int, int, int, int, int, int) { return 0; }
 void setClock(ClockSource, time_t) {}
 #include "logging.inc"
+#include "fw_build_log.h"
 #include "legacy_header.inc"
 #include "legacy_logging.inc"
 #include "telemetry_format.h"
@@ -354,6 +357,58 @@ void schemaFailureChecks() {
   check(!mount_failure.begin(header) && !mount_failure.writeLine("1,2,3,ok"), "mount failure never writes");
 }
 
+void fwBuildChecks() {
+  const std::string fw = "FW build=v1.4.0-rc.2+12.gabc1234.dirty v=1004000 elf=0123456789abcdef part=app1";
+  const std::string line = "EVT,1791348543,1000,ACTIVE,12.50,12.60," + fw + "\n";
+  const std::string head = LOG_HEADER + "\n";
+  auto boot = [](const std::map<std::string, std::string>& files) {
+    LittleFS = Filesystem{};
+    LittleFS.files = files;
+    datalogger = DataLogger{};
+    datalogger.onNewSegment(logFwBuild);
+    return datalogger.begin(LOG_HEADER);
+  };
+  fake_ms = 1000;
+  current_state = ACTIVE;
+
+  check(boot({}), "first boot mounts");
+  check(LittleFS.files.at("/log0000.csv") == head + line, "a new segment starts with the build line: " +
+        LittleFS.files.at("/log0000.csv").substr(head.size()));
+
+  const std::string kept = head + "1,2\n";
+  check(boot({{"/log0000.csv", kept}}) && LittleFS.files.size() == 1 && LittleFS.files.at("/log0000.csv") == kept,
+        "continuing a segment (a deep-sleep wake) writes no build line");
+
+  const std::string old = "soc,lat\n1,2\n";
+  check(boot({{"/log0000.csv", old}}), "schema change mounts");
+  check(LittleFS.files.at("/log0000.csv") == old && LittleFS.files.at("/log0001.csv") == head + line,
+        "a schema rotation in begin() starts the new segment with the build line");
+  DataLogger legacy;
+  check(legacy.beginBaseline(LOG_HEADER) && LittleFS.files.size() == 2,
+        "eacc642 firmware appends to a segment that starts with the build line instead of rotating");
+
+  const std::string full = head + std::string(SEGMENT_BYTES - head.size() - 10, 'x') + "\n";
+  check(boot({{"/log0000.csv", full}}) && LittleFS.files.size() == 1, "a nearly full segment is continued");
+  logEvent("STATE x");
+  const std::string state = "EVT,1791348543,1000,ACTIVE,12.50,12.60,STATE x\n";
+  check(LittleFS.files.at("/log0000.csv") == full && LittleFS.files.at("/log0001.csv") == head + line + state,
+        "rotation inside logEvent puts the build line between the header and the event");
+  const size_t room = SEGMENT_BYTES - LittleFS.files.at("/log0001.csv").size();
+  check(datalogger.writeLine(std::string(room - 1, 'y')) && LittleFS.files.size() == 2,
+        "the build line is counted once: a row that exactly fills the segment stays in it");
+  check(datalogger.writeLine("z") && LittleFS.files.size() == 3 && LittleFS.files.at("/log0002.csv") == head + line + "z\n",
+        "the next row rotates, and the build line is not undercounted");
+
+  datalogger.clearAll();
+  check(LittleFS.files.size() == 1 && LittleFS.files.at("/log0000.csv") == head + line, "CLEAR restarts with the build line");
+
+  host_running_partition = nullptr;
+  logFwBuild();
+  host_running_partition = &host_app_partition;
+  check(LittleFS.files.at("/log0000.csv").find(" part=?\n") != std::string::npos, "an unknown slot is marked, not omitted");
+  datalogger = DataLogger{};
+}
+
 void emitDump() {
   LittleFS = Filesystem{};
   LittleFS.files["/log0000.csv"] = "millis,utc,soc\n1,1791348543,50\n";
@@ -459,10 +514,11 @@ int main(int argc, char** argv) {
   const std::string group = argc > 1 ? argv[1] : "all";
   if (group == "dump") { emitDump(); return 0; }
   check(group == "all" || group == "schema" || group == "logging" || group == "schema-failures" || group == "ble-write" ||
-        group == "motion", "known group");
+        group == "motion" || group == "fw-build", "known group");
   if (group == "all" || group == "schema") { schemaChecks(); std::cout << "PASS schema\n"; }
   if (group == "all" || group == "logging") { loggingChecks(); std::cout << "PASS logging\n"; }
   if (group == "all" || group == "schema-failures") { schemaFailureChecks(); std::cout << "PASS schema-failures\n"; }
   if (group == "all" || group == "ble-write") { bleWriteChecks(); std::cout << "PASS ble-write\n"; }
   if (group == "all" || group == "motion") { motionChecks(); std::cout << "PASS motion\n"; }
+  if (group == "all" || group == "fw-build") { fwBuildChecks(); std::cout << "PASS fw-build\n"; }
 }

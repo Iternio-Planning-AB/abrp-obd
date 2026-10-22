@@ -292,7 +292,7 @@ USB only: physical access by design. Type these into the serial monitor (115200 
 
 | Command | Does |
 |---|---|
-| `DUMP` | Stream the entire flash log over serial (about 2.7 MB, roughly 4 minutes). |
+| `DUMP` | Stream the entire flash log over serial (about 2.7 MB, roughly 4 minutes). Each segment starts with an `FW build=…` line naming the firmware that wrote it. |
 | `DUMP n` | Stream only the newest `n` log segments (about 256 KB each, roughly 25 s apiece); `DUMP 3` usually covers the last drive. |
 | `STAT` | Log storage usage. |
 | `CLEAR` | Erase the flash log. |
