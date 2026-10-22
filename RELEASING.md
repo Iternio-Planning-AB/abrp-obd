@@ -91,12 +91,15 @@ yours on official ones; that is the point.
 
 ## Known gaps
 
-- `platform = espressif32` in `platformio.ini` is unpinned, so two releases of the same commit can use different
-  toolchains.
 - The publish job trusts what the build job built. It checks only the build tag and the embedded public key, so a
   compromised PlatformIO dependency can't reach the key but could still get a backdoored image signed. The PyPI tools
   are pinned by hash (`.github/requirements/release.txt`), except starlette, which only `pio home` needs (see
-  `release.in`); pinning the platform narrows the rest.
+  `release.in`). The platform, the Arduino framework, esptool (which writes the signed `firmware.bin`) and SCons
+  (which runs every build step) are pinned by version in `platformio.ini`, with no hashes, so they hold only while
+  the registry doesn't republish a version; a pin without a `+` suffix also accepts a `+` rebuild of it. The
+  toolchain is pinned by the platform's own manifest. Bump them together, and compare images built before and
+  after from the same checkout path, core directory and `SOURCE_DATE_EPOCH`: `__FILE__` and `__DATE__` end up in
+  the image.
 - The lock covers only the tools the workflow installs. During the Build step, PlatformIO's `tool-esptoolpy` package
   runs a post-install script that pip-installs esptool's own dependencies (cryptography, ecdsa, bitstring, reedsolo,
   intelhex) by version range, without hashes, into the package's `_contrib` directory, where `pip check` doesn't
