@@ -248,6 +248,14 @@ streams it over BLE.
   handles it, but the Arduino library `log_e`s **before** reporting it, so a healthy dump prints
   hundreds of scary red lines. Analysis and the fix (bypass the wrapper, count the retries) are in
   `DEFERRED_POWER_WORK.md` (Part II) §8 — deliberately not applied.
+- **Which firmware wrote the log:** `EVT,…,FW build=<FW_BUILD_TAG> v=<OTA_FW_VERSION> elf=<16 hex>
+  part=<app0|app1>`. `elf` is the app ELF SHA-256 prefix esp_coredump checks (match it to
+  `sha256sum firmware.elf`); `part` tells an OTA'd slot from a USB flash. It is written right after the
+  header of every new segment (including after `CLEAR`), so even `DUMP 1` names the build, and after
+  `WAKE` on every boot that is not a deep-sleep wake. A segment-top line written by `begin()` comes
+  before `WAKE`, so its envelope reads `INIT,0.00,0.00` and, on a cold boot, utc 0: those are not
+  measurements. A non-deep-sleep `WAKE` with no `FW` line straight after it means older firmware is
+  running (a rollback or an old serial flash) — the newest `FW` line above it is then stale.
 
 ---
 

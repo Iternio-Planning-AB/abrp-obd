@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import subprocess
 import tempfile
@@ -13,14 +14,13 @@ import tempfile
 root = Path(__file__).resolve().parents[1]
 compiler = shlex.split(os.environ.get("CXX", "clang++"))
 parser = argparse.ArgumentParser()
-parser.add_argument("group", nargs="?", default="all", choices=["all", "schema", "logging", "schema-failures", "ble-write", "motion"])
+parser.add_argument("group", nargs="?", default="all", choices=["all", "schema", "logging", "schema-failures", "ble-write", "motion", "fw-build"])
 parser.add_argument("--capture-helper", type=Path)
 arguments = parser.parse_args()
 # The ble-write group tests the summary; this keeps blewrapper.cpp using it. A log or print call that names a
 # raw write buffer (input/value) other than through bleWriteSummary(), or a client key other than through
 # bleKeyForLog(), would put the AUTH secret or tlm_push_token into the flash log or onto USB serial.
 if arguments.group in ("all", "ble-write"):
-    import re
     ble_source = (root / "libraries/BLEWrapper/blewrapper.cpp").read_text()
     calls = re.findall(r"(?:logEvt|logError|Serial\.printf)\((.*?)\);", ble_source, re.S)
     leaks = [call for call in calls
@@ -28,6 +28,15 @@ if arguments.group in ("all", "ble-write"):
                           re.sub(r'bleWriteSummary\((input|value)\)|bleKeyForLog\(message_key\)|"(?:\\.|[^"\\])*"', "", call))]
     if leaks or ble_source.count("bleWriteSummary(") < 2:
         raise AssertionError(f"blewrapper.cpp logs a raw BLE write: {leaks}")
+# fw-build drives logFwBuild() and the segment hook; these keep setup() wiring both up.
+if arguments.group in ("all", "fw-build"):
+    setup_source = (root / "baseLogger/logger.ino").read_text()
+    hook = setup_source.find("datalogger.onNewSegment(logFwBuild);")
+    if hook < 0 or setup_source.find("datalogger.begin(", hook) < 0 or "datalogger.begin(" in setup_source[:hook]:
+        raise AssertionError("setup() must register logFwBuild as the segment hook before datalogger.begin()")
+    boot = re.search(r"if \(esp_reset_reason\(\) != ESP_RST_DEEPSLEEP\) logFwBuild\(\);", setup_source)
+    if not boot or boot.start() < setup_source.find('logEvent("WAKE '):
+        raise AssertionError("setup() must log the build after WAKE on every boot that is not a deep-sleep wake")
 with tempfile.TemporaryDirectory(prefix="obd-log-diagnostics-") as temporary:
     build = Path(temporary)
     source = (root / "libraries/DataLogger/datalogger.cpp").read_text()
