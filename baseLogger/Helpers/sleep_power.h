@@ -130,8 +130,8 @@ void enterDeepSleep(bool modem_on, const char* reason = nullptr) {
         Serial.printf("Pre-sleep flush skipped: open failed %s - %d frame(s) kept in flash\n", why.c_str(),
           obd_result_vector.size());
 #if ENABLE_LOGGING
-        logEvent("FLUSH skipped: open failed %s up=%ds - %d kept", why.c_str(), up_s,
-          (int)obd_result_vector.size());
+        logEvent("FLUSH skipped: open failed up=%ds - %d kept", up_s, (int)obd_result_vector.size());
+        logEvent("FLUSH open trace %s", why.c_str()); // own line, so a long trace can't push up=/kept past logEvent's 119 chars
         logEvent("FLUSH diag %s", network.netDiag().c_str()); // separates weak signal from slow TLS
 #endif
       } else {

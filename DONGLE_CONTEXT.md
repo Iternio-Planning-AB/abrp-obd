@@ -640,6 +640,14 @@ session.
   a missing token or an oversized header set. So a run of these never ends in `NET recover`. A session
   that refuses `HEADERLEN` (open trace `hdrlen`) does count toward it; that ladder is bounded by
   `net_reboot_count` (at most two reboots per outage).
+- **`NET diag ... open=<trace>`** names the session the POST used: `reused idle=<s>s` kept the previous one,
+  idle that long; `idle=<s>s <trace>` closed one idle past `SESSION_IDLE_MAX_MS` and opened fresh; a bare open
+  trace is a fresh open. On the cellular path an idle flow dies at about 60 s (most likely the carrier's NAT;
+  the server keeps one 200 s), and a POST on it gets the prompt and body ACK and then nothing
+  (`UPLOAD id=… http=0 err=empty p/a/r=1/1/255`). `AT+SHSTATE?` still says 1 on such a session, so nothing short
+  of sending detects it. The 50 s driving cadence keeps `reused idle=` at about 50-57 s, and `SESSION_IDLE_MAX_MS`
+  (57 s, checked at connect; the POST follows within ~2 s) reopens anything idle longer (a slow poll, every
+  CHARGING upload, whose poll is 60 s), so `reused idle=58s` or more is a bug.
 - **Charge cadence lines.**
   - The `SLEEP enter` cadence labels: `parked-held` is latched and silent at a high rail, `parked-cap`
     has spent `WAKE_CHARGING_MAX_MINUTES`, `pdw` is the post-drive window, and `followup` the one

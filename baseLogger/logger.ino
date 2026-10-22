@@ -2048,12 +2048,17 @@ void loop() {
           // g_http0_streak never advanced, no cleanup, and the recovery ladder never fired - so the loop
           // silently stalled (field-confirmed: ~2 min of zero upload attempts after a single http=0). Now an
           // open failure is handled in the else below so recovery still engages.
-          if (network.connect()) {
-          g_ble_handoff_pending = false; // one-shot: consume the fast handoff only once a session is actually open
 #if ENABLE_LOGGING
           // Signal + modem-voltage snapshot right before the POST, so each upload outcome below can be
           // attributed to RF (low csq), power (sagging vbat), or session (both healthy but still http=0).
-          logEvent("NET diag %s ble=%d obd=%d open=%s", network.netDiag().c_str(), g_ble_up ? 1 : 0, obd_count,
+          // Taken before connect(): its AT queries (up to 2.4 s) would otherwise sit between the idle check and
+          // the POST, on a session that must not be idle past ~60 s when the POST goes out (#8).
+          const std::string net_diag = network.netDiag();
+#endif
+          if (network.connect()) {
+          g_ble_handoff_pending = false; // one-shot: consume the fast handoff only once a session is actually open
+#if ENABLE_LOGGING
+          logEvent("NET diag %s ble=%d obd=%d open=%s", net_diag.c_str(), g_ble_up ? 1 : 0, obd_count,
             network.lastOpenTrace().c_str());
 #endif
           int before = (int)obd_result_vector.size();

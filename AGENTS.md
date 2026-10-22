@@ -192,6 +192,11 @@ not in this repo) also verifies a synthetic dump through it, including actual hi
 Run `python3 tests/run_upload_checks.py` for real SIM7070 send/AT parsing and upload-helper checks with
 ASan/UBSan and NDEBUG. UART is fake. Python hashlib/hmac/base64 independently verify the logged
 fingerprint and every signature, so the host mbedTLS shims are never their own oracle.
+Its `session` group (also part of `tls-ca`) runs the real `CellWrapper::connect()` on the real SH
+open/close/send: the production driving cadence plus one poll must not exceed `SESSION_IDLE_MAX_MS`, and the
+limit plus the measured connect-to-POST time must stay under the 61.3 s idle at which reused sessions failed
+in the field. Idle exactly the limit reuses (logged `reused idle=Ns`), 1 ms more reopens (`idle=Ns <trace>`,
+kept when that reopen fails), and a silent POST is http=0 with `p/a/r=1/1/255` and the retry opens fresh.
 Run `python3 tests/run_gzip_container_checks.py` for the actual gzip container wrapper, independent
 Python decompression/CRC/ISIZE checks, and fallback paths. ROM deflate, ROM CRC, and PSRAM are shims;
 these checks do not validate the real ROM output or modem transport.

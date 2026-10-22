@@ -454,9 +454,105 @@ void headers() {
     }
 }
 
+// Session reuse (#8): the real CellWrapper::connect()/disconnect()/sendBulk()/lastOpenTrace() on the real SH
+// open/close/send, against the production idle limit and upload cadence.
+#include <networkwrapper.h>
+#include "cellwrapper.h"
+#include "cell_session.inc"
+bool CellWrapper::init(const bool) { check(false, "init unused"); return false; }
+bool CellWrapper::connected() { return true; }
+bool CellWrapper::set_headers(const HeaderVector) { check(false, "set_headers unused"); return false; }
+void CellWrapper::restart() { check(false, "restart unused"); }
+void CellWrapper::reconnect() { check(false, "reconnect unused"); }
+void CellWrapper::powerOff() { check(false, "powerOff unused"); }
+HttpResponse CellWrapper::getEpoch() { check(false, "getEpoch unused"); return {}; }
+std::string CellWrapper::netDiag() { return {}; }
+long CellWrapper::upForMs() { return -1; }
+#include "session_config.inc"
+#include "cadence.inc"
+
+// Field (#8): the earliest POST that got the prompt and body ACK and then nothing went out 61.3 s after the
+// session's last request. The upload fires on the first poll past its delay (952 of 954 cycles within 1.8 s of
+// that poll's own delay), and the POST leaves connect() at most 2.0 s later (1110 uploads: signing, headers).
+const unsigned long EARLIEST_FAILED_IDLE_MS = 61300, POLL_OVERHEAD_MS = 2000, PRESEND_MS = 2000;
+const unsigned long WORST_CYCLE_IDLE_MS = getTransmissionDelay(ACTIVE) + getPollingDelay(ACTIVE) + POLL_OVERHEAD_MS;
+
+// ending: the replies after SHCONF, from SHCONN on.
+void sessionOpen(CFreematics& uart, bool first_of_boot, const Replies& ending = {OK, CONNECTED}) {
+    push(uart, OPEN_HEAD);
+    if (first_of_boot) push(uart, MARKER_PRESENT);
+    push(uart, TLS_CONTEXT);
+    push(uart, SHCONF);
+    push(uart, ending);
+}
+
+// A silent POST is the field signature: prompt, body ACK, the SHREQ command's OK, then no +SHREQ URC.
+int sessionPost(CellWrapper& cell, CFreematics& uart, bool answered) {
+    push(uart, {{1, ">"}, {1, "\r\nOK"}, answered ? Reply{1, "+SHREQ: \"POST\",200,0\r\n"} : Reply{-1, "\r\nOK\r\n"}});
+    const int code = cell.sendBulk("{}").responseCode;
+    check(uart.replies.empty(), "the POST used exactly its scripted replies");
+    return code;
+}
+
+bool reusedAfter(CellWrapper& cell, CFreematics& uart, unsigned long idle_ms) {
+    check(sessionPost(cell, uart, true) == 200, "POST");
+    fake_ms += idle_ms;
+    uart.writes.clear();
+    return cell.connect() && uart.writes.empty() && cell.lastOpenTrace() == "reused idle=" + std::to_string(idle_ms / 1000) + "s";
+}
+
+void session() {
+    check(WORST_CYCLE_IDLE_MS <= SESSION_IDLE_MAX_MS, "a normal driving cycle (cadence + one poll) reuses the session");
+    check(SESSION_IDLE_MAX_MS + PRESEND_MS < EARLIEST_FAILED_IDLE_MS,
+          "and nothing reused can reach its POST idle as long as the earliest field failure");
+
+    newBoot();
+    CFreematics uart;
+    default_uart = &uart;
+    CellWrapper cell(FreematicsESP32{}, "hologram");
+    default_uart = nullptr;
+    cell.set_url("api.iternio.com");
+    cell.set_api_page("/2/app/tlm");
+    cell.set_server_roots(SERVER_ROOTS_P7B, SERVER_ROOTS_LEN);
+    cell.set_session_idle_max_ms(SESSION_IDLE_MAX_MS);
+    sessionOpen(uart, true);
+    check(cell.connect() && cell.lastOpenTrace().rfind("ok ", 0) == 0, "first connect opens: " + cell.lastOpenTrace());
+
+    check(reusedAfter(cell, uart, WORST_CYCLE_IDLE_MS), "the next driving cycle reuses with no AT traffic: " + cell.lastOpenTrace());
+    check(reusedAfter(cell, uart, SESSION_IDLE_MAX_MS), "so does a session idle exactly the limit");
+
+    check(sessionPost(cell, uart, false) == 0 && cell.transferDiagnostics().post_result == 255,
+          "a silent POST is http=0, logged p/a/r=1/1/255 as in the field");
+    push(uart, {OK});
+    cell.disconnect(); // what the loop does after a failed POST
+    fake_ms += 1000;
+    sessionOpen(uart, false);
+    check(cell.connect() && cell.lastOpenTrace().rfind("ok ", 0) == 0 && uart.replies.empty(),
+          "the retry opens a fresh session, however short the gap: " + cell.lastOpenTrace());
+
+    check(sessionPost(cell, uart, true) == 200, "POST");
+    fake_ms += SESSION_IDLE_MAX_MS + 1; // a slow poll, or any CHARGING upload (its poll is 60 s)
+    uart.writes.clear();
+    push(uart, {OK}); // close()
+    sessionOpen(uart, false);
+    check(cell.connect() && uart.replies.empty() && uart.writes[0] == "AT+SHDISC\r" && uart.writes[1] == "AT+SHDISC\r",
+          "1 ms past the idle limit the session is torn down and opened fresh");
+    check(cell.lastOpenTrace().rfind("idle=" + std::to_string(SESSION_IDLE_MAX_MS / 1000) + "s ok ", 0) == 0,
+          "with the idle time in front of the open trace: " + cell.lastOpenTrace());
+
+    check(sessionPost(cell, uart, true) == 200, "POST");
+    fake_ms += SESSION_IDLE_MAX_MS + 1;
+    push(uart, {OK});
+    sessionOpen(uart, false, {TIMEOUT, TIMEOUT, OK, TIMEOUT, TIMEOUT, OK, BEARER}); // SHCONN, SHSTATE, SHDISC, twice
+    check(!cell.connect() && uart.replies.empty() &&
+          cell.lastOpenTrace().rfind("idle=" + std::to_string(SESSION_IDLE_MAX_MS / 1000) + "s shconn ", 0) == 0,
+          "a reopen that fails keeps its idle prefix: " + cell.lastOpenTrace());
+}
+
 int main(int argc, char** argv) {
     const std::string group = argc > 1 ? argv[1] : "all";
     if (group == "signing") { headers(); std::cout << "PASS upload signing headers\n"; return 0; }
+    if (group == "session") { session(); std::cout << "PASS upload session\n"; return 0; }
     headers();
     naming();
     present();
@@ -468,5 +564,6 @@ int main(int argc, char** argv) {
     openStreak();
     openVerified();
     probe();
+    session();
     std::cout << "PASS upload tls-ca\n";
 }
