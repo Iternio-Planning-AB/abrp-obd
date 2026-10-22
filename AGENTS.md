@@ -303,7 +303,11 @@ RTC retention and NVS across a re-plug need a dongle and a parked night (look fo
 
 Run `python3 tests/run_energy_checks.py` for charge progress/corroboration, the `is_charging` verdict
 and release latch (`signal`, `release`; replays field current sequences, no location data), the `setup()`
-wake gate (taper and charge-end reads), the `SLEEP enter` reason labels (`sleep-reason`), the ABD1 frame fitted to MTU−3 (`ble-frame`: compact 2 dp numbers, key filtering, priority trimming, MTU 23, and the `BLE tlm` log cadence), telemetry serialization, CSV columns, and schema-rotation checks under
+wake gate (taper and charge-end reads), the `SLEEP enter` reason labels (`sleep-reason`), the DC fast-charge hold
+(`dc-awake`: entry on the car's `is_dcfc` or inferred power, the per-charge DC latch through the taper, the
+time-based silent hold (a seeded hour of 60 % silence) and the backstop sleep, budget by elapsed time on motion wakes, the 30 s cadence outside BLE, the CHARGING hold and the sample-poke stay, the
+live rail/alarm/motion vetoes, motion promoting a held poke, every exit and its sleep tier, a new AC charge not
+latched, and the cadence kept under `SESSION_IDLE_MAX_MS`), the ABD1 frame fitted to MTU−3 (`ble-frame`: compact 2 dp numbers, key filtering, priority trimming, MTU 23, and the `BLE tlm` log cadence), telemetry serialization, CSV columns, and schema-rotation checks under
 ASan/UBSan. Add `--profiles /path/to/profiles` to exercise actual Scenic/iX3 production/developer
 equations with the firmware parser (optional: the ABRP backend profiles are not public). The runner extracts the current charging and logging code;
 filesystem and hardware are fakes, not on-device verification.

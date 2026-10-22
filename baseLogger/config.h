@@ -472,6 +472,8 @@
 // WAKE_PARKED_MINUTES with the latch up, so the car can sleep between polls and the rail drop still gets its
 // charge-end read. That costs no extra wake: a rail-high wake polls at the parked cadence anyway. Silence at
 // a lower rail (the taper band) keeps the bound above.
+// A DC charge held awake (DC_CHARGING_AWAKE_SECONDS) counts this in WAKE_DC_CHARGING_MINUTES of unbroken silence,
+// not in its 30 s polls: on a car silent on ~60% of polls, 4 polls in a row would drop it to parked-held hourly.
 #define CHARGE_SILENT_HOLD_POLLS 4
 // A charge held through rail-high silence, released at a sample poke or ended at a skip keeps its budget,
 // cap and corroboration: a stuck current that answers between silences, or at every 12 V top-up, would
@@ -487,14 +489,26 @@
 //   everything else (parked/asleep/idle)        -> LONG interval  = minimal battery sip.
 // Driving is governed by motion/the state machine, not this timer. Charging self-exits: when the charge ends,
 // current goes >= 0 AND the rail falls, so the next sleep automatically picks the long timer - no masking,
-// because we sleep between samples (we never hold the car awake). MAX is a cheap anti-runaway backstop: cap
+// because we sleep between samples. The one exception is a confirmed DC charge, held awake
+// (DC_CHARGING_AWAKE_SECONDS), where each poll still reads the rail and current that end it. MAX is a cheap anti-runaway backstop: cap
 // the TOTAL time spent in fast cadence so a stuck-high rail can't wake us every few minutes forever.
 #define WAKE_CHARGING_MINUTES      3      // dense sampling while actively AC charging
 // DC fast charging gets a denser cadence still. The reason is the person, not the battery: a fast
 // charge takes 20-40 minutes and the driver is usually watching progress from a restaurant or a shop
 // rather than sitting in the car, so a 3-minute-old SoC is visibly stale in a way it never is on an
 // overnight AC charge. The car's DC-DC is up throughout, so the extra wakes cost no 12 V.
+// Armed only when the dongle cannot stay awake through the charge (DC_CHARGING_AWAKE_SECONDS, below).
 #define WAKE_DC_CHARGING_MINUTES   1
+// Through a charge confirmed DC (the latch holds through the taper and the silent hold) and with the rail
+// showing the DC-DC up, stay awake and poll and upload this often over one reused session (issue #51). A
+// 1-minute wake is about the floor for sleep and wake: each one pays a modem attach (median ~10 s) and a fresh
+// TLS open (~3 s, ~5 KB). Motion suspends it for an ACTIVE_TIMER, so a drive gets ACTIVE's cadence. Each held
+// poll of a sample poke counts a whole WAKE_DC_CHARGING_MINUTES toward WAKE_CHARGING_MAX_MINUTES, so the cap
+// trips sooner; a streaming wake counts its elapsed time instead. With
+// a slow poll's margin it must stay under SESSION_IDLE_MAX_MS, so every upload reuses the session (#8: a flow
+// idle ~60 s dies); the runner and logger.ino assert it. Needs ENABLE_IO36_RAIL: without the rail it never holds.
+#define DC_CHARGING_AWAKE_SECONDS  30
+#define DC_CHARGING_POLL_MARGIN_MS 20000UL  // a slow poll: readPIDs timeouts plus the CSV row and log lines
 // Charge power (kW) at or above which a session is treated as DC when the car does not say so itself.
 // Only consulted if the vehicle profile has no is_dcfc PID - the car's own word always wins.
 // Far above any AC session: three-phase 22 kW is the practical ceiling and a measured Scenic AC charge
