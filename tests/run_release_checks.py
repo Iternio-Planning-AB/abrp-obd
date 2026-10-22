@@ -2,6 +2,7 @@
 """Host checks for the release tooling in baseLogger/tools (versioning, signing, workflow)."""
 
 import base64
+import configparser
 import hashlib
 import http.server
 import json
@@ -664,6 +665,31 @@ class WorkflowGuards(unittest.TestCase):
         self.assertLess(script.index("git/matching-refs/tags/"), script.index("gh release create"))
         self.assertIn("release not found", script, "only a definite not-found may count as absent")
         self.assertLess(script.index("--draft"), script.index("--draft=false"))
+
+
+class BuildInputs(unittest.TestCase):
+    def test_platform_and_the_packages_that_shape_the_image_are_pinned(self):
+        # Each env must pin for itself: [env] must not set these, and extends is not modelled.
+        pinned = r"\s*@\s*\d+\.\d+\.\d+(\+[0-9A-Za-z.-]+)?"
+        required = {"platformio/framework-arduinoespressif32", "platformio/tool-esptoolpy", "platformio/tool-scons"}
+        for ini_path in (ROOT / "baseLogger" / "platformio.ini", ROOT / "MEMS_test" / "platformio.ini"):
+            ini = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=("#", ";"))
+            self.assertTrue(ini.read(ini_path), f"{ini_path} missing")
+            if ini.has_section("env"):
+                self.assertNotIn("platform", ini["env"])
+                self.assertNotIn("platform_packages", ini["env"])
+            envs = [s for s in ini.sections() if s.startswith("env:")]
+            self.assertTrue(envs)
+            for env in envs:
+                with self.subTest(ini=ini_path.parent.name, env=env):
+                    self.assertRegex(ini[env].get("platform", ""), rf"^platformio/espressif32{pinned}$")
+                    # Every line pinned and listed once: a later line for the same package overrides the pin.
+                    packages = [p.strip() for p in ini[env].get("platform_packages", "").splitlines() if p.strip()]
+                    for pkg in packages:
+                        self.assertRegex(pkg, rf"^platformio/[a-z0-9-]+{pinned}$")
+                    names = [pkg.split("@")[0].strip() for pkg in packages]
+                    self.assertEqual(len(names), len(set(names)), "a package is listed twice")
+                    self.assertLessEqual(required, set(names))
 
 
 GIT_CLIFF = shlex.split(os.environ.get("GIT_CLIFF", "git-cliff"))

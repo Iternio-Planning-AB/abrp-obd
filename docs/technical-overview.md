@@ -126,7 +126,7 @@ Anything that must survive is `RTC_DATA_ATTR` or LittleFS.
 |---|---|
 | `logger.ino` | Main sketch. `setup()` is the wake ladder; `loop()` is the poll and upload cycle. The wake gate, profile apply and all service calls live here. |
 | `config.h` | **Every tunable and feature flag**, each with its reasoning. Start here to change behaviour. |
-| `platformio.ini` | Build configuration (board, framework, build flags). |
+| `platformio.ini` | Build configuration (board, framework, build flags). Platform, framework, esptool and SCons are pinned by version. |
 
 ### `baseLogger/Helpers/` — one concern per header
 
