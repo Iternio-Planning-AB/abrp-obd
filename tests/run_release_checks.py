@@ -557,6 +557,7 @@ class WorkflowGuards(unittest.TestCase):
                 pass
 
         server = http.server.HTTPServer(("127.0.0.1", 0), TokenEndpoint)
+        self.addCleanup(server.server_close)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(server.shutdown)
         env = {"PATH": os.environ["PATH"], "ACTIONS_ID_TOKEN_REQUEST_TOKEN": "request-token",
