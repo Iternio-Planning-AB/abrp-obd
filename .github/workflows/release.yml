@@ -51,7 +51,7 @@ jobs:
       # No build cache: the released image must come from a clean toolchain, not whatever a previous run left.
       # Every package these tools need, dependencies included, is pinned by hash in release.txt (regenerate it from
       # release.in), except starlette (see release.in): --no-deps installs without it, and pip check catches any other
-      # gap. The Build step still pip-installs esptool's own dependencies unpinned (see RELEASING.md).
+      # gap.
       - name: Install tools
         run: |
           python -m pip install --disable-pip-version-check --require-hashes --only-binary :all: --no-deps \
@@ -63,6 +63,16 @@ jobs:
             echo "::error title=pip check::unexpected pip check output; see release.in"
             exit 1
           fi
+
+      # tool-esptoolpy's post-install hook pip-installs esptool's own dependencies by version range (esptool.in).
+      # These are its wheels, by hash. Every later step gets a pip with no index, so it can install nothing else.
+      - name: Fetch esptool dependencies
+        run: |
+          python -m pip --version
+          python -m pip download --disable-pip-version-check --require-hashes --only-binary :all: --no-deps \
+            -d "$RUNNER_TEMP/wheels" -r .github/requirements/esptool.txt
+          echo "PIP_NO_INDEX=1" >> "$GITHUB_ENV"
+          echo "PIP_FIND_LINKS=$RUNNER_TEMP/wheels" >> "$GITHUB_ENV"
 
       - name: Check release tooling
         run: python3 tests/run_release_checks.py
@@ -79,6 +89,15 @@ jobs:
           name="$(python3 baseLogger/tools/fw_version.py "${args[@]}")"
           echo "name=$name" >> "$GITHUB_OUTPUT"
           echo "Releasing v$name from $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+
+      # Installs the platform and its packages, which runs the esptool hook.
+      - name: Install PlatformIO packages
+        working-directory: baseLogger
+        run: pio pkg install -e esp32dev
+
+      # The hook hides its own failure, and pip doesn't re-check the fetched wheels' hashes when it installs them.
+      - name: Check esptool dependencies
+        run: python3 baseLogger/tools/check_esptool_deps.py --wheels "$RUNNER_TEMP/wheels"
 
       - name: Build
         working-directory: baseLogger
