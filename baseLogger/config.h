@@ -463,9 +463,23 @@
 // A poll the car did not answer is not evidence the charge stopped. FIELD (Ioniq 5-profile car, 2026-10-05):
 // OBD went silent on ~60% of polls mid-charge at a 14.8 V rail; two silent polls released the latch while the
 // rail was still high, so neither the taper confirm nor the charge-end read fired and ABRP kept CHARGING at
-// 77%. Up to this many consecutive silent polls hold the release; past it they count, which bounds a car that
-// never answers to a few extra fast-cadence wakes.
+// 77%. Up to this many consecutive silent polls hold the release at the charging cadence; past it they count,
+// which bounds a car that never answers to a few extra fast-cadence wakes.
+// Except on a sample poke at a rail >= RAIL_AWAKE_VOLTS. FIELD (issue #7, Ioniq 5-profile car, AC charge): the
+// car answered near charge transitions but was silent for about 80 minutes mid-charge at 14.9 V, the bound
+// released the latch with the rail still high, and the pause that followed was a plain skip with no read.
+// Silence with the DC-DC on never counts toward the release; past this many polls it waits at
+// WAKE_PARKED_MINUTES with the latch up, so the car can sleep between polls and the rail drop still gets its
+// charge-end read. That costs no extra wake: a rail-high wake polls at the parked cadence anyway. Silence at
+// a lower rail (the taper band) keeps the bound above.
 #define CHARGE_SILENT_HOLD_POLLS 4
+// A charge held through rail-high silence, released at a sample poke or ended at a skip keeps its budget,
+// cap and corroboration: a stuck current that answers between silences, or at every 12 V top-up, would
+// otherwise get a fresh WAKE_CHARGING_MAX_MINUTES and CHARGE_CORROBORATE_MINUTES each time and never relax.
+// A drive still resets them. Only this long after the last charge evidence is
+// the state stale enough to drop, so a car whose rail never falls (a 12 V maintainer) starts its next real
+// charge fresh. 6 h is past any pause inside one session and short of the gap between two.
+#define CHARGE_STALE_RESET_MINUTES 360
 
 // ---- Adaptive wake cadence (Feature B) ----
 // The next deep-sleep timer is chosen PER-SLEEP from what this wake observed - there is no persistent "mode":
@@ -500,6 +514,12 @@
 // WAKE_CHARGING_MAX. Sized for the slowest real case: ~1.2 kW net into 100 kWh with whole-percent soc
 // and no kwh_charged steps once in ~50-60 min.
 #define CHARGE_CORROBORATE_MINUTES 90
+// Post-drive window (DONGLE_CONTEXT §6): a fast charge started right after parking must not wait out the
+// parked cadence because its first rail-high polls went unanswered. For this long after the last motion,
+// at most this many times, a silent rail-high poke comes back in WAKE_CHARGING_MINUTES. Opened only at the
+// awake-ladder end with a fresh high rail, never from OBD; the ladder spends about five minutes of it.
+#define POST_DRIVE_WINDOW_MINUTES  15
+#define POST_DRIVE_MAX_POLLS       5
 
 // ---- Charge-taper bridging (recently-charging confirm-poll latch) ----
 // PROBLEM proven in the field: during a charge taper (CV phase) the DC-DC backs off and the rail drops to

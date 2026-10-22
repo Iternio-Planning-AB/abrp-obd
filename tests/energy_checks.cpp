@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <fstream>
 #include <iostream>
@@ -64,6 +65,12 @@ void progressChecks() {
 struct ChargePoll {
   bool recently_charging = false, g_sample_poke = false, g_taper_confirm = false, charging_cap_latched = false;
   uint8_t charge_release_polls = 0, charge_silent_polls = 0;
+  // The rail the gate saw before a sample poke. 13.1 V is the taper band, where silence still releases.
+  float g_rail_before_poke = 13.1f;
+  uint8_t charge_followup = 0, pdw_open = 0, pdw_polls = 0;
+  uint64_t pdw_open_us = 0, charge_last_evidence_us = 0;
+  const char* g_cadence_reason = nullptr;
+  bool reason(const char* r) const { return g_cadence_reason && std::strcmp(g_cadence_reason, r) == 0; }
   uint32_t taper_confirm_wakes = 0, charging_fast_minutes = 0, charge_uncorroborated_s = 0;
   double prev_parked_soc = -1, prev_parked_kwh = -1, prev_parked_soe = -1, prev_charge_soc = 0;
   double charge_corr_soc_hw = -1, charge_corr_kwh_hw = -1, charge_corr_soe_hw = -1;
@@ -75,12 +82,13 @@ struct ChargePoll {
   void resetChargeCorroboration() {
 #include "reset_corroboration.inc"
   }
+#include "charge_wake_state.inc"
   struct Result { bool evaluated, charging, progress; };
   Result poll(OBDVector current_frame, bool is_currently_parked = true) {
     const int obd_count = (int)current_frame.size();
-    const bool is_dcfc = false;
 #include "charge_signal.inc"
 #include "charge_progress.inc"
+#include "charge_dcfc.inc"
 #include "charge_release.inc"
     bool evaluated = false, published = false;
     for (const auto& res : current_frame)
@@ -247,6 +255,133 @@ void releaseChecks() {
   check(!answered.recently_charging, "answered polls with no evidence still release after CHARGE_RELEASE_POLLS");
 }
 
+
+// A car that stops answering mid-charge while its DC-DC holds the rail high. The silence is the car, not the
+// end of the charge, so it never releases; past the hold it waits at the parked cadence with the latch up.
+void highRailSilenceChecks() {
+  ChargePoll car;
+  car.g_sample_poke = true;
+  car.g_rail_before_poke = 14.9f;
+  car.poll({{"current", -12.0}, {"soc", 50}});
+  check(car.recently_charging && car.g_next_wake_minutes == WAKE_CHARGING_MINUTES, "an answered charge latches");
+  uint32_t fast = 0, uncorroborated = 0;
+  for (int i = 0; i < 30; ++i) {
+    car.now += car.g_next_wake_minutes * 60000UL;
+    car.poll({});
+    check(car.recently_charging && car.charge_release_polls == 0, "high-rail silence never counts toward release");
+    if (i < CHARGE_SILENT_HOLD_POLLS) {
+      check(car.g_next_wake_minutes == WAKE_CHARGING_MINUTES, "the first silent polls keep the charging cadence");
+      fast = car.charging_fast_minutes;
+      uncorroborated = car.charge_uncorroborated_s;
+    } else {
+      check(car.g_next_wake_minutes == WAKE_PARKED_MINUTES, "past the hold, high-rail silence waits at parked cadence");
+      check(!car.charging_cap_latched, "a held poll sets no cap");
+      if (car.now < CHARGE_STALE_RESET_MINUTES * 60000UL)
+        check(car.charging_fast_minutes == fast && car.charge_uncorroborated_s == uncorroborated,
+              "a held poll neither accrues nor refills the charge's budget");
+      else
+        check(car.charging_fast_minutes == 0 && car.charge_uncorroborated_s == 0, "a long-stale hold drops the old budget");
+    }
+  }
+
+  ChargePoll counted;
+  counted.g_sample_poke = true;
+  counted.g_rail_before_poke = 14.9f;
+  counted.recently_charging = true;
+  counted.poll({{"current", 0.4}});
+  check(counted.charge_release_polls == 1, "an answered poll with no evidence starts the release");
+  for (int i = 0; i < 2 * CHARGE_SILENT_HOLD_POLLS; ++i) counted.poll({});
+  check(counted.recently_charging && counted.charge_release_polls == 1, "held polls neither advance nor reset the release");
+  counted.poll({{"current", 0.4}});
+  check(!counted.recently_charging, "the next answered poll with no evidence completes the release");
+
+  // A car whose rail never drops (a 12 V maintainer) must not hand the old charge's budget to the next one.
+  ChargePoll stale;
+  stale.g_sample_poke = true;
+  stale.g_rail_before_poke = 14.9f;
+  stale.recently_charging = stale.charging_cap_latched = true;
+  stale.charging_fast_minutes = WAKE_CHARGING_MAX_MINUTES;
+  stale.charge_corr_soc_hw = stale.prev_charge_soc = 90;
+  for (int i = 0; i < 50; ++i) {
+    stale.now += WAKE_PARKED_MINUTES * 60000UL;
+    stale.poll({});
+  }
+  stale.g_taper_confirm = true;
+  for (double soc = 30; soc < 33; soc += 0.5) {
+    stale.now += stale.g_next_wake_minutes * 60000UL;
+    stale.poll({{"current", -12.0}, {"soc", soc}});
+    check(stale.g_next_wake_minutes == WAKE_CHARGING_MINUTES, "a new lower-SoC charge after a long hold gets the charging cadence");
+    check(stale.taper_confirm_wakes == 0, "and its own SoC baseline for the taper stall budget");
+  }
+
+  ChargePoll motion;
+  motion.g_rail_before_poke = 14.9f;
+  motion.recently_charging = true;
+  for (int i = 0; i < CHARGE_SILENT_HOLD_POLLS + CHARGE_RELEASE_POLLS; ++i) motion.poll({});
+  check(!motion.recently_charging, "a silent streaming wake still releases on the existing bound");
+}
+
+// A rail-high car with a stuck charging current and a frozen SoC that answers one poll in six or seven. The
+// hold between answers must not refill its budget: it still reaches the uncorroborated or capped cadence.
+void stuckCurrentChecks() {
+  for (const int period : {6, 7}) {
+    ChargePoll car;
+    car.g_sample_poke = true;
+    car.g_rail_before_poke = 14.9f;
+    car.g_next_wake_minutes = WAKE_CHARGING_MINUTES;
+    int poll = 0, fast = 0;
+    bool relaxed = false;
+    while (car.now < 7UL * 24 * 60 * 60 * 1000) {
+      car.now += car.g_next_wake_minutes * 60000UL;
+      car.poll(poll++ % period ? OBDVector{} : OBDVector{{"current", -12.0}, {"soc", 55}});
+      if (car.g_next_wake_minutes < WAKE_PARKED_MINUTES) fast++;
+      relaxed |= car.reason("parked-uncorroborated") || car.reason("parked-cap");
+    }
+    check(relaxed, "a stuck current held through rail-high silence still relaxes");
+    check(fast * WAKE_CHARGING_MINUTES <= CHARGE_CORROBORATE_MINUTES + period * WAKE_CHARGING_MINUTES,
+          "a week of a stuck current costs about one corroboration budget of fast polls");
+  }
+
+  // The silent-corroboration scenario at a high rail: the 90-minute fallback must hold through the holds.
+  ChargePoll wake;
+  wake.g_sample_poke = true;
+  wake.g_rail_before_poke = 14.9f;
+  int poll = 0;
+  unsigned long relaxed_at = 0;
+  while (wake.now < 4UL * 60 * 60 * 1000 && !relaxed_at) {
+    wake.now += WAKE_CHARGING_MINUTES * 60000UL;
+    wake.poll(poll++ % 6 ? OBDVector{} : OBDVector{{"current", -12.0}, {"soe", 40000}});
+    if (wake.reason("parked-uncorroborated")) relaxed_at = wake.now;
+  }
+  check(relaxed_at >= CHARGE_CORROBORATE_MINUTES * 60000UL && relaxed_at <= (CHARGE_CORROBORATE_MINUTES + 30) * 60000UL,
+        "an uncorroborated charge relaxes on wall-clock time at a high rail too");
+
+  // A pause inside one session (released at a rail-high poke) keeps the spent budget for the resume.
+  ChargePoll paused;
+  paused.g_sample_poke = true;
+  paused.g_rail_before_poke = 14.9f;
+  paused.recently_charging = paused.charging_cap_latched = true;
+  paused.charging_fast_minutes = WAKE_CHARGING_MAX_MINUTES;
+  paused.poll({{"current", -12.0}, {"soc", 55}});
+  paused.now += WAKE_PARKED_MINUTES * 60000UL;
+  paused.poll({{"current", 0.4}, {"soc", 55}});
+  paused.now += WAKE_PARKED_MINUTES * 60000UL;
+  paused.poll({{"current", 0.4}, {"soc", 55}});
+  check(!paused.recently_charging, "two answered polls with no evidence release");
+  paused.now += WAKE_PARKED_MINUTES * 60000UL;
+  paused.poll({{"current", -12.0}, {"soc", 55}});
+  check(paused.reason("parked-cap"), "a resume after a rail-high release keeps the cap");
+
+  ChargePoll later;
+  later.g_sample_poke = true;
+  later.g_rail_before_poke = 14.9f;
+  later.charging_cap_latched = true;
+  later.charging_fast_minutes = WAKE_CHARGING_MAX_MINUTES;
+  later.now = (CHARGE_STALE_RESET_MINUTES + 30) * 60000UL;
+  later.poll({{"current", 0.4}, {"soc", 55}});
+  check(!later.charging_cap_latched && later.charging_fast_minutes == 0,
+        "a rail-high poke long after the last evidence drops the old budget");
+}
 // The real SLEEP enter line and the two escalation sleeps that name their own reason.
 #define ENABLE_LOGGING 1
 namespace sleep_reason {
@@ -264,6 +399,14 @@ int g_next_wake_minutes = WAKE_PARKED_MINUTES, g_recovers_since_ok = 0;
 unsigned long net_reboot_count = 0, wdt_reset_count = 0;
 bool g_wdt_wake = false;
 float g_last_io36 = 12.6f;
+const char* g_cadence_reason = nullptr;
+bool window_opened = false;
+bool pdwOpenWindow() { return window_opened = true; }
+// A window opened at the backstop names its 3-minute cadence; the explicit reason must still win.
+void pdwArmAtLadderEnd() {
+  g_next_wake_minutes = WAKE_CHARGING_MINUTES;
+  g_cadence_reason = "pdw";
+}
 std::vector<OBDVector> obd_result_vector;
 std::string slept;
 void logSleep(bool modem_on, const char* reason) {
@@ -292,6 +435,7 @@ void checks() {
   g_recovers_since_ok = 2;
   recoverSleep();
   check(has("timer=1min reason=net-recover "), "the modem-recovery reboot logs its own reason, not dc-charge");
+  check(window_opened, "the modem-recovery reboot opens the post-drive window");
   g_wdt_wake = true;
   wdt_reset_count = 2;
   wdtSleep();
@@ -299,6 +443,12 @@ void checks() {
   slept.clear();
   backstopSleep();
   check(has("reason=backstop "), "the parked MAX_AWAKE backstop logs its own reason");
+  check(g_next_wake_minutes == WAKE_CHARGING_MINUTES, "the backstop still ends the ladder with the post-drive window");
+  g_cadence_reason = "parked-held";
+  g_next_wake_minutes = WAKE_PARKED_MINUTES;
+  enterDeepSleep(true);
+  check(has("reason=parked-held "), "a named cadence decision beats the reason derived from the timer");
+  g_cadence_reason = nullptr;
   g_next_wake_minutes = WAKE_DC_CHARGING_MINUTES;
   enterDeepSleep(true);
   check(has("reason=dc-charge "), "a cadence sleep still names its tier from the armed timer");
@@ -671,7 +821,16 @@ struct WakeGate {
   bool taper = false, charge_end = false;
   uint32_t taper_confirm_wakes = 0;
   int corroboration_resets = 0;
+  bool g_sample_poke = false;
+  float g_rail_before_poke = 0;
+  uint8_t charge_followup = 0;
+  int g_alarm_flag = 0;
+  bool alarmEnforced() const { return false; }
   void resetChargeCorroboration() { corroboration_resets++; }
+  // Long after any charge evidence.
+  uint64_t charge_last_evidence_us = 0;
+  uint64_t esp_rtc_get_time_us() const { return 1ULL << 40; }
+#include "charge_stale.inc"
   bool poll(float rail, bool is_cold = false, bool is_motion = false, bool awake = false,
             bool heartbeat_due = false) {
 #include "wake_gate.inc"
@@ -722,6 +881,275 @@ void chargeEndChecks() {
   loop.poll({});
   gate.recently_charging = loop.recently_charging;
   check(gate.poll(12.51f) && gate.charge_end, "the rail drop after a silent end of charge gets the charge-end read");
+
+  ChargePoll held;
+  held.g_sample_poke = true;
+  held.g_rail_before_poke = 14.9f;
+  held.poll({{"current", -12.0}, {"soc", 60}});
+  for (int i = 0; i < 10; ++i) held.poll({});
+  WakeGate fall;
+  fall.recently_charging = held.recently_charging;
+  check(fall.poll(12.7f) && fall.charge_end, "the rail drop after a long high-rail silence gets the charge-end read");
+}
+
+// A dongle across deep sleeps: the setup() gate, the loop poll and the awake-ladder end, with RTC state as
+// members. Time is one clock: millis() and the RTC both read now, and a sleep adds its timer.
+struct Dongle : ChargePoll {
+  bool charge_end_polled = false, alarm = false, charge_end = false, polled = false;
+  int g_alarm_flag = 0, next = WAKE_PARKED_MINUTES;
+  float ladder_rail = 0;
+  unsigned long last_active = 0;
+  const char* g_wake_reason = "TIMER";
+  bool g_pdw_ladder_done = false;
+  int fast_pokes = 0, low_rail_polls = 0;
+  bool alarmEnforced() const { return alarm; }
+  float readIO36Rail() const { return ladder_rail; }
+#define ENABLE_SLEEP 1  // the production sleep build, where the ladder reads the rail itself
+#define ENABLE_MEMS 1
+#include "pdw_ladder.inc"
+#undef ENABLE_SLEEP
+#undef ENABLE_MEMS
+  bool gate(float rail, bool is_cold, bool is_motion, bool awake = true, bool heartbeat_due = false) {
+#include "wake_gate.inc"
+    charge_end = charge_end_poll;
+    return should_poll;
+  }
+  // Fresh RAM, as every wake is a reboot.
+  void boot() {
+    g_sample_poke = g_taper_confirm = g_pdw_ladder_done = false;
+    g_rail_before_poke = 0;
+    g_next_wake_minutes = WAKE_PARKED_MINUTES;
+    g_cadence_reason = nullptr;
+  }
+  // A timer wake: the gate, then the skip path in setup() or one sample-poke poll.
+  int wake(float rail, const OBDVector& frame = {}) {
+    now += (unsigned long)next * 60000UL;
+    boot();
+    chargeWakeStateSanitize(true);
+    polled = gate(rail, false, false);
+    if (!polled) {
+#include "gate_skip.inc"
+    } else {
+      poll(frame);
+      if (rail < RAIL_AWAKE_VOLTS) low_rail_polls++;
+      else if (g_next_wake_minutes < WAKE_PARKED_MINUTES && !recently_charging) fast_pokes++;
+    }
+    return next = g_next_wake_minutes;
+  }
+  // A motion wake or power-on: streams polls while awake, then the ladder (about five minutes) ends in sleep.
+  int awake(float rail, bool cold, const OBDVector& frame = {}, float rail_at_end = -1) {
+    now += (unsigned long)next * 60000UL;
+    boot();
+    chargeWakeStateSanitize(!cold);
+    g_wake_reason = cold ? "POWERON" : "MOTION";
+    polled = gate(rail, cold, !cold);
+    for (int i = 0; i < 12; ++i) {
+      now += 5000;
+      poll(frame);
+    }
+    last_active = now;
+    now += 5UL * 60000UL;
+    ladder_rail = rail_at_end < 0 ? rail : rail_at_end;
+    pdwArmAtLadderEnd();
+    return next = g_next_wake_minutes;
+  }
+};
+
+const OBDVector SILENT = {};
+const OBDVector TOP_UP = {{"current", 0.3}, {"soc", 60}};
+
+// One follow-up after a charge, never a low-rail read without evidence, and never a second follow-up.
+void followupChecks() {
+  Dongle car;
+  car.wake(14.9f, {{"current", -12.0}, {"soc", 60}});
+  check(car.recently_charging && car.next == WAKE_CHARGING_MINUTES, "an answered charge latches");
+  car.wake(12.7f, TOP_UP);
+  check(car.charge_end && !car.recently_charging, "the rail drop gets its charge-end read");
+  check(car.charge_followup == 1, "a charge that ended arms one follow-up");
+  check(car.wake(12.7f) == WAKE_PARKED_MINUTES && !car.polled, "a low rail after the charge is not read");
+  check(car.wake(14.9f) == WAKE_CHARGING_MINUTES, "the first silent high-rail poke after a charge follows up in 3 min");
+  check(car.charge_followup == 0, "the follow-up is spent");
+  check(car.wake(14.9f) == WAKE_PARKED_MINUTES, "a silent follow-up goes back to the parked cadence");
+  check(car.wake(14.9f) == WAKE_PARKED_MINUTES, "and there is no second follow-up");
+
+  Dongle quiet;
+  quiet.wake(14.9f, {{"current", -12.0}, {"soc", 60}});
+  quiet.wake(12.7f);
+  check(quiet.charge_end && quiet.next == WAKE_PARKED_MINUTES && quiet.charge_followup == 1,
+        "a silent charge-end read at a low rail does not spend the follow-up");
+
+  Dongle answers;
+  answers.wake(14.9f, {{"current", -12.0}, {"soc", 60}});
+  answers.wake(14.9f, TOP_UP);
+  answers.wake(14.9f, TOP_UP);
+  check(!answers.recently_charging && answers.charge_followup == 1, "a release in the loop arms the follow-up too");
+  check(answers.wake(14.9f) == WAKE_CHARGING_MINUTES, "its silent high-rail poke follows up");
+  answers.wake(14.9f, {{"current", -11.0}, {"soc", 64}});
+  check(answers.recently_charging && answers.next == WAKE_CHARGING_MINUTES, "a follow-up that answers with evidence latches");
+
+  // A week of 12 V top-ups after one charge: the rail rises about four times a day, silent or answering 0 A.
+  Dongle week;
+  week.wake(14.9f, {{"current", -12.0}, {"soc", 60}});
+  week.wake(12.7f, TOP_UP);
+  week.fast_pokes = week.low_rail_polls = 0;
+  for (int i = 0; i < 7 * 48; ++i) {
+    const bool high = i % 12 == 5;
+    week.wake(high ? 14.4f : (i % 3 ? 12.7f : 13.1f), high && i % 24 == 5 ? SILENT : TOP_UP);
+  }
+  check(week.fast_pokes == 1, "a week of top-ups after a charge costs exactly one follow-up");
+  check(week.low_rail_polls == 0, "and no low-rail read without charge evidence");
+
+  Dongle drive;
+  drive.charge_followup = 1;
+  drive.awake(13.5f, false);
+  check(drive.charge_followup == 0, "motion clears an armed follow-up");
+  drive.charge_followup = 1;
+  drive.awake(13.5f, true);
+  check(drive.charge_followup == 0, "a power-on clears it");
+
+  ChargePoll rtc;
+  rtc.charge_followup = 1;
+  rtc.pdw_open = 1;
+  rtc.pdw_open_us = 1000;
+  rtc.pdw_polls = 1;
+  rtc.charge_last_evidence_us = 1000;
+  rtc.chargeWakeStateSanitize(true);
+  check(rtc.charge_followup == 1 && rtc.pdw_open == 1 && rtc.pdw_polls == 1, "a deep-sleep wake keeps the state");
+  rtc.chargeWakeStateSanitize(false);
+  check(!rtc.charge_followup && !rtc.pdw_open && !rtc.pdw_open_us && !rtc.pdw_polls && !rtc.charge_last_evidence_us,
+        "any other boot zeroes the follow-up and the window");
+}
+
+// The post-drive window: keyed on the awake ladder and a fresh rail read, never on OBD.
+void postDriveChecks() {
+  // No speed key and no answers during the drive: the window still opens on the rail.
+  Dongle fast;
+  check(fast.awake(14.2f, false) == WAKE_CHARGING_MINUTES && fast.pdw_open, "a drive ending at a high rail opens the window");
+  const unsigned long last_motion = fast.last_active;
+  int pokes = 0;
+  while (fast.next == WAKE_CHARGING_MINUTES && pokes < 20) {
+    fast.wake(14.9f);
+    if (fast.next == WAKE_CHARGING_MINUTES) {
+      pokes++;
+      check(fast.now - last_motion < POST_DRIVE_WINDOW_MINUTES * 60000UL, "window polls stay inside the window");
+    }
+  }
+  check(pokes >= 1 && pokes <= POST_DRIVE_MAX_POLLS, "a silent car gets a bounded number of 3-minute polls");
+  check(fast.next == WAKE_PARKED_MINUTES && !fast.pdw_open, "the window expires across sleeps");
+
+  Dongle capped;
+  capped.awake(14.2f, false);
+  capped.pdw_polls = POST_DRIVE_MAX_POLLS;
+  check(capped.wake(14.9f) == WAKE_PARKED_MINUTES && !capped.pdw_open, "a spent poll budget ends the window early");
+  check(capped.awake(14.2f, false) == WAKE_CHARGING_MINUTES && capped.pdw_open && capped.pdw_polls == 0,
+        "the next drive opens a fresh window");
+
+  Dongle reboot;
+  reboot.boot();
+  reboot.ladder_rail = 14.5f;
+  reboot.last_active = reboot.now;
+  check(reboot.pdwOpenWindow() && reboot.g_next_wake_minutes == WAKE_PARKED_MINUTES,
+        "opening the window leaves the cadence to its caller (the NET-recovery reboot keeps its 1 min)");
+
+  Dongle low;
+  check(low.awake(13.5f, false, SILENT, 12.6f) == WAKE_PARKED_MINUTES && !low.pdw_open, "a low rail at the ladder end opens nothing");
+  low.ladder_rail = 14.5f;
+  low.pdwArmAtLadderEnd();
+  check(!low.pdw_open && low.g_next_wake_minutes == WAKE_PARKED_MINUTES, "the ladder end decides once per wake");
+  check(low.wake(12.6f) == WAKE_PARKED_MINUTES && !low.polled, "and polls nothing");
+
+  Dongle dropped;
+  dropped.awake(14.2f, false);
+  check(dropped.wake(12.6f) == WAKE_PARKED_MINUTES && !dropped.polled, "a window never reads a low rail");
+
+  Dongle plugged;
+  plugged.pdw_open = 1;
+  plugged.pdw_polls = POST_DRIVE_MAX_POLLS;
+  check(plugged.awake(14.6f, true) == WAKE_CHARGING_MINUTES && plugged.pdw_open && plugged.pdw_polls == 0,
+        "a power-on at a high rail opens a fresh window");
+
+  Dongle dc;
+  dc.awake(14.2f, false);
+  dc.wake(14.9f, {{"current", -150.0}, {"voltage", 400.0}, {"soc", 30}});
+  check(dc.recently_charging && dc.next == WAKE_DC_CHARGING_MINUTES && !dc.pdw_open,
+        "a DC answer in the window takes the DC cadence and closes the window");
+
+  Dongle charging;
+  charging.wake(14.9f, {{"current", -12.0}, {"soc", 60}});
+  check(charging.awake(14.9f, false, {{"current", -12.0}, {"soc", 60}}) == WAKE_CHARGING_MINUTES && !charging.pdw_open,
+        "a ladder ending on the charging cadence leaves it alone");
+
+  Dongle stale;
+  stale.awake(14.2f, false);
+  stale.pdw_open = 0;
+  stale.g_pdw_ladder_done = false;
+  stale.g_next_wake_minutes = WAKE_PARKED_MINUTES;
+  stale.last_active = stale.now - (POST_DRIVE_WINDOW_MINUTES + 5) * 60000UL;
+  stale.pdwArmAtLadderEnd();
+  check(!stale.pdw_open && stale.g_next_wake_minutes == WAKE_PARKED_MINUTES, "a window already past opens nothing");
+
+  // The ladder never opens over a latched, capped or sampled wake.
+  for (int c = 0; c < 3; ++c) {
+    Dongle busy;
+    busy.boot();
+    busy.recently_charging = c == 0;
+    busy.charging_cap_latched = c == 1;
+    busy.g_sample_poke = c == 2;
+    busy.ladder_rail = 14.5f;
+    busy.last_active = busy.now;
+    busy.pdwArmAtLadderEnd();
+    check(!busy.pdw_open && busy.g_next_wake_minutes == WAKE_PARKED_MINUTES,
+          "a latched, capped or sample-poke wake opens no window");
+  }
+
+  Dongle both;
+  both.awake(14.2f, false);
+  both.charge_followup = 1;
+  both.wake(14.9f);
+  check(both.next == WAKE_CHARGING_MINUTES && both.pdw_polls == 1 && both.charge_followup == 1,
+        "inside the window the follow-up is not spent");
+}
+
+// A stuck charging current on a car whose 12 V is topped up every three hours: two hours at a high rail,
+// answering is_charging, then a low rail where it is silent. Each top-up is inside the stale window of the
+// last, so it must continue the old budget rather than start a fresh one.
+void topUpChecks() {
+  Dongle car;
+  const OBDVector stuck = {{"current", -12.0}, {"soc", 55}};
+  const unsigned long window = CHARGE_STALE_RESET_MINUTES * 60000UL;
+  std::map<unsigned long, int> fast;  // fast polls per stale window
+  while (car.now < 7UL * 24 * 60 * 60 * 1000) {
+    const bool high = car.now % (3UL * 60 * 60 * 1000) < 2UL * 60 * 60 * 1000;
+    car.wake(high ? 14.4f : 12.7f, high ? stuck : SILENT);
+    if (car.polled && car.next < WAKE_PARKED_MINUTES) fast[car.now / window]++;
+  }
+  for (const auto& w : fast)
+    check(w.second <= CHARGE_CORROBORATE_MINUTES / WAKE_CHARGING_MINUTES + CHARGE_SILENT_HOLD_POLLS + 2,
+          "top-ups inside the stale window share one corroboration budget");
+
+  // A drive is not a pause: it still drops the old charge's state.
+  car.recently_charging = false;
+  car.awake(13.8f, false, {{"current", 20.0}, {"soc", 55}});
+  check(car.charging_fast_minutes == 0 && !car.charging_cap_latched && car.charge_uncorroborated_s == 0,
+        "a drive resets the charge budget, cap and corroboration");
+}
+
+// The alarm gate (§7): a flagged car gets none of the extra polls.
+void alarmChecks() {
+  Dongle car;
+  car.alarm = true;
+  check(car.awake(14.2f, false) == WAKE_PARKED_MINUTES && !car.pdw_open, "a flagged car opens no post-drive window");
+  car.recently_charging = true;
+  car.charge_followup = 1;
+  check(car.wake(14.9f) == WAKE_PARKED_MINUTES && !car.polled, "a flagged car is not sampled, latched or not");
+  check(car.wake(12.7f) == WAKE_PARKED_MINUTES && !car.polled, "nor read at the rail drop");
+}
+
+// A week with no charge and no drive: 12 V top-ups about four times a day cost nothing extra.
+void costChecks() {
+  Dongle idle;
+  for (int i = 0; i < 7 * 48; ++i) idle.wake(i % 12 == 5 ? 14.4f : 12.7f, i % 24 == 5 ? SILENT : TOP_UP);
+  check(idle.fast_pokes == 0 && idle.low_rail_polls == 0, "top-ups with no charge and no drive cost no extra poll");
 }
 
 void profileChecks(const std::string& directory) {
@@ -762,12 +1190,22 @@ int main(int argc, char** argv) {
   if (group == "all" || group == "signal") signalChecks();
   if (group == "all" || group == "release") {
     releaseChecks();
+    highRailSilenceChecks();
+    stuckCurrentChecks();
     attendedChargeChecks();
     taperStallChecks();
     silentCorroborationChecks();
   }
   if (group == "all" || group == "corroboration") corroborationChecks();
-  if (group == "all" || group == "wake-gate") { wakeGateChecks(); chargeEndChecks(); }
+  if (group == "all" || group == "wake-gate") {
+    wakeGateChecks();
+    chargeEndChecks();
+    followupChecks();
+    postDriveChecks();
+    alarmChecks();
+    costChecks();
+    topUpChecks();
+  }
   if (group == "all" || group == "logging") loggingChecks();
   if (group == "all" || group == "schema") schemaChecks();
   if (group == "all" || group == "transport") transportChecks();

@@ -115,6 +115,44 @@ void changeState(ActivityState new_state) {
   polling_delay = getPollingDelay(new_state);
 }
 
+#if OBD_ALARM_GATE
+bool alarmEnforced(); // alarm_gate.h is included after this file
+#endif
+// Open the post-drive window (POST_DRIVE_WINDOW_MINUTES) if the rail is high now, once per wake. Only after an
+// awake period on the parked cadence: a latched, capped or recovery cadence was chosen for a reason.
+bool pdwOpenWindow() {
+  if (g_pdw_ladder_done) return false;
+  g_pdw_ladder_done = true;
+#if OBD_ALARM_GATE
+  if (alarmEnforced()) return false;
+#endif
+  if (g_sample_poke || recently_charging || charging_cap_latched || g_next_wake_minutes != WAKE_PARKED_MINUTES)
+    return false;
+#if ENABLE_IO36_RAIL && ENABLE_SLEEP && ENABLE_MEMS
+  const float rail = readIO36Rail();
+#else
+  const float rail = 0.0f;
+#endif
+  // Timed from the last motion, not from now: the ladder's own idle minutes count toward the window.
+  const uint64_t now_us = esp_rtc_get_time_us();
+  const uint64_t idle_us = (uint64_t)(millis() - last_active) * 1000ULL;
+  pdw_open_us = idle_us < now_us ? now_us - idle_us : 0;
+  pdw_polls = 0;
+  pdw_open = rail >= RAIL_AWAKE_VOLTS;
+  if (!pdwActive(now_us)) pdw_open = 0;
+#if ENABLE_LOGGING
+  logEvent("POSTDRIVE window %s wake=%s rail=%.2f idle=%lus", pdw_open ? "opened" : "closed", g_wake_reason, rail,
+    (unsigned long)(idle_us / 1000000ULL));
+#endif
+  return pdw_open;
+}
+// End of the awake ladder: an open window comes back on the charging cadence.
+void pdwArmAtLadderEnd() {
+  if (!pdwOpenWindow()) return;
+  g_next_wake_minutes = WAKE_CHARGING_MINUTES;
+  g_cadence_reason = "pdw";
+}
+
 /*
   Use movement and BLE connection to derive what activity state should be set
 */
@@ -169,6 +207,7 @@ void handleActivityState() {
     logEvent("AWAKE_BACKSTOP awake=%lus parked -> force deep sleep (ceiling=%dmin)",
       millis() / 1000UL, MAX_AWAKE_MINUTES);
 #endif
+    pdwArmAtLadderEnd();
     enterDeepSleep(true, "backstop");
   }
 #endif
@@ -238,7 +277,10 @@ void handleActivityState() {
       // No movement or connection: drop to deep sleep until a WOM (door/motion) event or periodic timer.
       // Suppressed during a serial maintenance session so a USB dump isn't cut off mid-stream. modem_on=true:
       // the modem was powered this wake, so flush buffered frames and power it down on the way out.
-      if (!maintenance_mode) enterDeepSleep(true); // never returns - the chip reboots into setup() on wake
+      if (!maintenance_mode) {
+        pdwArmAtLadderEnd();
+        enterDeepSleep(true); // never returns - the chip reboots into setup() on wake
+      }
 #endif
     }
     break;
