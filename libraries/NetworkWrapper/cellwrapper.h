@@ -9,12 +9,20 @@
 #include <networkwrapper.h>
 #include <utility>
 
+// What one AT+CNTP exchange reported (CellWrapper::syncNtp).
+struct NtpResult {
+  int code = -1;          // +CNTP result: 1 = ok, 61 net, 62 DNS, 63 connect, 66 timeout; -1 = no result line
+  unsigned long ms = 0;   // the whole exchange, PDP activation included
+  std::string utc;        // "yyyy/MM/dd,hh:mm:ss" when the result line carries the time, else ""
+};
+
 class CellWrapper : public NetworkWrapper {
 public:
   CellWrapper(FreematicsESP32 sys, std::string apn);
 
   /* Establish network connection (hologram) */
   bool init(const bool retry = false) override;
+  bool init(const bool retry, unsigned int registration_timeout_ms);
 
   /* Connect to network server (telemetry API) */
   bool connect() override;
@@ -50,8 +58,9 @@ public:
   std::string readClock();
 
   /* Sync the modem RTC from an NTP server over the data link (AT+CNTP). Reliable when carrier NITZ is
-     absent. tz is set to 0 so AT+CCLK then reads UTC. Returns true on a reported success. */
-  bool syncNtp();
+     absent. tz is set to 0 so AT+CCLK then reads UTC. Returns true on a reported success; `result` gets the
+     +CNTP code (-1 = no answer), the duration and the UTC time the result carries, if the modem sends one. */
+  bool syncNtp(NtpResult* result = nullptr);
 
   /* One-line signal (AT+CSQ) + modem voltage (AT+CBC) + CEREG state snapshot for diagnostics */
   std::string netDiag() override;
@@ -63,8 +72,8 @@ public:
   void set_server_roots(const uint8_t* p7b, size_t len) override { net.setCaBundle(p7b, len); }
   bool trustRefused() override { return net.trustRefused(); }
 
-  /* net.openTrace() of the last connect(), "reused" if it kept a live session, prefixed "idle=Ns" if it
-     closed one that had sat idle too long */
+  /* net.openTrace() of the last connect(), "reused idle=Ns" if it kept a live session, prefixed "idle=Ns" if
+     it closed one that had sat idle too long */
   std::string lastOpenTrace() override;
 
   /* ms since init() completed (registered + APN bound), or -1 if not ready */
@@ -80,12 +89,15 @@ public:
   void dumpRadioConfig();
 
 private:
+  bool finishInit(unsigned int registration_timeout_ms);
+
   /* Dead-RF revival ladder step (called from reconnect() when unregistered with csq=99). */
   void reviveDeadRadio();
 
   std::string apn;
   std::string api_page;
   HTTPClientSIM net;
+  bool m_initialized = false;
   bool m_ready = false;  // modem set up + APN attached; coarse "link up" flag for connected()
   const char* m_init_stage = "begin";
   char m_registration = '?';
@@ -93,11 +105,10 @@ private:
   bool m_reused = false;        // last connect() kept a live session instead of calling net.open()
   unsigned long m_last_use_ms = 0;  // millis() of the session's last open or request
   unsigned long m_idle_max_ms = 0;  // reuse limit, see set_session_idle_max_ms
-  long m_idle_closed_s = -1;        // idle seconds of the session the last connect() closed, -1 if none
+  long m_idle_s = -1;               // idle seconds of the session the last connect() found, -1 if none
   unsigned long m_last_cfun_ms = 0; // last AT+CFUN radio cycle; used to rate-limit re-attach (roaming throttle guard)
   unsigned long m_dead_rf_since = 0; // millis() when csq=99-while-unregistered was first seen (0 = radio alive)
   uint8_t m_revive_stage = 0;        // dead-RF ladder: 0 none, 1 CFUN cycled, 2 modem rebooted, 3 power-cycled
 };
 
 #endif
-

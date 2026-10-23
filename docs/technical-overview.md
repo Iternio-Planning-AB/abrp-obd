@@ -116,7 +116,8 @@ long the ESP32 is awake, which is why the cadences and the rail gate matter more
 current.
 
 **Deep sleep is a reboot, not a resume.** RAM is wiped and `setup()` runs again from the top.
-Anything that must survive is `RTC_DATA_ATTR` or LittleFS.
+Anything that must survive is `RTC_DATA_ATTR` or LittleFS. `RTC_DATA_ATTR` survives deep sleep only: a
+panic, watchdog or software reset reloads it.
 
 ## Code layout
 
@@ -137,13 +138,14 @@ order and share its globals. See [`AGENTS.md`](../AGENTS.md) before adding one.
 |---|---|
 | `state_machine.h` | The activity state machine (BLE / ACTIVE / CHARGING / STANDBY). |
 | `sleep_power.h` | Deep sleep (the one `enterDeepSleep` primitive), the IO36 12 V rail read, wake-cause decoding, wake-on-motion arming. |
+| `wdt_streak.h` | The consecutive panic/WDT/brownout reset count behind the crash-loop escalation, whether the modem may still be powered, and whether a trip's closing PARK may be unsent, kept in `RTC_NOINIT` memory so the resets they track don't wipe them. |
 | `mems.h` | ICM-42627 motion sensor: movement detection and wake-on-motion. |
 | `icm42627_cal.h` | Accelerometer bias calibration and the WOM threshold. |
 | `gps_location.h` | GNSS position, the parked-location average, the movement-streak logic. |
-| `clock_sync.h` | Sets the RTC from GNSS / NITZ / NTP / the HTTP `Date` header, and on each wake removes the drift deep sleep added, at a rate learned from NITZ/NTP resyncs. |
+| `clock_sync.h` | Sets the RTC from GNSS / NITZ / NTP / the HTTP `Date` header, and on each wake removes the drift deep sleep added, at a rate learned from NTP and confirmed GNSS (never from NITZ). |
 | `telemetry_format.h` | Builds the ABRP telemetry frame (cellular body plus the trimmed BLE frame). |
 | `network_upload.h` | Cellular upload, bulk POST, the offline backlog. |
-| `gzip_body.h` | gzip for the POST body, using the ESP32 boot ROM's deflate. |
+| `gzip_body.h` | gzip for the POST body: vendored zlib, state in PSRAM, each sent body verified by inflating it again. |
 | `geo_backlog.h` | Keeps location provenance in the backlog so stale positions are never uploaded as fresh. |
 | `ble.h` | The BLEWrapper instance, per-wake BLE bring-up/teardown, the persisted-profile loader, `bleRelaying()`. |
 | `log_dump.h` | BLE log-retrieval protocol (ABD7). |
@@ -167,6 +169,7 @@ order and share its globals. See [`AGENTS.md`](../AGENTS.md) before adding one.
 | `tools/ota_sign.py` | Sign a firmware image for OTA (KMS in the release workflow, or a local PEM). |
 | `tools/server_roots.py` | Write `server_roots.h` from root CA PEMs. |
 | `tools/fw_version.py`, `tools/pio_version.py` | Release version naming and its injection into the build; also the `factory` target, a single merged image for esptool on a blank unit. |
+| `tools/psram_libs.py`, `tools/pio_psram_libs.py` | Link the PSRAM-safe C/C++ runtime, and fail the build if the linker map shows any other. |
 | `utils/serial_monitor.py`, `serial_to_file.py`, `file_to_serial.py`, `USB_Serial_Dump.py` | Serial helpers (e.g. capturing a `DUMP` to a file). |
 
 ### `libraries/` — vendored dependencies
@@ -179,6 +182,7 @@ order and share its globals. See [`AGENTS.md`](../AGENTS.md) before adding one.
 | `NetworkWrapper` | Abstract network class, implemented by `CellWrapper` and `WiFiWrapper`. The modem's network mode and LTE-M band list are set in `cellwrapper.cpp`. |
 | `DataLogger` | LittleFS CSV logging and segment rotation. |
 | `ESP32Time`, `mathparser`, `nlohmann` | RTC, PID equation evaluation, JSON. |
+| `zlib` | zlib 1.3.2, unmodified subset (deflate, inflate, CRC-32), for the gzip upload body. See its `README.md`. |
 
 ### `tests/` — host checks
 
@@ -208,11 +212,17 @@ intended production values. Any change needs a reflash.
 | `CELL_APN` | `"hologram"` | The SIM provider's APN. |
 | `ENABLE_CELL` / `ENABLE_WIFI` | `1` / `0` | Transport select. This is the cellular build. |
 | `CATM_BANDS` (in `cellwrapper.cpp`) | `1,3,8,20,28` | LTE-M bands the modem scans: the European set. |
+| `CELL_REGISTRATION_AWAKE_MS` / `CELL_REGISTRATION_PARKED_MS` | `30000` / `45000` ms | Initial registration-search allowance: normal multi-poll wakes / single-poll parked sampling. Modem startup, SIM checks, diagnostics and successful data setup are additional, not inside this budget. |
+| `BACKLOG_MAX_SEND_AGE_SECONDS` | 6 days | A queued or restored frame older than this when it would be sent is dropped (`UPLOAD dropped … reason=age`), judged only on a trusted clock. |
+| `GEO_MAX_SEND_AGE_SECONDS` | 29 days | A location or heading older than this is left out of the upload; the server refuses anything past 30 days. |
 
 `cellwrapper.cpp` also sets the modem to GSM+LTE (`CNMP=51`) with LTE-M only on the LTE side
 (`CMNB=1`). All three are written once and persist in the modem's NVM, so a matching value is never
 rewritten. Release images are built with these defaults: a dongle running a custom APN or band list
 must be updated over USB, because an OTA release would put the defaults back.
+
+After search expiry, OBD proceeds offline while the modem keeps scanning. The 20-second reconnect
+probe completes data setup without another power-key pulse or network-mode/band reconfiguration.
 
 ### Security and access
 
@@ -257,6 +267,7 @@ during setup, and parked charge sampling is suppressed. The remaining limits for
 | `RAIL_AWAKE_VOLTS` | `13.3` | Rail voltage above which the car counts as awake/charging. **Per-vehicle — measure it.** |
 | `WAKE_PARKED_MINUTES` | `30` | Deep-sleep timer cadence while parked. |
 | `WAKE_CHARGING_MINUTES` / `WAKE_DC_CHARGING_MINUTES` | `3` / `1` | Faster cadence while AC / DC charging. |
+| `DC_CHARGING_AWAKE_SECONDS` | `30` s | Once a charge is confirmed DC, stay awake while the rail is up and poll and upload this often over one reused session instead of the 1-minute wake, through the taper and short silences. Motion, BLE, a low rail or the alarm flag pause it; the charge end, the cap or corroboration end it. Must stay under `SESSION_IDLE_MAX_MS` with a slow poll's margin. |
 | `MAX_AWAKE_MINUTES` | `60` | Hard backstop: force sleep after this even if something is holding it awake. |
 | `ACTIVE_TIMER` / `CHARGING_TIMER` | 5 / 5 min | Inactivity leashes between state transitions. |
 | `CHARGE_END_POLL_FLOOR` | `12.2` V | After a charge, a rail between this and 13.0 V gets one final read, so the charge end and final SoC reach ABRP. |
@@ -265,7 +276,9 @@ during setup, and parked charge sampling is suppressed. The remaining limits for
 | `CHARGE_STALE_RESET_MINUTES` | `360` min | How long a held or paused charge keeps its fast-cadence budget, cap and corroboration after the last charge evidence, so a stuck current can't get a fresh budget at every silence. |
 | `POST_DRIVE_WINDOW_MINUTES` / `POST_DRIVE_MAX_POLLS` | `15` min / `5` | After a drive ends with the rail high, a rail-high wake the car doesn't answer comes back in 3 minutes instead of 30. This lasts for this long after the last motion and is capped at this many polls, so a fast charge started right after parking is caught. |
 | `PARK_RELOCATE_MIN_M` / `_MAX_HDOP` / `_MAX_SPREAD_M` | `500` m / `250` (HDOP 2.5) / `50` m | A parked car whose average of fresh, good (HDOP ≤ 2.5), tightly clustered (within 50 m) stationary GNSS fixes lies this far from its frozen spot, or has no frozen spot yet, is moved there: for a drive the GNSS never saw moving, or a cold boot. |
-| `GPS_JUMP_MARGIN_M` / `GPS_JUMP_MAX_MPS` (in `FreematicsPlus.cpp`) | `2000` m / `70` m/s | A new GNSS fix is accepted within this margin plus this speed times the seconds since the last new fix; three consistent fresh fixes outside it, at most 60 s apart, replace a bad anchor. |
+| `GPS_JUMP_MARGIN_M` / `GPS_JUMP_MAX_MPS` (in `FreematicsPlus.cpp`) | `2000` m / `70` m/s | A new GNSS fix is accepted within this margin plus this speed times the seconds since the anchor fix's receiver time last changed; three consistent fresh fixes outside it, at most 60 s apart, replace a bad anchor. |
+| `GPS_JUMP_ALT_MARGIN_M` / `GPS_JUMP_ALT_MAX_MPS` (in `FreematicsPlus.cpp`) | `500` m / `3` m/s | The same rule for altitude, which refuses a fix that is horizontally plausible but far off vertically (logged as `gps_read=coord`, `gps_field=4`). An altitude of 0, as a 2D fix may report, is not checked. |
+| `GPS_JUMP_CONFIRM` (in `FreematicsPlus.cpp`) | `2` | A wake's first fix is held (`gps_read=unconfirmed`) until the next fresh fix, at most 120 s later, agrees with it on both bounds; the agreeing fix is the first one used (`GPS first fix confirmed held=N`). A held fix without one is replaced by the next (`GPS first fix unconfirmed`, once a wake). Costs about one poll on each wake that powers the GNSS. |
 | `IO36_LOCKOUT_LOW` / `_HIGH` | 8.0 / 11.0 V | Weak-battery band: suppress all polling so a recoverable 12 V isn't pushed over the edge. |
 
 `RAIL_AWAKE_VOLTS` was calibrated on one car with almost no margin: driving 13.25–15.2 V,
@@ -304,6 +317,8 @@ USB only: physical access by design. Type these into the serial monitor (115200 
 | `AUTHCLEAR` | Erase the auth secret, revoking every phone. The next phone to connect provisions a new one. |
 | `OTARESET` | Clear the OTA anti-downgrade floor (after a bench flash to a lower version). |
 | `JWSTEST` | Self-test the profile-signature verifier. |
+| `GZTEST <bytes> [count]` | Compress and verify `count` (default 100, at most 2000) synthetic upload bodies of `bytes` and print pass/fail by cause. Holds the main loop (BLE requests and sleep wait) for at most 30 s; any key stops it sooner. |
+| `PANIC` / `WDTHANG` | Bench only: crash now, or hang until the watchdog resets the dongle (5 min), to check the crash-loop streak in the log. Two in a row make the next boot sleep instead. |
 | `RESUME` | Hand back to normal duty (re-allow sleep) after a maintenance session. |
 
 > **One-sided bonds bite.** If you clear bonds on the dongle (or reflash with bonding disabled), also

@@ -91,6 +91,7 @@ time_t parseHttpDate(const char*) { return 0; }
 void esp_task_wdt_reset() {}
 #include "telemetry_format.h"
 #include "gps_location.h"
+#include "drive_state.h"
 void gpsUnlatch() {
 #include "gps_unlatch.inc"
 }
@@ -113,11 +114,13 @@ struct FakeNetwork {
     return {responseCode, "{}"};
   }
 } network;
-bool gzipBody(const std::string&, std::string&) { return false; }
+#include "gzip_fake.h"
+GzipOutcome gzipBody(const std::string&, std::string&) { return GZIP_UNAVAILABLE; }
 int logging_errors = 0, g_last_http = 0, g_http0_streak = 0;
 unsigned long g_last_post_ms = 0;
 std::string g_last_status, tlm_push_token = "test-token", api_key = "test-key";
 std::vector<OBDVector> obd_result_vector;
+unsigned long upload_capped = 0, upload_spilled = 0;
 #include "tlm_signature.h"
 #include "network_upload.h"
 #include "backlog_fs.h"
@@ -160,9 +163,10 @@ void resetFixture() {
   g_gps_powered = is_currently_parked = frozen_valid = false;
   frozen_lat = frozen_lon = 0;
   gps_anchor_date = gps_anchor_time = 0;
-  gps_anchor_ms = gps_run_ms = 0;
+  gps_anchor_ms = gps_run_ms = gps_alt_ref_ms = 0;
+  gps_alt_ref = 0;
   gps_run_last = GPS_DATA{};
-  gps_run_n = 0;
+  gps_run_n = gps_unconfirmed_n = 0;
   gps_fix_date = gps_fix_time = gps_fix_seq = 0;
   gps_fix_changed_ms = park_last_ts = 0;
   park_acc_lat = park_acc_lon = 0;
@@ -175,11 +179,30 @@ void resetFixture() {
   g_last_status.clear();
 }
 
-GPS_DATA acceptLink(const std::string& reply, const std::string& label) {
+bool readLink(const std::string& reply) {
   sys.link = &link;
   link.response = reply;
+  return pollGpsData();
+}
+
+// The wake's first fix is held until a second fresh fix agrees, so a check about something else first sends
+// the same fix one receiver unit earlier. The first-fix rule itself is checked in gps-jump with readLink().
+void confirmFirstFix(const std::string reply, const std::string& label) {
+  if (gpsJumpAnchor(gpsData.lat, gpsData.lng) || reply.rfind("$GNIFO,", 0) != 0) return;
+  std::vector<std::string> fields;
+  std::stringstream stream(reply.substr(7));
+  for (std::string field; std::getline(stream, field, ',');) fields.push_back(field);
+  if (fields.size() < 4 || !gpsJumpAnchor(std::atol(fields[2].c_str()) / 1e6f, std::atol(fields[3].c_str()) / 1e6f))
+    return;
+  std::string echo = "$GNIFO," + fields[0] + "," + std::to_string(std::atol(fields[1].c_str()) - 1);
+  for (size_t i = 2; i < fields.size(); ++i) echo += "," + fields[i];
+  check(!readLink(echo) && sys.gpsReadDiagnostics().result == GPSReadResult::Unconfirmed, label + ": first fix held");
+}
+
+GPS_DATA acceptLink(const std::string& reply, const std::string& label) {
+  confirmFirstFix(reply, label);
   const unsigned commandCalls = link.commandCalls;
-  check(pollGpsData(), label + " accepted");
+  check(readLink(reply), label + " accepted");
   check(link.commandCalls == commandCalls + 1, label + " sends only one ATGPS request");
   return *gd;
 }
@@ -219,8 +242,9 @@ uint16_t linkHeading(const std::string& raw) {
   gpsData = GPS_DATA{};
   gpsData.heading = 123;
   sys.link = &link;
-  link.response = "$GNIFO,41026,110757,59329000,18068000,2500,2000," + raw + ",12,7\r";
-  check(pollGpsData(), "numeric reply retains position");
+  const std::string reply = "$GNIFO,41026,110757,59329000,18068000,2500,2000," + raw + ",12,7\r";
+  confirmFirstFix(reply, "heading " + raw);
+  check(readLink(reply), "numeric reply retains position");
   check(gpsData.sat == 12 && gpsData.hdop == 7, "fields after course retained");
   return gpsData.heading;
 }
@@ -643,11 +667,12 @@ void gpsRelocate() {
   check(frozen_valid && std::string(gpsLocationSource()) == "frozen", "cold-boot average becomes the frozen spot");
 }
 
-// A moving GNIFO record `second` receiver seconds after 11:10:00, coordinates in 1e6 units.
-std::string jumpFix(int second, long lat, long lng) {
+// A GNIFO record `second` receiver seconds after 11:10:00: coordinates in 1e6 units, altitude in cm, then
+// speed, course, satellites and HDOP. The default is a good moving fix.
+std::string jumpFix(int second, long lat, long lng, long alt = 2500, const std::string& rest = "2000,9000,12,7") {
   const int t = 11100000 + second / 60 * 10000 + second % 60 * 100;
-  return "$GNIFO,41026," + std::to_string(t) + "," + std::to_string(lat) + "," + std::to_string(lng) +
-         ",2500,2000,9000,12,7\r";
+  return "$GNIFO,41026," + std::to_string(t) + "," + std::to_string(lat) + "," + std::to_string(lng) + "," +
+         std::to_string(alt) + "," + rest + "\r";
 }
 
 int jumpReanchors = 0;
@@ -658,9 +683,9 @@ GPS_DATA jumpAccept(const std::string& reply, const std::string& label) {
   return fix;
 }
 
-void jumpReject(const std::string& reply, const GPS_DATA& lastGood, const std::string& label) {
+void jumpReject(const std::string& reply, const GPS_DATA& lastGood, const std::string& label, int8_t field = -1) {
   rejectLink(reply, lastGood, label);
-  checkDiagnostics(GPSReadResult::CoordinateRejected, reply.size(), -1, label);
+  checkDiagnostics(GPSReadResult::CoordinateRejected, reply.size(), field, label);
   check(!sys.gpsReadDiagnostics().reanchored, label + " does not re-anchor");
 }
 
@@ -742,6 +767,100 @@ void gpsJump() {
     jumpReject(jumpFix(5 * k, 55738990, lng), last, "spike consistent with the first");
   }
   check(jumpReanchors == 0, "an accepted fix restarts the re-anchor run");
+
+  // #59: after a fix loss, two fresh fixes at ~181 km/h, HDOP 255, horizontally plausible from the anchor and
+  // from each other, but far off vertically. Altitude is the only thing that gives them away.
+  const std::string bogus = "9773,9000,5,255";
+  fresh();
+  last = jumpAccept(jumpFix(0, 59330000, lng), "crawl anchor");
+  fake_ms += 90000;
+  jumpReject(jumpFix(90, 59348000, lng, 2500 + 240000, bogus), last, "bogus fix after a loss", 4);
+  fake_ms += 7000;
+  jumpReject(jumpFix(97, 59351400, lng, 2500 + 300000, "9759,9000,6,255"), last, "second bogus fix", 4);
+  fake_ms += 5000;
+  jumpReject(jumpFix(102, 59354800, lng, 2500 + 368000, "9760,9000,6,255"), last, "third bogus fix", 4);
+  fake_ms += 5000;
+  jumpAccept(jumpFix(107, 59330000 + step, lng), "good fix after the bogus run");
+  check(jumpReanchors == 0, "a run that is consistent only horizontally never re-anchors");
+
+  fresh();
+  last = jumpAccept(jumpFix(0, 59330000, lng), "anchor before a long loss");
+  fake_ms += 600000;
+  jumpReject(jumpFix(600, 59348000, lng, 2500 + 240000, bogus), last, "bogus fix after 10 min", 4);
+
+  fresh();
+  jumpAccept(jumpFix(0, 59330000, lng), "garage anchor");
+  fake_ms += 300000;
+  jumpAccept(jumpFix(300, 59340000, lng, 2500 + 130000), "fresh fix 1300 m higher after a 5-minute climb");
+  fake_ms += 5000;
+  last = jumpAccept(jumpFix(305, 59340000 + step, lng, 0), "2D fix reporting altitude 0");
+  fake_ms += 5000;
+  jumpReject(jumpFix(310, 59340000 + 2 * step, lng, 2500 + 230000), last, "far off vertically after a 2D fix", 4);
+  fake_ms += 5000;
+  jumpReject(jumpFix(315, 59340000 + 2 * step, 18209500, 2500 + 400000), last, "far off both ways", -1);
+  fake_ms += 5000;
+  jumpAccept(jumpFix(320, 59340000 + 2 * step, lng, 2500 + 130000), "3D fix after them");
+
+  fresh();
+  const auto high = jumpAccept(jumpFix(0, 59330000, lng, 1100000), "cold-start anchor far up");
+  for (int k = 1; k <= 2; ++k) {
+    fake_ms += 5000;
+    jumpReject(jumpFix(5 * k, 59330000 + step * k, lng), high, "good fix below a bad-altitude anchor", 4);
+  }
+  fake_ms += 5000;
+  jumpAccept(jumpFix(15, 59330000 + step * 3, lng), "third consistent fix");
+  check(sys.gpsReadDiagnostics().reanchored && sys.gpsReadDiagnostics().reanchor_rejects == 2,
+        "a bad-altitude anchor re-anchors on the third consistent fix");
+
+  fresh();
+  const auto sticky = jumpAccept(jumpFix(0, 59330000, lng, 150000), "cold-start anchor 1.5 km up");
+  for (int k = 1; k <= 3; ++k) {
+    fake_ms += 5000;
+    jumpReject(jumpFix(10 * k - 5, 0, 0, 0, "0,0,0,0"), sticky, "no-fix reply between real fixes");
+    fake_ms += 5000;
+    if (k < 3) jumpReject(jumpFix(10 * k, 59330000 + step * k, lng), sticky, "real fix in poor sky", 4);
+  }
+  jumpAccept(jumpFix(30, 59330000 + step * 3, lng), "third real fix");
+  check(jumpReanchors == 1, "no-fix replies between real fixes do not pin a bad-altitude anchor");
+
+  // The wake's first fix: held until the next fresh fix agrees with it on the same bounds.
+  auto held = [](const std::string& reply, const std::string& label) {
+    check(!readLink(reply) && sys.gpsReadDiagnostics().result == GPSReadResult::Unconfirmed && gd->lat == 0,
+          label + " is held, not accepted");
+  };
+  auto confirmed = [](const std::string& reply, unsigned held, const std::string& label) {
+    check(readLink(reply) && sys.gpsReadDiagnostics().confirmed && sys.gpsReadDiagnostics().confirm_held == held &&
+          !sys.gpsReadDiagnostics().reanchored && gd->time == std::stoul(reply.substr(13, 8)),
+          label + " confirms the first fix and is the one used");
+  };
+  fresh();
+  held(jumpFix(0, 59348000, lng, 2500 + 240000, bogus), "bogus fix at power-on");
+  fake_ms += 7000;
+  held(jumpFix(7, 59351400, lng, 2500 + 300000, "9759,9000,6,255"), "second bogus fix at power-on");
+  fake_ms += 5000;
+  held(jumpFix(12, 59330000, lng), "first real fix");
+  held(jumpFix(12, 59330000, lng), "its replay");
+  fake_ms += 5000;
+  check(readLink("$GNIFO,41026,11101500,0,0,200000,0,0,0,0\r") && gd->lat == 0, "no-fix reply still accepted");
+  fake_ms += 5000;
+  confirmed(jumpFix(22, 59330000 + step, lng, 0), 3, "an agreeing 2D fix");
+  fake_ms += 5000;
+  jumpAccept(jumpFix(27, 59330000 + 2 * step, lng), "3D fix after it, not judged against the no-fix altitude");
+
+  fresh();
+  held(jumpFix(0, 59430000, lng), "cold-start fix 11 km off, good HDOP");
+  fake_ms += 5000;
+  held(jumpFix(5, 59330000, lng), "real fix that disagrees only horizontally");
+  check(sys.gpsReadDiagnostics().confirm_restarted, "the dropped candidate is reported");
+  fake_ms += 60500;
+  confirmed(jumpFix(65, 59330000 + step, lng), 2, "the next real fix at the charging cadence");
+
+  fresh();
+  held(jumpFix(0, 59330000, lng), "first fix");
+  fake_ms += GPS_JUMP_CONFIRM_GAP_MS + 1000;
+  held(jumpFix(121, 59330000 + step, lng), "agreeing fix after the window");
+  fake_ms += 5000;
+  confirmed(jumpFix(126, 59330000 + 2 * step, lng), 2, "the next agreeing fix");
 }
 
 void feedRmc(const std::string& course, const std::string& latitude = "5920.000") {
@@ -1263,12 +1382,13 @@ void geoBacklogRows() {
   }
   LittleFS.seed(bounded);
   obd_result_vector.clear();
+  upload_capped = 0;
   loadUploadBacklog();
-  check(obd_result_vector.size() == MAX_UPLOAD_BUFFER && !LittleFS.exists(UPLOAD_BACKLOG_PATH),
-        "MAX120 load cap and existing load/delete behavior unchanged");
+  check(obd_result_vector.size() == MAX_UPLOAD_BUFFER && !LittleFS.exists(UPLOAD_BACKLOG_PATH) && upload_capped == 1,
+        "MAX120 load cap counts the drop and keeps load/delete behavior");
   const auto bounded_points = json::parse(bulkStringV2(obd_result_vector, 1791500000));
   for (size_t i = 0; i < bounded_points.size(); ++i)
-    check(bounded_points[i]["soc"]["time"] == v2Time(1791500000 + i), "mixed queue load cap preserves FIFO");
+    check(bounded_points[i]["soc"]["time"] == v2Time(1791500001 + i), "mixed queue load cap drops the oldest and preserves FIFO");
 }
 
 void geoBacklog() {
@@ -1381,7 +1501,7 @@ void geoLegacy() {
 
 // The real poll-upload gate, buffer push and pre-sleep trip-end marker (logger.ino, sleep_power.h).
 bool park_marker_owed = false;
-void bufferPoll(OBDVector current_frame) {
+void bufferPoll(OBDVector current_frame, bool ble_relayed = false) {
 #include "upload_gate.inc"
 #include "upload_buffer.inc"
 }
@@ -1446,6 +1566,16 @@ void uploadGate() {
   const auto marker = json::parse(bulkStringV2({obd_result_vector.back()}, T));
   check(marker.size() == 1 && marker[0].size() == 2 && marker[0]["drivingState"]["state"] == "PARK",
         "trip-end marker serializes to a PARK point");
+  // A trip end after a full buffer: the marker is frame MAX + 1 in the backlog, and the restore keeps the
+  // newest frames, as the loop's cap does (#49).
+  obd_result_vector.assign(MAX_UPLOAD_BUFFER, {{"utc", T}, {"soc", 49}, {"is_parked", 0}});
+  park_marker_owed = true;
+  queueParkMarker();
+  saveUploadBacklog();
+  obd_result_vector.clear();
+  loadUploadBacklog();
+  check(obd_result_vector.size() == MAX_UPLOAD_BUFFER && obd_result_vector.back().size() == 2,
+        "a backlog over the cap loses its oldest frame, never the trip-end marker");
   obd_result_vector = {parked};
   g_geo_accepted = g_geo_queued = {};
   saveUploadBacklog();
@@ -1464,7 +1594,33 @@ void uploadGate() {
   setClock(CLK_HTTP, T);
   bufferPoll(frozen);
   check(obd_result_vector.size() == 1, "a fix restored under an untrusted clock is not buffered again once it is trusted");
-  obd_result_vector.clear();
+
+  // A phone taking the transport (#58): what is queued for cellular stays queued, and what it relays is not.
+  resetFixture();
+  setClock(CLK_HTTP, T);
+  park_marker_owed = false;
+  parkedFixture();
+  OBDVector parked_fix{{"utc", T}};
+  addGpsData(parked_fix);
+  is_currently_parked = false;
+  bufferPoll({{"utc", T - 3}, {"soc", 60}});
+  bufferPoll({{"utc", T - 2}, {"soc", 59}});
+  park_marker_owed = false;
+  bufferPoll({{"utc", T - 1}, {"soc", 58}}, true);
+  check(obd_result_vector.size() == 2 && park_marker_owed, "a relayed driving poll is not queued and still owes the marker");
+  is_currently_parked = true;
+  bufferPoll(parked_fix, true);
+  check(obd_result_vector.size() == 2 && obd_result_vector[0][0].second == T - 3 && obd_result_vector[1][0].second == T - 2,
+        "frames queued before the phone relayed stay queued, in order");
+  bufferPoll(parked_fix);
+  check(obd_result_vector.size() == 3, "after the session the fix the phone never carried is queued");
+  network.received.clear();
+  check(uploadBuffered(false) && obd_result_vector.empty() && network.received.size() == 3, "the handoff drains them");
+
+  upload_capped = 0;
+  for (int i = 0; i <= MAX_UPLOAD_BUFFER; ++i) bufferPoll({{"utc", T - MAX_UPLOAD_BUFFER + i}, {"soc", 50}});
+  check(obd_result_vector.size() == MAX_UPLOAD_BUFFER && obd_result_vector[0][0].second == T - MAX_UPLOAD_BUFFER + 1 &&
+        upload_capped == 1, "the cap drops the oldest frame and counts it for the log");
 }
 
 int main(int argc, char** argv) {

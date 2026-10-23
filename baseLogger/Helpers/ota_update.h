@@ -546,14 +546,19 @@ static void otaFinalize() {
   otaNvsPut("attempt", ota_img_version);
 
   otaSendStatus(OTA_PH_COMMITTED, 0, ota_img_version);
+  if (g_config_pending) dropUnsavedPush("ota"); // a push the transfer held back dies with the reboot
 #if ENABLE_LOGGING
   logEvent("OTA committed v%lu (%lu B) -> reboot into trial boot",
     (unsigned long)ota_img_version, (unsigned long)ota_img_size);
+#if ENABLE_NETWORK
+  saveUploadBacklog();   // frames kept through the session; the boot after the update uploads them
+#endif
   datalogger.end();      // flush + close the log segment; the reboot wipes RAM
 #endif
   Serial.printf("OTA: committed, rebooting into new firmware\n");
   Serial.flush();
   delay(600);            // let the COMMITTED notify actually go out over the air before we reset
+  wdtStreakEnd();
   esp_restart();         // never returns
 }
 
@@ -786,9 +791,9 @@ void otaService() {
 
 /*
   Is this boot an unconfirmed trial boot? Cheap and callable at the very top of setup(), before Serial - used
-  to skip the cold-boot-only branches that would otherwise damage a post-OTA boot (the 2s serial-attach delay
-  and, critically, rtc.setTime(0), which would zero the clock and make every frame unuploadable until GNSS
-  locks). Cached, because the answer changes once we mark the image valid.
+  to skip the cold-boot-only 2 s serial-attach delay. (It no longer spares the clock: a trial boot zeroes it
+  like a cold boot, because the time esp_restart() leaves behind was seen ~28 years off - #13.) Cached, because
+  the answer changes once we mark the image valid.
 */
 bool otaIsTrialBoot() {
   static int8_t cached = -1;
@@ -815,6 +820,9 @@ static bool otaSelfTest() {
 #endif
 #if ENABLE_MEMS
   if (mems == 0) ok = false;                     // motion sensor absent -> sleep/wake logic would be broken
+#endif
+#if ENABLE_NETWORK
+  if (!gzipSelfTest()) ok = false;               // misbuilt compressor -> every upload body would fail
 #endif
   return ok;
 }

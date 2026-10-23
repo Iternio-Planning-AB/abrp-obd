@@ -13,7 +13,13 @@ source = (root / "libraries/FreematicsPlus/FreematicsNetwork.cpp").read_text()
 header = (root / "libraries/FreematicsPlus/FreematicsNetwork.h").read_text()
 logging = (root / "baseLogger/Helpers/logging.h").read_text()
 clock = (root / "baseLogger/Helpers/clock_sync.h").read_text()
+gzip_body = (root / "baseLogger/Helpers/gzip_body.h").read_text()
 logger = (root / "baseLogger/logger.ino").read_text()
+cell = (root / "libraries/NetworkWrapper/cellwrapper.cpp").read_text()
+config = (root / "baseLogger/config.h").read_text()
+machine = (root / "baseLogger/Helpers/state_machine.h").read_text()
+sys.path.insert(0, str(root / "tests/support"))
+from extract import block  # noqa: E402
 streak_line = next(line for line in logger.splitlines() if "if (!g_upload_local_fail)" in line)
 geo_reset_line = next(line for line in logger.splitlines() if "resetGeoAccepted(" in line)
 open_streak_line = next(line for line in logger.splitlines() if "if (!network.trustRefused())" in line)
@@ -25,7 +31,7 @@ def section(text, first, last):
 compiler = shlex.split(os.environ.get("CXX", "clang++"))
 print(subprocess.check_output([*compiler, "--version"], text=True).splitlines()[0], flush=True)
 group = sys.argv[1] if len(sys.argv) > 1 else "all"
-if group not in {"all", "body-ack", "stages", "responses", "unknown", "fingerprint", "errors", "queue", "geo-expiry", "geo-retry", "geo-sizing", "geo-dedup", "logging-off", "tls-ca", "signing"}:
+if group not in {"all", "body-ack", "stages", "responses", "unknown", "fingerprint", "errors", "queue", "geo-expiry", "geo-retry", "geo-sizing", "geo-dedup", "logging-off", "tls-ca", "signing", "gzip-fallback", "session"}:
     sys.exit("Unknown upload test group: " + group)
 environment = dict(os.environ)
 environment["UBSAN_OPTIONS"] = environment.get("UBSAN_OPTIONS", "") + ":halt_on_error=1"
@@ -40,13 +46,25 @@ with tempfile.TemporaryDirectory(prefix="obd-upload-checks-") as temporary:
     (build / "upload_streak.inc").write_text(streak_line + "\n")
     (build / "geo_reset.inc").write_text(geo_reset_line + "\n")
     (build / "open_streak.inc").write_text(open_streak_line + "\n")
+    (build / "token_push.inc").write_text(section(logger, "      const std::string pushed_token", "      std::string profile_dump"))
     (build / "tls_defines.inc").write_text(section(header, "// Root-CA install (HTTPClientSIM::ensureCa)", "#define RECV_BUF_SIZE"))
     (build / "tls_members.inc").write_text(section(header, "    enum CaState", "    HTTPTransferDiagnostics m_transfer_diagnostics;") +
                                            section(header, "    char m_open_trace[", "\n};"))
     (build / "tls_open.inc").write_text(section(source, "int HTTPClientSIM::bearerState", "bool HTTPClientSIM::close()"))
+    (build / "tls_close.inc").write_text(section(source, "bool HTTPClientSIM::close()", "std::pair<int, int> handlePair"))
+    (build / "cell_session.inc").write_text(
+        next(line for line in cell.splitlines() if line.startswith("CellWrapper::CellWrapper(")) + "\n" +
+        section(cell, "bool CellWrapper::connect()", "void CellWrapper::restart()") +
+        block(cell, "void CellWrapper::set_api_page(", "cellwrapper.cpp") +
+        section(cell, "HttpResponse CellWrapper::sendBulk", "long CellWrapper::upForMs()"))
+    (build / "session_config.inc").write_text(section(config, "#ifndef SESSION_IDLE_MAX_MS", "#endif") + "#endif\n")
+    (build / "cadence.inc").write_text(block(logger, "enum ActivityState {", "logger.ino").rstrip() + ";\n" +
+                                       block(machine, "unsigned long getTransmissionDelay(", "state_machine.h") +
+                                       block(machine, "unsigned long getPollingDelay(", "state_machine.h"))
     (build / "upload_command.inc").write_text(section(source, "commandResponse CellSIMCOM::sendCommand", "float CellSIMCOM::parseDegree"))
     (build / "upload_log_event.inc").write_text(section(logging, "void logEvent(const char* fmt", "// Defined in ota_update.h"))
     (build / "clock_quality.inc").write_text(section(clock, "bool clockValid(", "// UTC calendar time"))
+    (build / "gzip_outcome.inc").write_text(section(gzip_body, "enum GzipOutcome", "\n};\n") + "\n};\n")
     (build / "FreematicsPlus.h").write_text('#pragma once\n#include "upload_transport_fixture.h"\nstruct FreematicsESP32 {};\n')
     flags = [
         *compiler, "-std=c++17", "-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-DNDEBUG",
@@ -57,9 +75,9 @@ with tempfile.TemporaryDirectory(prefix="obd-upload-checks-") as temporary:
     targets = []
     if group in {"all", "body-ack", "stages", "responses"}:
         targets.append(("upload_checks", "upload_checks.cpp", [], group))
-    if group in {"all", "fingerprint", "errors", "queue", "geo-expiry", "geo-retry", "geo-sizing", "geo-dedup", "signing"}:
+    if group in {"all", "fingerprint", "errors", "queue", "geo-expiry", "geo-retry", "geo-sizing", "geo-dedup", "signing", "gzip-fallback"}:
         targets.append(("upload_helpers_checks", "upload_helpers_checks.cpp", [], group))
-    if group in {"all", "tls-ca", "signing"}:
+    if group in {"all", "tls-ca", "signing", "session"}:
         targets.append(("tls_ca_checks", "tls_ca_checks.cpp", [], group))
     if group in {"all", "logging-off"}:
         targets.append(("upload_logging_off_checks", "upload_helpers_checks.cpp", ["-DENABLE_LOGGING=0"], "all"))

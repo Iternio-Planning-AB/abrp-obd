@@ -105,6 +105,10 @@ jobs:
           RELEASE_VERSION: ${{ steps.version.outputs.name }}
         run: pio run -e esp32dev -t factory
 
+      - name: Check the PSRAM runtime
+        # The build checks this too (tools/pio_psram_libs.py); this step does not depend on that hook firing (#64).
+        run: python3 baseLogger/tools/psram_libs.py baseLogger/.pio/build/esp32dev/firmware.map
+
       - name: Release notes
         env:
           NAME: ${{ steps.version.outputs.name }}

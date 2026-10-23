@@ -19,7 +19,7 @@
 
 using OBDVector = std::vector<std::pair<std::string, double>>;
 
-enum class SmKind { POLL, ADVANCE, LADDER, HOLD, SLEEP, WAKE, MAINT };
+enum class SmKind { POLL, ADVANCE, LADDER, HOLD, SLEEP, WAKE, MAINT, CRASH };
 enum class SmTo { ACTIVE, BLE, CHARGING, STANDBY };
 enum { SM_NONE, SM_SPEED, SM_VRS, SM_BOTH };  // which speed keys the poll carries (BOTH: speed, then vrs)
 enum { SM_TIMER, SM_MOTION, SM_COLD };   // wake cause
@@ -38,6 +38,8 @@ struct SmEvent {
   SmTo to = SmTo::ACTIVE;
   bool modem_on = true;
   const char* reason = nullptr;
+  bool sent = false;   // SLEEP: the pre-sleep flush sent every buffered frame
+  bool crash = false;  // SLEEP: a panic in the pre-sleep flush, after the marker block
   int cause = SM_TIMER;
   float rail = 12.6f;
   bool awake = true;
@@ -80,11 +82,16 @@ SmEvent Maint(bool on) {
   e.on = on;
   return e;
 }
-SmEvent Sleep(bool modem_on = true, bool clock_ok = true, const char* reason = nullptr) {
-  SmEvent e{SmKind::SLEEP, std::string("SLEEP(") + (modem_on ? "modem" : "nomodem") + (clock_ok ? "" : ",noclock") + ")"};
-  e.modem_on = modem_on, e.clock_ok = clock_ok, e.reason = reason;
+SmEvent Sleep(bool modem_on = true, bool clock_ok = true, const char* reason = nullptr, bool sent = false,
+             bool crash = false) {
+  SmEvent e{SmKind::SLEEP, std::string("SLEEP(") + (modem_on ? "modem" : "nomodem") + (clock_ok ? "" : ",noclock") +
+                             (sent ? ",sent" : "") + (crash ? ",crash" : "") + ")"};
+  e.modem_on = modem_on, e.clock_ok = clock_ok, e.reason = reason, e.sent = sent, e.crash = crash;
   return e;
 }
+SmEvent Sent() { return Sleep(true, true, nullptr, true); }
+SmEvent FlushCrash() { return Sleep(true, true, nullptr, false, true); }
+SmEvent Crash() { return SmEvent{SmKind::CRASH, "CRASH"}; }
 SmEvent Wake(int cause, float rail, bool awake = true, bool charge_latched = false) {
   const char* names[] = {"timer", "motion", "cold"};
   std::ostringstream name;
@@ -377,6 +384,101 @@ void scenarios() {
   }
 }
 
+
+// ---- the marker debt across a crash (#49), on CUR only ----
+// The setup() restore is a drive writer SM_PIN does not have, so a crash that owes the marker is meant to differ
+// from OLD: these run CUR alone, with its properties (a crash never loses the debt or an unsent marker).
+void playCur(const SmEvent& e, std::vector<SmEvent>& trace) {
+  const sm_cur::Snap pre = sm_cur::save();
+  trace.push_back(e);
+  sm_cur::step(e);
+  events++;
+  if (const char* broken = sm_cur::propertyBroken(pre, e)) fail(std::string("CUR property: ") + broken, trace);
+}
+void startCur(std::vector<SmEvent>& trace) {
+  trace.clear();
+  const SmEvent boot = Wake(SM_COLD, 12.6f);
+  trace.push_back(boot);
+  sm_cur::powerOn(boot);
+}
+std::vector<SmEvent> crashAlphabet() {
+  std::vector<SmEvent> a = ALPHABET;
+  a.push_back(Crash());
+  a.push_back(FlushCrash());
+  a.push_back(Sent());
+  return a;
+}
+unsigned long crash_leaves = 0;
+void enumerateCur(int depth, const std::vector<SmEvent>& alphabet, std::vector<SmEvent>& trace) {
+  if (depth == 0) { crash_leaves++; return; }
+  const sm_cur::Snap node = sm_cur::save();
+  for (const auto& e : alphabet) {
+    sm_cur::restore(node);
+    playCur(e, trace);
+    enumerateCur(depth - 1, alphabet, trace);
+    trace.pop_back();
+  }
+}
+
+void crashes(int depth) {
+  std::vector<SmEvent> t;
+  using namespace sm_cur;
+  // A panic mid-drive (#49): .rtc.data is reloaded and the clock zeroed, the debt comes back from the store,
+  // and the first modem sleep once a poll has the clock again closes the trip.
+  startCur(t);
+  playCur(Poll(SM_SPEED, 25), t);
+  playCur(Crash(), t);
+  check(park_marker_owed && is_currently_parked && obd_result_vector.empty(), "a crash keeps the debt", t);
+  playCur(Ladder(SmTo::STANDBY), t);
+  playCur(Sleep(true, false), t);
+  check(park_marker_owed && sm_store_marker && obd_result_vector.empty(), "no clock, no marker: the debt waits", t);
+  playCur(Wake(SM_MOTION, 12.6f), t);
+  playCur(Poll(SM_NONE, 0, false, 0, false), t);
+  playCur(Ladder(SmTo::STANDBY), t);
+  playCur(Sleep(), t);
+  check(!park_marker_owed && obd_result_vector.size() == 1 && obd_result_vector[0].size() == 2 && sm_store_marker,
+        "one marker queued; its crash copy stays until it is sent", t);
+  // In the backlog, then a panic after the next wake loaded it: the marker is lost, the debt is not.
+  playCur(Wake(SM_TIMER, 13.6f), t);
+  playCur(Poll(SM_NONE, 0, false, 0, false), t);
+  playCur(Crash(), t);
+  check(park_marker_owed && obd_result_vector.empty(), "a crash after the backlog load keeps the debt", t);
+  playCur(Ladder(SmTo::STANDBY), t);
+  playCur(Sent(), t);
+  check(!park_marker_owed && obd_result_vector.empty() && !sm_store_marker, "a sent marker pays both copies", t);
+  playCur(Wake(SM_TIMER, 13.6f), t);
+  playCur(Crash(), t);
+  playCur(Ladder(SmTo::STANDBY), t);
+  playCur(Sleep(), t);
+  check(!park_marker_owed && obd_result_vector.empty(), "a crash after the trip was closed owes nothing", t);
+
+  // A panic in the pre-sleep flush, after the marker block cleared the debt (#30's field crash site).
+  startCur(t);
+  playCur(Poll(SM_SPEED, 25), t);
+  playCur(Ladder(SmTo::STANDBY), t);
+  playCur(FlushCrash(), t);
+  check(park_marker_owed && obd_result_vector.empty(), "a crash in the flush keeps the debt it had just paid", t);
+  playCur(Poll(SM_NONE, 0), t);
+  playCur(Ladder(SmTo::STANDBY), t);
+  playCur(Sleep(), t);
+  check(!park_marker_owed && obd_result_vector.size() == 2 && obd_result_vector.back().size() == 2,
+        "and the next modem sleep queues the marker again", t);
+
+  const auto alphabet = crashAlphabet();
+  startCur(t);
+  enumerateCur(depth, alphabet, t);
+  for (uint32_t seed : {1u, 2u, 3u, 4u, 5u}) {
+    std::mt19937 rng(seed);
+    for (int sequence = 0; sequence < 1000; ++sequence) {
+      startCur(t);
+      for (int i = 0; i < 30; ++i) {
+        const int k = std::uniform_int_distribution<int>(0, 7)(rng);
+        playCur(k == 0 ? Crash() : k == 1 ? FlushCrash() : k == 2 ? Sent() : randomEvent(rng), t);
+      }
+    }
+  }
+}
+
 int main(int argc, char** argv) {
   std::string group = "all";
   int depth = 5;  // caught every harness mutant that depth 6 did, in ~3 s; --depth 6 runs the 11 M sequences
@@ -385,8 +487,8 @@ int main(int argc, char** argv) {
     if (arg == "--depth" && i + 1 < argc) depth = std::atoi(argv[++i]);
     else group = arg;
   }
-  if (group != "all" && group != "enumerate" && group != "random" && group != "scenarios") {
-    std::cerr << "unknown group " << group << " (all, enumerate, random, scenarios)\n";
+  if (group != "all" && group != "enumerate" && group != "random" && group != "scenarios" && group != "crash") {
+    std::cerr << "unknown group " << group << " (all, enumerate, random, scenarios, crash)\n";
     return 2;
   }
   using clock = std::chrono::steady_clock;
@@ -406,6 +508,11 @@ int main(int argc, char** argv) {
     const double s = std::chrono::duration<double>(clock::now() - t0).count();
     std::cout << "PASS: enumerate depth " << depth << " over " << ALPHABET.size() << " symbols, " << leaves
               << " sequences in " << s << "s\n";
+  }
+  if (group == "all" || group == "crash") {
+    crashes(depth);
+    std::cout << "PASS: crash (CUR only: scenarios, depth " << depth << " over " << crashAlphabet().size() << " symbols, "
+              << crash_leaves << " sequences, 5 seeds x 1000 x 30)\n";
   }
   std::cout << "events compared: " << events << '\n';
 }
