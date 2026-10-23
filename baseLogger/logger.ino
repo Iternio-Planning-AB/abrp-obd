@@ -405,6 +405,8 @@ ActivityState current_state = UNINITIALIZED;
 */
 #if ENABLE_LOGGING
 void logEvent(const char* fmt, ...);           // Helpers/logging.h
+#else
+#define logEvent(...) ((void)0)                // helpers log unguarded; with logging off there is nowhere to write
 #endif
 #if ENABLE_NETWORK
 bool uploadBuffered(bool drain);               // Helpers/network_upload.h
@@ -1124,7 +1126,7 @@ void setup() {
   }
   config_initialized = true;
 
-#if ENABLE_NETWORK && ENABLE_LOGGING
+#if (ENABLE_NETWORK) && ENABLE_LOGGING // parenthesised: ENABLE_NETWORK is a bare `||`
   // Restore telemetry that couldn't be uploaded before the last sleep (wedged bearer / dead spot). Only
   // reachable on a polling wake - gate skips slept long before this - and the modem is freshly booted here,
   // so the normal upload path drains these with their original (correct) utc stamps.

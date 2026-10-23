@@ -42,10 +42,13 @@ A clean build prints two pre-existing `"PRINT" redefined` warnings, from `Freema
 `mathparser/parser.cpp`. They are not yours; anything else probably is.
 
 **CI runs the host checks only.** `.github/workflows/host-tests.yml` runs every `tests/run_*.py` on each
-pull request and on `main`, normally and with `CXX='clang++ -DNDEBUG'`. Nothing in CI builds the firmware
-or touches a device, so a green PR proves the host checks and nothing more. Merging needs its `ci` job,
+pull request and on `main`, normally and with `CXX='clang++ -DNDEBUG'`. Apart from the one job below, nothing in CI builds
+the firmware or touches a device, so a green PR proves the host checks and nothing more. Merging needs its `ci` job,
 the one check the `main` ruleset requires: a new job goes in that job's `needs`. See *Testing* below,
 because that gap is the single biggest difference from a normal repo.
+
+The `variants` job compiles the non-default `config.h` variants with `sh tools/check_variants.sh` from `baseLogger/`;
+it never builds the default image. `ENABLE_WIFI 1` (with `ENABLE_CELL 0`) only compiles, as it overflows IRAM, and its TLS is unverified: bench only.
 
 ## The rules that bite first
 
