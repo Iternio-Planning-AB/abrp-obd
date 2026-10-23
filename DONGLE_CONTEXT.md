@@ -421,6 +421,23 @@ the backend has aged out stays off the map until it relocates, drives or reboots
 backend silently dropped counts as sent until then too. `UPLOAD body` logs `loc=` (locations in the body) and
 `ldup=` (suppressed repeats).
 
+**A phone taking the transport keeps the cellular queue** (#58). The BLE notify goes out before the frame is
+buffered, and its answer decides both: a relayed frame is not queued (the phone posts it as `APP_OBD`), and
+frames already queued (failed-POST retries, a slow drain, a restored backlog) are kept while cellular stands
+down. They are not kept in RAM: a queued frame costs about 1 KB of internal heap, Bluedroid about 97 KB, and the
+session's pairing, profile push, OTA and log dump need what is left, so the first relayed poll parks them in the
+backlog file (`spillUploadBacklog`). The first poll after relaying ends puts them back in front of anything
+queued since, and the handoff drains them oldest first, at most `UPLOAD_MAX_BATCHES_PER_CYCLE` x
+`MAX_FRAMES_PER_POST` per cycle. Nothing goes up over cellular while frames are parked, so a sleep or an OTA
+reboot in the session saves RAM behind them and the next wake sends them in order; over the cap the load drops
+the oldest. A frame the phone relayed never goes over cellular, including the dongle's own fix (BLE trims
+`lat`/`lon`/`heading`; the phone supplies its own). A profile push with a different (or, after an unreadable
+profile, an unknown) `tlm_push_token` discards the queue and the parked file (`UPLOAD discarded n=…
+reason=token`): those frames may be another vehicle's history. The cap drops the oldest frame past
+`MAX_UPLOAD_BUFFER`, logged once per capped stretch (`UPLOAD discarded n=… reason=cap`, at the next accepted
+upload or the backlog save). `BLE relay spilled=` logs the parked count and the heap at the start of each relay
+stretch.
+
 **Where the PID list / vehicle profile comes from:** the app fetches it from the ABRP backend by
 `typecode` (`getObdBlePids`), gets back `{ obdPids, jws }`, and pushes it to the dongle over ABD2.
 The `obdPids` is the per-model map of PIDs → CAN commands + equations that `OBDWrapper` evaluates; the
@@ -4458,7 +4475,7 @@ unreachable for the whole wake**, i.e. the whole drive.
 
 Compounding: on a denied cycle while the phone is relaying, the BLE frame is stripped to
 `{is_parked,is_charging}` (telemetry_format.h strips lat/lon/utc), the BLE send succeeds, so
-logger.ino ~1360 **clears the upload buffer**, and `bleRelaying()` stands cellular down — data
+logger.ino ~1360 **clears the upload buffer** (fixed in #58, see §6a), and `bleRelaying()` stands cellular down — data
 flows nowhere; only the flash CSV survives. The app compounds it: after 5 min without telemetry the
 UI reports "Not connected" on a perfectly healthy link (bleStateThunk/ConnectivityStatus).
 

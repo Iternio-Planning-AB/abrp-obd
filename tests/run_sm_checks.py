@@ -109,6 +109,8 @@ void sm_emplace(OBDVector& current_frame) {{
 void sm_buffer(OBDVector& current_frame, bool frame_has_data) {{
   int g_geo_queued = 0, poll_geo = 0;
   (void)g_geo_queued;
+  const bool ble_relayed = false; // no phone in this harness; OLD ignores both
+  unsigned long upload_capped = 0;
 {buffer}}}
 void sm_marker() {{
 {marker}}}

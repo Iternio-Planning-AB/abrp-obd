@@ -136,8 +136,12 @@ int logging_errors = 0, g_last_http = 0, g_http0_streak = 0;
 unsigned long g_last_post_ms = 0;
 std::string g_last_status, tlm_push_token = "test-token-actual", api_key = "test-key-actual";
 std::vector<OBDVector> obd_result_vector;
+unsigned long upload_capped = 0, upload_spilled = 0;
 #include "tlm_signature.h"
 #include "network_upload.h"
+void pushToken(json newConfig) {
+#include "token_push.inc"
+}
 
 void reset() {
     rtc.epoch = 1791112000; rtc.reads = 0;
@@ -300,6 +304,61 @@ void queue() {
 #if ENABLE_LOGGING
     check(g_upload_request_id == 0, "drop has no POST diagnostics");
 #endif
+}
+// A relay session parks the queue in flash and hands it back in order; a new token drops it from both (#58).
+void bleHandover() {
+    reset();
+    auto utcs = [] { std::vector<double> u; for (const auto& f : obd_result_vector) for (const auto& kv : f) if (kv.first == "utc") u.push_back(kv.second); return u; };
+    const std::vector<double> parked_then_new{1791112000, 1791112001, 1791112002};
+#if ENABLE_LOGGING
+    obd_result_vector = {frame(0), frame(1)};
+    spillUploadBacklog();
+    check(obd_result_vector.empty() && upload_spilled == 2, "a relay session parks the queue in flash");
+    obd_result_vector = {frame(2)};
+    loadUploadBacklog();
+    check(utcs() == parked_then_new && upload_spilled == 0 && !LittleFS.exists("/upload_backlog.jsonl"),
+          "the parked frames come back ahead of the ones queued since");
+    obd_result_vector = {frame(0), frame(1)};
+    spillUploadBacklog();
+    obd_result_vector = {frame(2)}; // the trip-end marker of a sleep during the session
+    check(uploadBuffered(true) && network.sent.empty() && obd_result_vector.size() == 1,
+          "nothing goes up ahead of the parked frames");
+    saveUploadBacklog();
+    obd_result_vector.clear();
+    loadUploadBacklog();
+    check(utcs() == parked_then_new, "a sleep during the session saves behind them, and the next wake restores all");
+    LittleFS.fail_open = true;
+    spillUploadBacklog();
+    check(obd_result_vector.size() == 3 && upload_spilled == 0, "a queue flash refused stays in RAM");
+    LittleFS.fail_open = false;
+    upload_capped = 3; saveUploadBacklog(); saveUploadBacklog();
+    check(events("UPLOAD discarded n=3 reason=cap").size() == 1 && events("UPLOAD discarded").size() == 1,
+          "a capped stretch logs once, before the backlog is saved");
+    LittleFS.files.clear();
+    obd_result_vector.clear();
+    for (unsigned i = 0; i < MAX_UPLOAD_BUFFER; ++i) obd_result_vector.push_back(frame(i));
+    spillUploadBacklog();
+    obd_result_vector = {frame(MAX_UPLOAD_BUFFER)};
+    upload_capped = 0; saveUploadBacklog(); obd_result_vector.clear(); loadUploadBacklog();
+    check(utcs().size() == MAX_UPLOAD_BUFFER && utcs().front() == 1791112001 &&
+          utcs().back() == 1791112000 + MAX_UPLOAD_BUFFER && upload_capped == 1,
+          "over the cap the oldest parked frame goes, not the trip-end marker");
+    upload_capped = 0; obd_result_vector.clear(); LittleFS.files.clear();
+    obd_result_vector = {frame(0)};
+    spillUploadBacklog();
+#endif
+    obd_result_vector.push_back(frame(1));
+    pushToken({{"tlm_push_token", tlm_push_token}});
+    check(obd_result_vector.size() == 1 && upload_spilled == ENABLE_LOGGING &&
+          LittleFS.exists("/upload_backlog.jsonl") == ENABLE_LOGGING, "a re-push for the same vehicle keeps the queue, parked or not");
+    const std::string token = tlm_push_token;
+    pushToken({{"tlm_push_token", "other-vehicle"}});
+    check(obd_result_vector.empty() && !LittleFS.exists("/upload_backlog.jsonl") && upload_spilled == 0 &&
+          tlm_push_token == "other-vehicle", "a new token drops what was polled under the old one, parked or not");
+#if ENABLE_LOGGING
+    check(events("UPLOAD discarded n=2 reason=token").size() == 1, "and says how much");
+#endif
+    tlm_push_token = token;
 }
 void geoExpiry() {
     reset();
@@ -940,7 +999,7 @@ int main(int argc, char** argv) {
     if (group == "all" || group == "fingerprint") fingerprint();
     if (group == "all" || group == "errors") safeErrors();
 #endif
-    if (group == "all" || group == "queue") queue();
+    if (group == "all" || group == "queue") { queue(); bleHandover(); }
     if (group == "all" || group == "geo-expiry") { geoExpiry(); geoClockQuality(); geoExplicitClock(); geoBoundaries(); }
     if (group == "all" || group == "geo-retry" || group == "geo-sizing") geoPublicClockReads();
     if (group == "all" || group == "geo-retry") geoTrustRetry();

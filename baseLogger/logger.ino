@@ -89,7 +89,7 @@ bool logging_message_printed = false; // print message once
 // motion has stopped (see changeState). This is the IMU "smart cheat" - there is no real gear PID.
 // Written only by the drive region (Helpers/drive_state.h), as are g_last_speed_ms and park_marker_owed.
 bool is_currently_parked = true;
-// Set when a DRIVE frame enters the upload buffer, cleared when the pre-sleep PARK marker is queued: the
+// Set when a DRIVE frame enters the upload buffer or is relayed over BLE, cleared when the pre-sleep PARK marker is queued: the
 // server has been told DRIVE and not yet PARK. RTC so a trip end that straddles a deep sleep (the mid-drive
 // modem-recovery sleep) is still closed on the next wake, while a parked heartbeat wake owes nothing and opens
 // no connection. Every other reset reloads it, so setup() restores it from wdt_streak.h, which keeps it set
@@ -150,6 +150,10 @@ std::vector<OBDVector> obd_result_vector{};
 // Cap on the in-RAM upload buffer (frames awaiting upload). Prevents unbounded growth -> OOM during long
 // offline periods; oldest frames are dropped (the full log is preserved in flash regardless).
 const size_t MAX_UPLOAD_BUFFER = 120;
+// Frames the cap dropped since the last UPLOAD discarded line (see logUploadCapped).
+unsigned long upload_capped = 0;
+// Frames parked in the backlog file for a BLE session (see spillUploadBacklog).
+unsigned long upload_spilled = 0;
 // How often the loop kicks a WiFi reconnect while offline. Kept comfortably longer than a normal
 // association (a cold-boot connect can take ~10-15s) so a retry never aborts an attempt mid-flight.
 const unsigned long WIFI_RETRY_MS = 20000;
@@ -428,7 +432,7 @@ void logEvent(const char* fmt, ...);           // Helpers/logging.h
 #if ENABLE_NETWORK
 bool uploadBuffered(bool drain);               // Helpers/network_upload.h
 #if ENABLE_LOGGING
-void saveUploadBacklog();                      // Helpers/network_upload.h
+bool saveUploadBacklog();                      // Helpers/network_upload.h
 void gzipLogWakeSummary();                     // Helpers/gzip_body.h
 bool uploadBacklogPending();                   // Helpers/network_upload.h
 #endif
@@ -1223,7 +1227,19 @@ void loop() {
       json newConfig = json::parse(g_pending_config_str);
       json config = newConfig["configJson"];
       config.erase("utc"); // clock-set side channel, not a profile field; also breaks the identity compare
-      tlm_push_token = newConfig.at("tlm_push_token").get<std::string>();
+      const std::string pushed_token = newConfig.at("tlm_push_token").get<std::string>();
+      // Frames polled under another (or an unknown) token may be another vehicle's history: never sign them
+      // with this one.
+      if (pushed_token != tlm_push_token) {
+#if (ENABLE_NETWORK) && ENABLE_LOGGING
+        if (!obd_result_vector.empty() || upload_spilled)
+          logEvent("UPLOAD discarded n=%lu reason=token", obd_result_vector.size() + upload_spilled);
+        LittleFS.remove(UPLOAD_BACKLOG_PATH); // what a relay session parked there
+        upload_spilled = 0;
+#endif
+        obd_result_vector.clear();
+      }
+      tlm_push_token = pushed_token;
       std::string profile_dump = config.dump();
       // A completed full push (either branch below) = a human actively drove the wizard at the car:
       // grant the bounded setup-session permit so the wizard's live PID test works while stationary
@@ -1611,6 +1627,9 @@ void loop() {
     // buffered behind an unsent one, is not news; any other, frozen or live, is.
 #if ENABLE_NETWORK
     const double poll_utc = uploadSendUtc();
+#if ENABLE_LOGGING
+    if (upload_spilled && !bleRelaying()) loadUploadBacklog(); // the session ended: its parked frames go first
+#endif
     seedGeoQueued(poll_utc);
     GeoMarks poll_geo = obd_result_vector.empty() ? g_geo_accepted : g_geo_queued;
     bool frame_has_data = v2HasTelemetry(current_frame, poll_utc, &poll_geo);
@@ -1962,18 +1981,32 @@ void loop() {
     }
     dcAwakeTrack();
 
-    if (frame_has_data) { // skip frames that would carry only drivingState so we never POST a meaningless tlm
-      obd_result_vector.push_back(current_frame); // store multiple frames to send at the same time, lowers cellular usage
-#if ENABLE_NETWORK
-      g_geo_queued = poll_geo;
+#if ENABLE_BLE
+    const uint16_t ble_mtu = ble.mtu();
+    const BleTlmFrame ble_frame = bleTlmFrame(current_frame, bleNotifyBudget(ble_mtu));
+    // Sent before buffering: one answer decides whether the phone or cellular carries this frame.
+    const bool ble_relayed = ble.logData(ble_frame.notify, ble_frame.full);
+#else
+    const bool ble_relayed = false;
 #endif
+
+    if (frame_has_data) { // skip frames that would carry only drivingState so we never POST a meaningless tlm
       driveFrameBuffered();
-      // Bound the RAM upload buffer so a long offline stretch can't grow it without limit (-> OOM). The
-      // full history is already in flash; for live telemetry the freshest frames matter most, so drop the
-      // oldest when over the cap.
-      if (obd_result_vector.size() > MAX_UPLOAD_BUFFER) {
-        obd_result_vector.erase(obd_result_vector.begin(),
-          obd_result_vector.begin() + (obd_result_vector.size() - MAX_UPLOAD_BUFFER));
+      // A relayed frame is not queued too (no second post as ABRP_OTA); the frames already queued stay and
+      // drain over cellular once the session ends.
+      if (!ble_relayed) {
+        obd_result_vector.push_back(current_frame); // store multiple frames to send at the same time, lowers cellular usage
+#if ENABLE_NETWORK
+        g_geo_queued = poll_geo;
+#endif
+        // Bound the RAM upload buffer so a long offline stretch can't grow it without limit (-> OOM). The
+        // full history is already in flash; for live telemetry the freshest frames matter most, so drop the
+        // oldest when over the cap.
+        if (obd_result_vector.size() > MAX_UPLOAD_BUFFER) {
+          upload_capped += obd_result_vector.size() - MAX_UPLOAD_BUFFER;
+          obd_result_vector.erase(obd_result_vector.begin(),
+            obd_result_vector.begin() + (obd_result_vector.size() - MAX_UPLOAD_BUFFER));
+        }
       }
     }
 #if PRINT
@@ -1988,9 +2021,10 @@ void loop() {
     datalogger.writeLine(buildLogLine(current_frame, obd_count));
 #endif
 #if ENABLE_BLE
-    const uint16_t ble_mtu = ble.mtu();
-    const BleTlmFrame ble_frame = bleTlmFrame(current_frame, bleNotifyBudget(ble_mtu));
-    if (ble.logData(ble_frame.notify, ble_frame.full)) {
+    if (ble_relayed) {
+#if (ENABLE_NETWORK) && ENABLE_LOGGING
+      spillUploadBacklog();
+#endif
       if (ble_mtu != g_logged_ble_mtu || ble_frame.dropped > g_logged_ble_drop) {
         g_logged_ble_mtu = ble_mtu;
         g_logged_ble_drop = ble_frame.dropped;
@@ -2004,6 +2038,10 @@ void loop() {
       if (!logging_message_printed) {
         Serial.printf("Logging data over BLE: ");
         logging_message_printed = true;
+#if ENABLE_LOGGING
+        logEvent("BLE relay spilled=%lu free=%lu maxblock=%lu", upload_spilled,
+          (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getMaxAllocHeap());
+#endif
       } else {
         Serial.printf("."); // Add a dot (show that something is happening)
       }
@@ -2013,7 +2051,6 @@ void loop() {
 #if PRINT
       Serial.printf("Successfully logged BLE\n");
 #endif
-      obd_result_vector.clear(); // BLE connected: stream to the phone, stand cellular down (clear the buffer)
     } else { // if logging data over BLE failed / no phone connected -> fall through to the cellular block
       if (logging_message_printed) {
         logging_message_printed = false;
@@ -2065,7 +2102,7 @@ void loop() {
       // No token, no upload. Belt-and-braces since an unpaired dongle also never polls, so the buffer
       // should be empty anyway - but the alternative is powering the modem for a POST the API can only
       // answer 401, and this is the one condition where that is knowable in advance.
-      if (!bleRelaying() && !g_ota_active && !ble_upload_grace && !obd_result_vector.empty() &&
+      if (!bleRelaying() && !upload_spilled && !g_ota_active && !ble_upload_grace && !obd_result_vector.empty() &&
           !tlm_push_token.empty() &&
           (ble_handoff_fire || dc_first_upload || ( millis() - last_broadcast ) > upload_delay)) {
         // Awake-aware backoff. The fail cap exists to stop the modem thrashing a SLEEPING car's 12V when
@@ -2104,6 +2141,7 @@ void loop() {
 #if ENABLE_LOGGING
             logEvent("UPLOAD ok http=%d t=%lums sent=%d left=%d %s", g_last_http, g_last_post_ms, sent,
               (int)obd_result_vector.size(), g_last_status.c_str());
+            logUploadCapped();
 #endif
 #if ENABLE_CELL
             clockNtpAfterUpload(sent, clockCarActive(obd_count > 0, !is_currently_parked, g_last_io36, recently_charging));

@@ -47,6 +47,16 @@ with tempfile.TemporaryDirectory(prefix="obd-heading-checks-") as temporary:
     buffer_start = logger.index("    if (frame_has_data) {")
     buffer_end = logger.index("\n    }\n", buffer_start) + len("\n    }\n")
     (build / "upload_buffer.inc").write_text(logger[buffer_start:buffer_end])
+    relay_start = logger.index("    if (ble_relayed) {")
+    relay = logger[relay_start:logger.index("\n    } else {", relay_start)]
+    if "obd_result_vector" in relay or "spillUploadBacklog();" not in relay:
+        raise RuntimeError("the BLE relay branch must park the cellular upload buffer in flash, never drop it (#58)")
+    if "if (upload_spilled && !bleRelaying()) loadUploadBacklog();" not in logger[gate_start:buffer_start]:
+        raise RuntimeError("the poll after a relay session must restore the parked frames before buffering (#58)")
+    ota = (root / "baseLogger/Helpers/ota_update.h").read_text()
+    ota_commit = ota[ota.index("static void otaFinalize()"):]
+    if not 0 <= ota_commit.find("saveUploadBacklog();") < ota_commit.index("esp_restart();"):
+        raise RuntimeError("the OTA reboot must save the upload backlog kept through the session (#58)")
     sleep = (root / "baseLogger/Helpers/sleep_power.h").read_text()
     marker_start = sleep.index("  if (rtc.getEpoch() > 1e9 && is_currently_parked")
     marker_end = sleep.index("\n  }\n", marker_start) + len("\n  }\n")

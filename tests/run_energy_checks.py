@@ -98,7 +98,7 @@ with tempfile.TemporaryDirectory(prefix="obd-energy-checks-") as temporary:
     end = logger.index("\n    /*\n      CHARGE PROGRESS", start)
     (build / "charge_signal.inc").write_text(logger[start:end])
     start = logger.index("    const bool was_recently_charging")
-    end = logger.index("\n\n    if (frame_has_data) { // skip frames", start)
+    end = logger.index("\n\n#if ENABLE_BLE\n    const uint16_t ble_mtu", start)
     (build / "charge_release.inc").write_text(logger[start:end])
     start = logger.index("    auto chargeCounterRose =")
     end = logger.index("\n    /*\n      DC or AC", start)

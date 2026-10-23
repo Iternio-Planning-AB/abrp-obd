@@ -120,6 +120,7 @@ int logging_errors = 0, g_last_http = 0, g_http0_streak = 0;
 unsigned long g_last_post_ms = 0;
 std::string g_last_status, tlm_push_token = "test-token", api_key = "test-key";
 std::vector<OBDVector> obd_result_vector;
+unsigned long upload_capped = 0, upload_spilled = 0;
 #include "tlm_signature.h"
 #include "network_upload.h"
 #include "backlog_fs.h"
@@ -1265,12 +1266,13 @@ void geoBacklogRows() {
   }
   LittleFS.seed(bounded);
   obd_result_vector.clear();
+  upload_capped = 0;
   loadUploadBacklog();
-  check(obd_result_vector.size() == MAX_UPLOAD_BUFFER && !LittleFS.exists(UPLOAD_BACKLOG_PATH),
-        "MAX120 load cap and existing load/delete behavior unchanged");
+  check(obd_result_vector.size() == MAX_UPLOAD_BUFFER && !LittleFS.exists(UPLOAD_BACKLOG_PATH) && upload_capped == 1,
+        "MAX120 load cap counts the drop and keeps load/delete behavior");
   const auto bounded_points = json::parse(bulkStringV2(obd_result_vector, 1791500000));
   for (size_t i = 0; i < bounded_points.size(); ++i)
-    check(bounded_points[i]["soc"]["time"] == v2Time(1791500000 + i), "mixed queue load cap preserves FIFO");
+    check(bounded_points[i]["soc"]["time"] == v2Time(1791500001 + i), "mixed queue load cap drops the oldest and preserves FIFO");
 }
 
 void geoBacklog() {
@@ -1383,7 +1385,7 @@ void geoLegacy() {
 
 // The real poll-upload gate, buffer push and pre-sleep trip-end marker (logger.ino, sleep_power.h).
 bool park_marker_owed = false;
-void bufferPoll(OBDVector current_frame) {
+void bufferPoll(OBDVector current_frame, bool ble_relayed = false) {
 #include "upload_gate.inc"
 #include "upload_buffer.inc"
 }
@@ -1476,7 +1478,33 @@ void uploadGate() {
   setClock(CLK_HTTP, T);
   bufferPoll(frozen);
   check(obd_result_vector.size() == 1, "a fix restored under an untrusted clock is not buffered again once it is trusted");
-  obd_result_vector.clear();
+
+  // A phone taking the transport (#58): what is queued for cellular stays queued, and what it relays is not.
+  resetFixture();
+  setClock(CLK_HTTP, T);
+  park_marker_owed = false;
+  parkedFixture();
+  OBDVector parked_fix{{"utc", T}};
+  addGpsData(parked_fix);
+  is_currently_parked = false;
+  bufferPoll({{"utc", T - 3}, {"soc", 60}});
+  bufferPoll({{"utc", T - 2}, {"soc", 59}});
+  park_marker_owed = false;
+  bufferPoll({{"utc", T - 1}, {"soc", 58}}, true);
+  check(obd_result_vector.size() == 2 && park_marker_owed, "a relayed driving poll is not queued and still owes the marker");
+  is_currently_parked = true;
+  bufferPoll(parked_fix, true);
+  check(obd_result_vector.size() == 2 && obd_result_vector[0][0].second == T - 3 && obd_result_vector[1][0].second == T - 2,
+        "frames queued before the phone relayed stay queued, in order");
+  bufferPoll(parked_fix);
+  check(obd_result_vector.size() == 3, "after the session the fix the phone never carried is queued");
+  network.received.clear();
+  check(uploadBuffered(false) && obd_result_vector.empty() && network.received.size() == 3, "the handoff drains them");
+
+  upload_capped = 0;
+  for (int i = 0; i <= MAX_UPLOAD_BUFFER; ++i) bufferPoll({{"utc", T - MAX_UPLOAD_BUFFER + i}, {"soc", 50}});
+  check(obd_result_vector.size() == MAX_UPLOAD_BUFFER && obd_result_vector[0][0].second == T - MAX_UPLOAD_BUFFER + 1 &&
+        upload_capped == 1, "the cap drops the oldest frame and counts it for the log");
 }
 
 int main(int argc, char** argv) {
