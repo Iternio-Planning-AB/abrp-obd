@@ -14,7 +14,18 @@ __attribute__((weak)) void cellModemPowerOffHook() {}
 CellWrapper::CellWrapper(FreematicsESP32 sys, std::string apn) : NetworkWrapper(sys), apn{ apn }, net{} { };
 
 bool CellWrapper::init(const bool retry/* = false */) {
+  // 45s registration window. REGRESSION FIX: I had cut this to 15s, but a COLD power-cycle needs longer to
+  // scan + camp (a healthy unit did ~9s, a slower one needed >15s) - and setting CNMP during init triggers a fresh
+  // scan, restarting that clock. 15s cut off legitimate cold attaches, so boot came up offline and only
+  // recovered after the modem had camped in the background across a later run. 45s lets a normal cold camp
+  // finish. If it still fails (true no-signal/garage), the loop's reconnect() probe completes it the moment
+  // the modem registers - so we never lose a registration, we just stop blocking.
+  return init(retry, 45000);
+}
+
+bool CellWrapper::init(const bool retry, unsigned int registration_timeout_ms) {
   do {
+    m_initialized = false;
     m_init_stage = "begin";
     Serial.printf("net begin\n");
     cellModemPowerOnHook(); // begin() powers the modem on
@@ -89,14 +100,8 @@ bool CellWrapper::init(const bool retry/* = false */) {
       memset(d, 0, sizeof(d)); sys.xbPurge(); sys.xbWrite("AT+SIMCOMATI\r"); sys.xbReceive(d, sizeof(d), 2000); Serial.printf("DIAG SIMCOMATI: %s\n", d);
       memset(d, 0, sizeof(d)); sys.xbPurge(); sys.xbWrite("AT+CNMP?\r");      sys.xbReceive(d, sizeof(d), 1000); Serial.printf("DIAG CNMP: %s\n", d);
     }
-    // 45s registration window. REGRESSION FIX: I had cut this to 15s, but a COLD power-cycle needs longer to
-    // scan + camp (a healthy unit did ~9s, a slower one needed >15s) - and setting CNMP above triggers a fresh
-    // scan, restarting that clock. 15s cut off legitimate cold attaches, so boot came up offline and only
-    // recovered after the modem had camped in the background across a later run. 45s lets a normal cold camp
-    // finish. If it still fails (true no-signal/garage), the loop's reconnect() probe completes it the moment
-    // the modem registers - so we never lose a registration, we just stop blocking.
-    m_init_stage = "registration";
-    if (!net.setup(apn.c_str(), 45000)) {
+    m_initialized = true;
+    if (!finishInit(registration_timeout_ms)) {
       Serial.printf("Failed to connect to server using apn %s\n", apn.c_str());
       // Full persistent-radio-config dump on the FIRST failure of this boot (read-only). Includes
       // the live CSQ/CPSI/CEREG/COPS diagnostics plus every NVM-backed setting that survives a
@@ -111,45 +116,54 @@ bool CellWrapper::init(const bool retry/* = false */) {
       }
       continue;
     }
-    Serial.printf("apn setup\n");
-    // Bind the APN to PDP context 0 for the SH HTTP data path. The Freematics open() runs AT+CNACT but
-    // NOT AT+CNCFG, so without this the context activates with no usable data binding and SH requests die
-    // with a bare "ERROR". (Confirmed against the standalone modem test, which does CNCFG and succeeds.)
-    {
-      char cmd[80], b[96] = { 0 };
-      snprintf(cmd, sizeof(cmd), "AT+CNCFG=0,0,\"%s\"\r", apn.c_str());
-      sys.xbPurge();
-      sys.xbWrite(cmd);
-      sys.xbReceive(b, sizeof(b), 3000);
-    }
-    // Enable NITZ (network time) so AT+CCLK reads a real date; persisted in the modem's NVM (see readClock).
-    {
-      char b[64] = { 0 };
-      sys.xbPurge();
-      sys.xbWrite("AT+CTZU=1\r");
-      sys.xbReceive(b, sizeof(b), 1000);
-    }
-    // Disable LTE-M power-saving (PSM + eDRX). Per Freematics' own notes, the SIM7070G on Cat-M1 can enter a
-    // PSM/eDRX "deep sleep" lockup when the tower forces it to sleep or changes bands: the modem's internal
-    // stack freezes, the ESP32 keeps pushing bytes, and only a real reset recovers it. That is exactly the
-    // http=0-at-strong-signal freeze seen mid-drive (and the community's "fails 49/50 at perfect signal").
-    // Turning PSM + eDRX off keeps the radio always-on so the tower can't park it in the locking state - a
-    // preventive fix that complements the CFUN radio-cycle recovery in restart().
-    {
-      char b[64] = { 0 };
-      const char* okerr[] = { "OK", "ERROR" };
-      sys.xbPurge(); sys.xbWrite("AT+CPSMS=0\r");  sys.xbReceive(b, sizeof(b), 2000, okerr, 2); // PSM off
-      memset(b, 0, sizeof(b));
-      sys.xbPurge(); sys.xbWrite("AT+CEDRXS=0\r"); sys.xbReceive(b, sizeof(b), 2000, okerr, 2); // eDRX off
-    }
-    if (!m_ready) m_ready_ms = millis();
-    m_ready = true;
-    m_dead_rf_since = 0; // radio proved alive - re-arm the dead-RF revival ladder
-    m_revive_stage = 0;
     return true;
   } while (retry);
   m_ready = false;
   return false;
+}
+
+bool CellWrapper::finishInit(unsigned int registration_timeout_ms) {
+  m_init_stage = "registration";
+  if (!net.setup(apn.c_str(), registration_timeout_ms)) {
+    m_ready = false;
+    return false;
+  }
+  Serial.printf("apn setup\n");
+  // Bind the APN to PDP context 0 for the SH HTTP data path. The Freematics open() runs AT+CNACT but
+  // NOT AT+CNCFG, so without this the context activates with no usable data binding and SH requests die
+  // with a bare "ERROR". (Confirmed against the standalone modem test, which does CNCFG and succeeds.)
+  {
+    char cmd[80], b[96] = { 0 };
+    snprintf(cmd, sizeof(cmd), "AT+CNCFG=0,0,\"%s\"\r", apn.c_str());
+    sys.xbPurge();
+    sys.xbWrite(cmd);
+    sys.xbReceive(b, sizeof(b), 3000);
+  }
+  // Enable NITZ (network time) so AT+CCLK reads a real date; persisted in the modem's NVM (see readClock).
+  {
+    char b[64] = { 0 };
+    sys.xbPurge();
+    sys.xbWrite("AT+CTZU=1\r");
+    sys.xbReceive(b, sizeof(b), 1000);
+  }
+  // Disable LTE-M power-saving (PSM + eDRX). Per Freematics' own notes, the SIM7070G on Cat-M1 can enter a
+  // PSM/eDRX "deep sleep" lockup when the tower forces it to sleep or changes bands: the modem's internal
+  // stack freezes, the ESP32 keeps pushing bytes, and only a real reset recovers it. That is exactly the
+  // http=0-at-strong-signal freeze seen mid-drive (and the community's "fails 49/50 at perfect signal").
+  // Turning PSM + eDRX off keeps the radio always-on so the tower can't park it in the locking state - a
+  // preventive fix that complements the CFUN radio-cycle recovery in restart().
+  {
+    char b[64] = { 0 };
+    const char* okerr[] = { "OK", "ERROR" };
+    sys.xbPurge(); sys.xbWrite("AT+CPSMS=0\r");  sys.xbReceive(b, sizeof(b), 2000, okerr, 2); // PSM off
+    memset(b, 0, sizeof(b));
+    sys.xbPurge(); sys.xbWrite("AT+CEDRXS=0\r"); sys.xbReceive(b, sizeof(b), 2000, okerr, 2); // eDRX off
+  }
+  if (!m_ready) m_ready_ms = millis();
+  m_ready = true;
+  m_dead_rf_since = 0; // radio proved alive - re-arm the dead-RF revival ladder
+  m_revive_stage = 0;
+  return true;
 }
 
 
@@ -205,8 +219,8 @@ void CellWrapper::reconnect() {
   // The modem needs no restarting to attach: once powered with CFUN=1 (boot init did that), it keeps trying
   // to register on its own in the background. So this is now a CHEAP NON-BLOCKING probe (~0.1-1s):
   //   - modem answers, not registered  -> return immediately; background attach continues, poll loop unhurt
-  //   - modem answers, registered      -> run init() to finish APN/CNCFG binding (fast: registration is the
-  //                                       slow step and it's already done) -> m_ready -> uploads resume
+  //   - modem answers, registered      -> finish APN/CNCFG binding without begin()/PWRKEY or radio config;
+  //                                       one registration recheck only -> m_ready -> uploads resume
   //   - modem doesn't answer at all    -> it's off/dead (boot init failed at power-on) -> full init() to
   //                                       power it on; this is the one blocking path and only fires when
   //                                       the modem is genuinely down, not every retry interval
@@ -247,7 +261,11 @@ void CellWrapper::reconnect() {
     return;
   }
   Serial.printf("Cell reconnect: registered - completing data setup\n");
-  init(); // registration already done -> setup() sees CGREG=1 immediately; completes in a few seconds
+  if (!m_initialized) {
+    init();
+    return;
+  }
+  finishInit(0); // setup(apn, 0) makes one registration pass, not an unbounded search
 }
 
 void CellWrapper::reviveDeadRadio() {
@@ -350,6 +368,7 @@ void CellWrapper::powerOff() {
   if (r != 1) {
     sys.xbTogglePower(2510); // ~2.5s PWRKEY hold = hardware power-off
   }
+  m_initialized = false;
   m_ready = false;
 }
 

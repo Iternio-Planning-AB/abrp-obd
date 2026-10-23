@@ -914,7 +914,7 @@ void setup() {
 #endif
 
 #if ENABLE_NETWORK
-  // ONE bounded network bring-up attempt (~5-10s healthy, ~35s worst case when registration times out).
+  // ONE network bring-up attempt (30s registration search, or 45s for a one-poll parked wake, plus setup).
   // History: init(retry=true) had NO deadline and once looped 2.4 HOURS (boot 147); then a 90s retry window
   // still burned ~93s of drive start before the first poll at every bad-coverage departure (the measured
   // capture-loss windows). Now: try once, then CONTINUE THE WAKE OFFLINE - polling starts ~60s earlier,
@@ -931,8 +931,12 @@ void setup() {
 #endif
   } else {
     unsigned long t0 = millis();
-    esp_task_wdt_reset(); // one attempt is bounded (~35s max, inside the 300s wedge guard)
+    esp_task_wdt_reset(); // registration is bounded separately from begin/SIM/config and diagnostics
+#if ENABLE_CELL
+    net_ok = network.init(false, g_sample_poke ? CELL_REGISTRATION_PARKED_MS : CELL_REGISTRATION_AWAKE_MS);
+#else
     net_ok = network.init(false);
+#endif
 #if ENABLE_LOGGING
     if (net_ok) logEvent("NET init=up t=%lus", (millis() - t0) / 1000UL);
     else {

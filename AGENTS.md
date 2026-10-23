@@ -375,3 +375,9 @@ the modem accepts; that needs `TLSCHECK` on a dongle.
 byte, every signed POST recomputed by the runner from the captured wire bytes with Python's
 hashlib/hmac (gzip on and off), no `X-TLM-TOKEN`, and the real `setHeaders()` AT output (quote escaping,
 refused values, the header budget, abort on a refused `AT+SHAHEAD`) and the best-effort User-Agent.
+
+## Cellular registration host checks
+
+Run `python3 tests/run_modem_checks.py` normally and with `CXX='clang++ -DNDEBUG'`.
+It exercises production cellular startup, registration/recovery and sleep against fake UART/time/hardware.
+Host checks do not verify real attachment timing, electrical sleep behavior or vehicle power/GPS.

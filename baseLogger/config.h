@@ -810,11 +810,12 @@
 #define ACTIVE_TIMER 5*60*1000   // 5 min: driving/idle stage (speed>0 or accel refreshes this leash)
 #define CHARGING_TIMER 5*60*1000 // 5 min: second idle stage before STANDBY -> deep sleep
 
-// VESTIGIAL - no longer referenced. Setup now makes exactly ONE init attempt (~35s worst case, inherently
-// bounded) and continues offline on failure; the loop's cheap CGREG reconnect probe re-attaches mid-drive.
+// Setup makes ONE init attempt: 30s registration search for multi-poll wakes, the field-proven 45s for
+// single-poll parked wakes; begin/SIM/config/diagnostics are separate. Background scans survive expiry.
 // History kept for context: init(retry=true) once looped 2.4 HOURS at a no-service spot (boot 147); a 90s
-// retry window then still burned ~93s of drive start before the first poll (the 41%-capture windows).
-#define NET_INIT_TIMEOUT_MS 90000UL
+// retry window burned ~93s before the first poll (41%-capture windows).
+#define CELL_REGISTRATION_AWAKE_MS 30000U
+#define CELL_REGISTRATION_PARKED_MS 45000U
 
 // Task-watchdog wedge guard (the brick preventer). Boot 153: the device wedged INSIDE modem init - main
 // loop blocked so hard that already-advertising BLE couldn't accept a connection - and sat there 52+ min
