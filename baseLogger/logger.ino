@@ -1189,7 +1189,8 @@ void loop() {
   // Deferred while a firmware update is transferring: applying a profile runs obd.initialize() (a full ATZ +
   // ~10 init AT commands, seconds of blocking) plus a LittleFS profile write and possibly an NVS commit - all
   // of which would stall the sector ACKs and contend with esp_ota_write for the same flash chip. The flag is
-  // sticky, so nothing is lost: the push applies on the first iteration after the update finishes.
+  // sticky, so nothing is lost: the push applies on the first iteration after the update finishes (or, if
+  // the update ends in its reboot, otaFinalize drops it so the app pushes it again).
   // Deferred during a log dump for the same two reasons (window replies stall; the profile write mutates the
   // filesystem the dump is mid-way through reading).
   if (g_config_pending && !g_ota_active && !g_logdump_active) {
@@ -1218,36 +1219,36 @@ void loop() {
         last_applied_profile = profile_dump;
 #if ENABLE_LOGGING
         logEvent("CONFIG applied from BLE push (%d bytes, on loop task)", (int)profile_dump.size());
-        // Persist the accepted push (profile + token) so it survives sleep/reboot. This is what keeps the
-        // NVS hash truthful: boot restores THIS file (loadPersistedProfile) instead of reverting to factory,
-        // and standalone cellular wakes then run the pushed profile too.
-        File pf = LittleFS.open(PROFILE_PATH, "w");
-        if (pf) {
-          pf.print(g_pending_config_str.c_str());
-          pf.close();
-          logEvent("PROFILE persisted to flash (%d bytes)", (int)g_pending_config_str.size());
-        } else {
-          // Couldn't persist: the hash (already committed by the wrapper) would outlive the RAM-only profile.
-          // Invalidate it so the app re-pushes next connect instead of fast-pathing onto a stale factory boot.
-          ble.invalidateHash();
-          logEvent("PROFILE persist FAILED - hash invalidated (app will re-push)");
-        }
 #endif
       } else {
 #if ENABLE_LOGGING
         logEvent("CONFIG push identical to running profile - re-init skipped");
 #endif
       }
+#if ENABLE_LOGGING
+      // Persist the accepted push (profile + token) so it survives sleep/reboot. This is what keeps the
+      // NVS hash truthful: boot restores THIS file (loadPersistedProfile) instead of reverting to factory,
+      // and standalone cellular wakes then run the pushed profile too. Every full push is written, an
+      // identical profile included: the app's hash covers the token.
+      File pf = LittleFS.open(PROFILE_PATH, "w");
+      const bool saved = pf && pf.print(g_pending_config_str.c_str()) == g_pending_config_str.size();
+      if (pf) pf.close();
+      if (saved) {
+        logEvent("PROFILE persisted to flash (%d bytes)", (int)g_pending_config_str.size());
+      } else {
+        dropUnsavedPush("write");
+      }
+#endif
       config_initialized = true;
     }
     catch (const json::exception& err) {
       Serial.printf("CONFIG apply failed: %s\n", err.what());
-      // The wrapper committed the new hash at SETUP OK, but the profile never applied: invalidate so the
-      // fast path can't claim it - the app re-pushes on the next connect.
-      ble.invalidateHash();
+      // The wrapper committed the new hash at SETUP OK, but the profile never applied (the RAM token may
+      // already have moved): drop the hash and the file so no wake runs either half - the app re-pushes.
 #if ENABLE_LOGGING
-      logEvent("CONFIG apply FAILED: %.60s - hash invalidated (app will re-push)", err.what());
+      logEvent("CONFIG apply FAILED: %.60s", err.what());
 #endif
+      dropUnsavedPush("apply");
     }
   }
 #endif

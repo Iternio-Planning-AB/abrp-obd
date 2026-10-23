@@ -19,6 +19,7 @@ void alarmFlagHook(int v);
 bool alarmFlagged();
 bool alarmEnforced();
 extern bool g_obd_needs_init;
+void dropUnsavedPush(const char* why); // defined with the persisted profile below
 
 /*
   Callbackfunction for BLEWrapper. To be called when config has been completely transferred over BLE
@@ -142,6 +143,7 @@ void bleDeinitForSleep() {
   uint32_t heap_before = ESP.getFreeHeap();
   ble.deinit();
   g_ble_up = false;
+  if (g_config_pending) dropUnsavedPush("sleep"); // no callback can arrive now; RAM goes with the sleep
   Serial.printf("BLE down before sleep (heap %lu -> %lu freed)\n",
     (unsigned long)heap_before, (unsigned long)ESP.getFreeHeap());
 #if ENABLE_LOGGING
@@ -160,10 +162,21 @@ void bleDeinitForSleep() {}
   itself lived in RAM - so every sleep/reboot silently reverted to the factory initScenic() profile while the
   fast path (HASH OK) told the app its pushed profile was still active. Masked so far because the app's Scenic
   profile ~= initScenic; a genuinely different profile would have polled the wrong PIDs on every standalone
-  wake. Fix: the loop's config-apply block writes the accepted push (configJson + tlm_push_token) to this
-  file; boot loads it in preference to the factory profile. Hash and profile now live or die together.
+  wake. Fix: the loop's config-apply block writes every accepted push (configJson + tlm_push_token) to this
+  file; boot loads it in preference to the factory profile. Hash and profile now live or die together. A push
+  that cannot be written, or is still waiting for the loop when RAM goes, takes both down (dropUnsavedPush).
 */
 static const char* PROFILE_PATH = "/vehicle_profile.json";
+
+// A full push that will never reach the file (it failed to apply or write, or sleep / the OTA reboot wipes RAM before the
+// loop applied it), while the wrapper already committed its hash at SETUP OK. Drop the hash AND the file: no
+// later wake may run a profile or token older than the last accepted push. The app re-pushes on its next
+// connect; until then the dongle waits as an unpaired one does.
+void dropUnsavedPush(const char* why) {
+  LittleFS.remove(PROFILE_PATH);
+  ble.invalidateHash();
+  logEvent("PROFILE push not saved (%s) - profile removed, hash invalidated (app will re-push)", why);
+}
 
 bool loadPersistedProfile() {
   if (!LittleFS.exists(PROFILE_PATH)) return false;
@@ -202,4 +215,6 @@ bool loadPersistedProfile() {
     return false;
   }
 }
+#elif ENABLE_BLE
+void dropUnsavedPush(const char*) { ble.invalidateHash(); } // nothing on flash to remove
 #endif
