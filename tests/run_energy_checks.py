@@ -9,7 +9,7 @@ import tempfile
 
 arguments = argparse.ArgumentParser()
 arguments.add_argument("group", nargs="?", default="all",
-                       choices=["all", "progress", "signal", "release", "corroboration", "wake-gate", "logging", "schema", "transport", "sleep-reason", "ble-frame", "profiles"])
+                       choices=["all", "progress", "signal", "release", "corroboration", "wake-gate", "logging", "schema", "transport", "sleep-reason", "wdt-streak", "ble-frame", "profiles"])
 arguments.add_argument("--profiles", type=Path)
 args = arguments.parse_args()
 if args.group == "profiles" and args.profiles is None:
@@ -23,6 +23,8 @@ logging = (root / "baseLogger/Helpers/logging.h").read_text()
 datalogger = (root / "libraries/DataLogger/datalogger.cpp").read_text()
 sleep = (root / "baseLogger/Helpers/sleep_power.h").read_text()
 state_machine = (root / "baseLogger/Helpers/state_machine.h").read_text()
+streak = (root / "baseLogger/Helpers/wdt_streak.h").read_text()
+ota = (root / "baseLogger/Helpers/ota_update.h").read_text()
 
 
 
@@ -33,6 +35,25 @@ WORST_EVENT_ARGS = {
     "SAMPLE_POLL ": (99, 1, 1, 255, 1, 99, 15.99, 15.99, 1, 255, 1, 15),
     "ATRVGATE atrv=": (15.99, 15.99, "ASLEEP", "poll(taper-confirm)", 9999999, 999999, 999999, 1, "ENFORCE"),
 }
+# The host stand-in for the streak store keeps its bytes across boots, as RTC_NOINIT_ATTR does and
+# RTC_DATA_ATTR (reloaded on every reset but a deep-sleep wake) does not.
+if not re.search(r"^RTC_NOINIT_ATTR WdtStreakStore wdt_streak_store;", streak, re.MULTILINE):
+    raise SystemExit("FAIL: the WDT streak store must be RTC_NOINIT_ATTR: RTC_DATA_ATTR is reloaded by every crash it counts")
+# Counted before anything that can crash or hang: a reset ahead of the advance would repeat with the count frozen.
+setup = logger.index("void setup() {")
+if not setup < logger.index("  wdt_reset_count = wdtStreakAdvance(") < logger.index("  Serial.begin(115200);", setup):
+    raise SystemExit("FAIL: setup() must advance the WDT streak before Serial.begin()")
+# The modem flag is kept by CellWrapper's hooks: every init() may power the modem on, only an acknowledged
+# AT+CPOWD proves it off. The fake network in the test stands on these.
+cell = (root / "libraries/NetworkWrapper/cellwrapper.cpp").read_text()
+init = cell[cell.index("bool CellWrapper::init("):]
+if not init.index("cellModemPowerOnHook();") < init.index("net.begin(&sys)"):
+    raise SystemExit("FAIL: CellWrapper::init must call cellModemPowerOnHook() before net.begin()")
+power_off = cell[cell.index("void CellWrapper::powerOff() {"):]
+if not re.search(r"\n  if \(r == 1\) cellModemPowerOffHook\(\);", power_off[:power_off.index("\n}\n")]):
+    raise SystemExit("FAIL: CellWrapper::powerOff must call cellModemPowerOffHook() on the CPOWD ack only")
+if not re.search(r"wdtStreakEnd\(\);\n\s*esp_restart\(\);\s*// never returns", ota):
+    raise SystemExit("FAIL: the OTA commit must end the WDT streak right before its esp_restart()")
 for prefix, values in WORST_EVENT_ARGS.items():
     start = logger.index('logEvent("' + prefix) + len('logEvent("')
     message = logger[start:logger.index('"', start)] % values
@@ -92,7 +113,14 @@ with tempfile.TemporaryDirectory(prefix="obd-energy-checks-") as temporary:
     end = sleep.index("WOM_THRESHOLD_G);\n", start) + len("WOM_THRESHOLD_G);\n")
     (build / "sleep_log.inc").write_text(sleep[start:end])
     (build / "net_recover_sleep.inc").write_text(block(logger, "if (g_recovers_since_ok >= 2 && net_reboot_count < 2) {"))
-    (build / "wdt_streak_sleep.inc").write_text(block(logger, "if (g_wdt_wake && wdt_reset_count >= 2) {"))
+    start = logger.index("  wdt_reset_count = wdtStreakAdvance(")
+    (build / "wdt_streak_wake.inc").write_text(logger[start:logger.index("\n", start) + 1])
+    (build / "wdt_streak_sleep.inc").write_text(block(logger, "if (wdt_reset_count >= 2) {"))
+    start = sleep.index("  bool modem_down = modem_on;")
+    (build / "sleep_probe.inc").write_text(sleep[start:sleep.index("#endif\n", start) + 7])
+    start = sleep.index("  if (modem_down) network.powerOff();")
+    (build / "sleep_modem.inc").write_text(sleep[start:sleep.index("\n", start) + 1])
+    (build / "reconnect.inc").write_text(block(logger, "if (!g_weak_rail_cold_boot && !bleRelaying() && !g_ota_active"))
     (build / "backstop_sleep.inc").write_text(block(state_machine, "if (!maintenance_mode && !g_ota_active && !g_logdump_active"))
     (build / "ble_frame_log.inc").write_text(block(logger, "if (ble_mtu != g_logged_ble_mtu"))
     executable = build / "energy_checks"

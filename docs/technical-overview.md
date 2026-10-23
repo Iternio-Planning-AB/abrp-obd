@@ -116,7 +116,8 @@ long the ESP32 is awake, which is why the cadences and the rail gate matter more
 current.
 
 **Deep sleep is a reboot, not a resume.** RAM is wiped and `setup()` runs again from the top.
-Anything that must survive is `RTC_DATA_ATTR` or LittleFS.
+Anything that must survive is `RTC_DATA_ATTR` or LittleFS. `RTC_DATA_ATTR` survives deep sleep only: a
+panic, watchdog or software reset reloads it.
 
 ## Code layout
 
@@ -137,6 +138,7 @@ order and share its globals. See [`AGENTS.md`](../AGENTS.md) before adding one.
 |---|---|
 | `state_machine.h` | The activity state machine (BLE / ACTIVE / CHARGING / STANDBY). |
 | `sleep_power.h` | Deep sleep (the one `enterDeepSleep` primitive), the IO36 12 V rail read, wake-cause decoding, wake-on-motion arming. |
+| `wdt_streak.h` | The consecutive panic/WDT reset count behind the crash-loop escalation, and whether the modem may still be powered, kept in `RTC_NOINIT` memory so the resets they track don't wipe them. |
 | `mems.h` | ICM-42627 motion sensor: movement detection and wake-on-motion. |
 | `icm42627_cal.h` | Accelerometer bias calibration and the WOM threshold. |
 | `gps_location.h` | GNSS position, the parked-location average, the movement-streak logic. |
@@ -307,6 +309,7 @@ USB only: physical access by design. Type these into the serial monitor (115200 
 | `OTARESET` | Clear the OTA anti-downgrade floor (after a bench flash to a lower version). |
 | `JWSTEST` | Self-test the profile-signature verifier. |
 | `GZTEST <bytes> [count]` | Compress and verify `count` (default 100, at most 2000) synthetic upload bodies of `bytes` and print pass/fail by cause. Holds the main loop (BLE requests and sleep wait) for at most 30 s; any key stops it sooner. |
+| `PANIC` / `WDTHANG` | Bench only: crash now, or hang until the watchdog resets the dongle (5 min), to check the crash-loop streak in the log. Two in a row make the next boot sleep instead. |
 | `RESUME` | Hand back to normal duty (re-allow sleep) after a maintenance session. |
 
 > **One-sided bonds bite.** If you clear bonds on the dongle (or reflash with bonding disabled), also

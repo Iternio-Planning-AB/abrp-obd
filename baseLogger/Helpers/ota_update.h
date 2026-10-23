@@ -555,6 +555,7 @@ static void otaFinalize() {
   Serial.printf("OTA: committed, rebooting into new firmware\n");
   Serial.flush();
   delay(600);            // let the COMMITTED notify actually go out over the air before we reset
+  wdtStreakEnd();
   esp_restart();         // never returns
 }
 

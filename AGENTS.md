@@ -71,8 +71,9 @@ must never compile — the reference FreematicsPlus would collide with the real 
 
 **Deep sleep is a reboot, not a resume.** RAM is wiped and `setup()` runs again from the top. Anything
 that must survive is `RTC_DATA_ATTR` (wake/sleep counters, the charging budget, the taper latch, the
-watchdog streak, the frozen parked fix) or LittleFS (the vehicle profile, the upload backlog). A plain
-global reset to its initialiser on every wake is the most common way to get this wrong.
+frozen parked fix) or LittleFS (the vehicle profile, the upload backlog). A plain global reset to its
+initialiser on every wake is the most common way to get this wrong. `RTC_DATA_ATTR` survives deep sleep
+only: a panic, WDT or software reset reloads it too (`DONGLE_CONTEXT.md` §11).
 
 **BLE callbacks run on the Bluedroid task and must only copy bytes and set a flag.** All NVS, crypto
 and OBD work happens on the loop task, in the matching `*Service()` function. This is stated as
@@ -330,7 +331,10 @@ RTC retention and NVS across a re-plug need a dongle and a parked night (look fo
 
 Run `python3 tests/run_energy_checks.py` for charge progress/corroboration, the `is_charging` verdict
 and release latch (`signal`, `release`; replays field current sequences, no location data), the `setup()`
-wake gate (taper and charge-end reads), the `SLEEP enter` reason labels (`sleep-reason`), the ABD1 frame fitted to MTU−3 (`ble-frame`: compact 2 dp numbers, key filtering, priority trimming, MTU 23, and the `BLE tlm` log cadence), telemetry serialization, CSV columns, and schema-rotation checks under
+wake gate (taper and charge-end reads), the `SLEEP enter` reason labels (`sleep-reason`), the crash-loop
+streak (`wdt-streak`: the real `wdt_streak.h` store across simulated resets, garbage and foreign stores,
+the escalation's threshold and cadence, the OTA commit ending it, the retained "modem may be on" flag
+every sleep acts on, and the weak-rail cold boot never reconnecting the modem), the ABD1 frame fitted to MTU−3 (`ble-frame`: compact 2 dp numbers, key filtering, priority trimming, MTU 23, and the `BLE tlm` log cadence), telemetry serialization, CSV columns, and schema-rotation checks under
 ASan/UBSan. Add `--profiles /path/to/profiles` to exercise actual Scenic/iX3 production/developer
 equations with the firmware parser (optional: the ABRP backend profiles are not public). The runner extracts the current charging and logging code;
 filesystem and hardware are fakes, not on-device verification.

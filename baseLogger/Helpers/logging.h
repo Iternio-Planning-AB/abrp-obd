@@ -193,7 +193,7 @@ void handleLogCommands() {
   const bool is_dump = cmd.equalsIgnoreCase("DUMP") ||
                        (cmd.length() > 5 && cmd.substring(0, 5).equalsIgnoreCase("DUMP "));
   if ((g_ota_active || g_logdump_active) &&
-      (is_dump || cmd.equalsIgnoreCase("CLEAR") ||
+      (is_dump || cmd.equalsIgnoreCase("CLEAR") || cmd.equalsIgnoreCase("PANIC") || cmd.equalsIgnoreCase("WDTHANG") ||
        cmd.equalsIgnoreCase("RADIO") || cmd.equalsIgnoreCase("CLKPROBE") || cmd.equalsIgnoreCase("TLSCHECK") ||
        cmd.substring(0, 6).equalsIgnoreCase("GZTEST") ||
        cmd.substring(0, 2).equalsIgnoreCase("AT"))) {
@@ -284,5 +284,15 @@ void handleLogCommands() {
   // Bench check of the compressor and its verifier on synthetic bodies (gzip_body.h).
   else if (cmd.substring(0, 6).equalsIgnoreCase("GZTEST")) gzipBenchTest(cmd.c_str() + 6);
   else if (cmd.equalsIgnoreCase("RESUME")) maintenance_mode = false; // hand back to normal duty (sleep allowed)
+  // Bench-only, physical access: the two resets the crash-loop guard counts (wdt_streak.h), to see on a dongle
+  // that its count survives them. Two in a row escalate. PANIC aborts now; WDTHANG stops feeding the wedge
+  // watchdog, which resets after WEDGE_WDT_TIMEOUT_S.
+  else if (cmd.equalsIgnoreCase("PANIC") || cmd.equalsIgnoreCase("WDTHANG")) {
+    const bool hang = cmd.equalsIgnoreCase("WDTHANG");
+    logEvent("CONSOLE %s requested (streak=%lu)", hang ? "WDTHANG" : "PANIC", (unsigned long)wdt_reset_count);
+    Serial.flush();
+    if (!hang) abort();
+    for (;;) delay(1000);
+  }
 }
 #endif
