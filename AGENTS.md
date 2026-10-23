@@ -201,7 +201,12 @@ BLE byte-stream reading, cached GPS fields, native millis wrap, and that BLE wri
 records keys, never values, and (`motion`) the per-minute `MOTION` line aggregation: percentages, peak/mean,
 one line per minute, the partial-minute flush at sleep and uncounted OTA/log-dump windows. `fw-build` covers the `FW build=` line: top of every new segment (first boot, schema
 rotation, size rotation inside `logEvent` with the segment size still exact, `CLEAR`), again on a
-non-deep-sleep boot, never on a continued segment, and the `eacc642` loader not rotating on it. `--capture-helper <absolute-script-path>` (optional; the helper is an internal tool,
+non-deep-sleep boot, never on a continued segment, and the `eacc642` loader not rotating on it. `dump-since` covers `DUMP SINCE`: clockless boots
+taking their boot's first epoch across a segment boundary, a never-clocked boot taking the epoch before it, a
+millis-drop boot boundary, context lines under their own segment headers, a since older than everything (byte-equal
+to `DUMP`) and newer than everything (header and end marker), that segments ending before since are never opened,
+that logging resumes, and the console parse. `--since-helper <absolute path to capture2.py>` (optional; internal
+tool) runs 300 random synthetic logs against its `SinceFilter`. `--capture-helper <absolute-script-path>` (optional; the helper is an internal tool,
 not in this repo) also verifies a synthetic dump through it, including actual historical
 `eacc642` logger-begin and CSV-builder code simulating a firmware rollback; this does not open a device.
 `CXX="clang++ -DNDEBUG"` keeps assertions checked.

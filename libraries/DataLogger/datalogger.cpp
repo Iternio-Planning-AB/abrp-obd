@@ -1,4 +1,5 @@
 #include "datalogger.h"
+#include <string.h>
 
 // Tunables. SEGMENT_BYTES is the unit of rotation AND of deletion, so it trades granularity (how much
 // old data is dropped at once) against file count. HEADROOM keeps the FS from ever being driven 100%
@@ -179,6 +180,227 @@ void DataLogger::dump(Stream& out, int newest) {
   out.printf("===== end of dump =====\n");
 
   if (wasOpen) openSegment(resumeIndex);
+}
+
+// DUMP SINCE. The line-time rule is the host capture script's (SinceFilter in its capture2.py), which also
+// filters what this sends, so the two agree:
+//  - a CSV row (`millis,utc,...`) or an EVT line (`EVT,utc,millis,state,atrv,rail,text`) has a time; any
+//    other line takes the verdict of the line before it;
+//  - utc >= 1e9 is a real epoch. A smaller one, logged before the clock was set, takes its boot's first real
+//    epoch; a boot with none takes the last epoch before it, and with none at all it is kept;
+//  - a boot starts at a `WAKE reason=` event or where millis goes backwards;
+//  - the boot's WAKE and `FW build=` lines, and each segment's `=====` line and CSV header, come ahead of
+//    the first kept line.
+// Only the first kept line (the cut) is found here; everything after it streams verbatim, as DUMP does, and
+// the host filter trims what the rule would still drop after it (lines from a clock that stepped back).
+// The scan starts at the newest segment whose last epoch is before `since`, announced at once so a host
+// probe sees the reply in its window; older segments are not opened, which assumes the clock does not run
+// backwards across segments. Lines before the log's first time (torn or pattern-less) are never a cut.
+namespace {
+const uint64_t SINCE_CLOCK_VALID = 1000000000ULL; // capture2's CLOCK_VALID, compared with >= as it does
+const int SINCE_MAX_CONTEXT = 8;                  // a boot's WAKE and FW lines: one FW per segment it spans
+
+struct LineTime {
+  bool timed = false, wake = false, fw = false;
+  uint64_t utc = 0, millis = 0;
+};
+
+// Saturates, so an overlong digit run still compares as Python's unbounded int does.
+bool takeDigits(const char*& p, const char* end, uint64_t& value) {
+  const char* first = p;
+  for (value = 0; p < end && *p >= '0' && *p <= '9'; ++p)
+    value = value > (UINT64_MAX - 9) / 10 ? UINT64_MAX : value * 10 + (uint64_t)(*p - '0');
+  return p > first;
+}
+
+bool startsWith(const char* p, const char* end, const char* prefix) {
+  const size_t n = strlen(prefix);
+  return (size_t)(end - p) >= n && memcmp(p, prefix, n) == 0;
+}
+
+// The fields SinceFilter's ROW_RE and EVT_RE take from a line; its first bytes are enough.
+LineTime lineTime(const char* line, size_t len) {
+  LineTime t;
+  const char* p = line;
+  const char* end = line + len;
+  if (startsWith(p, end, "EVT,")) {
+    p += 4;
+    if (!takeDigits(p, end, t.utc) || !(p < end && *p++ == ',') || !takeDigits(p, end, t.millis) || !(p < end && *p++ == ','))
+      return LineTime{};
+    for (int field = 0; field < 3; ++field) { // state, atrv, rail
+      const char* comma = (const char*)memchr(p, ',', end - p);
+      if (!comma) return LineTime{};
+      p = comma + 1;
+    }
+    t.wake = startsWith(p, end, "WAKE reason=");
+    t.fw = startsWith(p, end, "FW build=");
+  } else if (!takeDigits(p, end, t.millis) || !(p < end && *p++ == ',') || !takeDigits(p, end, t.utc) || !(p < end && *p++ == ',')) {
+    return LineTime{};
+  }
+  t.timed = true;
+  return t;
+}
+
+// Reads a segment line by line through one buffer, keeping each line's first bytes.
+struct LineScanner {
+  File& file;
+  uint8_t buf[512];
+  size_t len = 0, pos = 0;
+  size_t offset = 0;  // file offset of the next unread byte: the end of the current line
+  size_t start = 0;   // file offset of the current line
+  char head[192];     // an EVT line's fields up to its text prefix fit easily
+  size_t headLen = 0;
+  explicit LineScanner(File& f) : file(f) {}
+  bool next() {
+    start = offset;
+    headLen = 0;
+    for (;;) {
+      if (pos == len) {
+        const int n = file.read(buf, sizeof(buf));
+        if (n <= 0) return offset > start; // a last line without its newline still counts
+        len = (size_t)n;
+        pos = 0;
+      }
+      const uint8_t c = buf[pos++];
+      ++offset;
+      if (c == '\n') return true;
+      if (headLen < sizeof(head)) head[headLen++] = (char)c;
+    }
+  }
+  bool csvHeader() const { return start == 0 && startsWith(head, head + headLen, "millis,utc,"); }
+};
+
+// The last real epoch among the whole lines in a segment's last 512 bytes; false when there is none.
+bool tailEpoch(const char* path, uint64_t& epoch) {
+  File f = LittleFS.open(path, "r");
+  if (!f) return false;
+  uint8_t buf[512];
+  const size_t size = f.size();
+  const size_t from = size > sizeof(buf) ? size - sizeof(buf) : 0;
+  const int n = f.seek(from) ? (int)f.read(buf, sizeof(buf)) : 0;
+  f.close();
+  const char* p = (const char*)buf;
+  const char* end = p + (n > 0 ? n : 0);
+  if (from > 0) { // the first line began before the chunk
+    const char* nl = (const char*)memchr(p, '\n', end - p);
+    p = nl ? nl + 1 : end;
+  }
+  bool found = false;
+  while (p < end) {
+    const char* nl = (const char*)memchr(p, '\n', end - p);
+    const LineTime t = lineTime(p, (nl ? nl : end) - p);
+    if (t.timed && t.utc >= SINCE_CLOCK_VALID) { epoch = t.utc; found = true; }
+    p = nl ? nl + 1 : end;
+  }
+  return found;
+}
+
+// Bytes [from, to) of a segment, to its end when `to` is past it.
+size_t copyRange(const char* path, size_t from, size_t to, Stream& out) {
+  File f = LittleFS.open(path, "r");
+  if (!f) return 0;
+  size_t sent = 0;
+  if (f.seek(from)) {
+    uint8_t buf[512];
+    for (int n; from + sent < to && (n = f.read(buf, to - from - sent < sizeof(buf) ? to - from - sent : sizeof(buf))) > 0;) {
+      out.write(buf, n);
+      sent += (size_t)n;
+    }
+  }
+  f.close();
+  return sent;
+}
+
+// The `=====` line dump() prints, then the segment's CSV header when it has one, or the whole segment.
+size_t segmentHeader(const char* path, Stream& out, bool whole = false) {
+  File f = LittleFS.open(path, "r");
+  if (!f) return 0;
+  char banner[64];
+  int n = snprintf(banner, sizeof(banner), "===== %s (%u bytes) =====\n", path, (unsigned)f.size());
+  if (n < 0 || n >= (int)sizeof(banner)) n = 0; // cannot happen for pathFor() names; never read past banner
+  LineScanner scan(f);
+  const size_t header = whole ? (size_t)-1 : scan.next() && scan.csvHeader() ? scan.offset : 0;
+  f.close();
+  out.write((const uint8_t*)banner, n);
+  return n + (header ? copyRange(path, 0, header, out) : 0);
+}
+
+struct LineMark {
+  int seg = -1;
+  size_t off = 0, len = 0;
+  LineMark() {}
+  LineMark(int s, size_t o, size_t l) : seg(s), off(o), len(l) {}
+  bool before(const LineMark& other) const { return seg < other.seg || (seg == other.seg && off < other.off); }
+};
+} // namespace
+
+DataLogger::SinceStats DataLogger::dumpSince(Stream& out, uint32_t since) {
+  SinceStats stats;
+  if (!mounted) { out.printf("[log] not mounted\n"); return stats; }
+  invalidateReadCursor();
+  bool wasOpen = (bool)active; // as dump(): no reads alongside the append handle
+  int resumeIndex = activeIndex;
+  if (active) active.close();
+
+  const int lo = lowestIndex(), hi = highestIndex();
+  for (int i = hi; lo >= 0 && i >= lo && stats.start < 0; --i) {
+    uint64_t last;
+    if (tailEpoch(pathFor(i).c_str(), last) && last < since) stats.start = i; // a gap fails the open
+  }
+  if (stats.start < 0) stats.start = lo;
+
+  LineMark cut, pending, context[SINCE_MAX_CONTEXT];
+  int contexts = 0;
+  if (stats.start >= 0) {
+    stats.sent += segmentHeader(pathFor(stats.start).c_str(), out);
+    bool clocked = false, clockless = false; // the boot has had a real epoch / a small utc before one
+    bool epochBefore = stats.start != lo;     // the skipped segments end before since
+    bool haveMillis = false;
+    uint64_t lastMillis = 0;
+    for (int i = stats.start; i <= hi && cut.seg < 0; ++i) {
+      File f = LittleFS.open(pathFor(i).c_str(), "r"); // index gaps are normal after budget deletions
+      if (!f) continue;
+      LineScanner scan(f);
+      while (cut.seg < 0 && scan.next()) {
+        const LineTime t = lineTime(scan.head, scan.headLen);
+        if (!t.timed || scan.csvHeader()) continue;
+        const LineMark here(i, scan.start, scan.offset - scan.start);
+        if (t.wake || (haveMillis && t.millis < lastMillis)) { // a new boot
+          if (clockless && !clocked && !epochBefore) { cut = pending; break; }
+          clocked = clockless = false;
+          contexts = 0;
+        }
+        haveMillis = true;
+        lastMillis = t.millis;
+        if (t.utc >= SINCE_CLOCK_VALID) {
+          if (t.utc >= since) cut = clockless && !clocked ? pending : here; // the clockless lines take this epoch
+          clocked = epochBefore = true;
+        } else if (!clocked && !clockless) {
+          clockless = true;
+          pending = here;
+        }
+        if ((t.wake || t.fw) && contexts < SINCE_MAX_CONTEXT) context[contexts++] = here;
+      }
+      f.close();
+    }
+    if (cut.seg < 0 && clockless && !clocked && !epochBefore) cut = pending; // a clockless last boot
+  }
+
+  if (cut.seg >= 0) {
+    stats.cut = cut.seg;
+    int shown = stats.start;
+    for (int c = 0; c < contexts && context[c].before(cut); ++c) {
+      if (context[c].seg != shown) stats.sent += segmentHeader(pathFor(shown = context[c].seg).c_str(), out);
+      stats.sent += copyRange(pathFor(context[c].seg).c_str(), context[c].off, context[c].off + context[c].len, out);
+    }
+    if (cut.seg != shown) stats.sent += segmentHeader(pathFor(cut.seg).c_str(), out);
+    stats.sent += copyRange(pathFor(cut.seg).c_str(), cut.off, (size_t)-1, out);
+    for (int i = cut.seg + 1; i <= hi; ++i) stats.sent += segmentHeader(pathFor(i).c_str(), out, true);
+  }
+  out.printf("===== end of dump =====\n");
+
+  if (wasOpen) openSegment(resumeIndex);
+  return stats;
 }
 
 size_t DataLogger::totalSize() {
