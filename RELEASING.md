@@ -91,16 +91,25 @@ yours on official ones; that is the point.
 
 ## Known gaps
 
+- CI never links the firmware, so the linker-map check (`tools/pio_psram_libs.py`, which fails any image that
+  links a runtime without the PSRAM workaround) first runs in the release build. After a platform, framework or
+  toolchain bump, build the merge commit with `pio run -e esp32dev` before tagging, and run `GZTEST 12000` on a
+  dongle: it compresses in PSRAM.
 - The publish job trusts what the build job built. It checks only the build tag and the embedded public key, so a
   compromised PlatformIO dependency can't reach the key but could still get a backdoored image signed. The PyPI tools
   are pinned by hash (`.github/requirements/release.txt`), except starlette, which only `pio home` needs (see
-  `release.in`). The platform, the Arduino framework, esptool (which writes the signed `firmware.bin`) and SCons
-  (which runs every build step) are pinned by version in `platformio.ini`, with no hashes, so they hold only while
-  the registry doesn't republish a version; a pin without a `+` suffix also accepts a `+` rebuild of it. The
-  toolchain is pinned by the platform's own manifest. Bump them together, and compare images built before and
-  after from the same checkout path, core directory and `SOURCE_DATE_EPOCH`: `__FILE__` and `__DATE__` end up in
-  the image.
-- The lock covers only the tools the workflow installs. During the Build step, PlatformIO's `tool-esptoolpy` package
-  runs a post-install script that pip-installs esptool's own dependencies (cryptography, ecdsa, bitstring, reedsolo,
-  intelhex) by version range, without hashes, into the package's `_contrib` directory, where `pip check` doesn't
-  look (#46).
+  `release.in`), and so are esptool's own dependencies, which `tool-esptoolpy`'s post-install script pip-installs
+  while PlatformIO installs its packages (`esptool.txt`; from the fetch on, pip has no index, only those wheels). The
+  platform, the Arduino framework, esptool (which writes the signed `firmware.bin`) and SCons (which runs every build
+  step) are pinned by version in `platformio.ini`, with no hashes, so they hold only while the registry doesn't
+  republish a version; a pin without a `+` suffix also accepts a `+` rebuild of it. The toolchain is pinned by the
+  platform's own manifest. Bump them together, and compare images built before and after from the same checkout path,
+  core directory and `SOURCE_DATE_EPOCH`: `__FILE__` and `__DATE__` end up in the image.
+- esptool's dependency list is copied by hand from the package's `package-postinstall.py` (`esptool_deps`) into
+  `esptool.in`. On an esptool bump, copy the new list and regenerate `esptool.txt` with the command in `esptool.in`.
+  *Check esptool dependencies* fails the run when the installed hook's list differs from `esptool.in`, or when
+  `_contrib` holds anything but the files the hash-checked wheels list, byte for byte. pip doesn't re-check a fetched
+  wheel's hash when it installs it; a hashed `PIP_CONSTRAINT` would, but pip 25.0.1 (the one CPython 3.12.15 bundles)
+  then refuses the hook's `~=` ranges. If PyPI deletes a locked file, *Fetch esptool dependencies* fails and nothing
+  can be released until the lock is regenerated. pip itself is not pinned: setup-python's bundled pip checks the
+  hashes and runs the hook's install (the run prints its version).

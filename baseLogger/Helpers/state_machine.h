@@ -113,8 +113,7 @@ void changeState(ActivityState new_state) {
   // (-> CHARGING/STANDBY). Pairs with the speed > 0 unlatch in loop() so the parked state is
   // restored without depending on a deep-sleep reboot to reset the global.
   if (new_state == CHARGING || new_state == STANDBY) {
-    if (!is_currently_parked) freezeParkedLocation(); // 0->1: capture the stabilized last-driving fix
-    is_currently_parked = true;
+    driveIdle(); // 0->1: freezes the stabilized last-driving fix
   }
   transmission_delay = getTransmissionDelay(new_state);
   polling_delay = getPollingDelay(new_state);
@@ -123,6 +122,51 @@ void changeState(ActivityState new_state) {
 #if OBD_ALARM_GATE
 bool alarmEnforced(); // alarm_gate.h is included after this file
 #endif
+
+// DC_CHARGING_AWAKE_SECONDS. Motion within an ACTIVE_TIMER suspends the hold, so a drive is polled at ACTIVE's
+// own cadence from the first motion.
+bool dcMotionRecent() { return g_last_motion_ms && millis() - g_last_motion_ms < (unsigned long)ACTIVE_TIMER; }
+// Why a confirmed DC charge does not hold the wake awake right now, read live on every use; null when it does.
+const char* dcAwakeVeto(ActivityState state) {
+  if (state == BLE) return "ble";                           // the phone's session keeps its own cadence
+  if (g_last_io36 < RAIL_AWAKE_VOLTS) return "rail";        // the DC-DC is not up
+#if OBD_ALARM_GATE
+  if (alarmEnforced()) return "alarm";                      // a flagged car is never held awake parked
+#endif
+  if (dcMotionRecent()) return "motion";
+  return nullptr;
+}
+bool dcAwakeHeld(ActivityState state) { return g_dc_confirmed && !dcAwakeVeto(state); }
+// A held charge polls and uploads every DC_CHARGING_AWAKE_SECONDS. Read at the poll and upload gates: the
+// state delays are snapshots taken at changeState(), and the hold changes between transitions.
+unsigned long dcAwakeDelay(ActivityState state, unsigned long state_delay) {
+  return dcAwakeHeld(state) ? (unsigned long)DC_CHARGING_AWAKE_SECONDS * 1000UL : state_delay;
+}
+// Log the hold's edges: on every loop pass and after every poll, so a live veto is seen when it fires.
+void dcAwakeTrack() {
+  const bool held = dcAwakeHeld(current_state);
+  const char* veto = dcAwakeVeto(current_state);
+#if ENABLE_LOGGING
+  if (held && !g_dc_logged) {
+    logEvent("DC_AWAKE on rail=%.2f fast=%lumin", g_last_io36, (unsigned long)charging_fast_minutes);
+  } else if (!held && g_dc_logged) {
+    g_dc_refused_logged = true;
+    const char* why = veto ? veto : g_cadence_reason ? g_cadence_reason : "not-dc";
+#if ENABLE_MEMS
+    if (veto && !strcmp(veto, "motion"))
+      logEvent("DC_AWAKE off reason=motion rail=%.2f peak=%.3f axmax=%.3f", g_last_io36, motion_window_peak,
+        motion_window_axmax);
+    else
+#endif
+      logEvent("DC_AWAKE off reason=%s rail=%.2f", why, g_last_io36);
+  } else if (!held && g_dc_confirmed && veto && !g_dc_refused_logged) {
+    logEvent("DC_AWAKE refused reason=%s rail=%.2f", veto, g_last_io36);
+    g_dc_refused_logged = true;
+  }
+#endif
+  g_dc_logged = held;
+}
+
 // Open the post-drive window (POST_DRIVE_WINDOW_MINUTES) if the rail is high now, once per wake. Only after an
 // awake period on the parked cadence: a latched, capped or recovery cadence was chosen for a reason.
 bool pdwOpenWindow() {
@@ -177,7 +221,7 @@ void handleActivityState() {
     // so no speed frames arrive and the driving leash would go stale: the time-based parked re-latch would
     // then fire on the first poll afterwards and mislabel a moving car as parked - freezing a bogus "parked
     // location" in the process. Hold the leash instead of letting unobserved time count against it.
-    if (!is_currently_parked) g_last_speed_ms = millis();
+    driveSessionHold();
   } else {
     active = detectMovement(500);
   }
@@ -267,9 +311,10 @@ void handleActivityState() {
   case CHARGING:
     // Removed the "connected -> BLE" revive: a connection ALONE must not pull us back to the awake state (that
     // was the stay-awake-while-connected behaviour). Real motion still revives; otherwise progress to sleep.
+    // A confirmed DC charge holds here, awake (DC_CHARGING_AWAKE_SECONDS); the backstop still bounds it.
     if (active) {
       changeState(ACTIVE);
-    } else if (now - last_active > CHARGING_TIMER) {
+    } else if (now - last_active > CHARGING_TIMER && !dcAwakeHeld(current_state)) {
       changeState(STANDBY);
     }
     break;

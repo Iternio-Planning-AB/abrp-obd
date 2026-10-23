@@ -103,7 +103,10 @@
 
 #ifndef ENABLE_WIFI
 #define ENABLE_WIFI 0    // bench/office builds only; replaces cellular, it does not run alongside it
+#endif
+// Outside the #ifndef above so -D ENABLE_WIFI=1 gets the seeds too.
 #if ENABLE_WIFI
+#warning "ENABLE_WIFI: TLS is not verified - bench only"
 /*
   Empty on purpose - no network credentials in the source tree.
 
@@ -115,9 +118,16 @@
 
   Dormant at ENABLE_WIFI 0: this whole block is inside the guard.
 */
+#ifndef WIFI_SSID
 #define WIFI_SSID ""
+#endif
+#ifndef WIFI_PASSWORD
 #define WIFI_PASSWORD ""
+#endif
+#ifndef WIFI_PATH
 #define WIFI_PATH "https://api.iternio.com/1/tlm/send"
+#endif
+#ifndef WIFI_BULK_PATH
 #define WIFI_BULK_PATH "https://api.iternio.com/2/app/tlm" // v2 tlm endpoint (see TLM_V2_PATH)
 #endif
 #endif
@@ -128,8 +138,18 @@
 
 #ifndef ENABLE_CELL
 #define ENABLE_CELL 1    // the product transport
+#endif
+#if ENABLE_WIFI && ENABLE_CELL
+#error "ENABLE_WIFI replaces the modem: build it with -D ENABLE_CELL=0"
+#endif
+// Outside the #ifndef above so -D ENABLE_CELL=1 gets the seeds too.
+#if ENABLE_CELL
+#ifndef CELL_APN
 #define CELL_APN "hologram"
+#endif
+#ifndef CELL_HOST
 #define CELL_HOST "api.iternio.com"
+#endif
 /*
   SERVER ROOTS: uploads go only over a chain that verifies against Helpers/server_roots.h, else nothing
   is sent. A server moving to a new CA needs firmware trusting the new root shipped BEFORE the switch.
@@ -340,6 +360,20 @@
 #define CLOCK_DRIFT_MIN_SLEEP_S 3600
 #define CLOCK_DRIFT_GAIN 2
 #define CLOCK_DRIFT_MAX_PPM 15000
+
+// Clock sources (clock_sync.h).
+//   REF_ERR_S:        two GNSS records teach the drift rate only if the GNSS time advanced as millis() did, to
+//                     within this. A frozen or replayed record cannot, so it never teaches.
+//   NTP_MIN_INTERVAL: AT+CCLK is the free resync, but on one test SIM it was minutes off, so it never teaches;
+//                     NTP is the non-GNSS teacher. It costs a DNS lookup and a round trip on the data bearer, so it
+//                     only follows an upload while the car is in use, at most once per wake and, unless nothing
+//                     else can set the clock, at most this often (doubling after each failure, to 4x).
+//   NTP_MAX_DISAGREE: NTP is unauthenticated, so with a valid clock it may step it at most this far from this
+//                     wake's AT+CCLK reading (field CCLK error: up to ~3 min), or, without one, this far beyond
+//                     what CLOCK_DRIFT_MAX_PPM over the sleep could explain. A spoofed reply cannot roll it days.
+#define CLOCK_REF_ERR_S 2
+#define CLOCK_NTP_MIN_INTERVAL_S (6 * 3600)
+#define CLOCK_NTP_MAX_DISAGREE_S 600
 #define CLOCK_MAX_EPOCH ((uint64_t)std::numeric_limits<time_t>::max() < UINT32_MAX ? \
                          (uint64_t)std::numeric_limits<time_t>::max() : (uint64_t)UINT32_MAX)
 
@@ -477,6 +511,8 @@
 // WAKE_PARKED_MINUTES with the latch up, so the car can sleep between polls and the rail drop still gets its
 // charge-end read. That costs no extra wake: a rail-high wake polls at the parked cadence anyway. Silence at
 // a lower rail (the taper band) keeps the bound above.
+// A DC charge held awake (DC_CHARGING_AWAKE_SECONDS) counts this in WAKE_DC_CHARGING_MINUTES of unbroken silence,
+// not in its 30 s polls: on a car silent on ~60% of polls, 4 polls in a row would drop it to parked-held hourly.
 #define CHARGE_SILENT_HOLD_POLLS 4
 // A charge held through rail-high silence, released at a sample poke or ended at a skip keeps its budget,
 // cap and corroboration: a stuck current that answers between silences, or at every 12 V top-up, would
@@ -492,14 +528,26 @@
 //   everything else (parked/asleep/idle)        -> LONG interval  = minimal battery sip.
 // Driving is governed by motion/the state machine, not this timer. Charging self-exits: when the charge ends,
 // current goes >= 0 AND the rail falls, so the next sleep automatically picks the long timer - no masking,
-// because we sleep between samples (we never hold the car awake). MAX is a cheap anti-runaway backstop: cap
+// because we sleep between samples. The one exception is a confirmed DC charge, held awake
+// (DC_CHARGING_AWAKE_SECONDS), where each poll still reads the rail and current that end it. MAX is a cheap anti-runaway backstop: cap
 // the TOTAL time spent in fast cadence so a stuck-high rail can't wake us every few minutes forever.
 #define WAKE_CHARGING_MINUTES      3      // dense sampling while actively AC charging
 // DC fast charging gets a denser cadence still. The reason is the person, not the battery: a fast
 // charge takes 20-40 minutes and the driver is usually watching progress from a restaurant or a shop
 // rather than sitting in the car, so a 3-minute-old SoC is visibly stale in a way it never is on an
 // overnight AC charge. The car's DC-DC is up throughout, so the extra wakes cost no 12 V.
+// Armed only when the dongle cannot stay awake through the charge (DC_CHARGING_AWAKE_SECONDS, below).
 #define WAKE_DC_CHARGING_MINUTES   1
+// Through a charge confirmed DC (the latch holds through the taper and the silent hold) and with the rail
+// showing the DC-DC up, stay awake and poll and upload this often over one reused session (issue #51). A
+// 1-minute wake is about the floor for sleep and wake: each one pays a modem attach (median ~10 s) and a fresh
+// TLS open (~3 s, ~5 KB). Motion suspends it for an ACTIVE_TIMER, so a drive gets ACTIVE's cadence. Each held
+// poll of a sample poke counts a whole WAKE_DC_CHARGING_MINUTES toward WAKE_CHARGING_MAX_MINUTES, so the cap
+// trips sooner; a streaming wake counts its elapsed time instead. With
+// a slow poll's margin it must stay under SESSION_IDLE_MAX_MS, so every upload reuses the session (#8: a flow
+// idle ~60 s dies); the runner and logger.ino assert it. Needs ENABLE_IO36_RAIL: without the rail it never holds.
+#define DC_CHARGING_AWAKE_SECONDS  30
+#define DC_CHARGING_POLL_MARGIN_MS 20000UL  // a slow poll: readPIDs timeouts plus the CSV row and log lines
 // Charge power (kW) at or above which a session is treated as DC when the car does not say so itself.
 // Only consulted if the vehicle profile has no is_dcfc PID - the car's own word always wins.
 // Far above any AC session: three-phase 22 kW is the practical ceiling and a measured Scenic AC charge
@@ -570,6 +618,16 @@
 // 1000 leaves margin). uploadBuffered() shrinks each batch until its serialized body fits, so richer
 // frames (more OBD PIDs) automatically mean fewer frames per POST instead of undeliverable POSTs.
 #define CELL_MAX_POST_BYTES 1000
+
+// zlib settings for the POST body (gzip_body.h). On synthetic 12-point driving bodies, level 9 with a 4 KB
+// window and memLevel 4 matches the miniz tdefl ratio within 0.5 % (1182 vs 1186 B). Window size makes no
+// difference from 2 KB up. Below about one point (1 KB) it collapses (1809 B). State is ~29 KB of PSRAM.
+#define GZIP_LEVEL 9
+#define GZIP_WINDOW_BITS 12
+#define GZIP_MEM_LEVEL 4
+// Gzip failures in one wake (bodies that fail verification, or the server rejecting a gzip body) after
+// which the rest of the wake goes plain. Corruption that repeats is not worth more airtime.
+#define GZIP_FAILS_PER_WAKE 2
 #define GEO_MAX_SEND_AGE_SECONDS (29UL * 24UL * 60UL * 60UL)
 
 // Catch-up burst: how many capped POSTs the STEADY-STATE (in-loop) upload may fire back-to-back in one
@@ -771,11 +829,12 @@
 #define ACTIVE_TIMER 5*60*1000   // 5 min: driving/idle stage (speed>0 or accel refreshes this leash)
 #define CHARGING_TIMER 5*60*1000 // 5 min: second idle stage before STANDBY -> deep sleep
 
-// VESTIGIAL - no longer referenced. Setup now makes exactly ONE init attempt (~35s worst case, inherently
-// bounded) and continues offline on failure; the loop's cheap CGREG reconnect probe re-attaches mid-drive.
+// Setup makes ONE init attempt: 30s registration search for multi-poll wakes, the field-proven 45s for
+// single-poll parked wakes; begin/SIM/config/diagnostics are separate. Background scans survive expiry.
 // History kept for context: init(retry=true) once looped 2.4 HOURS at a no-service spot (boot 147); a 90s
-// retry window then still burned ~93s of drive start before the first poll (the 41%-capture windows).
-#define NET_INIT_TIMEOUT_MS 90000UL
+// retry window burned ~93s before the first poll (41%-capture windows).
+#define CELL_REGISTRATION_AWAKE_MS 30000U
+#define CELL_REGISTRATION_PARKED_MS 45000U
 
 // Task-watchdog wedge guard (the brick preventer). Boot 153: the device wedged INSIDE modem init - main
 // loop blocked so hard that already-advertising BLE couldn't accept a connection - and sat there 52+ min

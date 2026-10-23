@@ -279,6 +279,33 @@ awake.** Polling a sleeping EV wakes its ECUs, which then stay awake on the *car
   car before trusting anything that keys on it.
 - **Wake sources:** wake-on-motion (ICM-42627 interrupt, threshold ~0.158 g) and a timer
   (`WAKE_PARKED_MINUTES 30` / `WAKE_CHARGING_MINUTES 3`).
+- **A confirmed DC fast charge stays awake** (issue #51). A poll that reads DC (the car's `is_dcfc`, else at least
+  `DC_CHARGING_MIN_KW` inferred) holds the wake, and the car's `is_dcfc`, or two inferred DC polls in a row (one garbage
+  frame must not do it), latch `dc_session` (RTC) for that charge. While the rail
+  is at least `RAIL_AWAKE_VOLTS`, each poll that still shows charge evidence (the taper under 40 kW included), or
+  comes within `CHARGE_SILENT_HOLD_POLLS` x `WAKE_DC_CHARGING_MINUTES` (4 min) of unbroken silence, sets
+  `g_dc_confirmed`. Silence is counted by time, not by its 30 s polls: that is the tolerance a 1-minute DC wake had,
+  and a car silent on ~60 % of polls would otherwise drop to `parked-held` several times an hour. The dongle then stays awake and polls
+  and uploads every `DC_CHARGING_AWAKE_SECONDS` (30) over one reused session, and the ladder holds in `CHARGING`.
+  - `dcAwakeHeld()` vetoes the hold live, not only at a poll: the BLE state (it keeps its own cadence), a rail under
+    `RAIL_AWAKE_VOLTS`, an alarm-flagged car (§7), or motion within an `ACTIVE_TIMER` (`g_last_motion_ms`, stamped only
+    by `detectMovement`). A drive starting is therefore polled at ACTIVE's 5 s from its first motion.
+  - Motion on a held sample poke promotes the wake in place: BLE and GNSS come up, and from then on charging samples
+    need the streaming confirm (`CHARGE_STREAM_CONFIRM_SECONDS`), so regen is never a charge. Sleeping instead would
+    not bring a motion wake: `configureWOM()` clears motion already seen, and a person sitting still does not trip WOM.
+  - Ends: the charge end (an answered poll with no charge evidence), the rail drop, silence past the hold
+    (`parked-held`, as before), the cap, corroboration, the car's `is_dcfc` 0, a drive. The session itself ends at the
+    charge end (an answered poll with no charge evidence, so a DC plug swapped for AC starts fresh), a fresh latch, a
+    drive, the car's `is_dcfc` 0 or the stale reset. A sleep inside the session uses the 1-minute DC tier; the charge
+    end and the rail drop sleep as before (3 min while latched). AC charging never latches.
+  - Each held poll of a sample poke counts a whole `WAKE_DC_CHARGING_MINUTES` toward the cap, so it trips sooner (the
+    safe way). A streaming wake (motion, a promoted poke) counts its elapsed time, at most a tier per poll, so somebody
+    moving about the car for an hour costs an hour of budget, not a tier per 5 s poll. The
+    max-awake backstop is not exempt: after `MAX_AWAKE_MINUTES` of awake time the wake sleeps 1 min and the session's
+    next sample poke holds again, about a 1-minute gap per awake hour.
+  - BLE keeps its rules, but its windows move: a held motion wake keeps advertising up to the backstop instead of about
+    10 minutes, and a held sample poke has no BLE until something moves and promotes it.
+  - With `ENABLE_IO36_RAIL 0` the rail reads 0 and it never holds.
 - **Following a charge on a car that answers intermittently** (issue #7). Every extra poll is bounded, and
   a low-rail read needs proven charging. Three rules cover it:
   - A latched charge that goes silent at a rail ≥ `RAIL_AWAKE_VOLTS` never releases. After
@@ -327,10 +354,41 @@ itself is not sent. HTTP 200 *is* the acceptance — v2 has no `status` field in
 
 Compression is the reason for v2: the SIM7070 refuses a request body over `SHCONF BODYLEN=1024`, so
 body bytes are what limit points per POST — measured, 1000 bytes holds 5 points raw and ~21 gzipped.
-Deflate is the ESP32 boot ROM's miniz, driven from `gzip_body.h` with the ~300 KB compressor in PSRAM.
+Deflate is vendored zlib 1.3.2 (`libraries/zlib`, level 9, 4 KB window), driven from `gzip_body.h`, with
+~40 KB of compressor and verifier state in PSRAM. Each body that is sent is inflated again and compared with
+its input first. A body that fails is not sent, and its frames are kept. After `GZIP_FAILS_PER_WAKE`
+failures (verify or server gzip errors), or after a reset inside the compressor (an `RTC_NOINIT`
+breadcrumb), the rest of the wake goes plain where plain fits. A frame too big to send plain is held for
+the next wake's backlog, and the frames behind it still go. It must not go back to the boot-ROM miniz: ROM `tdefl` needs ~6.5 KB of stack, which overflowed the
+8 KB loop task on the pre-sleep drain, and ROM code has no PSRAM cache workaround (issue #21).
+
+Bodies over 4 KB are in PSRAM, which this rev 1 chip writes safely only through the `esp32-psram` runtime
+(§11 item 8, #64). Linked without it, the verifier refused up to every body over ~5 KB: header byte 9 came
+back zeroed after zlib's `memcpy` wrote next to it (field: 6 of 7; bench: 300 of 300 at 12 KB, none with the
+PSRAM runtime). The OTA self-test therefore compresses a 16 KB body, so the trial boot exercises PSRAM.
+`GZTEST <bytes> [count]` on the serial console runs the compressor and verifier on synthetic bodies; run it at
+9000 and 12000 B after a platform or toolchain bump. The per-wake `GZIP n= big= fail= raw_max=` line counts
+bodies with a buffer in PSRAM and gzip failures.
 
 Time sync has **three** sources, not four: GNSS (`CLK_GPS`, wins), the modem's `AT+CCLK` (`CLK_NITZ`),
 `AT+CNTP` (`CLK_NTP`), plus the `Date` header on each telemetry POST (`CLK_HTTP`) as a coarse anchor.
+All of them set the clock; only NTP and a confirmed GNSS pair (two records in one wake advancing as
+`millis()` did) teach the deep-sleep drift rate. AT+CCLK was minutes off on one test SIM, so it never teaches,
+and its steps are accounted to the millisecond (`clock_unref_step_ms`) so they cannot skew the next window; a
+phone utc push restarts the window instead (`clockForgetWindow`). NTP costs data and a DNS lookup, so it never
+drives the modem, attaches or extends a wake:
+- `clockNtpAfterUpload` asks it right after an upload that sent frames while the car is in use (OBD answering,
+  driving, charging, or the rail at `RAIL_AWAKE_VOLTS`), at most once per wake, and only when it is the only
+  source (no AT+CCLK time this wake, or no valid clock) or a window of at least an hour of sleep is teachable
+  and `CLOCK_NTP_MIN_INTERVAL_S` (6 h, doubling to 24 h after failures) has passed.
+- `clockNtpNoClock` is the one exception: with no valid clock at all, setup() and the loop recovery ask it once
+  per wake on a modem already up for this wake's upload, before the poll, even with the car asleep - otherwise
+  every frame of the wake would go without a utc.
+- NTP is unauthenticated, so with a valid clock a step is bounded: within `CLOCK_NTP_MAX_DISAGREE_S` of this
+  wake's AT+CCLK reading, or without one, within what `CLOCK_DRIFT_MAX_PPM` over the sleep explains plus that
+  margin. Further than that it is `disagree`: no set, no teach, and the attempt counts as failed.
+
+A post-OTA boot zeroes the clock like a cold boot (#13).
 There is no `GET /2/utc` call — `CellWrapper::getEpoch()` exists but nothing invokes it, and `UTC_KEY`
 / `UTC_PATH` are gone.
 
@@ -446,7 +504,8 @@ bounded by `MAX_UPLOAD_BUFFER` (the oldest go first).
 | Who | Sees | Can do |
 |---|---|---|
 | Passive listener on the cellular path | TLS only | nothing |
-| Active MITM with any certificate under the bundled roots (name and dates are not checked) | uploads: positions, battery, the api key, keyid, signatures | read; replay an exact earlier request, at any later time (no `created`); swallow uploads by answering 200, so the frames are dropped; set the clock through unauthenticated NTP when a resync runs and GPS is stale (pre-existing; the HTTP `Date` header is not read on cellular), and if that resync ends an hour or more of sleep it also teaches a skewed drift rate (bounded by `CLOCK_DRIFT_MAX_PPM`, kept in NVS across a re-plug, halved toward the truth by each honest window after); not forge a new request or learn the token |
+| Active MITM with any certificate under the bundled roots (name and dates are not checked) | uploads: positions, battery, the api key, keyid, signatures | read; replay an exact earlier request, at any later time (no `created`); swallow uploads by answering 200, so the frames are dropped; not forge a new request or learn the token |
+| On-path network, DNS spoofer or NTP pool member (no certificate) | NTP replies | step the clock when NTP is asked and GPS is stale (only on a wake already uploading, at most once per wake): with a valid clock at most `CLOCK_NTP_MAX_DISAGREE_S` from this wake's AT+CCLK reading, or without one, beyond what `CLOCK_DRIFT_MAX_PPM` over the sleep explains; with no valid clock, freely (it is the fallback). It can nudge the drift rate within `CLOCK_DRIFT_MAX_PPM`, kept in NVS across a re-plug and halved toward the truth by each honest window after. The HTTP `Date` header is not read on cellular. It cannot roll a valid clock back days to defeat the send-time geo expiry |
 | Anyone with the token | — | post as the car. The token reaches the dongle over BLE at pairing (ABD2 profile push; LESC Just Works: encrypted, not MITM-authenticated) and is held by the phone app; cellular signing does not change either |
 
 This assumes a high-entropy token (a UUIDv4, ~122 random bits): the keyid is an unsalted SHA-256 prefix
@@ -604,10 +663,20 @@ session.
   newest `n` segments (about 25 s each), and `DUMP 3` usually covers the last drive. It is genuinely "the tool that made every other bug in this
   project findable".
 - **Clock lines.** The board has no 32 kHz crystal, so deep sleep keeps time on the internal RC, which runs
-  ~0.6 % fast. Each wake takes that back at a learned rate. `CLOCK drift <raw> raw, <residual> residual over
-  <s> asleep -> rate <ppm>` is a NITZ/NTP resync teaching the rate. `NET clock resynced ... (residual)` is
-  what compensation left over. `NET clock resync FAILED` means the wake runs on the compensated RTC. After each
-  deep-sleep `WAKE`, `CLOCK wake slept <s>, adjusted <ms> at <ppm>` says what that wake corrected.
+  ~0.6 % fast. Each wake takes that back at a learned rate; after each deep-sleep `WAKE`, `CLOCK wake slept <s>,
+  adjusted <ms> at <ppm>` says what that wake corrected. `CLOCK drift <raw> raw, <residual> residual over <s>
+  asleep -> rate <ppm> ... src=<ntp|gps>` is a teaching sync (NTP, or a confirmed GNSS pair); `residual` is what
+  compensation left over, net of any CCLK or single-GNSS steps since the last teaching sync. `CLOCK <src> step
+  <s>[ ref]` is the first step of 2 s or more per source per wake, and every teaching one (`ref`); `CLOCK <src>
+  set, was unset` the first time after a cold boot or OTA.
+  `CLOCK ntp=<ok|same|disagree|code|to>/<ms>ms on=<upload+obd|drive|charge|rail|noclock> for=<time|teach>`
+  `[ d=<s>][ retry=<h>h]` is one NTP attempt and what triggered it (`same`: the readback could not be told apart
+  from CCLK, so it was applied as CCLK; `disagree`: refused as further than the bound, by `d`; `62` is DNS).
+  `CLOCK ntp=gated why=<asleep|nodata> for=time` (once per wake) means the clock had no source this wake and NTP
+  could not run: the car is asleep, or the upload sent nothing. `CLOCK resync FAILED` (once per wake) means the
+  wake runs on the compensated RTC, or with no clock at all. Still to check on a dongle: what `AT+CNTP` mode 1
+  really does (the time on the result line, and whether it also sets the modem RTC), and NTP right after a POST
+  (the SH session is still open, `syncNtp` purges the UART, and a failure can block ~20 s).
 - **`MOTION act=<%> n=<windows> s=<span> peak=<g> mean=<g> axmax=<g> obd parked chg`** is one line per awake
   minute (and the partial minute before `SLEEP enter`; one in progress when an OTA reboots is lost). `act` is the
   share of observed time whose `detectMovement` window saw motion: each window stands for the time
@@ -619,10 +688,32 @@ session.
   on it, and OTA/log-dump windows (which bypass `detectMovement`) are not counted.
 - **`SLEEP enter ... reason=<r>`** names why the dongle slept. `dc-charge`, `charging` and `parked` are the
   cadence tiers, read back from the armed timer (1, 3, 30 min). `net-recover` is the modem-recovery
-  reboot (1 min), `wdt-streak` the WDT-streak escalation, `backstop` the parked MAX_AWAKE ceiling. Charge
+  reboot (1 min), `wdt-streak` the WDT-streak escalation (below), `backstop` the parked MAX_AWAKE ceiling. Charge
   cadence decisions the timer can't tell apart name themselves: `parked-held`, `parked-cap`,
   `parked-uncorroborated`, `pdw` and `followup` (below). An explicit sleep reason wins over a cadence
   label, which wins over the timer.
+- **`DC_AWAKE on rail=<v> fast=<min>`** and **`DC_AWAKE off reason=<r> rail=<v>`** bracket a DC charge held
+  awake (§6). In between, `UPLOAD ok` comes about every 30 s plus the poll, on a reused session; `NET diag ... idle=<ms>`
+  is the time since the last upload, to check against `SESSION_IDLE_MAX_MS` and the ~60 s drop (#8). `r` is the live
+  veto (`ble`, `rail`, `alarm`, `motion` with the window's `peak=`/`axmax=`), else the cadence label (`parked-cap`,
+  `parked-uncorroborated`, `parked-held`), else `not-dc`; a sleep that ends a hold logs its own reason (`backstop`,
+  `net-recover`). `DC_AWAKE refused reason=<veto>`, once per wake, is a DC poll that could not hold: a car whose DC-DC
+  sits under `RAIL_AWAKE_VOLTS` shows `rail`, charger vibration over the 0.1 g `detectMovement` threshold shows
+  `motion` (read the `MOTION` lines). `DC_AWAKE poke promoted` is motion on a held sample poke. During a held charge
+  `AWAKE_BACKSTOP` is expected once an awake hour (counted from boot, so sooner after a long drive).
+- **`<reset> reset recovered (streak=<n> retained=<0|1> owed=<0|1>)`** follows the `WAKE` of a panic, WDT
+  or brownout reset (`<reset>` is the `WAKE` line's `reset=`). `streak` counts consecutive ones, brownouts
+  included (#50: a battery that sags out on every modem start loops like a crash); a deep-sleep wake or any
+  other reset ends it. `retained=0` means the count did not survive the reset and restarted at 1; on a
+  `BROWNOUT` line it answers whether RTC memory survives a brownout on this board. `owed=1`: this boot owes
+  the trip-end `is_parked:1` marker, restored from the same store (#49). At `streak=2` the boot logs
+  `WDT streak=2 -> skip init, sleep <m>min` and sleeps with `reason=wdt-streak`: 30 min, or 3 min when the
+  rail says the car is awake. A crash boot zeroes the clock, so these lines and the sleep after them usually
+  carry no UTC; read them in order against the next `WAKE`. Nothing is reachable over BLE during that
+  sleep; re-plugging the dongle is a power-on, which never escalates. The same store remembers whether
+  the modem may still be powered (set by every modem init, cleared only by an acknowledged `AT+CPOWD`),
+  and a sleep that did not power it this wake sends it an `AT` while that is set: an answer gets `AT+CPOWD`
+  (so `SLEEP enter -> modem+GPS off` can follow a skip wake after a crash), silence counts as off.
 - **Log the *reason*, not just the outcome.** A subsystem that goes quiet with an empty log is the
   shape that gets misattributed to the cellular stack for weeks — this has happened more than once
   in this project (the transport-handoff bug; a stored hash claiming a profile that wasn't running).
@@ -701,6 +792,14 @@ Everything below except `README.md` and `docs/` is embedded verbatim in **Part I
 6. **Keep the obdble lane untouched** — everything for this dongle is an add-on.
 7. **Read `DEFERRED_POWER_WORK.md` before touching sleep** — several obvious "improvements" there are
    documented as net-negative or brick-risk.
+8. **Keep `tools/pio_psram_libs.py` in `extra_scripts`** — mallocs over 4 KB land in PSRAM, and on this
+   rev 1 chip only the `esp32-psram` runtime writes them safely (#64). A PSRAM test needs buffers over 4 KB.
+9. **`RTC_DATA_ATTR` survives deep sleep only.** The bootloader reloads it on every other reset, panic,
+   WDT and software reset included (#30: 20 panics in the field, every one `boot=1 sleeps=0`). State that
+   must survive a crash goes in `RTC_NOINIT_ATTR`, which is garbage after a power-on and may hold another
+   image's bytes after a rollback, so it needs a check that rejects both (`wdt_streak.h`: a magic and an
+   inverted copy). That store holds the crash-loop streak, the "modem may be on" flag and a copy of the
+   park-marker debt that is cleared only once the marker is sent, since the backlog is deleted when it loads.
 
 
 ---
