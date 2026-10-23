@@ -1125,6 +1125,11 @@ void setup() {
 #endif
   if (!custom_profile) {
     g_no_profile = true;
+#if ENABLE_BLE
+    // No profile to restore, so no stored hash may stand for one (a reset mid-forget, an older image that
+    // committed at SETUP OK, or a build that persists nothing): the next connect must push.
+    if (ble.get_crc_hash() != 0) ble.invalidateHash();
+#endif
     Serial.printf("No persisted vehicle profile - polling disabled until a profile is pushed\n");
 #if ENABLE_LOGGING
     logEvent("PROFILE none persisted - polling and upload wait for the BLE push");
@@ -1202,10 +1207,14 @@ void loop() {
   // Deferred during a log dump for the same two reasons (window replies stall; the profile write mutates the
   // filesystem the dump is mid-way through reading).
   if (g_config_pending && !g_ota_active && !g_logdump_active) {
+    std::string push; // the one copy of this push; a push completing during the apply stays pending
+    portENTER_CRITICAL(&g_config_mux);
+    push.swap(g_pending_config_str);
     g_config_pending = false;
+    portEXIT_CRITICAL(&g_config_mux);
     static std::string last_applied_profile;
     try {
-      json newConfig = json::parse(g_pending_config_str);
+      json newConfig = json::parse(push);
       json config = newConfig["configJson"];
       config.erase("utc"); // clock-set side channel, not a profile field; also breaks the identity compare
       const std::string pushed_token = newConfig.at("tlm_push_token").get<std::string>();
@@ -1245,26 +1254,34 @@ void loop() {
         logEvent("CONFIG push identical to running profile - re-init skipped");
 #endif
       }
+      const unsigned long hash = newConfig.at("hash").get<unsigned long>();
 #if ENABLE_LOGGING
       // Persist the accepted push (profile + token) so it survives sleep/reboot. This is what keeps the
       // NVS hash truthful: boot restores THIS file (loadPersistedProfile) instead of reverting to factory,
       // and standalone cellular wakes then run the pushed profile too. Every full push is written, an
-      // identical profile included: the app's hash covers the token.
+      // identical profile included: the app's hash covers the token. The stored hash goes to 0 before the
+      // file is touched and the push's own hash is committed only after it is whole, so a reset anywhere in
+      // between makes the next connect re-push instead of fast-pathing onto whatever the file holds.
+      ble.invalidateHash();
       File pf = LittleFS.open(PROFILE_PATH, "w");
-      const bool saved = pf && pf.print(g_pending_config_str.c_str()) == g_pending_config_str.size();
+      const bool saved = pf && pf.print(push.c_str()) == push.size();
       if (pf) pf.close();
       if (saved) {
-        logEvent("PROFILE persisted to flash (%d bytes)", (int)g_pending_config_str.size());
+        ble.commitHash(hash, true);
+        logEvent("PROFILE persisted to flash (%d bytes) - hash committed", (int)push.size());
       } else {
         dropUnsavedPush("write");
       }
+#else
+      // Nothing persists without logging: the hash holds for this boot only, so the next boot re-pushes.
+      ble.commitHash(hash, false);
 #endif
       config_initialized = true;
     }
     catch (const json::exception& err) {
       Serial.printf("CONFIG apply failed: %s\n", err.what());
-      // The wrapper committed the new hash at SETUP OK, but the profile never applied (the RAM token may
-      // already have moved): drop the hash and the file so no wake runs either half - the app re-pushes.
+      // The profile never applied (the RAM token may already have moved): drop the hash and the file so no
+      // wake runs either half - the app re-pushes.
 #if ENABLE_LOGGING
       logEvent("CONFIG apply FAILED: %.60s", err.what());
 #endif

@@ -302,7 +302,7 @@ USB only: physical access by design. Type these into the serial monitor (115200 
 | `CLKPROBE` | Check RTC drift and whether an HTTP `Date` header is reachable (blocks ~30–60 s). |
 | `TLSCHECK` | Open a fresh verified TLS session to the server (no data sent) and log the result. |
 | `BONDCLEAR` | Erase all BLE bonds. Phones must also "forget" the dongle. |
-| `AUTHCLEAR` | Erase the auth secret, revoking every phone. The next phone to connect provisions a new one. |
+| `AUTHCLEAR` | Erase the auth secret, revoking every phone (a connected one included), and forget the vehicle profile and push token. The next phone to connect provisions a new secret and pushes the profile; until then the dongle neither polls nor uploads. The flash log is kept. |
 | `OTARESET` | Clear the OTA anti-downgrade floor (after a bench flash to a lower version). |
 | `JWSTEST` | Self-test the profile-signature verifier. |
 | `RESUME` | Hand back to normal duty (re-allow sleep) after a maintenance session. |
@@ -322,7 +322,7 @@ The secret is provisioned trust-on-first-use by ECDH (`auth_kex.h`): the first p
 setup owns the dongle, and the secret lives only on that phone. Until then there is no window: any
 phone in range can claim an unprovisioned dongle, including one just cleared with `AUTHCLEAR`. It
 can be reset over BLE within five minutes of a power-on (an unplug and replug, so it needs physical
-access), or with `AUTHCLEAR` over serial. Design and phase history are in `DONGLE_CONTEXT.md` §3 and
+access), or with `AUTHCLEAR` over serial. Either reset also forgets the vehicle profile and push token. Design and phase history are in `DONGLE_CONTEXT.md` §3 and
 Appendix A.
 
 ## Releases and OTA

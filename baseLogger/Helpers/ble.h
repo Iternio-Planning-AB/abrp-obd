@@ -19,7 +19,9 @@ void alarmFlagHook(int v);
 bool alarmFlagged();
 bool alarmEnforced();
 extern bool g_obd_needs_init;
+extern bool g_no_profile;
 void dropUnsavedPush(const char* why); // defined with the persisted profile below
+void forgetProfile(const char* why);   // Helpers/auth_gate.h (after network_upload.h); AUTHCLEAR calls it too
 
 /*
   Callbackfunction for BLEWrapper. To be called when config has been completely transferred over BLE
@@ -31,19 +33,26 @@ void dropUnsavedPush(const char* why); // defined with the persisted profile bel
 // shared OBD UART and the live vehicle_commands json -> echoed/garbage responses (buffer "2291C8", ATRV 0.00),
 // out-of-bounds parses, and PANIC/WDT reboots that killed the BLE session. The callback now only validates and
 // STASHES the config; loop() applies it between poll cycles, where nothing else touches the OBD link.
-// (Write-string-then-set-flag / clear-flag-then-read ordering; pushes arrive seconds apart, no lock needed.)
+// The string is handed over by swap under g_config_mux: the loop's apply runs for seconds (obd.initialize), and
+// a second push completing meanwhile must neither tear the string the loop is reading nor become the file the
+// first push is persisted as. Only the swap and the flag sit inside the lock - nothing allocates or logs there.
 std::string g_pending_config_str;
 volatile bool g_config_pending = false;
+portMUX_TYPE g_config_mux = portMUX_INITIALIZER_UNLOCKED;
 
 bool configCallback(json newConfig) {
   try {
-    // Validate shape only - no hardware access on the BLE task. Must carry a profile + token.
+    // Validate shape only - no hardware access on the BLE task. Must carry a profile, token and hash.
     (void)newConfig.at("configJson");
     (void)newConfig.at("tlm_push_token").get<std::string>();
-    g_pending_config_str = newConfig.dump();
+    (void)newConfig.at("hash").get<unsigned long>();
+    std::string stash = newConfig.dump();
+    const int bytes = (int)stash.size();
+    portENTER_CRITICAL(&g_config_mux);
+    g_pending_config_str.swap(stash);
     g_config_pending = true;
-    Serial.printf("BLE config stashed (%d bytes) - applied by loop task between polls\n",
-      (int)g_pending_config_str.size());
+    portEXIT_CRITICAL(&g_config_mux);
+    Serial.printf("BLE config stashed (%d bytes) - applied by loop task between polls\n", bytes);
     return true;
   }
   catch (const json::exception& err) {
@@ -163,18 +172,19 @@ void bleDeinitForSleep() {}
   fast path (HASH OK) told the app its pushed profile was still active. Masked so far because the app's Scenic
   profile ~= initScenic; a genuinely different profile would have polled the wrong PIDs on every standalone
   wake. Fix: the loop's config-apply block writes every accepted push (configJson + tlm_push_token) to this
-  file; boot loads it in preference to the factory profile. Hash and profile now live or die together. A push
-  that cannot be written, or is still waiting for the loop when RAM goes, takes both down (dropUnsavedPush).
+  file and only then commits the push's hash (BLEWrapper::commitHash), so NVS never holds a hash whose profile
+  is not on flash; boot loads the file in preference to the factory profile. A push that cannot be written,
+  or is still waiting for the loop when RAM goes, takes the file down too (dropUnsavedPush).
 */
 static const char* PROFILE_PATH = "/vehicle_profile.json";
 
-// A full push that will never reach the file (it failed to apply or write, or sleep / the OTA reboot wipes RAM before the
-// loop applied it), while the wrapper already committed its hash at SETUP OK. Drop the hash AND the file: no
-// later wake may run a profile or token older than the last accepted push. The app re-pushes on its next
-// connect; until then the dongle waits as an unpaired one does.
+// A full push that will never reach the file: it failed to apply or write, or sleep / the OTA reboot wipes RAM
+// before the loop applied it. Its hash was never committed, but the file still holds the previous push, which may
+// carry another token. Drop the hash AND the file: no later wake may run a profile or token older than the last
+// accepted push. The app re-pushes on its next connect; until then the dongle waits as an unpaired one does.
 void dropUnsavedPush(const char* why) {
+  ble.invalidateHash(); // first: a reset between the two must not leave a hash with no file
   LittleFS.remove(PROFILE_PATH);
-  ble.invalidateHash();
   logEvent("PROFILE push not saved (%s) - profile removed, hash invalidated (app will re-push)", why);
 }
 
@@ -218,3 +228,4 @@ bool loadPersistedProfile() {
 #elif ENABLE_BLE
 void dropUnsavedPush(const char*) { ble.invalidateHash(); } // nothing on flash to remove
 #endif
+

@@ -266,12 +266,15 @@ void handleLogCommands() {
   // disconnect), so it cannot interfere with a transfer in flight.
   else if (cmd.equalsIgnoreCase("AUTHCLEAR")) {
     ble.clearAuthSecrets();
+    ble.set_authenticated(false); // the open session proved against the wiped secret: it re-pairs like any other
     // Say what this actually DOES: the next phone to connect provisions a brand-new secret and every
     // other phone holding the old one loses access. That is the point (revocation), but it also means
     // connect the phone that should keep access FIRST - whoever wins that race becomes the owner.
-    Serial.printf("AUTHCLEAR: auth secret wiped - the NEXT phone to connect sets a new one\n"
-                  "           (revokes every other phone; connect the keeper first)\n");
+    // The vehicle profile and push token go too: polling and upload wait for that phone's full push.
+    Serial.printf("AUTHCLEAR: auth secret, profile and push token wiped - the NEXT phone to connect sets a\n"
+                  "           new secret and pushes the profile (revokes every other phone; connect the keeper first)\n");
     logEvent("AUTHCLEAR secret wiped - next phone to connect provisions a new one (revocation)");
+    forgetProfile("authclear");
   }
 #endif
   // Prove the profile-signature check discriminates: re-verify the last real signed profile intact,

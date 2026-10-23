@@ -125,21 +125,37 @@ public:
 
   /* Compare hashvalue, true if same as stored */
   bool validate_hash(unsigned long hash);
-  void confirmHash();
   unsigned long get_crc_hash() { return crc_hash; }
   void set_force_repush(bool f) { force_repush = f; }
+  // The three below run on the loop task, so each opens its own NVS handle: the member one belongs to the
+  // Bluedroid task (clean, authenticate), and a shared handle opened on both tasks at once loses a write.
   // Clear the stored profile hash (RAM + NVS) so the next connect takes HASH NOT OK and the app re-pushes.
   // Called when the dongle can no longer guarantee hash == running profile (persisted profile unreadable,
   // config apply failed) - keeps the fast path truthful instead of claiming a profile we aren't running.
-  void invalidateHash() {
-    crc_hash = 0; new_hash = 0;
-    preferences.begin("BLE");
-    preferences.putULong("hash", 0);
-    preferences.end();
+  void invalidateHash() { commitHash(0, true); }
+  // Commit a push's hash once its profile is on flash (persist), or for this boot only when nothing is
+  // persisted: the fast path may only ever claim a profile the dongle can restore.
+  void commitHash(unsigned long hash, bool persist) {
+    crc_hash = hash;
+    if (!persist) return;
+    Preferences p;
+    if (!p.begin("BLE", false)) return;
+    p.putULong("hash", hash);
+    p.end();
+  }
+  // Key reset: forget the stored push - the hash and the AUTH copy of the push token (the whole namespace).
+  // The staging copies in RAM stay: they belong to the Bluedroid task and the next push's clean() resets them.
+  void forgetStoredPush() {
+    crc_hash = 0;
+    Preferences p;
+    if (!p.begin("BLE", false)) return;
+    p.clear();
+    p.end();
   }
 
   /* Store config values */
   void add_key(std::string key) { config_keys.push_back(key); }
+  void resetPushStaging() { new_hash = 0; hash_ok = false; config_keys.clear(); configJson.clear(); tlm_push_token.clear(); }
   std::vector<std::string> keys() { return config_keys; }
   json getConfig() { return configJson; }
   void setJsonValue(std::string key, json value) { configJson[key] = value; };

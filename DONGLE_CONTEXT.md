@@ -164,7 +164,9 @@ profile write.
 - Sharing between phones is by **QR code** — MITM-free without any key exchange or backend.
 - `AUTHCLEAR` is the **revocation** mechanism: wipe the secret, reconnect with the phone you want to
   keep, and every other holder is locked out. (It must always mint fresh — re-pushing known secrets
-  destroys revocation.)
+  destroys revocation.) It and the in-app key reset also forget the vehicle: profile file, stored hash,
+  push token and upload queue (`PROFILE forgotten`), so polling and upload wait for the next owner's push.
+  AUTHCLEAR also ends the grant of a session already open. Neither wipes the diagnostic flash log.
 - **Greet on the CCCD rising edge.** The dongle speaks first, when the app's subscription is armed,
   which removes the subscribe-vs-write race entirely — no retries, no timeouts.
 - **Two flags, deliberately:** `setup_unlocked` (the ABD2 state-machine latch) vs `authenticated`
@@ -336,7 +338,10 @@ There is no `GET /2/utc` call — `CellWrapper::getEpoch()` exists but nothing i
 
 There is **no built-in token and no factory profile.** Both arrive together in the ABD2 push and
 persist together in `/vehicle_profile.json`. Until then `g_no_profile` stops the poll and the empty
-token stops the upload, so an unpaired dongle advertises on BLE and does nothing else. (`v1
+token stops the upload, so an unpaired dongle advertises on BLE and does nothing else. The push's HASH is
+committed to NVS by the loop only once that file is written (zeroed first), so the HASH OK fast path never
+claims a profile that is not on flash; a push the dongle loses gets HASH NOT OK and a re-push. A connect that
+sends no HASH (the wizard's CLEAN) commits 0, so the next background connect re-pushes once. (`v1
 /1/tlm/send` and `/1/tlm/bulk` are no longer used; `bulkString` and `CELL_BULK_PATH` survive only as
 reference.)
 
