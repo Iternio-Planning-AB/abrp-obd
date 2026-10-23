@@ -45,6 +45,7 @@ struct Wake {
     void esp_task_wdt_reset() {}
     bool uploadBuffered(bool) { ++upload_attempts; return false; }
     void bleDeinitForSleep() { ++ble_teardowns; }
+    void driveMarkerQueued() { park_marker_owed = false; }
     void configureWOM(ICM_42627&) {}
     void esp_sleep_enable_ext0_wakeup(int, int) {}
     void esp_deep_sleep_start() { throw SleepReached{}; }
