@@ -71,13 +71,10 @@ int g_http0_streak = 0;
 // the escalation to 2 reboots per outage so a genuine dead-coverage drive can't reboot-loop.
 int g_recovers_since_ok = 0;
 RTC_DATA_ATTR uint32_t net_reboot_count = 0;
-// CONSECUTIVE wedge-guard (task WDT) resets. RTC RAM survives a WDT reset, so this counts back-to-back
-// wedged wakes: cleared on any clean deep-sleep wake (the previous wake ended normally). At >=2 the wake
-// after a WDT reset goes straight back to sleep on the parked cadence instead of re-running the wedge-prone
-// init a third time in a row - bounding a persistently-wedging modem to ~2 WDT windows per parked cycle
-// instead of a 5-minute reset loop burning the 12V all night.
-RTC_DATA_ATTR uint32_t wdt_reset_count = 0;
-bool g_wdt_wake = false; // this boot came from a wedge-guard (WDT) reset - set at wake, drives the escalation
+// This boot's place in a run of consecutive panic/WDT resets, 0 on any other boot (Helpers/wdt_streak.h);
+// setup()'s escalation acts on it.
+uint32_t wdt_reset_count = 0;
+bool g_wdt_streak_retained = false; // the streak store validated: on a crash boot, proof it survived the reset
 unsigned long polling_delay = 5000; //5 seconds
 // broadcast delay 25 seconds by default
 unsigned long transmission_delay = 25000;
@@ -109,8 +106,8 @@ unsigned long g_last_discharge_ms = 0;
 
 #if ENABLE_WIFI
 // One-shot guard for the cold-boot WiFi RF-flush recovery (see setup()). RTC memory survives the recovery
-// deep-sleep but is cleared by a true power loss, so the flush can fire at most once per power-up - this is
-// what prevents a boot loop when WiFi is simply unavailable.
+// deep-sleep but is cleared by a power loss or any other reset, so the flush can fire at most once per
+// power-up or reset - this is what prevents a boot loop when WiFi is simply unavailable.
 RTC_DATA_ATTR bool wifi_recovery_pending = false;
 #endif
 
@@ -210,9 +207,9 @@ bool g_clean_sleep = false;
 
 // GNSS freeze (Feature 4). The accurate fix exists at the END of a drive (GNSS stabilized over minutes of
 // being awake); a parked wake-up can't re-lock in the few seconds we're up, so its reading is garbage. So we
-// FREEZE the last good driving fix on the is_parked 0->1 transition (RTC-persisted, survives deep sleep) and
-// reuse it for every parked/charging frame instead of powering GNSS. g_gps_powered = did we power GNSS this
-// wake (only on a drive/cold boot) - gates the loop's gpsGetData and the pre-sleep gpsEnd.
+// FREEZE the last good driving fix on the is_parked 0->1 transition (RTC-persisted, survives deep sleep, lost
+// to any other reset) and reuse it for every parked/charging frame instead of powering GNSS. g_gps_powered =
+// did we power GNSS this wake (only on a drive/cold boot) - gates the loop's gpsGetData and the pre-sleep gpsEnd.
 RTC_DATA_ATTR double frozen_lat = 0.0;
 RTC_DATA_ATTR double frozen_lon = 0.0;
 RTC_DATA_ATTR bool   frozen_valid = false;
@@ -236,7 +233,8 @@ QueueHandle_t bleLogQueue = nullptr;
 // Also a control input: a silent sample poke at a rail >= RAIL_AWAKE_VOLTS holds the charge latch
 // (CHARGE_SILENT_HOLD_POLLS) and may shorten the cadence (charge_followup, POST_DRIVE_*).
 float g_rail_before_poke = 0.0f;
-// Per-power-session tallies (evidence the modem is rarely powered): cheap skip wakes vs poll wakes.
+// Tallies since the last reset that was not a deep-sleep wake (evidence the modem is rarely powered): cheap
+// skip wakes vs poll wakes.
 RTC_DATA_ATTR uint32_t skips_count = 0;
 RTC_DATA_ATTR uint32_t polls_count = 0;
 
@@ -339,12 +337,14 @@ void chargeWakeStateSanitize(bool deep_sleep) {
 
 // Test B (brownout vs clean sleep): set true immediately before esp_deep_sleep_start(); checked on the next
 // boot. If we wake and it's NOT set, we did NOT go through our own sleep path -> an uncommanded reset
-// (power loss / brownout / reflash), not a real timer/motion wake. RTC-persisted; cleared on power loss.
+// (power loss / brownout / reflash / panic / WDT), not a real timer/motion wake. RTC-persisted; every reset
+// but a deep-sleep wake clears it.
 RTC_DATA_ATTR bool clean_sleep_marker = false;
-// Running count of genuine BROWNOUT resets (esp_reset_reason()==ESP_RST_BROWNOUT) this power session - the
-// unambiguous "the rail sagged and reset the chip" signal for Test B. A deliberate reflash shows as POWERON
-// (clean_sleep=0) and does NOT bump this, so a non-zero count here is a real supply problem. Cross-check
-// against rail_v at that boot.
+// Genuine BROWNOUT resets (esp_reset_reason()==ESP_RST_BROWNOUT) - the unambiguous "the rail sagged and reset
+// the chip" signal for Test B. A deliberate reflash shows as POWERON (clean_sleep=0) and does NOT bump this,
+// so a non-zero count here is a real supply problem. Cross-check against rail_v at that boot. Not a running
+// count: the brownout reset itself reloads it, so it reads 1 from a brownout boot through the deep sleeps
+// after it, and 0 after any other reset that is not a deep-sleep wake.
 RTC_DATA_ATTR uint32_t brownout_count = 0;
 
 #if ENABLE_LOGGING
@@ -425,6 +425,7 @@ void changeState(ActivityState new_state);     // Helpers/state_machine.h
 #include "Helpers/clock_sync.h"
 #include "Helpers/telemetry_format.h"
 #include "Helpers/geo_backlog.h"
+#include "Helpers/wdt_streak.h"   // crash-loop streak store, RTC_NOINIT; advanced at the top of setup()
 #include "Helpers/sleep_power.h"
 #include "Helpers/ble.h"
 #include "Helpers/logging.h"
@@ -476,6 +477,11 @@ void setup() {
   resetGeoAccepted(esp_reset_reason() == ESP_RST_DEEPSLEEP);
 #endif
   chargeWakeStateSanitize(esp_reset_reason() == ESP_RST_DEEPSLEEP);
+  // Wedge-guard accounting, first: a reset before it would repeat with the count frozen. A TASK_WDT/WDT reset
+  // means the previous wake BLOCKED (boot-153 failure mode) and the watchdog recovered it. PANIC counts too:
+  // the task-WDT's panic handler can surface as ESP_RST_PANIC on this IDF, and a genuine crash-loop is the
+  // same overnight 12V hazard as a wedge-loop either way.
+  wdt_reset_count = wdtStreakAdvance(esp_reset_reason(), &g_wdt_streak_retained);
 #if PRINT
   // Only stall on a true power-on, so a serial monitor can attach in time to see boot output. Skip it on
   // every deep-sleep wake - periodic, motion, and especially the WiFi RF-flush recovery - so those reboots
@@ -587,26 +593,12 @@ void setup() {
 #endif
 
   // Test B: did this boot come through our own deep-sleep path? clean_sleep_marker was set true right before
-  // we slept and survives deep sleep in RTC RAM; a power loss / brownout clears it. So !clean_sleep => an
-  // UNCOMMANDED reset (brownout / power blip / reflash), regardless of what esp_reset_reason claims.
+  // we slept and survives deep sleep in RTC RAM; any other reset clears it. So !clean_sleep => an
+  // UNCOMMANDED reset (brownout / power blip / reflash / crash), regardless of what esp_reset_reason claims.
   g_clean_sleep = clean_sleep_marker;
   bool clean_sleep = g_clean_sleep;
   clean_sleep_marker = false;            // consume it; the next clean sleep will re-set it
   if (esp_reset_reason() == ESP_RST_BROWNOUT) brownout_count++; // count only genuine supply brownouts (not reflashes)
-
-  // Wedge-guard accounting: a TASK_WDT/WDT reset means the previous wake BLOCKED (boot-153 failure mode) and
-  // the watchdog recovered it - count CONSECUTIVE occurrences (RTC RAM survives the reset). PANIC counts
-  // too: the task-WDT's panic handler can surface as ESP_RST_PANIC on this IDF, and a genuine crash-loop is
-  // the same overnight 12V hazard as a wedge-loop either way. Any clean deep-sleep wake means the previous
-  // wake ended normally, so the streak clears.
-  {
-    esp_reset_reason_t rr = esp_reset_reason();
-    bool wdt_reset = (rr == ESP_RST_TASK_WDT || rr == ESP_RST_INT_WDT || rr == ESP_RST_WDT ||
-                      rr == ESP_RST_PANIC);
-    if (wdt_reset) wdt_reset_count++;
-    else if (rr == ESP_RST_DEEPSLEEP) wdt_reset_count = 0;
-    g_wdt_wake = wdt_reset;
-  }
 
 #if ENABLE_LOGGING
   // First line of every wake window: why we woke, how deep we are, and - for the brownout test - whether it
@@ -625,7 +617,10 @@ void setup() {
       (long)(g_clock_comp_us / 1000), (long)clock_drift_ppm, clock_drift_learned ? "" : " (unlearned)");
   // Make every watchdog recovery visible in the dump (acceptance: a wedge shows a WDT event, never a silent
   // multi-minute gap). streak = consecutive wedged wakes; at >=2 the escalation below sleeps instead of retrying.
-  if (g_wdt_wake) logEvent("WDT/PANIC reset recovered a wedged/crashed wake (streak=%lu)", (unsigned long)wdt_reset_count);
+  // retained=0 on a crash boot means the store did not survive the reset, so the streak restarted at 1.
+  if (wdt_reset_count)
+    logEvent("WDT/PANIC reset recovered a wedged/crashed wake (streak=%lu retained=%d)",
+      (unsigned long)wdt_reset_count, g_wdt_streak_retained ? 1 : 0);
 #endif
   // NOTE: a low-battery lockout was tried here using obd.getVoltage() (ATRV), but the logs show ATRV reads
   // ~5.3V when the car/CAN is asleep and ~13.5V only when awake - it does NOT report the true 12V battery
@@ -833,7 +828,8 @@ void setup() {
     // live - the reset especially, since it is only accepted within seconds of this very boot.
     //
     // The poll is still refused (should_poll is false and stays false), so no OBD request is made and the
-    // modem is never powered on this path. Only the radio comes up, for a bounded window.
+    // modem is never powered on this path (the loop's offline reconnect skips it too, or an unanswering modem
+    // would be powered on). Only the radio comes up, for a bounded window.
     if (!should_poll && weak_rail && wake_cause == ESP_SLEEP_WAKEUP_UNDEFINED) {
       g_weak_rail_cold_boot = true;
 #if ENABLE_LOGGING
@@ -870,18 +866,22 @@ void setup() {
   // neither. No-op if !ENABLE_BLE.
 #if ENABLE_SLEEP && ENABLE_MEMS
   // Wedge-guard escalation: two CONSECUTIVE wakes just ended in a WDT reset (both wedged in the init path
-  // below). Don't run it a third time back-to-back - sleep on the parked cadence and try fresh next wake,
-  // so a persistently-wedging modem costs ~2 WDT windows per cycle, not a 5-minute reset loop all night.
+  // below). Don't run it a third time back-to-back - sleep and try fresh next wake, so a persistently-wedging
+  // modem costs ~2 WDT windows per cycle, not a 5-minute reset loop all night. The parked cadence, unless the
+  // rail says the car is awake (driving or charging): WOM can miss a smooth road, and a charge is followed at
+  // the charging cadence anyway.
   // Placed AFTER the gate/MEMS init (enterDeepSleep needs the sensor) and BEFORE BLE/modem bring-up.
-  // modem_on=true: after a mid-init WDT reset the modem is almost certainly still powered from the wedged
-  // wake (the wedge IS modem init) - CPOWD it on the way down rather than leave it drawing through the sleep.
-  if (g_wdt_wake && wdt_reset_count >= 2) {
+  // modem_on only when a wake since the last acknowledged power-down reached network init (wdt_streak.h):
+  // after a mid-init WDT reset the modem is almost certainly still powered (the wedge IS modem init) - CPOWD
+  // it on the way down rather than leave it drawing through the sleep. Never otherwise: an unanswered CPOWD
+  // ends in a 2.5 s PWRKEY pulse, which switches an off modem ON.
+  if (wdt_reset_count >= 2) {
+    g_next_wake_minutes = g_last_io36 >= RAIL_AWAKE_VOLTS ? WAKE_CHARGING_MINUTES : WAKE_PARKED_MINUTES;
 #if ENABLE_LOGGING
     logEvent("WDT streak=%lu -> skip init, sleep %dmin (retry fresh next wake)",
-      (unsigned long)wdt_reset_count, WAKE_PARKED_MINUTES);
+      (unsigned long)wdt_reset_count, g_next_wake_minutes);
 #endif
-    g_next_wake_minutes = WAKE_PARKED_MINUTES;
-    enterDeepSleep(true, "wdt-streak"); // never returns
+    enterDeepSleep(wdtStreakModemMayBeOn(), "wdt-streak"); // never returns
   }
 #endif
 
@@ -1278,7 +1278,7 @@ void loop() {
   // the instant the phone drops - which is exactly the OTA resume window - and a modem reconnect/POST there
   // would block the loop for seconds (starving sector ACKs) or, via the http=0 recovery ladder, deep-sleep
   // the device mid-transfer.
-  if (!bleRelaying() && !g_ota_active && !network.connected() && (millis() - last_reconnect_try) > WIFI_RETRY_MS) {
+  if (!g_weak_rail_cold_boot && !bleRelaying() && !g_ota_active && !network.connected() && (millis() - last_reconnect_try) > WIFI_RETRY_MS) {
     Serial.printf("Network offline - retrying\n");
     network.reconnect();
     last_reconnect_try = millis();

@@ -6,12 +6,18 @@
 #define PRINT 0
 #endif
 
+// Modem power notifications; the sketch overrides them to keep its retained "modem may be on" flag
+// (baseLogger/Helpers/wdt_streak.h).
+__attribute__((weak)) void cellModemPowerOnHook() {}
+__attribute__((weak)) void cellModemPowerOffHook() {}
+
 CellWrapper::CellWrapper(FreematicsESP32 sys, std::string apn) : NetworkWrapper(sys), apn{ apn }, net{} { };
 
 bool CellWrapper::init(const bool retry/* = false */) {
   do {
     m_init_stage = "begin";
     Serial.printf("net begin\n");
+    cellModemPowerOnHook(); // begin() powers the modem on
     if (!net.begin(&sys)) {
       Serial.printf("No net connected\n");
       continue;
@@ -335,6 +341,7 @@ void CellWrapper::powerOff() {
   sys.xbPurge();
   sys.xbWrite("AT+CPOWD=1\r");
   int r = sys.xbReceive(b, sizeof(b), 3000, expect_pd, 1); // xbReceive returns matched index+1, so 1 = ack
+  if (r == 1) cellModemPowerOffHook(); // only an ack proves it off; the PWRKEY fallback leaves it unknown
   // Bench evidence for the sleep-floor work: which branch ran and what the modem actually said. The fallback
   // stays UNCONDITIONAL on a missing ack - it is what protects a powered-but-HUNG modem, which this firmware
   // has field history of (the reconnect "modem not answering" branch, the PSM lockup note above,
