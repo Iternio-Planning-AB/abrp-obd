@@ -103,7 +103,10 @@
 
 #ifndef ENABLE_WIFI
 #define ENABLE_WIFI 0    // bench/office builds only; replaces cellular, it does not run alongside it
+#endif
+// Outside the #ifndef above so -D ENABLE_WIFI=1 gets the seeds too.
 #if ENABLE_WIFI
+#warning "ENABLE_WIFI: TLS is not verified - bench only"
 /*
   Empty on purpose - no network credentials in the source tree.
 
@@ -115,9 +118,16 @@
 
   Dormant at ENABLE_WIFI 0: this whole block is inside the guard.
 */
+#ifndef WIFI_SSID
 #define WIFI_SSID ""
+#endif
+#ifndef WIFI_PASSWORD
 #define WIFI_PASSWORD ""
+#endif
+#ifndef WIFI_PATH
 #define WIFI_PATH "https://api.iternio.com/1/tlm/send"
+#endif
+#ifndef WIFI_BULK_PATH
 #define WIFI_BULK_PATH "https://api.iternio.com/2/app/tlm" // v2 tlm endpoint (see TLM_V2_PATH)
 #endif
 #endif
@@ -128,8 +138,18 @@
 
 #ifndef ENABLE_CELL
 #define ENABLE_CELL 1    // the product transport
+#endif
+#if ENABLE_WIFI && ENABLE_CELL
+#error "ENABLE_WIFI replaces the modem: build it with -D ENABLE_CELL=0"
+#endif
+// Outside the #ifndef above so -D ENABLE_CELL=1 gets the seeds too.
+#if ENABLE_CELL
+#ifndef CELL_APN
 #define CELL_APN "hologram"
+#endif
+#ifndef CELL_HOST
 #define CELL_HOST "api.iternio.com"
+#endif
 /*
   SERVER ROOTS: uploads go only over a chain that verifies against Helpers/server_roots.h, else nothing
   is sent. A server moving to a new CA needs firmware trusting the new root shipped BEFORE the switch.
