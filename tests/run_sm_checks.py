@@ -12,7 +12,8 @@ tests/sm_checks.cpp compiles each side into its own namespace around the same ha
 every event: the latch, the leash and hold times, the marker debt, published is_parked, buffered frames,
 alarm speed notes, freezes, and the exact logEvent and Serial sequences. It also checks the weak-rail gate
 and the max-awake backstop properties, on the working tree's gate and backstop. Groups: enumerate (exhaustive, --depth, default 5), random (fixed seeds),
-scenarios (named field cases), or all.
+scenarios (named field cases), or all. Before compiling, it checks that only drive_state.h assigns the
+park/drive storage, that alarm_gate.h names no drive state, and that every drive call is in an extracted block.
 
 The pin. SM_PIN is the main commit a refactor step is measured against. The step 1 (#24) and step 2 (#6)
 branches use the same pin: the code they move is unchanged there. Re-pin only when a behaviour change to
@@ -37,7 +38,7 @@ import time
 
 SM_PIN = "6457b2a1a355a43b57ae877d40bae2481afad49c"
 # Headers the CUR side includes ahead of its extracted blocks (inside namespace sm_cur).
-CUR_HEADERS = []
+CUR_HEADERS = ["drive_state.h"]
 
 root = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(root / "tests/support"))
@@ -175,6 +176,55 @@ for region, prefix in (("SM_RAM", ""), ("SM_RTC", "RTC_DATA_ATTR ")):
                 continue
             if not re.search(pattern, src["logger"], re.M):
                 sys.exit(f"FAIL: {region} {name} = {value} does not match its definition in logger.ino ({label})")
+
+
+
+def code_only(text):
+    """Text with string/char literals and comments blanked (newlines kept), so a check sees code only."""
+    return re.sub(r'"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|//[^\n]*|/\*.*?\*/',
+                  lambda m: re.sub(r"[^\n]", " ", m.group(0)), text, flags=re.S)
+
+
+# Step 1 (#24): drive_state.h is the only code that assigns the park/drive storage. An assignment here is
+# =, a compound assignment, ++/--, taking the address or binding a reference (an alias could assign), or
+# swap(); matched on the whole file, so a statement split over lines is still seen.
+DRIVE_STORAGE = ("is_currently_parked", "g_last_speed_ms", "park_marker_owed")
+DECLARATION = re.compile(r"(?:^|\n)\s*(?:RTC_DATA_ATTR\s+)?(?:bool|unsigned\s+long)\s*$")
+helpers = sorted((root / "baseLogger/Helpers").glob("*.h"))
+for path in [root / "baseLogger/logger.ino", *helpers]:
+    if path.name == "drive_state.h":
+        continue
+    code = code_only(path.read_text())
+    for name in DRIVE_STORAGE:
+        for m in re.finditer(rf"\b{name}\b", code):
+            before, after = code[:m.start()].rstrip(), code[m.end():].lstrip()
+            if path.name == "logger.ino" and DECLARATION.search(before) and after.startswith("="):
+                continue  # its definition
+            assigned = re.match(r"(?:[-+*/%&|^]|<<|>>)?=(?!=)|\+\+|--", after)
+            stepped = before.endswith(("++", "--"))
+            addressed = before.endswith("&") and not before.endswith("&&") and not re.search(r"[\w)\]]\s*&$", before)
+            bound = re.search(r"&\s*\w+\s*=$", before)
+            swapped = re.search(r"\bswap\s*\([^;]*$", before)
+            if assigned or stepped or addressed or bound or swapped:
+                number = code.count("\n", 0, m.start()) + 1
+                sys.exit(f"FAIL: {path.relative_to(root)}:{number} assigns {name}; only drive_state.h may (#24)")
+
+# The OBD-alarm gate takes no drive input. A regex sees identifiers, not wrappers: a helper defined elsewhere
+# that returns drive state is out of its reach, so review still matters.
+alarm = code_only(tree("baseLogger/Helpers/alarm_gate.h"))
+for pattern in (r"\bdrive[A-Z_]\w*", r"\bDrive\w*", r"\bDRIVE_\w*", r"\bis_currently_parked\b",
+                r"\bg_last_speed_ms\b", r"\bpark_marker_owed\b", r"\blast_active\b", r"\bg_drive\w*"):
+    if re.search(pattern, alarm):
+        sys.exit(f"FAIL: alarm_gate.h reads drive state ({pattern}); the OBD-alarm gate takes no drive input")
+
+# Every call into the drive region sits in a block this harness extracts, so none can be added unseen.
+DRIVE_CALL = r"\bdrive[A-Z]\w*\s*\("
+calls = sum(len(re.findall(DRIVE_CALL, code_only(p.read_text())))
+            for p in [root / "baseLogger/logger.ino", *helpers] if p.name != "drive_state.h")
+extracted = len(re.findall(DRIVE_CALL, code_only("".join(cur.values()))))
+if calls != extracted:
+    sys.exit(f"FAIL: {calls} drive_state.h calls in the firmware but {extracted} in the extracted blocks; "
+             "a call outside them is not compared against SM_PIN - extract its block")
 
 energy = tree("tests/energy_checks.cpp")
 field = "".join(block(energy, f"const std::vector<Sample> {n} = ", "tests/energy_checks.cpp").rstrip() + ";\n" for n in ("DRIVE_0930", "DRIVE_1012"))

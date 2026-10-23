@@ -104,7 +104,7 @@ void enterDeepSleep(bool modem_on, const char* reason = nullptr) {
     parked_frame.emplace_back("is_parked", 1.0);
     parked_frame.emplace_back("utc", rtc.getEpoch());
     obd_result_vector.push_back(parked_frame);
-    park_marker_owed = false;
+    driveMarkerQueued();
   }
 
   // Flush before deep sleep wipes RAM. handleActivityState() can trigger sleep before loop()'s normal send

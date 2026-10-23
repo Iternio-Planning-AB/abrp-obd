@@ -175,7 +175,10 @@ OTA and log-dump holds, a console session, both speed keys and a NaN speed, trip
 no-speed-PID drives). The fake clock advances inside every log line and freeze, as the device's does.
 After every event the latch, leash, hold time, marker debt, published `is_parked`, buffered frames,
 freezes, the GNSS age bound asked for, and the exact `logEvent` and Serial sequences must be equal; the
-weak-rail gate and the max-awake backstop are checked as properties, on the working tree's code. The pin rule and what the harness
+weak-rail gate and the max-awake backstop are checked as properties, on the working tree's code. Since step 1 (#24) the CUR side is the
+drive region in `Helpers/drive_state.h`, and the runner fails if anything outside that header assigns
+`is_currently_parked`, `g_last_speed_ms` or `park_marker_owed`, if `alarm_gate.h` names drive state, or if
+a call into the drive region sits outside the blocks it extracts. The pin rule and what the harness
 cannot prove (32-bit `millis()` wrap, other flag sets, code outside the extracted blocks) are in the
 runner's header. Energy and wake surfaces come in step 0b (#28).
 
