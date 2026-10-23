@@ -388,6 +388,11 @@ older token. The runner also checks that `otaFinalize` and `bleDeinitForSleep` d
 pending, after the boot-partition commit and after `ble.deinit()`, by position only. The BLE task, NVS and the reset
 itself are not exercised.
 
+## Config macro checks
+
+Run `python3 tests/run_config_checks.py`: preprocesses `config.h` for the default build and every flag set `tools/check_variants.sh` builds,
+and fails if `ENABLE_NETWORK` does not behave as one value inside an `#if` (`ENABLE_NETWORK && X`, `!ENABLE_NETWORK`).
+
 ## Cellular TLS trust checks
 
 Run `python3 tests/run_server_roots_checks.py` (add `--require-live` to fail rather than skip when

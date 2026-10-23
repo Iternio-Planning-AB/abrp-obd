@@ -228,7 +228,7 @@ bool forgetProfile(const char* why) {
 #if ENABLE_LOGGING
   LittleFS.remove(PROFILE_PATH);
 #endif
-#if (ENABLE_NETWORK) && ENABLE_LOGGING // parenthesised: ENABLE_NETWORK is a bare `||`
+#if ENABLE_NETWORK && ENABLE_LOGGING
   const unsigned long discarded = obd_result_vector.size() + g_upload_held.size() + upload_spilled;
   LittleFS.remove(UPLOAD_BACKLOG_PATH);
   upload_spilled = 0;
@@ -249,7 +249,7 @@ bool forgetProfile(const char* why) {
   logEvent("PROFILE forgotten (%s) - log erased (%d segments), profile and push token cleared%s%s", why, erased,
     ended_dump, ended_ota);
 #endif
-#if (ENABLE_NETWORK) && ENABLE_LOGGING
+#if ENABLE_NETWORK && ENABLE_LOGGING
   if (discarded) logEvent("UPLOAD discarded n=%lu reason=forget", discarded);
 #endif
   return true;
