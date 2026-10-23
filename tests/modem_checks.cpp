@@ -46,6 +46,10 @@ struct Wake {
     bool uploadBuffered(bool) { ++upload_attempts; return false; }
     void bleDeinitForSleep() { ++ble_teardowns; }
     void driveMarkerQueued() { park_marker_owed = false; }
+    bool wdtStreakModemMayBeOn() { return false; }
+    void wdtStreakModem(bool) {}
+    void wdtStreakMarker(bool) {}
+    bool uploadBacklogPending() { return false; }
     void configureWOM(ICM_42627&) {}
     void esp_sleep_enable_ext0_wakeup(int, int) {}
     void esp_deep_sleep_start() { throw SleepReached{}; }
