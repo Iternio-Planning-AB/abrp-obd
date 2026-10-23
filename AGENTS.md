@@ -41,11 +41,18 @@ Flash and watch with `pio run -e esp32dev -t upload -t monitor` (115200 baud).
 A clean build prints two pre-existing `"PRINT" redefined` warnings, from `FreematicsOBD.cpp` and
 `mathparser/parser.cpp`. They are not yours; anything else probably is.
 
+Every build checks its linker map and fails unless the C/C++ runtime came from the toolchain's PSRAM-safe
+multilib (`tools/pio_psram_libs.py`, #64): this ESP32 rev 1 can lose stores to PSRAM, where mallocs over 4 KB
+land.
+
 **CI runs the host checks only.** `.github/workflows/host-tests.yml` runs every `tests/run_*.py` on each
-pull request and on `main`, normally and with `CXX='clang++ -DNDEBUG'`. Nothing in CI builds the firmware
-or touches a device, so a green PR proves the host checks and nothing more. Merging needs its `ci` job,
+pull request and on `main`, normally and with `CXX='clang++ -DNDEBUG'`. Apart from the one job below, nothing in CI builds
+the firmware or touches a device, so a green PR proves the host checks and nothing more. Merging needs its `ci` job,
 the one check the `main` ruleset requires: a new job goes in that job's `needs`. See *Testing* below,
 because that gap is the single biggest difference from a normal repo.
+
+The `variants` job compiles the non-default `config.h` variants with `sh tools/check_variants.sh` from `baseLogger/`;
+it never builds the default image. `ENABLE_WIFI 1` (with `ENABLE_CELL 0`) only compiles, as it overflows IRAM, and its TLS is unverified: bench only.
 
 ## The rules that bite first
 
@@ -64,8 +71,9 @@ must never compile — the reference FreematicsPlus would collide with the real 
 
 **Deep sleep is a reboot, not a resume.** RAM is wiped and `setup()` runs again from the top. Anything
 that must survive is `RTC_DATA_ATTR` (wake/sleep counters, the charging budget, the taper latch, the
-watchdog streak, the frozen parked fix) or LittleFS (the vehicle profile, the upload backlog). A plain
-global reset to its initialiser on every wake is the most common way to get this wrong.
+frozen parked fix) or LittleFS (the vehicle profile, the upload backlog). A plain global reset to its
+initialiser on every wake is the most common way to get this wrong. `RTC_DATA_ATTR` survives deep sleep
+only: a panic, WDT or software reset reloads it too (`DONGLE_CONTEXT.md` §11).
 
 **BLE callbacks run on the Bluedroid task and must only copy bytes and set a flag.** All NVS, crypto
 and OBD work happens on the loop task, in the matching `*Service()` function. This is stated as
@@ -107,8 +115,9 @@ Pass a group name (`link-range`, `link-failures`, `link-truncated`, `link-requir
 `direct-range`, or `queue`) to run just that group.
 
 Run `python3 tests/run_release_checks.py` for the release tooling: version naming and selection, build-tag
-resolution, signing through a fake `aws` with throwaway keys, and the workflow's safety properties. The
-release-notes group needs `git-cliff` (or set `GIT_CLIFF`); without it, it is skipped, and with `CI` set it fails.
+resolution, signing through a fake `aws` with throwaway keys, the workflow's safety properties, and the
+linker-map check of `tools/psram_libs.py` (`PsramRuntimeLink`). The release-notes group needs `git-cliff` (or
+set `GIT_CLIFF`); without it, it is skipped, and with `CI` set it fails.
 
 Hardware verification still requires a real dongle, and the loop is:
 
@@ -159,7 +168,7 @@ and upload cycle), `Helpers/state_machine.h` (activity states and cadences), `He
 
 ## State-machine differential harness
 
-Run `python3 tests/run_sm_checks.py` (groups `scenarios`, `random`, `enumerate`; `--depth N`, default 5) for
+Run `python3 tests/run_sm_checks.py` (groups `scenarios`, `random`, `enumerate`, `crash`; `--depth N`, default 5) for
 the park/drive decision. The differential covers the drive region; shared context comes from the working
 tree. The blocks that write drive state (the poll-time unlatch and re-latch, the `is_parked` publish, the
 OTA/dump hold, `changeState`, the buffer block and the pre-sleep marker) come from the pinned `main` commit
@@ -173,7 +182,14 @@ OTA and log-dump holds, a console session, both speed keys and a NaN speed, trip
 no-speed-PID drives). The fake clock advances inside every log line and freeze, as the device's does.
 After every event the latch, leash, hold time, marker debt, published `is_parked`, buffered frames,
 freezes, the GNSS age bound asked for, and the exact `logEvent` and Serial sequences must be equal; the
-weak-rail gate and the max-awake backstop are checked as properties, on the working tree's code. The pin rule and what the harness
+weak-rail gate and the max-awake backstop are checked as properties, on the working tree's code. The `crash`
+group (#49) runs CUR alone, because the setup() restore of the marker debt is a drive writer SM_PIN does not
+have: a panic mid-drive, in the pre-sleep flush and after a backlog load, plus every 5-event sequence over the
+alphabet with a crash, a flush crash and a sent flush added, must never lose the debt or an unsent marker.
+On the differential's boots the restore is a no-op, so a restore that fires there fails it. Since step 1 (#24) the CUR side is the
+drive region in `Helpers/drive_state.h`, and the runner fails if anything outside that header assigns
+`is_currently_parked`, `g_last_speed_ms` or `park_marker_owed`, if `alarm_gate.h` names drive state, or if
+a call into the drive region sits outside the blocks it extracts. The pin rule and what the harness
 cannot prove (32-bit `millis()` wrap, other flag sets, code outside the extracted blocks) are in the
 runner's header. Energy and wake surfaces come in step 0b (#28).
 
@@ -193,9 +209,30 @@ not in this repo) also verifies a synthetic dump through it, including actual hi
 Run `python3 tests/run_upload_checks.py` for real SIM7070 send/AT parsing and upload-helper checks with
 ASan/UBSan and NDEBUG. UART is fake. Python hashlib/hmac/base64 independently verify the logged
 fingerprint and every signature, so the host mbedTLS shims are never their own oracle.
-Run `python3 tests/run_gzip_container_checks.py` for the actual gzip container wrapper, independent
-Python decompression/CRC/ISIZE checks, and fallback paths. ROM deflate, ROM CRC, and PSRAM are shims;
-these checks do not validate the real ROM output or modem transport.
+Its `session` group (also part of `tls-ca`) runs the real `CellWrapper::connect()` on the real SH
+open/close/send: the production driving cadence plus one poll must not exceed `SESSION_IDLE_MAX_MS`, and the
+limit plus the measured connect-to-POST time must stay under the 61.3 s idle at which reused sessions failed
+in the field. Idle exactly the limit reuses (logged `reused idle=Ns`), 1 ms more reopens (`idle=Ns <trace>`,
+kept when that reopen fails), and a silent POST is http=0 with `p/a/r=1/1/255` and the retry opens fresh.
+Run `python3 tests/run_gzip_container_checks.py` for the real `gzip_body.h` linked with the vendored
+zlib. What it covers:
+- the `libraries/zlib` SHA256SUMS drift check;
+- independent Python decompression and CRC/ISIZE checks;
+- an absolute ratio floor, 9 synthetic points under `CELL_MAX_POST_BYTES` for every seed;
+- the pinned `library.json`;
+- verify failures, each with its own cause, from tampering with the block type, a stored block, the CRC
+  and the ISIZE;
+- the failure budget;
+- the crash breadcrumb;
+- the PSRAM allocation and verify-memory failures, and the per-wake summary;
+- the refused member's header bytes in the verify-fail line, an OTA self-test body past the 4 KB malloc
+  threshold that refuses the field fault (header byte 9 zeroed), and the `GZTEST` console loop (counts by
+  cause, no failure budget spent, argument caps, any key stops it).
+
+zlib is compiled with `CC` (default `clang`), which takes `-DNDEBUG` from `CXX`. PSRAM allocation, RTC
+memory and the clock are shims. The checks do not prove what the server or the modem accepts.
+Upload group `gzip-fallback` checks that a gzip failure never sends an over-cap body or drops a frame, and
+that the sized body is the sent body.
 
 GPS CSV `gps_read=ok` means parsing accepted a reply, including replies with zero coordinates.
 `gps_fix` still means cached nonzero coordinates. Date/time and speed are the cached accepted record,
@@ -233,7 +270,7 @@ battery upload deliberately discards protected geo history. Queue power-loss ato
 
 `__geo_` is reserved, scrubbed from profile results and public serializers, and stored as numeric
 shadow metadata only in the private backlog. Legacy/invalid geo provenance drops geo, not otherwise
-eligible battery/state. Actual RTC retention, cross-image resets, ROM gzip and modem behavior remain
+eligible battery/state. Actual RTC retention, cross-image resets, on-device gzip and modem behavior remain
 hardware gates. Sender-side geo eligibility does not depend on any server-side change; the backend's existing
 clock-skew normalization is unchanged.
 
@@ -270,11 +307,12 @@ provenance/calendar acceptance is not narrowed by this wire-only eligibility bou
 
 Eligible location and heading retain their independent original observation UTC. Filtering never
 rewrites source frames or failed-send backlog provenance. Eligible battery/state retain original
-frame UTC, with stale-battery handling unchanged. Geo-only omitted batches keep the successful
-no-POST rule. Future-relative-to-corrected-send-clock normalization remains the backend's existing
+frame UTC; on a trusted send clock `uploadBuffered` drops a frame whose own UTC is more than
+`BACKLOG_MAX_SEND_AGE_SECONDS` (6 days, inclusive) old before sizing (upload group `queue`). Geo-only
+omitted batches keep the successful no-POST rule. Future-relative-to-corrected-send-clock normalization remains the backend's existing
 policy. Both host runners extract the production clock-quality predicates instead of faking them;
 UART, clocks, compression, and filesystems remain fakes. Real RTC retention, clock acquisition,
-modem timing, ROM gzip and hardware remain unverified; no device was flashed by these checks.
+modem timing, on-device gzip and hardware remain unverified; no device was flashed by these checks.
 
 ## Send-once geo verification
 
@@ -294,17 +332,28 @@ INT32_MAX (2038-01-19T03:14:07Z) is inclusive; INT32_MAX+1 and UINT32_MAX are un
 hosts retain the uint32 ceiling. This patch does not upgrade existing time-source/GPS conversion or
 battery/calendar formatting for dates after 2038; that broader firmware limitation remains unsupported.
 
-The `drift` group covers deep-sleep drift compensation by driving the real `clockCompensateSleep`, `setClock`
-and NVS save/restore from `clock_sync.h` against a fake microsecond clock: a night of 30-minute wakes is
-learned from its morning NITZ resync, the next night stays within seconds, GPS syncs never teach, one bad
-source moves the rate only 1/`CLOCK_DRIFT_GAIN`, and a wrong stored rate converges back. The real RC rate,
-RTC retention and NVS across a re-plug need a dongle and a parked night (look for `CLOCK drift` in the dump).
+Clock groups `drift`, `resync`, `bounds` and `modem` drive the real `clock_sync.h` (compensation, `setClock`,
+the drift learner, `clockResync`, both NTP triggers, the parsers, NVS) against a fake microsecond clock, `millis()`
+and a scripted modem; `modem` runs the real `CellWrapper::syncNtp`/`readClock` against a scripted UART. They also
+compile logger.ino's two NTP call sites against their globals, check every log line fits logEvent's buffer (at
+most 119 chars), and check that a post-OTA trial boot zeroes the clock. The source policy is in DONGLE_CONTEXT.md
+§6a. Still needing a dongle and a parked night: the real RC rate, RTC retention, NVS across a re-plug, what
+`AT+CNTP` mode 1 does, NTP right after a POST, and real NITZ quality (look for `CLOCK drift ... src=` and
+`CLOCK ntp=` in the dump).
 
 ## Energy and temperature host checks
 
 Run `python3 tests/run_energy_checks.py` for charge progress/corroboration, the `is_charging` verdict
 and release latch (`signal`, `release`; replays field current sequences, no location data), the `setup()`
-wake gate (taper and charge-end reads), the `SLEEP enter` reason labels (`sleep-reason`), the ABD1 frame fitted to MTU−3 (`ble-frame`: compact 2 dp numbers, key filtering, priority trimming, MTU 23, and the `BLE tlm` log cadence), telemetry serialization, CSV columns, and schema-rotation checks under
+wake gate (taper and charge-end reads), the `SLEEP enter` reason labels (`sleep-reason`), the crash-loop
+streak (`wdt-streak`: the real `wdt_streak.h` store across simulated resets, brownouts counting with
+crashes, garbage and foreign stores, the escalation's threshold and cadence, the OTA commit ending it, the
+retained "modem may be on" flag every sleep acts on, the park-marker debt copy, and the weak-rail cold boot
+never reconnecting the modem), the DC fast-charge hold
+(`dc-awake`: entry on the car's `is_dcfc` or inferred power, the per-charge DC latch through the taper, the
+time-based silent hold (a seeded hour of 60 % silence) and the backstop sleep, budget by elapsed time on motion wakes, the 30 s cadence outside BLE, the CHARGING hold and the sample-poke stay, the
+live rail/alarm/motion vetoes, motion promoting a held poke, every exit and its sleep tier, a new AC charge not
+latched, and the cadence kept under `SESSION_IDLE_MAX_MS`), the ABD1 frame fitted to MTU−3 (`ble-frame`: compact 2 dp numbers, key filtering, priority trimming, MTU 23, and the `BLE tlm` log cadence), telemetry serialization, CSV columns, and schema-rotation checks under
 ASan/UBSan. Add `--profiles /path/to/profiles` to exercise actual Scenic/iX3 production/developer
 equations with the firmware parser (optional: the ABRP backend profiles are not public). The runner extracts the current charging and logging code;
 filesystem and hardware are fakes, not on-device verification.
@@ -317,6 +366,16 @@ ahead of a single or first frame are dropped, a re-segmented reply under a forei
 are refused, replies with no anchor line and non-`22xxxx` requests are left to the plain parser, and
 truncated replies decode their partial bytes. Fixtures are scrubbed co-processor replies; the co-processor itself is not exercised.
 
+## Profile push checks
+
+Run `python3 tests/run_profile_checks.py` for the BLE profile hand-off: the real config-apply block from `loop()`
+and `loadPersistedProfile()` against an in-memory LittleFS. A full push writes `/vehicle_profile.json` even when
+the profile is unchanged (a token-only re-push survives a reboot, with the re-init still skipped), and a failed
+write, or a push that does not apply, invalidates the hash and removes the file, so the next boot cannot restore an
+older token. The runner also checks that `otaFinalize` and `bleDeinitForSleep` drop a push still
+pending, after the boot-partition commit and after `ble.deinit()`, by position only. The BLE task, NVS and the reset
+itself are not exercised.
+
 ## Cellular TLS trust checks
 
 Run `python3 tests/run_server_roots_checks.py` (add `--require-live` to fail rather than skip when
@@ -327,3 +386,9 @@ the modem accepts; that needs `TLSCHECK` on a dongle.
 byte, every signed POST recomputed by the runner from the captured wire bytes with Python's
 hashlib/hmac (gzip on and off), no `X-TLM-TOKEN`, and the real `setHeaders()` AT output (quote escaping,
 refused values, the header budget, abort on a refused `AT+SHAHEAD`) and the best-effort User-Agent.
+
+## Cellular registration host checks
+
+Run `python3 tests/run_modem_checks.py` normally and with `CXX='clang++ -DNDEBUG'`.
+It exercises production cellular startup, registration/recovery and sleep against fake UART/time/hardware.
+Host checks do not verify real attachment timing, electrical sleep behavior or vehicle power/GPS.

@@ -1,4 +1,5 @@
 #pragma once
+#include <cstring>
 #include <map>
 #include <memory>
 
@@ -25,6 +26,8 @@ struct File {
     return result;
   }
   void println(const char* value) { *data += std::string(value) + '\n'; }
+  size_t print(const char* value) { *data += value; return std::strlen(value); }
+  String readString() { String result{data->substr(offset)}; offset = data->size(); return result; }
   void close() {}
 };
 
@@ -34,7 +37,7 @@ struct FakeLittleFS {
   bool exists(const char* path) const { return files.count(path); }
   File open(const char* path, const char* mode) {
     if (fail_open) return {};
-    if (*mode == 'w') files[path] = std::make_shared<std::string>();
+    if (*mode == 'w' || (*mode == 'a' && !exists(path))) files[path] = std::make_shared<std::string>();
     return exists(path) ? File{files.at(path)} : File{};
   }
   void remove(const char* path) { files.erase(path); }

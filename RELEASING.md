@@ -91,6 +91,10 @@ yours on official ones; that is the point.
 
 ## Known gaps
 
+- CI never links the firmware, so the linker-map check (`tools/pio_psram_libs.py`, which fails any image that
+  links a runtime without the PSRAM workaround) first runs in the release build. After a platform, framework or
+  toolchain bump, build the merge commit with `pio run -e esp32dev` before tagging, and run `GZTEST 12000` on a
+  dongle: it compresses in PSRAM.
 - The publish job trusts what the build job built. It checks only the build tag and the embedded public key, so a
   compromised PlatformIO dependency can't reach the key but could still get a backdoored image signed. The PyPI tools
   are pinned by hash (`.github/requirements/release.txt`), except starlette, which only `pio home` needs (see
