@@ -534,9 +534,11 @@ bool boot(esp_reset_reason_t reason) {
 }
 
 void checks() {
-  const esp_reset_reason_t crashes[] = {ESP_RST_PANIC, ESP_RST_TASK_WDT, ESP_RST_INT_WDT, ESP_RST_WDT};
-  const esp_reset_reason_t others[] = {ESP_RST_POWERON, ESP_RST_BROWNOUT, ESP_RST_DEEPSLEEP, ESP_RST_SW,
-                                       ESP_RST_EXT, ESP_RST_UNKNOWN, ESP_RST_SDIO};
+  // A brownout loop (a weak battery that sags out every modem start) is the same overnight drain (#50).
+  const esp_reset_reason_t crashes[] = {ESP_RST_PANIC, ESP_RST_TASK_WDT, ESP_RST_INT_WDT, ESP_RST_WDT,
+                                        ESP_RST_BROWNOUT};
+  const esp_reset_reason_t others[] = {ESP_RST_POWERON, ESP_RST_DEEPSLEEP, ESP_RST_SW, ESP_RST_EXT,
+                                       ESP_RST_UNKNOWN, ESP_RST_SDIO};
   const std::string parked_log =
     "WDT streak=2 -> skip init, sleep " + std::to_string(WAKE_PARKED_MINUTES) + "min (retry fresh next wake)";
   std::memset(&wdt_streak_store, 0xA5, sizeof(wdt_streak_store));
@@ -557,6 +559,14 @@ void checks() {
   }
   check(boot(ESP_RST_PANIC) && wdt_reset_count == 2 && boot(ESP_RST_PANIC) && wdt_reset_count == 3,
         "a crash loop the sleep did not break keeps counting and keeps escalating");
+  boot(ESP_RST_DEEPSLEEP);
+  boot(ESP_RST_PANIC);
+  check(boot(ESP_RST_BROWNOUT) && wdt_reset_count == 2, "a brownout after a crash extends the same streak");
+  // A brownout that took RTC memory with it leaves garbage: counted from nothing, so never escalated.
+  boot(ESP_RST_BROWNOUT);
+  std::memset(&wdt_streak_store, 0xA5, sizeof(wdt_streak_store));
+  check(!boot(ESP_RST_BROWNOUT) && wdt_reset_count == 1 && !g_wdt_streak_retained,
+        "a brownout that lost the store counts 1 and says so");
   // An awake rail (driving, charging) comes back on the charging cadence instead of a parked half hour.
   boot(ESP_RST_DEEPSLEEP);
   boot(ESP_RST_PANIC);
@@ -564,15 +574,16 @@ void checks() {
   check(boot(ESP_RST_PANIC) && g_next_wake_minutes == WAKE_CHARGING_MINUTES, "an awake rail sleeps the charging cadence");
   g_last_io36 = 12.6f;
   // Bytes that are not this store - garbage, another layout, a torn write - never extend a streak.
-  const WdtStreakStore foreign[] = {{0xA5A5A5A5u, 1, 0, ~1u}, {WDT_STREAK_MAGIC ^ 1u, 1, 0, ~1u},
-    {WDT_STREAK_MAGIC, 1, 0, 1u}, {WDT_STREAK_MAGIC, 1, 0, ~2u}, {WDT_STREAK_MAGIC, 1, 1, ~1u},
-    {WDT_STREAK_MAGIC, 1, 2, ~1u}};
+  const WdtStreakStore foreign[] = {{0xA5A5A5A5u, 1, 0, 0, ~1u}, {WDT_STREAK_MAGIC ^ 1u, 1, 0, 0, ~1u},
+    {WDT_STREAK_MAGIC, 1, 0, 0, 1u}, {WDT_STREAK_MAGIC, 1, 0, 0, ~2u}, {WDT_STREAK_MAGIC, 1, 1, 0, ~1u},
+    {WDT_STREAK_MAGIC, 1, 2, 0, ~1u}, {WDT_STREAK_MAGIC, 1, 0, 1, ~1u}, {WDT_STREAK_MAGIC, 1, 0, 4, ~1u},
+    {WDT_STREAK_MAGIC, 1u << 30 | 1, 0, 0, ~(1u << 30 | 1)}};
   for (const auto& bytes : foreign) {
     boot(ESP_RST_DEEPSLEEP);
     boot(ESP_RST_PANIC);
     wdt_streak_store = bytes;
-    check(!boot(ESP_RST_PANIC) && wdt_reset_count == 1 && !g_wdt_streak_retained,
-          "a crash over an unrecognised store counts 1 and says nothing was retained");
+    check(!boot(ESP_RST_PANIC) && wdt_reset_count == 1 && !g_wdt_streak_retained && !wdtStreakMarkerOwed(),
+          "a crash over an unrecognised store counts 1, says nothing was retained and owes no marker");
   }
   // The OTA commit ends the streak in this image's store: a rollback boots this image on the trial image's
   // crash reset, and must not add that crash to one from before the update.
@@ -580,6 +591,25 @@ void checks() {
   boot(ESP_RST_PANIC);
   wdtStreakEnd();
   check(!boot(ESP_RST_PANIC) && wdt_reset_count == 1, "a rollback after a crash-recovery update does not escalate");
+
+  // The trip-end debt (#49): every reset keeps it while the store holds, and only the store's bytes lose it.
+  std::memset(&wdt_streak_store, 0xA5, sizeof(wdt_streak_store));
+  boot(ESP_RST_POWERON);
+  check(!wdtStreakMarkerOwed(), "a power loss owes no marker");
+  wdtStreakMarker(true);
+  auto keeps = [](esp_reset_reason_t reason) {
+    boot(reason);
+    check(wdtStreakMarkerOwed() && g_wdt_streak_retained, "a reset over an intact store keeps the debt");
+  };
+  for (auto reason : crashes) keeps(reason);
+  for (auto reason : others) keeps(reason);
+  wdtStreakModem(true);
+  wdtStreakEnd();
+  check(wdtStreakMarkerOwed(), "the modem flag and the OTA commit leave the debt alone");
+  wdtStreakMarker(false);
+  boot(ESP_RST_PANIC);
+  check(!wdtStreakMarkerOwed() && wdtStreakModemMayBeOn(), "a paid debt stays paid; the modem flag is its own");
+  boot(ESP_RST_DEEPSLEEP);
 
   // The modem flag. The escalation powers the modem down only if it may be on: the 2.5 s PWRKEY fallback
   // for an unanswered AT+CPOWD would switch an off modem ON for the whole sleep.

@@ -167,7 +167,7 @@ and upload cycle), `Helpers/state_machine.h` (activity states and cadences), `He
 
 ## State-machine differential harness
 
-Run `python3 tests/run_sm_checks.py` (groups `scenarios`, `random`, `enumerate`; `--depth N`, default 5) for
+Run `python3 tests/run_sm_checks.py` (groups `scenarios`, `random`, `enumerate`, `crash`; `--depth N`, default 5) for
 the park/drive decision. The differential covers the drive region; shared context comes from the working
 tree. The blocks that write drive state (the poll-time unlatch and re-latch, the `is_parked` publish, the
 OTA/dump hold, `changeState`, the buffer block and the pre-sleep marker) come from the pinned `main` commit
@@ -181,7 +181,11 @@ OTA and log-dump holds, a console session, both speed keys and a NaN speed, trip
 no-speed-PID drives). The fake clock advances inside every log line and freeze, as the device's does.
 After every event the latch, leash, hold time, marker debt, published `is_parked`, buffered frames,
 freezes, the GNSS age bound asked for, and the exact `logEvent` and Serial sequences must be equal; the
-weak-rail gate and the max-awake backstop are checked as properties, on the working tree's code. Since step 1 (#24) the CUR side is the
+weak-rail gate and the max-awake backstop are checked as properties, on the working tree's code. The `crash`
+group (#49) runs CUR alone, because the setup() restore of the marker debt is a drive writer SM_PIN does not
+have: a panic mid-drive, in the pre-sleep flush and after a backlog load, plus every 5-event sequence over the
+alphabet with a crash, a flush crash and a sent flush added, must never lose the debt or an unsent marker.
+On the differential's boots the restore is a no-op, so a restore that fires there fails it. Since step 1 (#24) the CUR side is the
 drive region in `Helpers/drive_state.h`, and the runner fails if anything outside that header assigns
 `is_currently_parked`, `g_last_speed_ms` or `park_marker_owed`, if `alarm_gate.h` names drive state, or if
 a call into the drive region sits outside the blocks it extracts. The pin rule and what the harness
@@ -316,9 +320,10 @@ RTC retention and NVS across a re-plug need a dongle and a parked night (look fo
 Run `python3 tests/run_energy_checks.py` for charge progress/corroboration, the `is_charging` verdict
 and release latch (`signal`, `release`; replays field current sequences, no location data), the `setup()`
 wake gate (taper and charge-end reads), the `SLEEP enter` reason labels (`sleep-reason`), the crash-loop
-streak (`wdt-streak`: the real `wdt_streak.h` store across simulated resets, garbage and foreign stores,
-the escalation's threshold and cadence, the OTA commit ending it, the retained "modem may be on" flag
-every sleep acts on, and the weak-rail cold boot never reconnecting the modem), the ABD1 frame fitted to MTU−3 (`ble-frame`: compact 2 dp numbers, key filtering, priority trimming, MTU 23, and the `BLE tlm` log cadence), telemetry serialization, CSV columns, and schema-rotation checks under
+streak (`wdt-streak`: the real `wdt_streak.h` store across simulated resets, brownouts counting with
+crashes, garbage and foreign stores, the escalation's threshold and cadence, the OTA commit ending it, the
+retained "modem may be on" flag every sleep acts on, the park-marker debt copy, and the weak-rail cold boot
+never reconnecting the modem), the ABD1 frame fitted to MTU−3 (`ble-frame`: compact 2 dp numbers, key filtering, priority trimming, MTU 23, and the `BLE tlm` log cadence), telemetry serialization, CSV columns, and schema-rotation checks under
 ASan/UBSan. Add `--profiles /path/to/profiles` to exercise actual Scenic/iX3 production/developer
 equations with the firmware parser (optional: the ABRP backend profiles are not public). The runner extracts the current charging and logging code;
 filesystem and hardware are fakes, not on-device verification.

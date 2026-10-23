@@ -90,9 +90,10 @@ bool logging_message_printed = false; // print message once
 // Written only by the drive region (Helpers/drive_state.h), as are g_last_speed_ms and park_marker_owed.
 bool is_currently_parked = true;
 // Set when a DRIVE frame enters the upload buffer, cleared when the pre-sleep PARK marker is queued: the
-// server has been told DRIVE and not yet PARK. RTC so a trip end that straddles a reboot (the mid-drive
-// modem-recovery sleep, a WDT reset) is still closed on the next wake, while a parked heartbeat wake owes
-// nothing and opens no connection.
+// server has been told DRIVE and not yet PARK. RTC so a trip end that straddles a deep sleep (the mid-drive
+// modem-recovery sleep) is still closed on the next wake, while a parked heartbeat wake owes nothing and opens
+// no connection. Every other reset reloads it, so setup() restores it from wdt_streak.h, which keeps it set
+// until the marker is sent, not just queued (#49).
 RTC_DATA_ATTR bool park_marker_owed = false;
 // millis() of the last speed>0 frame. Drives the TIME-BASED parked re-latch below: the state-machine re-latch
 // (changeState -> CHARGING/STANDBY) never fires while a connected phone holds the leash in the BLE state, so
@@ -413,6 +414,7 @@ void logEvent(const char* fmt, ...);           // Helpers/logging.h
 bool uploadBuffered(bool drain);               // Helpers/network_upload.h
 #if ENABLE_LOGGING
 void saveUploadBacklog();                      // Helpers/network_upload.h
+bool uploadBacklogPending();                   // Helpers/network_upload.h
 #endif
 #endif
 void bleDeinitForSleep();                      // Helpers/ble.h (no-op stub when BLE is disabled)
@@ -482,6 +484,7 @@ void setup() {
   // the task-WDT's panic handler can surface as ESP_RST_PANIC on this IDF, and a genuine crash-loop is the
   // same overnight 12V hazard as a wedge-loop either way.
   wdt_reset_count = wdtStreakAdvance(esp_reset_reason(), &g_wdt_streak_retained);
+  if (esp_reset_reason() != ESP_RST_DEEPSLEEP && wdtStreakMarkerOwed()) driveMarkerRestored();
 #if PRINT
   // Only stall on a true power-on, so a serial monitor can attach in time to see boot output. Skip it on
   // every deep-sleep wake - periodic, motion, and especially the WiFi RF-flush recovery - so those reboots
@@ -615,12 +618,12 @@ void setup() {
   if (g_clock_slept_s)
     logEvent("CLOCK wake slept %lus, adjusted %+ldms at %ld ppm%s", (unsigned long)g_clock_slept_s,
       (long)(g_clock_comp_us / 1000), (long)clock_drift_ppm, clock_drift_learned ? "" : " (unlearned)");
-  // Make every watchdog recovery visible in the dump (acceptance: a wedge shows a WDT event, never a silent
-  // multi-minute gap). streak = consecutive wedged wakes; at >=2 the escalation below sleeps instead of retrying.
-  // retained=0 on a crash boot means the store did not survive the reset, so the streak restarted at 1.
+  // Make every watchdog or brownout recovery visible in the dump (acceptance: a wedge shows a WDT event, never
+  // a silent multi-minute gap). streak = consecutive crashed wakes; at >=2 the escalation below sleeps instead
+  // of retrying. retained=0 means the store did not survive the reset, so the streak restarted at 1.
   if (wdt_reset_count)
-    logEvent("WDT/PANIC reset recovered a wedged/crashed wake (streak=%lu retained=%d)",
-      (unsigned long)wdt_reset_count, g_wdt_streak_retained ? 1 : 0);
+    logEvent("%s reset recovered (streak=%lu retained=%d owed=%d)", resetReasonStr(),
+      (unsigned long)wdt_reset_count, g_wdt_streak_retained ? 1 : 0, park_marker_owed ? 1 : 0);
 #endif
   // NOTE: a low-battery lockout was tried here using obd.getVoltage() (ATRV), but the logs show ATRV reads
   // ~5.3V when the car/CAN is asleep and ~13.5V only when awake - it does NOT report the true 12V battery
@@ -865,8 +868,8 @@ void setup() {
   // recurring 0x13.) Same !g_sample_poke guard as GPS: a charge-sample poke (nobody at the car) brings up
   // neither. No-op if !ENABLE_BLE.
 #if ENABLE_SLEEP && ENABLE_MEMS
-  // Wedge-guard escalation: two CONSECUTIVE wakes just ended in a WDT reset (both wedged in the init path
-  // below). Don't run it a third time back-to-back - sleep and try fresh next wake, so a persistently-wedging
+  // Wedge-guard escalation: two CONSECUTIVE wakes just ended in a WDT, panic or brownout reset (wdt_streak.h;
+  // a wedge is usually in the init path below). Don't run it a third time back-to-back - sleep and try fresh next wake, so a persistently-wedging
   // modem costs ~2 WDT windows per cycle, not a 5-minute reset loop all night. The parked cadence, unless the
   // rail says the car is awake (driving or charging): WOM can miss a smooth road, and a charge is followed at
   // the charging cadence anyway.
@@ -875,6 +878,8 @@ void setup() {
   // after a mid-init WDT reset the modem is almost certainly still powered (the wedge IS modem init) - CPOWD
   // it on the way down rather than leave it drawing through the sleep. Never otherwise: an unanswered CPOWD
   // ends in a 2.5 s PWRKEY pulse, which switches an off modem ON.
+  // A restored marker debt is not paid here: these boots zeroed the clock, which keeps enterDeepSleep's marker
+  // block shut, so the backlog this boot never loaded is not overwritten.
   if (wdt_reset_count >= 2) {
     g_next_wake_minutes = g_last_io36 >= RAIL_AWAKE_VOLTS ? WAKE_CHARGING_MINUTES : WAKE_PARKED_MINUTES;
 #if ENABLE_LOGGING
@@ -1933,6 +1938,7 @@ void loop() {
       Serial.printf("Empty frame (no OBD/GPS data) - skipping upload\n");
     }
 #endif
+    if (park_marker_owed) wdtStreakMarker(true); // as soon as it is buffered, before the upload can send it
 
 #if ENABLE_LOGGING
     // Log every reading (even when the frame is too thin to upload) with full hardware diagnostics.

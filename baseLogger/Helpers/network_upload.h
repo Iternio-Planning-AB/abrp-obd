@@ -357,13 +357,17 @@ void saveUploadBacklog() {
   if (obd_result_vector.empty()) return; // everything uploaded (or nothing polled) - leave no stale file
   File f = LittleFS.open(UPLOAD_BACKLOG_PATH, "w");
   if (!f) { Serial.printf("Backlog: open for write failed\n"); return; }
-  for (const auto& frame : obd_result_vector) {
-    f.println(encodeUploadFrame(frame).dump().c_str());
+  // The loader keeps the first MAX_UPLOAD_BUFFER lines, and the trip-end marker can be frame MAX + 1 (#49).
+  const size_t skip = obd_result_vector.size() > MAX_UPLOAD_BUFFER ? obd_result_vector.size() - MAX_UPLOAD_BUFFER : 0;
+  for (size_t i = skip; i < obd_result_vector.size(); ++i) {
+    f.println(encodeUploadFrame(obd_result_vector[i]).dump().c_str());
   }
   f.close();
-  Serial.printf("Backlog: %d unsent frame(s) persisted to flash\n", (int)obd_result_vector.size());
-  logEvent("BACKLOG saved %d unsent frame(s)", (int)obd_result_vector.size());
+  Serial.printf("Backlog: %d unsent frame(s) persisted to flash\n", (int)(obd_result_vector.size() - skip));
+  logEvent("BACKLOG saved %d unsent frame(s)", (int)(obd_result_vector.size() - skip));
 }
+
+bool uploadBacklogPending() { return LittleFS.exists(UPLOAD_BACKLOG_PATH); }
 
 // Called at the end of setup() on polling wakes only (gate skips sleep before this, leaving the file for the
 // next real wake). Loads into the normal RAM buffer, bounded by MAX_UPLOAD_BUFFER, then deletes the file -

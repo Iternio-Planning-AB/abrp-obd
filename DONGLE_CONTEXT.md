@@ -623,9 +623,12 @@ session.
   cadence decisions the timer can't tell apart name themselves: `parked-held`, `parked-cap`,
   `parked-uncorroborated`, `pdw` and `followup` (below). An explicit sleep reason wins over a cadence
   label, which wins over the timer.
-- **`WDT/PANIC reset recovered a wedged/crashed wake (streak=<n> retained=<0|1>)`** follows the `WAKE` of a
-  panic or WDT reset. `streak` counts consecutive ones; a deep-sleep wake or any other reset ends it.
-  `retained=0` means the count did not survive the reset and restarted at 1. At `streak=2` the boot logs
+- **`<reset> reset recovered (streak=<n> retained=<0|1> owed=<0|1>)`** follows the `WAKE` of a panic, WDT
+  or brownout reset (`<reset>` is the `WAKE` line's `reset=`). `streak` counts consecutive ones, brownouts
+  included (#50: a battery that sags out on every modem start loops like a crash); a deep-sleep wake or any
+  other reset ends it. `retained=0` means the count did not survive the reset and restarted at 1; on a
+  `BROWNOUT` line it answers whether RTC memory survives a brownout on this board. `owed=1`: this boot owes
+  the trip-end `is_parked:1` marker, restored from the same store (#49). At `streak=2` the boot logs
   `WDT streak=2 -> skip init, sleep <m>min` and sleeps with `reason=wdt-streak`: 30 min, or 3 min when the
   rail says the car is awake. A crash boot zeroes the clock, so these lines and the sleep after them usually
   carry no UTC; read them in order against the next `WAKE`. Nothing is reachable over BLE during that
@@ -709,7 +712,8 @@ Everything below except `README.md` and `docs/` is embedded verbatim in **Part I
    WDT and software reset included (#30: 20 panics in the field, every one `boot=1 sleeps=0`). State that
    must survive a crash goes in `RTC_NOINIT_ATTR`, which is garbage after a power-on and may hold another
    image's bytes after a rollback, so it needs a check that rejects both (`wdt_streak.h`: a magic and an
-   inverted copy).
+   inverted copy). That store holds the crash-loop streak, the "modem may be on" flag and a copy of the
+   park-marker debt that is cleared only once the marker is sent, since the backlog is deleted when it loads.
 
 
 ---
