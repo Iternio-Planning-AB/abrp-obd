@@ -164,6 +164,8 @@ void otaBenchReset();
 // JWSTEST branch below needs the declaration up here.
 void profileSigSelfTest();
 
+void gzipBenchTest(const char* args); // gzip_body.h, included after this file
+
 // Non-blocking-ish serial console for retrieving the flash log: DUMP (stream all; DUMP n = newest n segments), STAT (usage), CLEAR.
 void handleLogCommands() {
   if (!Serial.available()) return;
@@ -193,6 +195,7 @@ void handleLogCommands() {
   if ((g_ota_active || g_logdump_active) &&
       (is_dump || cmd.equalsIgnoreCase("CLEAR") || cmd.equalsIgnoreCase("PANIC") || cmd.equalsIgnoreCase("WDTHANG") ||
        cmd.equalsIgnoreCase("RADIO") || cmd.equalsIgnoreCase("CLKPROBE") || cmd.equalsIgnoreCase("TLSCHECK") ||
+       cmd.substring(0, 6).equalsIgnoreCase("GZTEST") ||
        cmd.substring(0, 2).equalsIgnoreCase("AT"))) {
     Serial.printf("BUSY: %s in progress - %s refused (try again when it finishes)\n",
       g_ota_active ? "firmware update" : "BLE log dump", cmd.c_str());
@@ -278,6 +281,8 @@ void handleLogCommands() {
   // tampered, and intact again (see profileSigSelfTest). A happy-path push cannot show this - it looks
   // the same whether the signature is enforced or blindly accepted.
   else if (cmd.equalsIgnoreCase("JWSTEST")) profileSigSelfTest();
+  // Bench check of the compressor and its verifier on synthetic bodies (gzip_body.h).
+  else if (cmd.substring(0, 6).equalsIgnoreCase("GZTEST")) gzipBenchTest(cmd.c_str() + 6);
   else if (cmd.equalsIgnoreCase("RESUME")) maintenance_mode = false; // hand back to normal duty (sleep allowed)
   // Bench-only, physical access: the two resets the crash-loop guard counts (wdt_streak.h), to see on a dongle
   // that its count survives them. Two in a row escalate. PANIC aborts now; WDTHANG stops feeding the wedge

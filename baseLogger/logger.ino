@@ -413,6 +413,7 @@ void logEvent(const char* fmt, ...);           // Helpers/logging.h
 bool uploadBuffered(bool drain);               // Helpers/network_upload.h
 #if ENABLE_LOGGING
 void saveUploadBacklog();                      // Helpers/network_upload.h
+void gzipLogWakeSummary();                     // Helpers/gzip_body.h
 #endif
 #endif
 void bleDeinitForSleep();                      // Helpers/ble.h (no-op stub when BLE is disabled)
@@ -605,9 +606,10 @@ void setup() {
   // was a clean (commanded) sleep wake, the decoded reset cause, the uncommanded count, and BOTH voltages
   // (ATRV vs true rail). Events fire on every wake including enforce-mode skips, so this captures wakes that
   // never write a telemetry row.
-  logEvent("WAKE reason=%s reset=%s clean_sleep=%d brownouts=%lu atrv=%.2f rail=%.2f boot=%lu sleeps=%lu",
+  // rev: the ESP32 silicon revision; the PSRAM cache bug the compiler workaround exists for is rev0/rev1.
+  logEvent("WAKE reason=%s reset=%s clean_sleep=%d brownouts=%lu atrv=%.2f rail=%.2f boot=%lu sleeps=%lu rev=%d",
     g_wake_reason, resetReasonStr(), clean_sleep ? 1 : 0, (unsigned long)brownout_count,
-    g_last_voltage, g_last_io36, (unsigned long)bootCount, (unsigned long)sleepCount);
+    g_last_voltage, g_last_io36, (unsigned long)bootCount, (unsigned long)sleepCount, (int)ESP.getChipRevision());
   // A deep-sleep wake cannot change the image: a new one is confirmed (otaHandlePendingVerify) before
   // anything can sleep. A boot that also opened a segment logs it twice; harmless, and it keeps the rule
   // "no FW line after a non-deep-sleep WAKE = older firmware" (DONGLE_CONTEXT.md §5).
