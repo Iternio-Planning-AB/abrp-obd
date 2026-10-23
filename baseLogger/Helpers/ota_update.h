@@ -786,9 +786,9 @@ void otaService() {
 
 /*
   Is this boot an unconfirmed trial boot? Cheap and callable at the very top of setup(), before Serial - used
-  to skip the cold-boot-only branches that would otherwise damage a post-OTA boot (the 2s serial-attach delay
-  and, critically, rtc.setTime(0), which would zero the clock and make every frame unuploadable until GNSS
-  locks). Cached, because the answer changes once we mark the image valid.
+  to skip the cold-boot-only 2 s serial-attach delay. (It no longer spares the clock: a trial boot zeroes it
+  like a cold boot, because the time esp_restart() leaves behind was seen ~28 years off - #13.) Cached, because
+  the answer changes once we mark the image valid.
 */
 bool otaIsTrialBoot() {
   static int8_t cached = -1;

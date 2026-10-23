@@ -323,6 +323,23 @@ Deflate is the ESP32 boot ROM's miniz, driven from `gzip_body.h` with the ~300 K
 
 Time sync has **three** sources, not four: GNSS (`CLK_GPS`, wins), the modem's `AT+CCLK` (`CLK_NITZ`),
 `AT+CNTP` (`CLK_NTP`), plus the `Date` header on each telemetry POST (`CLK_HTTP`) as a coarse anchor.
+All of them set the clock; only NTP and a confirmed GNSS pair (two records in one wake advancing as
+`millis()` did) teach the deep-sleep drift rate. AT+CCLK was minutes off on one test SIM, so it never teaches,
+and its steps are accounted to the millisecond (`clock_unref_step_ms`) so they cannot skew the next window; a
+phone utc push restarts the window instead (`clockForgetWindow`). NTP costs data and a DNS lookup, so it never
+drives the modem, attaches or extends a wake:
+- `clockNtpAfterUpload` asks it right after an upload that sent frames while the car is in use (OBD answering,
+  driving, charging, or the rail at `RAIL_AWAKE_VOLTS`), at most once per wake, and only when it is the only
+  source (no AT+CCLK time this wake, or no valid clock) or a window of at least an hour of sleep is teachable
+  and `CLOCK_NTP_MIN_INTERVAL_S` (6 h, doubling to 24 h after failures) has passed.
+- `clockNtpNoClock` is the one exception: with no valid clock at all, setup() and the loop recovery ask it once
+  per wake on a modem already up for this wake's upload, before the poll, even with the car asleep - otherwise
+  every frame of the wake would go without a utc.
+- NTP is unauthenticated, so with a valid clock a step is bounded: within `CLOCK_NTP_MAX_DISAGREE_S` of this
+  wake's AT+CCLK reading, or without one, within what `CLOCK_DRIFT_MAX_PPM` over the sleep explains plus that
+  margin. Further than that it is `disagree`: no set, no teach, and the attempt counts as failed.
+
+A post-OTA boot zeroes the clock like a cold boot (#13).
 There is no `GET /2/utc` call — `CellWrapper::getEpoch()` exists but nothing invokes it, and `UTC_KEY`
 / `UTC_PATH` are gone.
 
@@ -438,7 +455,8 @@ bounded by `MAX_UPLOAD_BUFFER` (the oldest go first).
 | Who | Sees | Can do |
 |---|---|---|
 | Passive listener on the cellular path | TLS only | nothing |
-| Active MITM with any certificate under the bundled roots (name and dates are not checked) | uploads: positions, battery, the api key, keyid, signatures | read; replay an exact earlier request, at any later time (no `created`); swallow uploads by answering 200, so the frames are dropped; set the clock through unauthenticated NTP when a resync runs and GPS is stale (pre-existing; the HTTP `Date` header is not read on cellular), and if that resync ends an hour or more of sleep it also teaches a skewed drift rate (bounded by `CLOCK_DRIFT_MAX_PPM`, kept in NVS across a re-plug, halved toward the truth by each honest window after); not forge a new request or learn the token |
+| Active MITM with any certificate under the bundled roots (name and dates are not checked) | uploads: positions, battery, the api key, keyid, signatures | read; replay an exact earlier request, at any later time (no `created`); swallow uploads by answering 200, so the frames are dropped; not forge a new request or learn the token |
+| On-path network, DNS spoofer or NTP pool member (no certificate) | NTP replies | step the clock when NTP is asked and GPS is stale (only on a wake already uploading, at most once per wake): with a valid clock at most `CLOCK_NTP_MAX_DISAGREE_S` from this wake's AT+CCLK reading, or without one, beyond what `CLOCK_DRIFT_MAX_PPM` over the sleep explains; with no valid clock, freely (it is the fallback). It can nudge the drift rate within `CLOCK_DRIFT_MAX_PPM`, kept in NVS across a re-plug and halved toward the truth by each honest window after. The HTTP `Date` header is not read on cellular. It cannot roll a valid clock back days to defeat the send-time geo expiry |
 | Anyone with the token | — | post as the car. The token reaches the dongle over BLE at pairing (ABD2 profile push; LESC Just Works: encrypted, not MITM-authenticated) and is held by the phone app; cellular signing does not change either |
 
 This assumes a high-entropy token (a UUIDv4, ~122 random bits): the keyid is an unsalted SHA-256 prefix
@@ -596,10 +614,20 @@ session.
   newest `n` segments (about 25 s each), and `DUMP 3` usually covers the last drive. It is genuinely "the tool that made every other bug in this
   project findable".
 - **Clock lines.** The board has no 32 kHz crystal, so deep sleep keeps time on the internal RC, which runs
-  ~0.6 % fast. Each wake takes that back at a learned rate. `CLOCK drift <raw> raw, <residual> residual over
-  <s> asleep -> rate <ppm>` is a NITZ/NTP resync teaching the rate. `NET clock resynced ... (residual)` is
-  what compensation left over. `NET clock resync FAILED` means the wake runs on the compensated RTC. After each
-  deep-sleep `WAKE`, `CLOCK wake slept <s>, adjusted <ms> at <ppm>` says what that wake corrected.
+  ~0.6 % fast. Each wake takes that back at a learned rate; after each deep-sleep `WAKE`, `CLOCK wake slept <s>,
+  adjusted <ms> at <ppm>` says what that wake corrected. `CLOCK drift <raw> raw, <residual> residual over <s>
+  asleep -> rate <ppm> ... src=<ntp|gps>` is a teaching sync (NTP, or a confirmed GNSS pair); `residual` is what
+  compensation left over, net of any CCLK or single-GNSS steps since the last teaching sync. `CLOCK <src> step
+  <s>[ ref]` is the first step of 2 s or more per source per wake, and every teaching one (`ref`); `CLOCK <src>
+  set, was unset` the first time after a cold boot or OTA.
+  `CLOCK ntp=<ok|same|disagree|code|to>/<ms>ms on=<upload+obd|drive|charge|rail|noclock> for=<time|teach>`
+  `[ d=<s>][ retry=<h>h]` is one NTP attempt and what triggered it (`same`: the readback could not be told apart
+  from CCLK, so it was applied as CCLK; `disagree`: refused as further than the bound, by `d`; `62` is DNS).
+  `CLOCK ntp=gated why=<asleep|nodata> for=time` (once per wake) means the clock had no source this wake and NTP
+  could not run: the car is asleep, or the upload sent nothing. `CLOCK resync FAILED` (once per wake) means the
+  wake runs on the compensated RTC, or with no clock at all. Still to check on a dongle: what `AT+CNTP` mode 1
+  really does (the time on the result line, and whether it also sets the modem RTC), and NTP right after a POST
+  (the SH session is still open, `syncNtp` purges the UART, and a failure can block ~20 s).
 - **`MOTION act=<%> n=<windows> s=<span> peak=<g> mean=<g> axmax=<g> obd parked chg`** is one line per awake
   minute (and the partial minute before `SLEEP enter`; one in progress when an OTA reboots is lost). `act` is the
   share of observed time whose `detectMovement` window saw motion: each window stands for the time

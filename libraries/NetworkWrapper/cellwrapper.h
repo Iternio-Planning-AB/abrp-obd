@@ -9,6 +9,13 @@
 #include <networkwrapper.h>
 #include <utility>
 
+// What one AT+CNTP exchange reported (CellWrapper::syncNtp).
+struct NtpResult {
+  int code = -1;          // +CNTP result: 1 = ok, 61 net, 62 DNS, 63 connect, 66 timeout; -1 = no result line
+  unsigned long ms = 0;   // the whole exchange, PDP activation included
+  std::string utc;        // "yyyy/MM/dd,hh:mm:ss" when the result line carries the time, else ""
+};
+
 class CellWrapper : public NetworkWrapper {
 public:
   CellWrapper(FreematicsESP32 sys, std::string apn);
@@ -50,8 +57,9 @@ public:
   std::string readClock();
 
   /* Sync the modem RTC from an NTP server over the data link (AT+CNTP). Reliable when carrier NITZ is
-     absent. tz is set to 0 so AT+CCLK then reads UTC. Returns true on a reported success. */
-  bool syncNtp();
+     absent. tz is set to 0 so AT+CCLK then reads UTC. Returns true on a reported success; `result` gets the
+     +CNTP code (-1 = no answer), the duration and the UTC time the result carries, if the modem sends one. */
+  bool syncNtp(NtpResult* result = nullptr);
 
   /* One-line signal (AT+CSQ) + modem voltage (AT+CBC) + CEREG state snapshot for diagnostics */
   std::string netDiag() override;

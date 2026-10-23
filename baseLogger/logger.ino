@@ -494,11 +494,10 @@ void setup() {
   // NITZ-set time; wiping it every wake made the ATRV gate (which runs BEFORE NITZ re-syncs) see epoch 0,
   // think the heartbeat was always due, and poll on every wake - keeping the car awake. Preserve the retained
   // time on deep-sleep wakes so the gate's heartbeat-interval math actually works.
-  // ...but do NOT zero the clock on a post-OTA boot. esp_restart() keeps the RTC timer running, so the time
-  // survives; wiping it would leave every frame without a utc (and therefore unuploadable) until the GNSS
-  // re-locks - and the cellular NTP recovery is rate-limited and suppressed while a phone is connected,
-  // which is exactly the state right after an update.
-  if (wake_cause == ESP_SLEEP_WAKEUP_UNDEFINED && !otaIsTrialBoot()) rtc.setTime(0);
+  // A post-OTA boot is zeroed too (#13). The system time esp_restart() leaves behind was seen ~28 years in the
+  // future on the bench; a smaller error would pass clockValid() and be stamped on uploaded frames. The cost is
+  // frames without utc for the ~14 s until AT+CCLK, NTP or GNSS sets the clock.
+  if (wake_cause == ESP_SLEEP_WAKEUP_UNDEFINED) rtc.setTime(0);
   // Before anything reads the clock (the ATRV gate's heartbeat math, the first event stamps).
   clockDriftRestore();
   clockCompensateSleep(esp_reset_reason() == ESP_RST_DEEPSLEEP);
@@ -966,17 +965,9 @@ void setup() {
   network.set_server_roots(SERVER_ROOTS_P7B, SERVER_ROOTS_LEN); // see SERVER ROOTS in config.h
   network.set_session_idle_max_ms(SESSION_IDLE_MAX_MS);
 
-  // Acquire UTC for the cellular path. Skipped entirely on a deep-sleep wake (the ESP32 RTC keeps running
-  // and stays valid), so this only actually executes on a cold/POWERON boot.
-  //   1) One free AT+CCLK read: local query, ~50ms, no data. parseCclk() rejects the unset 1980/2080
-  //      default. Whether this works is per-SIM, not rare-vs-common: the roaming Hologram SIM's visited
-  //      networks deliver no NITZ, but the Telia SIM does (CLKPROBE: AT+CLTS: 1, AT+CCLK within 2 s of a
-  //      just-synced RTC). So it is worth trying FIRST every time, and on a NITZ SIM step 2 never runs.
-  //   2) NTP over the data bearer, for the SIMs where step 1 comes back empty (field-confirmed on the
-  //      Hologram SIM: the old 10x1s NITZ wait always ran to exhaustion = pure boot delay). syncNtp() is
-  //      ~1s now that xbReceive gets expected-match strings (see CellWrapper::syncNtp). Not infallible
-  //      either - it resolves pool.ntp.org over the bearer, and CLKPROBE saw it fail "+CNTP: 62" (DNS).
-  // GPS still overrides with authoritative time the moment it locks (setClock priority).
+  // Acquire UTC for the cellular path from AT+CCLK (clockResync); NTP only ever follows an upload while the car is
+  // in use (clockNtpAfterUpload). GPS still overrides with authoritative time the moment it locks (setClock priority).
+  // On a deep-sleep wake the RTC kept running, so this only spends anything once the clock is unset or stale.
   //
   // BUG FIX (kept): this block (incl. set_api_page below) was #if !ENABLE_BLE - with BLE enabled api_page
   // stayed empty and every upload POSTed to the wrong URL (HTTP 404). It must always run for cellular.
@@ -984,38 +975,8 @@ void setup() {
   // true across every deep sleep - so the clock was set once on the first boot with coverage and then
   // free-ran on the RC oscillator at ~30 s/hour, forever, unless a GPS fix happened to correct it.
   // See CLOCK_RESYNC_SECONDS and the note on last_clock_sync_epoch for the measurements.
-  if (clockNeedsSync()) {
-    const time_t before = clockValid() ? rtc.getEpoch() : 0;
-    // Captured BEFORE the sync: setClock() overwrites last_clock_sync_epoch, so reading it afterwards
-    // would measure the interval against the value that just replaced it.
-    const time_t prev_sync = last_clock_sync_epoch;
-    time_t t = parseCclk(network.readClock().c_str());
-    if (t) {
-      setClock(CLK_NITZ, t);
-      Serial.printf("Clock set from NITZ: %s UTC\n", rtc.getTime("%Y-%m-%d %H:%M:%S").c_str());
-    } else if (network.connected()) {
-      Serial.printf("No NITZ (expected on roaming SIM) - syncing clock via NTP...\n");
-      if (network.syncNtp()) {
-        t = parseCclk(network.readClock().c_str());
-        if (t) {
-          setClock(CLK_NTP, t);
-          Serial.printf("Clock set from NTP: %s UTC\n", rtc.getTime("%Y-%m-%d %H:%M:%S").c_str());
-        }
-      }
-    }
-#if ENABLE_LOGGING
-    // Log the CORRECTION, not just "set": the skew is invisible on the device. It is the residual left
-    // after the wake's drift compensation; the raw drift and the learned rate are in the CLOCK drift line.
-    if (t && before && prev_sync) {
-      logEvent("NET clock resynced %+lds after %lds (residual)", (long)(t - before), (long)(before - prev_sync));
-    } else if (t) {
-      logEvent("NET clock: set");
-    } else {
-      logEvent("NET clock resync FAILED (no NITZ/NTP) - %s, wake compensated %+ldms",
-        clockValid() ? "keeping RTC" : "UNSET (retry in loop / await GPS)", (long)(g_clock_comp_us / 1000));
-    }
-#endif
-  }
+  // The modem is only up here on a wake that polls and uploads, so with no valid clock at all NTP may follow.
+  if (clockNeedsSync() && !clockResync("boot")) clockNtpNoClock();
   network.set_api_page(TLM_V2_PATH); // uploads use the v2 tlm endpoint (logNetwork -> sendBulk)
 #endif
 #endif
@@ -1168,12 +1129,12 @@ void loop() {
   alarmGateService();
 
 #if ENABLE_BLE
-  // A phone utc push set the clock without clockNoteRealSync(): the sleep counted so far no longer explains
-  // the clock's error, so restart the drift window rather than learn ~0 ppm from it.
+  // A phone utc push set the clock without clockNoteRealSync(): the sleep and steps counted so far no longer
+  // explain the clock's error, so restart the drift window rather than learn a wrong rate from it.
   static uint32_t seen_time_pushes = 0;
   if (ble.timePushes() != seen_time_pushes) {
     seen_time_pushes = ble.timePushes();
-    clock_slept_since_sync = 0;
+    clockForgetWindow();
   }
 
   // Apply a BLE-pushed profile HERE, on the loop task, between poll cycles - never on the Bluedroid task
@@ -1326,14 +1287,12 @@ void loop() {
       // skipped for lack of utc (seen on the bench). Also the ONLY correction during a long awake
       // stretch (driving, or a BLE relay session), since setup() does not run again until the next sleep.
       //
-      // Same two sources in the same order as setup(): the modem's own NITZ-set clock first, because
-      // AT+CCLK is a local query (~50 ms, no data, cannot fail on DNS), then NTP. The order matters more
-      // than it looks - CLKPROBE on the Telia SIM got a good AT+CCLK while AT+CNTP failed outright with
-      // "+CNTP: 62" (DNS). This path used to be NTP-ONLY, so on that SIM a whole driving session had no
-      // working correction at all even though the right answer was one free AT command away.
+      // Same resync as setup() (clockResync: AT+CCLK; NTP follows uploads instead). This path used to be
+      // NTP-ONLY, so on a NITZ SIM (good AT+CCLK, AT+CNTP failing "+CNTP: 62") a whole driving session had
+      // no working correction at all even though the right answer was one free AT command away.
       // Both sources sit behind ONE rate limit. AT+CCLK is cheap but not free, and on a SIM with
       // neither NITZ nor working DNS this block never succeeds - unlimited, it would pay ~50 ms of AT
-      // per loop iteration (plus syncNtp's ~1 s) for the whole session. 30 s between attempts costs
+      // per loop iteration for the whole session. 30 s between attempts costs
       // nothing against the CLOCK_RESYNC_SECONDS budget. Never while a phone is RELAYING so it can't
       // stall the live stream - bleRelaying, not bleConnected: frames without utc are skipped for
       // upload, so an unpaired camping phone that also blocked clock recovery would starve cellular of
@@ -1341,21 +1300,7 @@ void loop() {
       static unsigned long last_clock_retry = 0;
       if (!t && !bleRelaying() && !g_ota_active && (millis() - last_clock_retry) > 30000UL) {
         last_clock_retry = millis();
-        t = parseCclk(network.readClock().c_str());
-        if (t) {
-          setClock(CLK_NITZ, t);
-#if ENABLE_LOGGING
-          logEvent("NET clock: NITZ (loop recovery)");
-#endif
-        } else if (network.syncNtp()) {   // no NITZ on this SIM - fall back to NTP over the bearer
-          t = parseCclk(network.readClock().c_str());
-          if (t) {
-            setClock(CLK_NTP, t);
-#if ENABLE_LOGGING
-            logEvent("NET clock: NTP (loop recovery)");
-#endif
-          }
-        }
+        if (!clockResync("loop")) clockNtpNoClock();  // before the poll, so its frame gets a utc
       }
 #endif
     }
@@ -2058,6 +2003,9 @@ void loop() {
 #if ENABLE_LOGGING
             logEvent("UPLOAD ok http=%d t=%lums sent=%d left=%d %s", g_last_http, g_last_post_ms, sent,
               (int)obd_result_vector.size(), g_last_status.c_str());
+#endif
+#if ENABLE_CELL
+            clockNtpAfterUpload(sent, clockCarActive(obd_count > 0, !is_currently_parked, g_last_io36, recently_charging));
 #endif
             upload_fail_count = 0;
             g_http0_streak = 0;

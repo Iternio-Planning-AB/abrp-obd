@@ -291,11 +291,14 @@ INT32_MAX (2038-01-19T03:14:07Z) is inclusive; INT32_MAX+1 and UINT32_MAX are un
 hosts retain the uint32 ceiling. This patch does not upgrade existing time-source/GPS conversion or
 battery/calendar formatting for dates after 2038; that broader firmware limitation remains unsupported.
 
-The `drift` group covers deep-sleep drift compensation by driving the real `clockCompensateSleep`, `setClock`
-and NVS save/restore from `clock_sync.h` against a fake microsecond clock: a night of 30-minute wakes is
-learned from its morning NITZ resync, the next night stays within seconds, GPS syncs never teach, one bad
-source moves the rate only 1/`CLOCK_DRIFT_GAIN`, and a wrong stored rate converges back. The real RC rate,
-RTC retention and NVS across a re-plug need a dongle and a parked night (look for `CLOCK drift` in the dump).
+Clock groups `drift`, `resync`, `bounds` and `modem` drive the real `clock_sync.h` (compensation, `setClock`,
+the drift learner, `clockResync`, both NTP triggers, the parsers, NVS) against a fake microsecond clock, `millis()`
+and a scripted modem; `modem` runs the real `CellWrapper::syncNtp`/`readClock` against a scripted UART. They also
+compile logger.ino's two NTP call sites against their globals, check every log line fits logEvent's buffer (at
+most 119 chars), and check that a post-OTA trial boot zeroes the clock. The source policy is in DONGLE_CONTEXT.md
+§6a. Still needing a dongle and a parked night: the real RC rate, RTC retention, NVS across a re-plug, what
+`AT+CNTP` mode 1 does, NTP right after a POST, and real NITZ quality (look for `CLOCK drift ... src=` and
+`CLOCK ntp=` in the dump).
 
 ## Energy and temperature host checks
 
