@@ -27,6 +27,10 @@ public:
   // deleting the oldest segment(s) so total usage stays under budget. Returns false if not mounted.
   bool writeLine(const std::string& line);
 
+  // Called right after a brand-new segment is opened (and its header written), so each segment can start
+  // with its own context line. The hook may call writeLine(); nullptr (the default) writes nothing extra.
+  void onNewSegment(void (*hook)()) { newSegmentHook = hook; }
+
   void flush();            // commit buffered data (cheap to call often; called per row already)
   void end();              // flush + close the active segment (call before deep sleep)
 
@@ -51,6 +55,7 @@ public:
 private:
   bool mounted = false;
   std::string header_;
+  void (*newSegmentHook)() = nullptr;
   int activeIndex = -1;
   File active;
   size_t activeSize = 0;

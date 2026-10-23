@@ -6,6 +6,11 @@
 #define PRINT 0
 #endif
 
+// Modem power notifications; the sketch overrides them to keep its retained "modem may be on" flag
+// (baseLogger/Helpers/wdt_streak.h).
+__attribute__((weak)) void cellModemPowerOnHook() {}
+__attribute__((weak)) void cellModemPowerOffHook() {}
+
 CellWrapper::CellWrapper(FreematicsESP32 sys, std::string apn) : NetworkWrapper(sys), apn{ apn }, net{} { };
 
 bool CellWrapper::init(const bool retry/* = false */) {
@@ -23,6 +28,7 @@ bool CellWrapper::init(const bool retry, unsigned int registration_timeout_ms) {
     m_initialized = false;
     m_init_stage = "begin";
     Serial.printf("net begin\n");
+    cellModemPowerOnHook(); // begin() powers the modem on
     if (!net.begin(&sys)) {
       Serial.printf("No net connected\n");
       continue;
@@ -353,6 +359,7 @@ void CellWrapper::powerOff() {
   sys.xbPurge();
   sys.xbWrite("AT+CPOWD=1\r");
   int r = sys.xbReceive(b, sizeof(b), 3000, expect_pd, 1); // xbReceive returns matched index+1, so 1 = ack
+  if (r == 1) cellModemPowerOffHook(); // only an ack proves it off; the PWRKEY fallback leaves it unknown
   // Bench evidence for the sleep-floor work: which branch ran and what the modem actually said. The fallback
   // stays UNCONDITIONAL on a missing ack - it is what protects a powered-but-HUNG modem, which this firmware
   // has field history of (the reconnect "modem not answering" branch, the PSM lockup note above,
@@ -379,7 +386,7 @@ void CellWrapper::set_api_page(const char* new_api_page) {
   api_page = new_api_page;
 }
 
-bool CellWrapper::syncNtp() {
+bool CellWrapper::syncNtp(NtpResult* result) {
   // Sync the modem RTC from NTP over the data bearer - robust where carrier NITZ isn't delivered (the
   // roaming Hologram SIM never received the NITZ push; AT+CCLK stayed at the 1980 default).
   // UPDATE (field, 2026-08): NITZ pushes ARE now arriving on this unit - the serial logs show *PSUTTZ + DST
@@ -404,17 +411,48 @@ bool CellWrapper::syncNtp() {
   sys.xbWrite("AT+CNTPCID=0\r");                  // run NTP over context 0
   sys.xbReceive(b, sizeof(b), 2000, okerr, 2);
   memset(b, 0, sizeof(b));
+  // Mode 1 is meant to put the time on the result line, which a NITZ push landing between the sync and an
+  // AT+CCLK readback cannot overwrite. UNVERIFIED on a dongle: the manuals disagree on whether mode 1 also sets
+  // the modem RTC (or 2 does). The time is taken from the result line either way, so an unset RTC is harmless.
+  // A modem that refuses the long form gets the original one.
   sys.xbPurge();
-  sys.xbWrite("AT+CNTP=\"pool.ntp.org\",0\r");    // server, timezone 0 -> modem RTC stored as UTC
-  sys.xbReceive(b, sizeof(b), 2000, okerr, 2);
+  sys.xbWrite("AT+CNTP=\"pool.ntp.org\",0,0,1\r"); // server, timezone 0 (UTC), cid 0, mode 1 (see above)
+  if (sys.xbReceive(b, sizeof(b), 2000, okerr, 2) != 1) {
+    memset(b, 0, sizeof(b));
+    sys.xbPurge();
+    sys.xbWrite("AT+CNTP=\"pool.ntp.org\",0\r");
+    sys.xbReceive(b, sizeof(b), 2000, okerr, 2);
+  }
   memset(b, 0, sizeof(b));
   const char* cntp[] = { "+CNTP:" };              // result URC arrives AFTER the server round-trip
   sys.xbPurge();
   sys.xbWrite("AT+CNTP\r");                        // execute the sync
   sys.xbReceive(b, sizeof(b), 15000, cntp, 1);
-  bool ok = strstr(b, "+CNTP: 1") != nullptr;     // 1=ok; 61=net 62=dns 63=conn 66=timeout (SIM7070)
-  Serial.printf("NTP sync %s in %lums (%s)\n", ok ? "ok" : "FAILED",
-    (unsigned long)(millis() - t0), b);
+  char* line = strstr(b, "+CNTP:");
+  if (line && !strstr(line, "\r\n")) {           // matched on the prefix: let the rest of the line arrive
+    const char* eol[] = { "\r\n" };
+    char tail[64] = { 0 };
+    sys.xbReceive(tail, sizeof(tail), 500, eol, 1);
+    strncat(b, tail, sizeof(b) - strlen(b) - 1);
+  }
+  int code = -1;
+  if (line) sscanf(line, "+CNTP: %d", &code);
+  bool ok = code == 1;                            // 1=ok; 61=net 62=dns 63=conn 66=timeout (SIM7070)
+  const unsigned long ms = millis() - t0;
+  Serial.printf("NTP sync %s in %lums (%s)\n", ok ? "ok" : "FAILED", ms, b);
+  if (result) {
+    result->code = code;
+    result->ms = ms;
+    result->utc.clear();
+    const char* comma = line ? strchr(line, ',') : nullptr;
+    const char* cr = line ? strchr(line, '\r') : nullptr;
+    if (ok && comma && (!cr || comma < cr)) {     // the time must be on the result line itself
+      const char* p = comma + 1;
+      if (*p == '"') ++p;
+      const char* end = p + strcspn(p, "\"\r\n");
+      result->utc.assign(p, end - p);
+    }
+  }
   return ok;
 }
 
@@ -423,7 +461,8 @@ std::string CellWrapper::readClock() {
   char buf[160] = { 0 };
   sys.xbPurge();
   sys.xbWrite("AT+CCLK?\r");
-  sys.xbReceive(buf, sizeof(buf), 1000);
+  const char* okerr[] = { "OK", "ERROR" };        // return on the answer, not after the whole 1 s
+  sys.xbReceive(buf, sizeof(buf), 1000, okerr, 2);
   char* p = strstr(buf, "+CCLK:");
   if (!p) return std::string();
   p = strchr(p, '"');
