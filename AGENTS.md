@@ -197,9 +197,25 @@ not in this repo) also verifies a synthetic dump through it, including actual hi
 Run `python3 tests/run_upload_checks.py` for real SIM7070 send/AT parsing and upload-helper checks with
 ASan/UBSan and NDEBUG. UART is fake. Python hashlib/hmac/base64 independently verify the logged
 fingerprint and every signature, so the host mbedTLS shims are never their own oracle.
-Run `python3 tests/run_gzip_container_checks.py` for the actual gzip container wrapper, independent
-Python decompression/CRC/ISIZE checks, and fallback paths. ROM deflate, ROM CRC, and PSRAM are shims;
-these checks do not validate the real ROM output or modem transport.
+Run `python3 tests/run_gzip_container_checks.py` for the real `gzip_body.h` linked with the vendored
+zlib. What it covers:
+- the `libraries/zlib` SHA256SUMS drift check;
+- independent Python decompression and CRC/ISIZE checks;
+- an absolute ratio floor, 9 synthetic points under `CELL_MAX_POST_BYTES` for every seed;
+- the pinned `library.json`;
+- verify failures, each with its own cause, from tampering with the block type, a stored block, the CRC
+  and the ISIZE;
+- the failure budget;
+- the crash breadcrumb;
+- the PSRAM allocation and verify-memory failures, and the per-wake summary;
+- the refused member's header bytes in the verify-fail line, an OTA self-test body past the 4 KB malloc
+  threshold that refuses the field fault (header byte 9 zeroed), and the `GZTEST` console loop (counts by
+  cause, no failure budget spent, argument caps, any key stops it).
+
+zlib is compiled with `CC` (default `clang`), which takes `-DNDEBUG` from `CXX`. PSRAM allocation, RTC
+memory and the clock are shims. The checks do not prove what the server or the modem accepts.
+Upload group `gzip-fallback` checks that a gzip failure never sends an over-cap body or drops a frame, and
+that the sized body is the sent body.
 
 GPS CSV `gps_read=ok` means parsing accepted a reply, including replies with zero coordinates.
 `gps_fix` still means cached nonzero coordinates. Date/time and speed are the cached accepted record,
@@ -237,7 +253,7 @@ battery upload deliberately discards protected geo history. Queue power-loss ato
 
 `__geo_` is reserved, scrubbed from profile results and public serializers, and stored as numeric
 shadow metadata only in the private backlog. Legacy/invalid geo provenance drops geo, not otherwise
-eligible battery/state. Actual RTC retention, cross-image resets, ROM gzip and modem behavior remain
+eligible battery/state. Actual RTC retention, cross-image resets, on-device gzip and modem behavior remain
 hardware gates. Sender-side geo eligibility does not depend on any server-side change; the backend's existing
 clock-skew normalization is unchanged.
 
@@ -278,7 +294,7 @@ frame UTC, with stale-battery handling unchanged. Geo-only omitted batches keep 
 no-POST rule. Future-relative-to-corrected-send-clock normalization remains the backend's existing
 policy. Both host runners extract the production clock-quality predicates instead of faking them;
 UART, clocks, compression, and filesystems remain fakes. Real RTC retention, clock acquisition,
-modem timing, ROM gzip and hardware remain unverified; no device was flashed by these checks.
+modem timing, on-device gzip and hardware remain unverified; no device was flashed by these checks.
 
 ## Send-once geo verification
 

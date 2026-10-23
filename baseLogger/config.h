@@ -565,6 +565,16 @@
 // 1000 leaves margin). uploadBuffered() shrinks each batch until its serialized body fits, so richer
 // frames (more OBD PIDs) automatically mean fewer frames per POST instead of undeliverable POSTs.
 #define CELL_MAX_POST_BYTES 1000
+
+// zlib settings for the POST body (gzip_body.h). On synthetic 12-point driving bodies, level 9 with a 4 KB
+// window and memLevel 4 matches the miniz tdefl ratio within 0.5 % (1182 vs 1186 B). Window size makes no
+// difference from 2 KB up. Below about one point (1 KB) it collapses (1809 B). State is ~29 KB of PSRAM.
+#define GZIP_LEVEL 9
+#define GZIP_WINDOW_BITS 12
+#define GZIP_MEM_LEVEL 4
+// Gzip failures in one wake (bodies that fail verification, or the server rejecting a gzip body) after
+// which the rest of the wake goes plain. Corruption that repeats is not worth more airtime.
+#define GZIP_FAILS_PER_WAKE 2
 #define GEO_MAX_SEND_AGE_SECONDS (29UL * 24UL * 60UL * 60UL)
 
 // Catch-up burst: how many capped POSTs the STEADY-STATE (in-loop) upload may fire back-to-back in one
