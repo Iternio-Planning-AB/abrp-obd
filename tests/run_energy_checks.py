@@ -54,8 +54,21 @@ if not re.search(r"^RTC_NOINIT_ATTR WdtStreakStore wdt_streak_store;", streak, r
     raise SystemExit("FAIL: the WDT streak store must be RTC_NOINIT_ATTR: RTC_DATA_ATTR is reloaded by every crash it counts")
 # Counted before anything that can crash or hang: a reset ahead of the advance would repeat with the count frozen.
 setup = logger.index("void setup() {")
-if not setup < logger.index("  wdt_reset_count = wdtStreakAdvance(") < logger.index("  Serial.begin(115200);", setup):
+advance = logger.index("  wdt_reset_count = wdtStreakAdvance(", setup)
+if not setup < advance < logger.index("  Serial.begin(115200);", setup):
     raise SystemExit("FAIL: setup() must advance the WDT streak before Serial.begin()")
+prefix = logger[setup + len("void setup() {"):advance]
+prefix = re.sub(r"//[^\n]*|/\*.*?\*/", "", prefix, flags=re.S)
+approved_prefix = """
+esp_sleep_wakeup_cause_t wake_cause = esp_sleep_get_wakeup_cause();
+resetFrozenGpsProvenance(esp_reset_reason() == ESP_RST_DEEPSLEEP);
+#if ENABLE_NETWORK
+resetGeoAccepted(esp_reset_reason() == ESP_RST_DEEPSLEEP);
+#endif
+chargeWakeStateSanitize(esp_reset_reason() == ESP_RST_DEEPSLEEP);
+"""
+if " ".join(prefix.split()) != " ".join(approved_prefix.split()):
+    raise SystemExit("FAIL: only approved reset-state initialization may precede accounting")
 # The modem flag is kept by CellWrapper's hooks: every init() may power the modem on, only an acknowledged
 # AT+CPOWD proves it off. The fake network in the test stands on these.
 cell = (root / "libraries/NetworkWrapper/cellwrapper.cpp").read_text()
@@ -139,10 +152,19 @@ with tempfile.TemporaryDirectory(prefix="obd-energy-checks-") as temporary:
     start = sleep.index('  logEvent("SLEEP enter -> %s+GPS off, timer=')
     end = sleep.index("WOM_THRESHOLD_G);\n", start) + len("WOM_THRESHOLD_G);\n")
     (build / "sleep_log.inc").write_text(sleep[start:end])
+    (build / "reset_reason.inc").write_text(block(sleep, "static const char* resetReasonStr() {"))
     (build / "net_recover_sleep.inc").write_text(block(logger, "if (g_recovers_since_ok >= 2 && net_reboot_count < 2) {"))
     start = logger.index("  wdt_reset_count = wdtStreakAdvance(")
     (build / "wdt_streak_wake.inc").write_text(logger[start:logger.index("\n", start) + 1])
     (build / "wdt_streak_sleep.inc").write_text(block(logger, "if (wdt_reset_count >= 2) {"))
+    end = logger.index("#if PRINT", start)
+    startup = logger[start:end]
+    startup_end = start + len(startup)
+    for anchor in ("clockDriftRestore();", "datalogger.begin(", "sys.begin()", "logEvent(",
+                   "softResetMEMS();", "mems->begin()", "calibrateMEMS();", "alarmGateLoad();"):
+        if startup_end >= logger.index(anchor, setup):
+            raise SystemExit(f"FAIL: the WDT startup guard must precede {anchor}")
+    (build / "wdt_streak_startup.inc").write_text(startup)
     start = sleep.index("  bool modem_down = modem_on;")
     (build / "sleep_probe.inc").write_text(sleep[start:sleep.index("#endif\n", start) + 7])
     start = sleep.index("  if (modem_down) network.powerOff();")

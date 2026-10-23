@@ -72,8 +72,10 @@ must never compile — the reference FreematicsPlus would collide with the real 
 **Deep sleep is a reboot, not a resume.** RAM is wiped and `setup()` runs again from the top. Anything
 that must survive is `RTC_DATA_ATTR` (wake/sleep counters, the charging budget, the taper latch, the
 frozen parked fix) or LittleFS (the vehicle profile, the upload backlog). A plain global reset to its
-initialiser on every wake is the most common way to get this wrong. `RTC_DATA_ATTR` survives deep sleep
-only: a panic, WDT or software reset reloads it too (`DONGLE_CONTEXT.md` §11).
+initialiser on every wake is the most common way to get this wrong. At crash streak 3, an early exception
+takes timer-only deep sleep before peripheral initialisation; it deliberately leaves already-powered
+peripherals on and does not arm WOM for that sleep. `RTC_DATA_ATTR` survives deep sleep only: a panic, WDT
+or software reset reloads it too (`DONGLE_CONTEXT.md` §11).
 
 **BLE callbacks run on the Bluedroid task and must only copy bytes and set a flag.** All NVS, crypto
 and OBD work happens on the loop task, in the matching `*Service()` function. This is stated as
@@ -151,7 +153,8 @@ is not verified by a bench test, and saying so is part of reporting it.
 
 In the source, the entry points are `logger.ino` (`setup()` is the wake ladder, `loop()` is the poll
 and upload cycle), `Helpers/state_machine.h` (activity states and cadences), `Helpers/sleep_power.h`
-(the one `enterDeepSleep` primitive every sleep path goes through) and `Helpers/auth_gate.h` (ABD8).
+(the normal `enterDeepSleep` primitive; setup's timer-only crash-loop emergency is an explicit exception)
+and `Helpers/auth_gate.h` (ABD8).
 
 ## Etiquette
 
@@ -354,7 +357,8 @@ wake gate (taper and charge-end reads), the `SLEEP enter` reason labels (`sleep-
 streak (`wdt-streak`: the real `wdt_streak.h` store across simulated resets, brownouts counting with
 crashes, garbage and foreign stores, the escalation's threshold and cadence, the OTA commit ending it, the
 retained "modem may be on" flag every sleep acts on, the park-marker debt copy, and the weak-rail cold boot
-never reconnecting the modem), the DC fast-charge hold
+never reconnecting the modem, plus the extracted startup slice verifying the threshold-3 timer-only sleep
+before `sys.begin()`; RTC retention and actual peripheral power remain hardware gates), the DC fast-charge hold
 (`dc-awake`: entry on the car's `is_dcfc` or inferred power, the per-charge DC latch through the taper, the
 time-based silent hold (a seeded hour of 60 % silence) and the backstop sleep, budget by elapsed time on motion wakes, the 30 s cadence outside BLE, the CHARGING hold and the sample-poke stay, the
 live rail/alarm/motion vetoes, motion promoting a held poke, every exit and its sleep tier, a new AC charge not

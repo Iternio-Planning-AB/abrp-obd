@@ -319,7 +319,7 @@ USB only: physical access by design. Type these into the serial monitor (115200 
 | `OTARESET` | Clear the OTA anti-downgrade floor (after a bench flash to a lower version). |
 | `JWSTEST` | Self-test the profile-signature verifier. |
 | `GZTEST <bytes> [count]` | Compress and verify `count` (default 100, at most 2000) synthetic upload bodies of `bytes` and print pass/fail by cause. Holds the main loop (BLE requests and sleep wait) for at most 30 s; any key stops it sooner. |
-| `PANIC` / `WDTHANG` | Bench only: crash now, or hang until the watchdog resets the dongle (5 min), to check the crash-loop streak in the log. Two in a row make the next boot sleep instead. |
+| `PANIC` / `WDTHANG` | Bench only: crash now, or hang until the watchdog resets the dongle (5 min), to check the crash-loop streak. Two in a row use the existing sleep escalation; if a third crash happens before it runs, setup takes an early timer-only parked sleep before peripheral init, leaving already-powered peripherals on and WOM unarmed. |
 | `RESUME` | Hand back to normal duty (re-allow sleep) after a maintenance session. |
 
 > **One-sided bonds bite.** If you clear bonds on the dongle (or reflash with bonding disabled), also
