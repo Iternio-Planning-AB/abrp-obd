@@ -693,6 +693,8 @@ Everything below except `README.md` and `docs/` is embedded verbatim in **Part I
 6. **Keep the obdble lane untouched** — everything for this dongle is an add-on.
 7. **Read `DEFERRED_POWER_WORK.md` before touching sleep** — several obvious "improvements" there are
    documented as net-negative or brick-risk.
+8. **Keep `tools/pio_psram_libs.py` in `extra_scripts`** — mallocs over 4 KB land in PSRAM, and on this
+   rev 1 chip only the `esp32-psram` runtime writes them safely (#64). A PSRAM test needs buffers over 4 KB.
 
 
 ---

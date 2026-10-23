@@ -167,6 +167,7 @@ order and share its globals. See [`AGENTS.md`](../AGENTS.md) before adding one.
 | `tools/ota_sign.py` | Sign a firmware image for OTA (KMS in the release workflow, or a local PEM). |
 | `tools/server_roots.py` | Write `server_roots.h` from root CA PEMs. |
 | `tools/fw_version.py`, `tools/pio_version.py` | Release version naming and its injection into the build; also the `factory` target, a single merged image for esptool on a blank unit. |
+| `tools/psram_libs.py`, `tools/pio_psram_libs.py` | Link the PSRAM-safe C/C++ runtime, and fail the build if the linker map shows any other. |
 | `utils/serial_monitor.py`, `serial_to_file.py`, `file_to_serial.py`, `USB_Serial_Dump.py` | Serial helpers (e.g. capturing a `DUMP` to a file). |
 
 ### `libraries/` — vendored dependencies
