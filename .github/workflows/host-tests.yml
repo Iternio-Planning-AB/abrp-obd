@@ -1,5 +1,6 @@
 # Every host runner (tests/run_*.py) on each pull request and on main, normally and with NDEBUG. Host checks
-# only: clang++ and Python, no firmware build, no hardware, no secrets. See AGENTS.md (Testing).
+# only: clang++ and Python, no hardware, no secrets. The `variants` job below builds the non-default firmware
+# configs. See AGENTS.md (Testing).
 name: Host tests
 
 on:
@@ -67,11 +68,60 @@ jobs:
             exit 1
           fi
 
+  # The non-default config.h variants (tools/check_variants.sh); the host runners never see the firmware build. The
+  # toolchain comes in exactly as release.yml installs it (hash-pinned tools, esptool dependencies from wheels, no
+  # index afterwards), and no cache: a pull request must not read or poison one the release build could trust.
+  variants:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      RELEASE_VERSION: "0.0.0"        # a fixed name: the build needs no tags
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install tools
+        run: |
+          python -m pip install --disable-pip-version-check --require-hashes --only-binary :all: --no-deps \
+            -r .github/requirements/release.txt
+          out="$(python -m pip check --disable-pip-version-check 2>&1)" || true
+          echo "$out"
+          # Exactly the missing starlette, for the pinned platformio: any other output, a clean check included, fails.
+          if [ "$out" != "platformio 6.1.18 requires starlette, which is not installed." ]; then
+            echo "::error title=pip check::unexpected pip check output; see release.in"
+            exit 1
+          fi
+
+      - name: Fetch esptool dependencies
+        run: |
+          python -m pip --version
+          python -m pip download --disable-pip-version-check --require-hashes --only-binary :all: --no-deps \
+            -d "$RUNNER_TEMP/wheels" -r .github/requirements/esptool.txt
+          echo "PIP_NO_INDEX=1" >> "$GITHUB_ENV"
+          echo "PIP_FIND_LINKS=$RUNNER_TEMP/wheels" >> "$GITHUB_ENV"
+
+      - name: Install PlatformIO packages
+        working-directory: baseLogger
+        run: pio pkg install -e esp32dev
+
+      - name: Check esptool dependencies
+        run: python3 baseLogger/tools/check_esptool_deps.py --wheels "$RUNNER_TEMP/wheels"
+
+      - name: Build the variants
+        run: sh baseLogger/tools/check_variants.sh
+
   # The one check the main ruleset requires (cloudops tf/abrp-obd), so a new job joins `needs` here and the ruleset
   # stays as it is. always(): a skipped required check counts as passed, so this must run, and fail, when a need fails.
   ci:
     if: always()
-    needs: [host-tests]
+    needs: [host-tests, variants]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions: {}

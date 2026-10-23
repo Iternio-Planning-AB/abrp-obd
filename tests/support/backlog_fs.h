@@ -1,4 +1,5 @@
 #pragma once
+#include <cstring>
 #include <map>
 #include <memory>
 
@@ -25,6 +26,8 @@ struct File {
     return result;
   }
   void println(const char* value) { *data += std::string(value) + '\n'; }
+  size_t print(const char* value) { *data += value; return std::strlen(value); }
+  String readString() { String result{data->substr(offset)}; offset = data->size(); return result; }
   void close() {}
 };
 

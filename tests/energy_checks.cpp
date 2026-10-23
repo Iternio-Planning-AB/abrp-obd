@@ -408,7 +408,6 @@ void logEvent(const char* format, ...) {
 }
 int g_next_wake_minutes = WAKE_PARKED_MINUTES, g_recovers_since_ok = 0;
 unsigned long net_reboot_count = 0, wdt_reset_count = 0;
-bool g_wdt_wake = false;
 float g_last_io36 = 12.6f;
 const char* g_cadence_reason = nullptr;
 bool window_opened = false;
@@ -422,6 +421,7 @@ std::vector<OBDVector> obd_result_vector;
 std::string slept, dc_off;
 bool g_dc_logged = false;
 void logSleep(bool modem_on, const char* reason) {
+  bool modem_down = modem_on;
 #include "sleep_log.inc"
 }
 void enterDeepSleep(bool modem_on, const char* reason = nullptr) {
@@ -434,6 +434,7 @@ void enterDeepSleep(bool modem_on, const char* reason = nullptr) {
 void recoverSleep() {
 #include "net_recover_sleep.inc"
 }
+bool wdtStreakModemMayBeOn() { return true; }
 void wdtSleep() {
 #include "wdt_streak_sleep.inc"
 }
@@ -452,7 +453,6 @@ void checks() {
   recoverSleep();
   check(has("timer=1min reason=net-recover "), "the modem-recovery reboot logs its own reason, not dc-charge");
   check(window_opened, "the modem-recovery reboot opens the post-drive window");
-  g_wdt_wake = true;
   wdt_reset_count = 2;
   wdtSleep();
   check(has("reason=wdt-streak "), "the WDT-streak escalation logs its own reason");
@@ -527,6 +527,235 @@ void checks() {
   check(edge("DC_AWAKE off reason=parked-cap "), "a cadence decision names itself");
 }
 }  // namespace dc_track
+// The crash-loop guard: the real store and advance (Helpers/wdt_streak.h), the setup() accounting and the
+// escalation. One global stands in for RTC_NOINIT memory, so it keeps whatever a boot left in it; the runner
+// checks the firmware declares it RTC_NOINIT_ATTR, which is what the stand-in assumes.
+namespace wdt_streak {
+enum esp_reset_reason_t {  // IDF 4.4 values
+  ESP_RST_UNKNOWN, ESP_RST_POWERON, ESP_RST_EXT, ESP_RST_SW, ESP_RST_PANIC, ESP_RST_INT_WDT,
+  ESP_RST_TASK_WDT, ESP_RST_WDT, ESP_RST_DEEPSLEEP, ESP_RST_BROWNOUT, ESP_RST_SDIO
+};
+#define RTC_NOINIT_ATTR
+#include "wdt_streak.h"
+#undef RTC_NOINIT_ATTR
+esp_reset_reason_t reset_reason = ESP_RST_POWERON;
+esp_reset_reason_t esp_reset_reason() { return reset_reason; }
+uint32_t wdt_reset_count = 0;
+bool g_wdt_streak_retained = false, g_weak_rail_cold_boot = false, g_ota_active = false;
+float g_last_io36 = 12.6f;
+int g_next_wake_minutes = 0;
+std::string last_log, sleep_reason;
+bool slept_modem_on = false;
+void logEvent(const char* format, ...) {
+  char line[256];
+  va_list args;
+  va_start(args, format);
+  vsnprintf(line, sizeof(line), format, args);
+  va_end(args);
+  last_log = line;
+}
+// CellWrapper and the SIM7070 as far as power goes: init() powers it on through the power-on hook; CPOWD
+// powers off an answering modem (ack, power-off hook), and otherwise the PWRKEY fallback toggles it (the
+// hook calls are checked in cellwrapper.cpp by the runner). A hung modem is on but answers nothing.
+struct {
+  bool on = false, hung = false, dead = false;
+  int inits = 0, power_offs = 0;
+  bool connected() { return false; }
+  void reconnect() { init(); }  // an unanswering modem gets a full init()
+  void init() { inits++; cellModemPowerOnHook(); on = !dead; }
+  std::string sendRawAt(const char*, unsigned) { return on && !hung ? "AT\r\r\nOK\r\n" : ""; }
+  void powerOff() {
+    power_offs++;
+    if (on && !hung) { cellModemPowerOffHook(); on = false; }
+    else if (!dead) { on = !on; hung = false; }  // 2.5 s PWRKEY
+  }
+} network;
+struct { void printf(const char*, ...) {} } Serial;
+bool bleRelaying() { return false; }
+unsigned long millis() { return 600000UL; }
+const unsigned long WIFI_RETRY_MS = 20000;
+unsigned long last_reconnect_try = 0;
+void offlineRetry() {
+#include "reconnect.inc"
+}
+// The modem part of enterDeepSleep, then the sleep itself.
+void enterDeepSleep(bool modem_on, const char* reason = nullptr) {
+#define ENABLE_CELL 1
+#include "sleep_probe.inc"
+#undef ENABLE_CELL
+#include "sleep_modem.inc"
+  sleep_reason = reason ? reason : "?";
+  slept_modem_on = modem_on;
+}
+void wake() {
+#include "wdt_streak_wake.inc"
+}
+void escalation() {
+#include "wdt_streak_sleep.inc"
+}
+// One boot: the reset the bootloader reports, then setup()'s accounting and escalation.
+bool boot(esp_reset_reason_t reason) {
+  reset_reason = reason;
+  sleep_reason.clear();
+  wake();
+  escalation();
+  return sleep_reason == "wdt-streak";
+}
+
+void checks() {
+  // A brownout loop (a weak battery that sags out every modem start) is the same overnight drain (#50).
+  const esp_reset_reason_t crashes[] = {ESP_RST_PANIC, ESP_RST_TASK_WDT, ESP_RST_INT_WDT, ESP_RST_WDT,
+                                        ESP_RST_BROWNOUT};
+  const esp_reset_reason_t others[] = {ESP_RST_POWERON, ESP_RST_DEEPSLEEP, ESP_RST_SW, ESP_RST_EXT,
+                                       ESP_RST_UNKNOWN, ESP_RST_SDIO};
+  const std::string parked_log =
+    "WDT streak=2 -> skip init, sleep " + std::to_string(WAKE_PARKED_MINUTES) + "min (retry fresh next wake)";
+  std::memset(&wdt_streak_store, 0xA5, sizeof(wdt_streak_store));
+  check(!boot(ESP_RST_POWERON) && wdt_reset_count == 0, "a power-on over garbage starts at 0");
+  for (auto crash : crashes) {
+    check(!boot(ESP_RST_DEEPSLEEP) && wdt_reset_count == 0, "a deep-sleep wake ends the streak");
+    check(!boot(crash) && wdt_reset_count == 1 && g_wdt_streak_retained,
+          "the first crash reset counts 1 from a retained store");
+    check(boot(crash) && wdt_reset_count == 2, "the second consecutive crash reset escalates");
+    check(g_next_wake_minutes == WAKE_PARKED_MINUTES, "a parked rail sleeps the parked cadence");
+    check(last_log == parked_log, "the escalation logs it");
+  }
+  for (auto other : others) {
+    boot(ESP_RST_PANIC);
+    check(boot(ESP_RST_PANIC) && wdt_reset_count >= 2, "consecutive crash boots extend the streak");
+    check(!boot(other) && wdt_reset_count == 0, "any reset but a crash ends the streak");
+    check(!boot(ESP_RST_PANIC) && wdt_reset_count == 1, "a crash after it starts again at 1");
+  }
+  check(boot(ESP_RST_PANIC) && wdt_reset_count == 2 && boot(ESP_RST_PANIC) && wdt_reset_count == 3,
+        "a crash loop the sleep did not break keeps counting and keeps escalating");
+  boot(ESP_RST_DEEPSLEEP);
+  boot(ESP_RST_PANIC);
+  check(boot(ESP_RST_BROWNOUT) && wdt_reset_count == 2, "a brownout after a crash extends the same streak");
+  // A brownout that took RTC memory with it leaves garbage: counted from nothing, so never escalated.
+  boot(ESP_RST_BROWNOUT);
+  std::memset(&wdt_streak_store, 0xA5, sizeof(wdt_streak_store));
+  check(!boot(ESP_RST_BROWNOUT) && wdt_reset_count == 1 && !g_wdt_streak_retained,
+        "a brownout that lost the store counts 1 and says so");
+  // An awake rail (driving, charging) comes back on the charging cadence instead of a parked half hour.
+  boot(ESP_RST_DEEPSLEEP);
+  boot(ESP_RST_PANIC);
+  g_last_io36 = RAIL_AWAKE_VOLTS;
+  check(boot(ESP_RST_PANIC) && g_next_wake_minutes == WAKE_CHARGING_MINUTES, "an awake rail sleeps the charging cadence");
+  g_last_io36 = 12.6f;
+  // Bytes that are not this store - garbage, another layout, a torn write - never extend a streak.
+  const WdtStreakStore foreign[] = {{0xA5A5A5A5u, 1, 0, 0, ~1u}, {WDT_STREAK_MAGIC ^ 1u, 1, 0, 0, ~1u},
+    {WDT_STREAK_MAGIC, 1, 0, 0, 1u}, {WDT_STREAK_MAGIC, 1, 0, 0, ~2u}, {WDT_STREAK_MAGIC, 1, 1, 0, ~1u},
+    {WDT_STREAK_MAGIC, 1, 2, 0, ~1u}, {WDT_STREAK_MAGIC, 1, 0, 1, ~1u}, {WDT_STREAK_MAGIC, 1, 0, 4, ~1u},
+    {WDT_STREAK_MAGIC, 1u << 30 | 1, 0, 0, ~(1u << 30 | 1)}};
+  for (const auto& bytes : foreign) {
+    boot(ESP_RST_DEEPSLEEP);
+    boot(ESP_RST_PANIC);
+    wdt_streak_store = bytes;
+    check(!boot(ESP_RST_PANIC) && wdt_reset_count == 1 && !g_wdt_streak_retained && !wdtStreakMarkerOwed(),
+          "a crash over an unrecognised store counts 1, says nothing was retained and owes no marker");
+  }
+  // The OTA commit ends the streak in this image's store: a rollback boots this image on the trial image's
+  // crash reset, and must not add that crash to one from before the update.
+  boot(ESP_RST_DEEPSLEEP);
+  boot(ESP_RST_PANIC);
+  wdtStreakEnd();
+  check(!boot(ESP_RST_PANIC) && wdt_reset_count == 1, "a rollback after a crash-recovery update does not escalate");
+
+  // The trip-end debt (#49): every reset keeps it while the store holds, and only the store's bytes lose it.
+  std::memset(&wdt_streak_store, 0xA5, sizeof(wdt_streak_store));
+  boot(ESP_RST_POWERON);
+  check(!wdtStreakMarkerOwed(), "a power loss owes no marker");
+  wdtStreakMarker(true);
+  auto keeps = [](esp_reset_reason_t reason) {
+    boot(reason);
+    check(wdtStreakMarkerOwed() && g_wdt_streak_retained, "a reset over an intact store keeps the debt");
+  };
+  for (auto reason : crashes) keeps(reason);
+  for (auto reason : others) keeps(reason);
+  wdtStreakModem(true);
+  wdtStreakEnd();
+  check(wdtStreakMarkerOwed(), "the modem flag and the OTA commit leave the debt alone");
+  wdtStreakMarker(false);
+  boot(ESP_RST_PANIC);
+  check(!wdtStreakMarkerOwed() && wdtStreakModemMayBeOn(), "a paid debt stays paid; the modem flag is its own");
+  boot(ESP_RST_DEEPSLEEP);
+
+  // The modem flag. The escalation powers the modem down only if it may be on: the 2.5 s PWRKEY fallback
+  // for an unanswered AT+CPOWD would switch an off modem ON for the whole sleep.
+  std::memset(&wdt_streak_store, 0xA5, sizeof(wdt_streak_store));
+  boot(ESP_RST_POWERON);
+  check(!wdtStreakModemMayBeOn(), "a power loss cut the modem's power as well");
+  boot(ESP_RST_PANIC);
+  check(boot(ESP_RST_PANIC) && !slept_modem_on, "crashes that never reached the modem leave it off");
+  boot(ESP_RST_DEEPSLEEP);
+  network.init();
+  boot(ESP_RST_PANIC);
+  check(boot(ESP_RST_PANIC) && slept_modem_on && !wdtStreakModemMayBeOn(),
+        "a crash after network init powers the modem down, and the ack clears the flag");
+  boot(ESP_RST_DEEPSLEEP);
+  boot(ESP_RST_PANIC);
+  network.init();
+  check(boot(ESP_RST_PANIC) && slept_modem_on, "network init in the crash-recovery wake counts too");
+  network.init();
+  boot(ESP_RST_POWERON);
+  check(wdtStreakModemMayBeOn(), "an EN-pin reset (POWERON over an intact store) keeps the flag");
+  boot(ESP_RST_BROWNOUT);
+  check(wdtStreakModemMayBeOn(), "a brownout leaves the modem as it was");
+  // A lost store after any other reset: the wake before may have powered the modem.
+  boot(ESP_RST_DEEPSLEEP);
+  enterDeepSleep(false);
+  boot(ESP_RST_PANIC);
+  std::memset(&wdt_streak_store, 0xA5, sizeof(wdt_streak_store));
+  check(!boot(ESP_RST_PANIC) && wdtStreakModemMayBeOn(), "a lost store assumes the modem may be on");
+  check(boot(ESP_RST_PANIC) && slept_modem_on, "and the escalation after it powers the modem down");
+  network.on = false;
+  // Every sleep acts on the flag, not only the escalation: a skip sleep after a crash powers down a modem
+  // the crashed wake left on.
+  boot(ESP_RST_DEEPSLEEP);
+  network.init();
+  check(!boot(ESP_RST_PANIC), "one crash after network init does not escalate");
+  enterDeepSleep(false);
+  check(!network.on && !wdtStreakModemMayBeOn(), "a skip sleep powers down a modem a crash left on");
+  // A wedge in modem init: the escalation's CPOWD goes unanswered and its PWRKEY switches the hung modem
+  // off, leaving the flag "on". The next skip sleep must not PWRKEY the now-off modem back on.
+  boot(ESP_RST_DEEPSLEEP);
+  network.init();
+  network.hung = true;
+  boot(ESP_RST_TASK_WDT);
+  check(boot(ESP_RST_TASK_WDT) && !network.on && wdtStreakModemMayBeOn(),
+        "the escalation's PWRKEY switches a hung modem off and leaves the flag unknown");
+  boot(ESP_RST_DEEPSLEEP);
+  enterDeepSleep(false);
+  check(!network.on && !wdtStreakModemMayBeOn(), "a silent modem is off: no PWRKEY, flag cleared");
+  enterDeepSleep(false);
+  check(!network.on, "and the sleeps after it leave it off");
+  // A dead or absent modem never acknowledges: one probe clears the flag, then skip sleeps cost nothing.
+  network.dead = true;
+  network.init();
+  enterDeepSleep(true);
+  check(wdtStreakModemMayBeOn(), "an unacknowledged power-down leaves the flag set");
+  enterDeepSleep(false);
+  network.power_offs = 0;
+  enterDeepSleep(false);
+  check(!wdtStreakModemMayBeOn() && network.power_offs == 0, "a dead modem stops costing a power-down per sleep");
+  network.dead = false;
+  // A wake that powered the modem powers it down as before, flag or not.
+  network.init();
+  wdtStreakModem(false);
+  enterDeepSleep(true);
+  check(!network.on && network.power_offs == 1, "modem_on=true still sends the power-down without a probe");
+  // A weak-rail cold boot is BLE-only: the offline retry must not reconnect, which on an unanswering modem
+  // runs a full init() and powers it on.
+  boot(ESP_RST_POWERON);
+  network.inits = 0;
+  g_weak_rail_cold_boot = true;
+  offlineRetry();
+  check(network.inits == 0 && !wdtStreakModemMayBeOn(), "a weak-rail cold boot never powers the modem");
+  g_weak_rail_cold_boot = false;
+  offlineRetry();
+  check(network.inits == 1 && wdtStreakModemMayBeOn(), "any other offline wake retries, and flags the modem");
+}
+}  // namespace wdt_streak
 #undef WOM_THRESHOLD_G
 #undef ENABLE_LOGGING
 
@@ -1551,7 +1780,7 @@ int main(int argc, char** argv) {
   const std::string group = argc > 1 ? argv[1] : "all";
   check(group == "all" || group == "progress" || group == "signal" || group == "release" ||
         group == "corroboration" || group == "wake-gate" ||
-        group == "logging" || group == "transport" || group == "sleep-reason" || group == "profiles" || group == "schema" ||
+        group == "logging" || group == "transport" || group == "sleep-reason" || group == "wdt-streak" || group == "profiles" || group == "schema" ||
         group == "ble-frame" || group == "dc-awake", "known test group");
   if (group == "all" || group == "progress") progressChecks();
   if (group == "all" || group == "signal") signalChecks();
@@ -1579,6 +1808,7 @@ int main(int argc, char** argv) {
   if (group == "all" || group == "ble-frame") { bleFrameChecks(); ble_frame_log::checks(); }
   if (group == "all" || group == "sleep-reason") sleep_reason::checks();
   if (group == "all" || group == "dc-awake") { dcAwakeChecks(); dc_track::checks(); }
+  if (group == "all" || group == "wdt-streak") wdt_streak::checks();
   if (argc > 2 && (group == "all" || group == "profiles")) profileChecks(argv[2]);
   std::cout << "Energy " << group << " checks PASS\n";
 }
