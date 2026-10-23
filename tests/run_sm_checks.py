@@ -158,7 +158,7 @@ if not saved < start < sleep.index("  bleDeinitForSleep();") or any(not l.lstrip
     sys.exit("FAIL: the marker clear must follow saveUploadBacklog() outside its #if blocks, before bleDeinitForSleep()")
 # crash() models a zeroed clock: it keeps the wdt-streak escalation sleep from queueing a restored marker and
 # overwriting the backlog that boot never loaded.
-line(logger, "  if (wake_cause == ESP_SLEEP_WAKEUP_UNDEFINED && !otaIsTrialBoot()) rtc.setTime(0);", PATHS["logger"])
+line(logger, "  if (wake_cause == ESP_SLEEP_WAKEUP_UNDEFINED) rtc.setTime(0);", PATHS["logger"])
 
 # The differential covers the drive region only. OLD takes the blocks that write drive state from SM_PIN - the
 # speed loop, the GNSS branch and the time re-latch, the is_parked publish, the OTA/dump hold, changeState, the
