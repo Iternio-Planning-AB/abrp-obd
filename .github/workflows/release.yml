@@ -49,9 +49,30 @@ jobs:
           python-version: "3.12"
 
       # No build cache: the released image must come from a clean toolchain, not whatever a previous run left.
-      # Every package, dependencies included, is pinned by hash in release.txt (regenerate it from release.in).
+      # Every package these tools need, dependencies included, is pinned by hash in release.txt (regenerate it from
+      # release.in), except starlette (see release.in): --no-deps installs without it, and pip check catches any other
+      # gap.
       - name: Install tools
-        run: python -m pip install --disable-pip-version-check --require-hashes --only-binary :all: -r .github/requirements/release.txt
+        run: |
+          python -m pip install --disable-pip-version-check --require-hashes --only-binary :all: --no-deps \
+            -r .github/requirements/release.txt
+          out="$(python -m pip check --disable-pip-version-check 2>&1)" || true
+          echo "$out"
+          # Exactly the missing starlette, for the pinned platformio: any other output, a clean check included, fails.
+          if [ "$out" != "platformio 6.1.18 requires starlette, which is not installed." ]; then
+            echo "::error title=pip check::unexpected pip check output; see release.in"
+            exit 1
+          fi
+
+      # tool-esptoolpy's post-install hook pip-installs esptool's own dependencies by version range (esptool.in).
+      # These are its wheels, by hash. Every later step gets a pip with no index, so it can install nothing else.
+      - name: Fetch esptool dependencies
+        run: |
+          python -m pip --version
+          python -m pip download --disable-pip-version-check --require-hashes --only-binary :all: --no-deps \
+            -d "$RUNNER_TEMP/wheels" -r .github/requirements/esptool.txt
+          echo "PIP_NO_INDEX=1" >> "$GITHUB_ENV"
+          echo "PIP_FIND_LINKS=$RUNNER_TEMP/wheels" >> "$GITHUB_ENV"
 
       - name: Check release tooling
         run: python3 tests/run_release_checks.py
@@ -69,11 +90,24 @@ jobs:
           echo "name=$name" >> "$GITHUB_OUTPUT"
           echo "Releasing v$name from $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
 
+      # Installs the platform and its packages, which runs the esptool hook.
+      - name: Install PlatformIO packages
+        working-directory: baseLogger
+        run: pio pkg install -e esp32dev
+
+      # The hook hides its own failure, and pip doesn't re-check the fetched wheels' hashes when it installs them.
+      - name: Check esptool dependencies
+        run: python3 baseLogger/tools/check_esptool_deps.py --wheels "$RUNNER_TEMP/wheels"
+
       - name: Build
         working-directory: baseLogger
         env:
           RELEASE_VERSION: ${{ steps.version.outputs.name }}
         run: pio run -e esp32dev -t factory
+
+      - name: Check the PSRAM runtime
+        # The build checks this too (tools/pio_psram_libs.py); this step does not depend on that hook firing (#64).
+        run: python3 baseLogger/tools/psram_libs.py baseLogger/.pio/build/esp32dev/firmware.map
 
       - name: Release notes
         env:

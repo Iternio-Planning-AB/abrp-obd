@@ -103,7 +103,10 @@
 
 #ifndef ENABLE_WIFI
 #define ENABLE_WIFI 0    // bench/office builds only; replaces cellular, it does not run alongside it
+#endif
+// Outside the #ifndef above so -D ENABLE_WIFI=1 gets the seeds too.
 #if ENABLE_WIFI
+#warning "ENABLE_WIFI: TLS is not verified - bench only"
 /*
   Empty on purpose - no network credentials in the source tree.
 
@@ -115,9 +118,16 @@
 
   Dormant at ENABLE_WIFI 0: this whole block is inside the guard.
 */
+#ifndef WIFI_SSID
 #define WIFI_SSID ""
+#endif
+#ifndef WIFI_PASSWORD
 #define WIFI_PASSWORD ""
+#endif
+#ifndef WIFI_PATH
 #define WIFI_PATH "https://api.iternio.com/1/tlm/send"
+#endif
+#ifndef WIFI_BULK_PATH
 #define WIFI_BULK_PATH "https://api.iternio.com/2/app/tlm" // v2 tlm endpoint (see TLM_V2_PATH)
 #endif
 #endif
@@ -128,8 +138,18 @@
 
 #ifndef ENABLE_CELL
 #define ENABLE_CELL 1    // the product transport
+#endif
+#if ENABLE_WIFI && ENABLE_CELL
+#error "ENABLE_WIFI replaces the modem: build it with -D ENABLE_CELL=0"
+#endif
+// Outside the #ifndef above so -D ENABLE_CELL=1 gets the seeds too.
+#if ENABLE_CELL
+#ifndef CELL_APN
 #define CELL_APN "hologram"
+#endif
+#ifndef CELL_HOST
 #define CELL_HOST "api.iternio.com"
+#endif
 /*
   SERVER ROOTS: uploads go only over a chain that verifies against Helpers/server_roots.h, else nothing
   is sent. A server moving to a new CA needs firmware trusting the new root shipped BEFORE the switch.
@@ -579,6 +599,16 @@
 // 1000 leaves margin). uploadBuffered() shrinks each batch until its serialized body fits, so richer
 // frames (more OBD PIDs) automatically mean fewer frames per POST instead of undeliverable POSTs.
 #define CELL_MAX_POST_BYTES 1000
+
+// zlib settings for the POST body (gzip_body.h). On synthetic 12-point driving bodies, level 9 with a 4 KB
+// window and memLevel 4 matches the miniz tdefl ratio within 0.5 % (1182 vs 1186 B). Window size makes no
+// difference from 2 KB up. Below about one point (1 KB) it collapses (1809 B). State is ~29 KB of PSRAM.
+#define GZIP_LEVEL 9
+#define GZIP_WINDOW_BITS 12
+#define GZIP_MEM_LEVEL 4
+// Gzip failures in one wake (bodies that fail verification, or the server rejecting a gzip body) after
+// which the rest of the wake goes plain. Corruption that repeats is not worth more airtime.
+#define GZIP_FAILS_PER_WAKE 2
 #define GEO_MAX_SEND_AGE_SECONDS (29UL * 24UL * 60UL * 60UL)
 
 // Catch-up burst: how many capped POSTs the STEADY-STATE (in-loop) upload may fire back-to-back in one

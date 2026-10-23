@@ -546,6 +546,7 @@ static void otaFinalize() {
   otaNvsPut("attempt", ota_img_version);
 
   otaSendStatus(OTA_PH_COMMITTED, 0, ota_img_version);
+  if (g_config_pending) dropUnsavedPush("ota"); // a push the transfer held back dies with the reboot
 #if ENABLE_LOGGING
   logEvent("OTA committed v%lu (%lu B) -> reboot into trial boot",
     (unsigned long)ota_img_version, (unsigned long)ota_img_size);
@@ -554,6 +555,7 @@ static void otaFinalize() {
   Serial.printf("OTA: committed, rebooting into new firmware\n");
   Serial.flush();
   delay(600);            // let the COMMITTED notify actually go out over the air before we reset
+  wdtStreakEnd();
   esp_restart();         // never returns
 }
 
@@ -815,6 +817,9 @@ static bool otaSelfTest() {
 #endif
 #if ENABLE_MEMS
   if (mems == 0) ok = false;                     // motion sensor absent -> sleep/wake logic would be broken
+#endif
+#if ENABLE_NETWORK
+  if (!gzipSelfTest()) ok = false;               // misbuilt compressor -> every upload body would fail
 #endif
   return ok;
 }

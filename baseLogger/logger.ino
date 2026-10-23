@@ -71,13 +71,10 @@ int g_http0_streak = 0;
 // the escalation to 2 reboots per outage so a genuine dead-coverage drive can't reboot-loop.
 int g_recovers_since_ok = 0;
 RTC_DATA_ATTR uint32_t net_reboot_count = 0;
-// CONSECUTIVE wedge-guard (task WDT) resets. RTC RAM survives a WDT reset, so this counts back-to-back
-// wedged wakes: cleared on any clean deep-sleep wake (the previous wake ended normally). At >=2 the wake
-// after a WDT reset goes straight back to sleep on the parked cadence instead of re-running the wedge-prone
-// init a third time in a row - bounding a persistently-wedging modem to ~2 WDT windows per parked cycle
-// instead of a 5-minute reset loop burning the 12V all night.
-RTC_DATA_ATTR uint32_t wdt_reset_count = 0;
-bool g_wdt_wake = false; // this boot came from a wedge-guard (WDT) reset - set at wake, drives the escalation
+// This boot's place in a run of consecutive panic/WDT resets, 0 on any other boot (Helpers/wdt_streak.h);
+// setup()'s escalation acts on it.
+uint32_t wdt_reset_count = 0;
+bool g_wdt_streak_retained = false; // the streak store validated: on a crash boot, proof it survived the reset
 unsigned long polling_delay = 5000; //5 seconds
 // broadcast delay 25 seconds by default
 unsigned long transmission_delay = 25000;
@@ -90,11 +87,13 @@ bool logging_message_printed = false; // print message once
 // Latched state behind the is_parked telemetry parameter. Defaults to parked on every boot/wake;
 // unlatched to driving by speed > 0 in loop() and re-latched by the activity state machine once
 // motion has stopped (see changeState). This is the IMU "smart cheat" - there is no real gear PID.
+// Written only by the drive region (Helpers/drive_state.h), as are g_last_speed_ms and park_marker_owed.
 bool is_currently_parked = true;
 // Set when a DRIVE frame enters the upload buffer, cleared when the pre-sleep PARK marker is queued: the
-// server has been told DRIVE and not yet PARK. RTC so a trip end that straddles a reboot (the mid-drive
-// modem-recovery sleep, a WDT reset) is still closed on the next wake, while a parked heartbeat wake owes
-// nothing and opens no connection.
+// server has been told DRIVE and not yet PARK. RTC so a trip end that straddles a deep sleep (the mid-drive
+// modem-recovery sleep) is still closed on the next wake, while a parked heartbeat wake owes nothing and opens
+// no connection. Every other reset reloads it, so setup() restores it from wdt_streak.h, which keeps it set
+// until the marker is sent, not just queued (#49).
 RTC_DATA_ATTR bool park_marker_owed = false;
 // millis() of the last speed>0 frame. Drives the TIME-BASED parked re-latch below: the state-machine re-latch
 // (changeState -> CHARGING/STANDBY) never fires while a connected phone holds the leash in the BLE state, so
@@ -108,8 +107,8 @@ unsigned long g_last_discharge_ms = 0;
 
 #if ENABLE_WIFI
 // One-shot guard for the cold-boot WiFi RF-flush recovery (see setup()). RTC memory survives the recovery
-// deep-sleep but is cleared by a true power loss, so the flush can fire at most once per power-up - this is
-// what prevents a boot loop when WiFi is simply unavailable.
+// deep-sleep but is cleared by a power loss or any other reset, so the flush can fire at most once per
+// power-up or reset - this is what prevents a boot loop when WiFi is simply unavailable.
 RTC_DATA_ATTR bool wifi_recovery_pending = false;
 #endif
 
@@ -209,9 +208,9 @@ bool g_clean_sleep = false;
 
 // GNSS freeze (Feature 4). The accurate fix exists at the END of a drive (GNSS stabilized over minutes of
 // being awake); a parked wake-up can't re-lock in the few seconds we're up, so its reading is garbage. So we
-// FREEZE the last good driving fix on the is_parked 0->1 transition (RTC-persisted, survives deep sleep) and
-// reuse it for every parked/charging frame instead of powering GNSS. g_gps_powered = did we power GNSS this
-// wake (only on a drive/cold boot) - gates the loop's gpsGetData and the pre-sleep gpsEnd.
+// FREEZE the last good driving fix on the is_parked 0->1 transition (RTC-persisted, survives deep sleep, lost
+// to any other reset) and reuse it for every parked/charging frame instead of powering GNSS. g_gps_powered =
+// did we power GNSS this wake (only on a drive/cold boot) - gates the loop's gpsGetData and the pre-sleep gpsEnd.
 RTC_DATA_ATTR double frozen_lat = 0.0;
 RTC_DATA_ATTR double frozen_lon = 0.0;
 RTC_DATA_ATTR bool   frozen_valid = false;
@@ -235,7 +234,8 @@ QueueHandle_t bleLogQueue = nullptr;
 // Also a control input: a silent sample poke at a rail >= RAIL_AWAKE_VOLTS holds the charge latch
 // (CHARGE_SILENT_HOLD_POLLS) and may shorten the cadence (charge_followup, POST_DRIVE_*).
 float g_rail_before_poke = 0.0f;
-// Per-power-session tallies (evidence the modem is rarely powered): cheap skip wakes vs poll wakes.
+// Tallies since the last reset that was not a deep-sleep wake (evidence the modem is rarely powered): cheap
+// skip wakes vs poll wakes.
 RTC_DATA_ATTR uint32_t skips_count = 0;
 RTC_DATA_ATTR uint32_t polls_count = 0;
 
@@ -338,12 +338,14 @@ void chargeWakeStateSanitize(bool deep_sleep) {
 
 // Test B (brownout vs clean sleep): set true immediately before esp_deep_sleep_start(); checked on the next
 // boot. If we wake and it's NOT set, we did NOT go through our own sleep path -> an uncommanded reset
-// (power loss / brownout / reflash), not a real timer/motion wake. RTC-persisted; cleared on power loss.
+// (power loss / brownout / reflash / panic / WDT), not a real timer/motion wake. RTC-persisted; every reset
+// but a deep-sleep wake clears it.
 RTC_DATA_ATTR bool clean_sleep_marker = false;
-// Running count of genuine BROWNOUT resets (esp_reset_reason()==ESP_RST_BROWNOUT) this power session - the
-// unambiguous "the rail sagged and reset the chip" signal for Test B. A deliberate reflash shows as POWERON
-// (clean_sleep=0) and does NOT bump this, so a non-zero count here is a real supply problem. Cross-check
-// against rail_v at that boot.
+// Genuine BROWNOUT resets (esp_reset_reason()==ESP_RST_BROWNOUT) - the unambiguous "the rail sagged and reset
+// the chip" signal for Test B. A deliberate reflash shows as POWERON (clean_sleep=0) and does NOT bump this,
+// so a non-zero count here is a real supply problem. Cross-check against rail_v at that boot. Not a running
+// count: the brownout reset itself reloads it, so it reads 1 from a brownout boot through the deep sleeps
+// after it, and 0 after any other reset that is not a deep-sleep wake.
 RTC_DATA_ATTR uint32_t brownout_count = 0;
 
 #if ENABLE_LOGGING
@@ -405,25 +407,32 @@ ActivityState current_state = UNINITIALIZED;
 */
 #if ENABLE_LOGGING
 void logEvent(const char* fmt, ...);           // Helpers/logging.h
+#else
+#define logEvent(...) ((void)0)                // helpers log unguarded; with logging off there is nowhere to write
 #endif
 #if ENABLE_NETWORK
 bool uploadBuffered(bool drain);               // Helpers/network_upload.h
 #if ENABLE_LOGGING
 void saveUploadBacklog();                      // Helpers/network_upload.h
+void gzipLogWakeSummary();                     // Helpers/gzip_body.h
+bool uploadBacklogPending();                   // Helpers/network_upload.h
 #endif
 #endif
 void bleDeinitForSleep();                      // Helpers/ble.h (no-op stub when BLE is disabled)
 void changeState(ActivityState new_state);     // Helpers/state_machine.h
 
 #include "Helpers/motion_stats.h" // pure MOTION-line aggregation, used by mems.h
+#include "Helpers/drive_state.h"  // park/drive region: the only writer of the latch globals above
 #include "Helpers/mems.h"
 #include "Helpers/server_roots.h" // data only: the trust bundle setup() hands the cellular transport
 #include "Helpers/clock_sync.h"
 #include "Helpers/telemetry_format.h"
 #include "Helpers/geo_backlog.h"
+#include "Helpers/wdt_streak.h"   // crash-loop streak store, RTC_NOINIT; advanced at the top of setup()
 #include "Helpers/sleep_power.h"
 #include "Helpers/ble.h"
 #include "Helpers/logging.h"
+#include "Helpers/fw_build_log.h" // FW event: uses logEvent
 // after logging.h (uses logEvent) and before network_upload.h (uses gzipBody)
 #include "Helpers/gzip_body.h"
 #include "Helpers/tlm_signature.h" // pure builder used by network_upload.h
@@ -471,6 +480,12 @@ void setup() {
   resetGeoAccepted(esp_reset_reason() == ESP_RST_DEEPSLEEP);
 #endif
   chargeWakeStateSanitize(esp_reset_reason() == ESP_RST_DEEPSLEEP);
+  // Wedge-guard accounting, first: a reset before it would repeat with the count frozen. A TASK_WDT/WDT reset
+  // means the previous wake BLOCKED (boot-153 failure mode) and the watchdog recovered it. PANIC counts too:
+  // the task-WDT's panic handler can surface as ESP_RST_PANIC on this IDF, and a genuine crash-loop is the
+  // same overnight 12V hazard as a wedge-loop either way.
+  wdt_reset_count = wdtStreakAdvance(esp_reset_reason(), &g_wdt_streak_retained);
+  if (esp_reset_reason() != ESP_RST_DEEPSLEEP && wdtStreakMarkerOwed()) driveMarkerRestored();
 #if PRINT
   // Only stall on a true power-on, so a serial monitor can attach in time to see boot output. Skip it on
   // every deep-sleep wake - periodic, motion, and especially the WiFi RF-flush recovery - so those reboots
@@ -548,6 +563,7 @@ void setup() {
 #if ENABLE_LOGGING
   // Mount the flash log filesystem and open/continue the active segment. Done early so even setup-phase
   // failures could be logged later; survives across the deep-sleep reboots above.
+  datalogger.onNewSegment(logFwBuild); // every segment names the build, so rotation never loses it
   datalogger.begin(LOG_HEADER);
 #endif
 
@@ -580,41 +596,35 @@ void setup() {
 #endif
 
   // Test B: did this boot come through our own deep-sleep path? clean_sleep_marker was set true right before
-  // we slept and survives deep sleep in RTC RAM; a power loss / brownout clears it. So !clean_sleep => an
-  // UNCOMMANDED reset (brownout / power blip / reflash), regardless of what esp_reset_reason claims.
+  // we slept and survives deep sleep in RTC RAM; any other reset clears it. So !clean_sleep => an
+  // UNCOMMANDED reset (brownout / power blip / reflash / crash), regardless of what esp_reset_reason claims.
   g_clean_sleep = clean_sleep_marker;
   bool clean_sleep = g_clean_sleep;
   clean_sleep_marker = false;            // consume it; the next clean sleep will re-set it
   if (esp_reset_reason() == ESP_RST_BROWNOUT) brownout_count++; // count only genuine supply brownouts (not reflashes)
-
-  // Wedge-guard accounting: a TASK_WDT/WDT reset means the previous wake BLOCKED (boot-153 failure mode) and
-  // the watchdog recovered it - count CONSECUTIVE occurrences (RTC RAM survives the reset). PANIC counts
-  // too: the task-WDT's panic handler can surface as ESP_RST_PANIC on this IDF, and a genuine crash-loop is
-  // the same overnight 12V hazard as a wedge-loop either way. Any clean deep-sleep wake means the previous
-  // wake ended normally, so the streak clears.
-  {
-    esp_reset_reason_t rr = esp_reset_reason();
-    bool wdt_reset = (rr == ESP_RST_TASK_WDT || rr == ESP_RST_INT_WDT || rr == ESP_RST_WDT ||
-                      rr == ESP_RST_PANIC);
-    if (wdt_reset) wdt_reset_count++;
-    else if (rr == ESP_RST_DEEPSLEEP) wdt_reset_count = 0;
-    g_wdt_wake = wdt_reset;
-  }
 
 #if ENABLE_LOGGING
   // First line of every wake window: why we woke, how deep we are, and - for the brownout test - whether it
   // was a clean (commanded) sleep wake, the decoded reset cause, the uncommanded count, and BOTH voltages
   // (ATRV vs true rail). Events fire on every wake including enforce-mode skips, so this captures wakes that
   // never write a telemetry row.
-  logEvent("WAKE reason=%s reset=%s clean_sleep=%d brownouts=%lu atrv=%.2f rail=%.2f boot=%lu sleeps=%lu",
+  // rev: the ESP32 silicon revision; the PSRAM cache bug the compiler workaround exists for is rev0/rev1.
+  logEvent("WAKE reason=%s reset=%s clean_sleep=%d brownouts=%lu atrv=%.2f rail=%.2f boot=%lu sleeps=%lu rev=%d",
     g_wake_reason, resetReasonStr(), clean_sleep ? 1 : 0, (unsigned long)brownout_count,
-    g_last_voltage, g_last_io36, (unsigned long)bootCount, (unsigned long)sleepCount);
+    g_last_voltage, g_last_io36, (unsigned long)bootCount, (unsigned long)sleepCount, (int)ESP.getChipRevision());
+  // A deep-sleep wake cannot change the image: a new one is confirmed (otaHandlePendingVerify) before
+  // anything can sleep. A boot that also opened a segment logs it twice; harmless, and it keeps the rule
+  // "no FW line after a non-deep-sleep WAKE = older firmware" (DONGLE_CONTEXT.md §5).
+  if (esp_reset_reason() != ESP_RST_DEEPSLEEP) logFwBuild();
   if (g_clock_slept_s)
     logEvent("CLOCK wake slept %lus, adjusted %+ldms at %ld ppm%s", (unsigned long)g_clock_slept_s,
       (long)(g_clock_comp_us / 1000), (long)clock_drift_ppm, clock_drift_learned ? "" : " (unlearned)");
-  // Make every watchdog recovery visible in the dump (acceptance: a wedge shows a WDT event, never a silent
-  // multi-minute gap). streak = consecutive wedged wakes; at >=2 the escalation below sleeps instead of retrying.
-  if (g_wdt_wake) logEvent("WDT/PANIC reset recovered a wedged/crashed wake (streak=%lu)", (unsigned long)wdt_reset_count);
+  // Make every watchdog or brownout recovery visible in the dump (acceptance: a wedge shows a WDT event, never
+  // a silent multi-minute gap). streak = consecutive crashed wakes; at >=2 the escalation below sleeps instead
+  // of retrying. retained=0 means the store did not survive the reset, so the streak restarted at 1.
+  if (wdt_reset_count)
+    logEvent("%s reset recovered (streak=%lu retained=%d owed=%d)", resetReasonStr(),
+      (unsigned long)wdt_reset_count, g_wdt_streak_retained ? 1 : 0, park_marker_owed ? 1 : 0);
 #endif
   // NOTE: a low-battery lockout was tried here using obd.getVoltage() (ATRV), but the logs show ATRV reads
   // ~5.3V when the car/CAN is asleep and ~13.5V only when awake - it does NOT report the true 12V battery
@@ -822,7 +832,8 @@ void setup() {
     // live - the reset especially, since it is only accepted within seconds of this very boot.
     //
     // The poll is still refused (should_poll is false and stays false), so no OBD request is made and the
-    // modem is never powered on this path. Only the radio comes up, for a bounded window.
+    // modem is never powered on this path (the loop's offline reconnect skips it too, or an unanswering modem
+    // would be powered on). Only the radio comes up, for a bounded window.
     if (!should_poll && weak_rail && wake_cause == ESP_SLEEP_WAKEUP_UNDEFINED) {
       g_weak_rail_cold_boot = true;
 #if ENABLE_LOGGING
@@ -858,19 +869,25 @@ void setup() {
   // recurring 0x13.) Same !g_sample_poke guard as GPS: a charge-sample poke (nobody at the car) brings up
   // neither. No-op if !ENABLE_BLE.
 #if ENABLE_SLEEP && ENABLE_MEMS
-  // Wedge-guard escalation: two CONSECUTIVE wakes just ended in a WDT reset (both wedged in the init path
-  // below). Don't run it a third time back-to-back - sleep on the parked cadence and try fresh next wake,
-  // so a persistently-wedging modem costs ~2 WDT windows per cycle, not a 5-minute reset loop all night.
+  // Wedge-guard escalation: two CONSECUTIVE wakes just ended in a WDT, panic or brownout reset (wdt_streak.h;
+  // a wedge is usually in the init path below). Don't run it a third time back-to-back - sleep and try fresh next wake, so a persistently-wedging
+  // modem costs ~2 WDT windows per cycle, not a 5-minute reset loop all night. The parked cadence, unless the
+  // rail says the car is awake (driving or charging): WOM can miss a smooth road, and a charge is followed at
+  // the charging cadence anyway.
   // Placed AFTER the gate/MEMS init (enterDeepSleep needs the sensor) and BEFORE BLE/modem bring-up.
-  // modem_on=true: after a mid-init WDT reset the modem is almost certainly still powered from the wedged
-  // wake (the wedge IS modem init) - CPOWD it on the way down rather than leave it drawing through the sleep.
-  if (g_wdt_wake && wdt_reset_count >= 2) {
+  // modem_on only when a wake since the last acknowledged power-down reached network init (wdt_streak.h):
+  // after a mid-init WDT reset the modem is almost certainly still powered (the wedge IS modem init) - CPOWD
+  // it on the way down rather than leave it drawing through the sleep. Never otherwise: an unanswered CPOWD
+  // ends in a 2.5 s PWRKEY pulse, which switches an off modem ON.
+  // A restored marker debt is not paid here: these boots zeroed the clock, which keeps enterDeepSleep's marker
+  // block shut, so the backlog this boot never loaded is not overwritten.
+  if (wdt_reset_count >= 2) {
+    g_next_wake_minutes = g_last_io36 >= RAIL_AWAKE_VOLTS ? WAKE_CHARGING_MINUTES : WAKE_PARKED_MINUTES;
 #if ENABLE_LOGGING
     logEvent("WDT streak=%lu -> skip init, sleep %dmin (retry fresh next wake)",
-      (unsigned long)wdt_reset_count, WAKE_PARKED_MINUTES);
+      (unsigned long)wdt_reset_count, g_next_wake_minutes);
 #endif
-    g_next_wake_minutes = WAKE_PARKED_MINUTES;
-    enterDeepSleep(true, "wdt-streak"); // never returns
+    enterDeepSleep(wdtStreakModemMayBeOn(), "wdt-streak"); // never returns
   }
 #endif
 
@@ -1079,7 +1096,7 @@ void setup() {
   }
   config_initialized = true;
 
-#if ENABLE_NETWORK && ENABLE_LOGGING
+#if (ENABLE_NETWORK) && ENABLE_LOGGING // parenthesised: ENABLE_NETWORK is a bare `||`
   // Restore telemetry that couldn't be uploaded before the last sleep (wedged bearer / dead spot). Only
   // reachable on a polling wake - gate skips slept long before this - and the modem is freshly booted here,
   // so the normal upload path drains these with their original (correct) utc stamps.
@@ -1144,7 +1161,8 @@ void loop() {
   // Deferred while a firmware update is transferring: applying a profile runs obd.initialize() (a full ATZ +
   // ~10 init AT commands, seconds of blocking) plus a LittleFS profile write and possibly an NVS commit - all
   // of which would stall the sector ACKs and contend with esp_ota_write for the same flash chip. The flag is
-  // sticky, so nothing is lost: the push applies on the first iteration after the update finishes.
+  // sticky, so nothing is lost: the push applies on the first iteration after the update finishes (or, if
+  // the update ends in its reboot, otaFinalize drops it so the app pushes it again).
   // Deferred during a log dump for the same two reasons (window replies stall; the profile write mutates the
   // filesystem the dump is mid-way through reading).
   if (g_config_pending && !g_ota_active && !g_logdump_active) {
@@ -1173,36 +1191,36 @@ void loop() {
         last_applied_profile = profile_dump;
 #if ENABLE_LOGGING
         logEvent("CONFIG applied from BLE push (%d bytes, on loop task)", (int)profile_dump.size());
-        // Persist the accepted push (profile + token) so it survives sleep/reboot. This is what keeps the
-        // NVS hash truthful: boot restores THIS file (loadPersistedProfile) instead of reverting to factory,
-        // and standalone cellular wakes then run the pushed profile too.
-        File pf = LittleFS.open(PROFILE_PATH, "w");
-        if (pf) {
-          pf.print(g_pending_config_str.c_str());
-          pf.close();
-          logEvent("PROFILE persisted to flash (%d bytes)", (int)g_pending_config_str.size());
-        } else {
-          // Couldn't persist: the hash (already committed by the wrapper) would outlive the RAM-only profile.
-          // Invalidate it so the app re-pushes next connect instead of fast-pathing onto a stale factory boot.
-          ble.invalidateHash();
-          logEvent("PROFILE persist FAILED - hash invalidated (app will re-push)");
-        }
 #endif
       } else {
 #if ENABLE_LOGGING
         logEvent("CONFIG push identical to running profile - re-init skipped");
 #endif
       }
+#if ENABLE_LOGGING
+      // Persist the accepted push (profile + token) so it survives sleep/reboot. This is what keeps the
+      // NVS hash truthful: boot restores THIS file (loadPersistedProfile) instead of reverting to factory,
+      // and standalone cellular wakes then run the pushed profile too. Every full push is written, an
+      // identical profile included: the app's hash covers the token.
+      File pf = LittleFS.open(PROFILE_PATH, "w");
+      const bool saved = pf && pf.print(g_pending_config_str.c_str()) == g_pending_config_str.size();
+      if (pf) pf.close();
+      if (saved) {
+        logEvent("PROFILE persisted to flash (%d bytes)", (int)g_pending_config_str.size());
+      } else {
+        dropUnsavedPush("write");
+      }
+#endif
       config_initialized = true;
     }
     catch (const json::exception& err) {
       Serial.printf("CONFIG apply failed: %s\n", err.what());
-      // The wrapper committed the new hash at SETUP OK, but the profile never applied: invalidate so the
-      // fast path can't claim it - the app re-pushes on the next connect.
-      ble.invalidateHash();
+      // The wrapper committed the new hash at SETUP OK, but the profile never applied (the RAM token may
+      // already have moved): drop the hash and the file so no wake runs either half - the app re-pushes.
 #if ENABLE_LOGGING
-      logEvent("CONFIG apply FAILED: %.60s - hash invalidated (app will re-push)", err.what());
+      logEvent("CONFIG apply FAILED: %.60s", err.what());
 #endif
+      dropUnsavedPush("apply");
     }
   }
 #endif
@@ -1228,7 +1246,7 @@ void loop() {
   // the instant the phone drops - which is exactly the OTA resume window - and a modem reconnect/POST there
   // would block the loop for seconds (starving sector ACKs) or, via the http=0 recovery ladder, deep-sleep
   // the device mid-transfer.
-  if (!bleRelaying() && !g_ota_active && !network.connected() && (millis() - last_reconnect_try) > WIFI_RETRY_MS) {
+  if (!g_weak_rail_cold_boot && !bleRelaying() && !g_ota_active && !network.connected() && (millis() - last_reconnect_try) > WIFI_RETRY_MS) {
     Serial.printf("Network offline - retrying\n");
     network.reconnect();
     last_reconnect_try = millis();
@@ -1499,15 +1517,7 @@ void loop() {
         // smooth-road fix: on glassy asphalt detectMovement() sees no accel spikes, so last_active would go
         // stale and the state machine would sleep mid-drive (and changeState() would then mislabel the frame
         // is_parked:1). Feeding speed into the leash holds us awake as long as the car reports motion.
-        if (is_currently_parked) {
-          Serial.printf("LEASH: speed=%.1f -> driving (unlatch parked, hold awake)\n", res.second);
-#if ENABLE_LOGGING
-          logEvent("LEASH driving speed=%.1f -> unlatch parked + hold awake (smooth-road guard)", res.second);
-#endif
-        }
-        is_currently_parked = false;
-        last_active = millis();
-        g_last_speed_ms = millis();
+        driveSpeed(res.second);
         // Feed the OBD-alarm gate's speed-hold: a genuine road speed is independent proof the car is
         // in transit, and it carries an already-granted driving permit through a GNSS outage (tunnel,
         // multi-storey). Continuation only - reaching this line at all means a poll was permitted.
@@ -1532,15 +1542,7 @@ void loop() {
     // next slept. Requiring a recent fix makes the unlatch expire on its own when fixes stop, and
     // then the 5-minute re-latch does what it was written to do.
     if (gpsMovingFresh(GPS_MOVING_MAX_AGE_MS)) {
-      if (is_currently_parked) {
-        Serial.printf("LEASH: GNSS %.1f km/h -> driving (unlatch parked, hold awake)\n", gd->speed * 1.852f);
-#if ENABLE_LOGGING
-        logEvent("LEASH driving gnss=%.1fkm/h -> unlatch parked (no OBD speed needed)", gd->speed * 1.852f);
-#endif
-      }
-      is_currently_parked = false;
-      last_active = millis();
-      g_last_speed_ms = millis();
+      driveGnss(gd->speed * 1.852f);
     }
 #endif
     // TIME-BASED parked re-latch (state-machine independent). The changeState re-latch can't fire while a
@@ -1549,14 +1551,8 @@ void loop() {
     // machine (no reported speed for ACTIVE_TIMER -> parked), just not blocked by the BLE hold. With the
     // latch restored, a forgotten connected phone is genuinely bounded by MAX_AWAKE_MINUTES, and plugging in
     // at a charger with the phone connected still detects is_charging.
-    if (!is_currently_parked && ( millis() - g_last_speed_ms ) > (unsigned long)ACTIVE_TIMER) {
-      freezeParkedLocation(); // 0->1 transition: capture the stabilized last-driving fix, as changeState does
-      is_currently_parked = true;
-#if ENABLE_LOGGING
-      logEvent("LEASH no speed for %lus -> re-latch parked (time-based; BLE-hold safe)",
-        (unsigned long)(ACTIVE_TIMER / 1000UL));
-#endif
-    }
+    // The 0->1 transition freezes the stabilized last-driving fix, as changeState does.
+    drivePollEnd();
     // Before is_parked is appended: a frame whose only v2 field would be drivingState is not worth a POST.
     // utc is always present, so this asks the serializer. A location or heading already accepted, or already
     // buffered behind an unsent one, is not news; any other, frozen or live, is.
@@ -1875,7 +1871,7 @@ void loop() {
 #if ENABLE_NETWORK
       g_geo_queued = poll_geo;
 #endif
-      if (!is_currently_parked) park_marker_owed = true;
+      driveFrameBuffered();
       // Bound the RAM upload buffer so a long offline stretch can't grow it without limit (-> OOM). The
       // full history is already in flash; for live telemetry the freshest frames matter most, so drop the
       // oldest when over the cap.
@@ -1889,6 +1885,7 @@ void loop() {
       Serial.printf("Empty frame (no OBD/GPS data) - skipping upload\n");
     }
 #endif
+    if (park_marker_owed) wdtStreakMarker(true); // as soon as it is buffered, before the upload can send it
 
 #if ENABLE_LOGGING
     // Log every reading (even when the frame is too thin to upload) with full hardware diagnostics.

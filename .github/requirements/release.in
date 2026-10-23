@@ -1,4 +1,7 @@
 # Build tools for release.yml. Regenerate release.txt after changing a pin:
-#   uv pip compile --generate-hashes --universal --python-version 3.12 .github/requirements/release.in -o .github/requirements/release.txt
+#   uv pip compile --generate-hashes --universal --python-version 3.12 --no-emit-package starlette .github/requirements/release.in -o .github/requirements/release.txt
+# starlette is left out because platformio 6.1.x caps it below every fixed version and only `pio home` imports it;
+# its own dependencies stay. platformio 6.2 lifts the cap. To bring starlette back, drop the flag, the --no-deps and
+# pip check in release.yml, and the starlette checks in tests/run_release_checks.py.
 platformio==6.1.18
 git-cliff==2.14.2

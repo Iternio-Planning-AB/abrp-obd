@@ -91,6 +91,7 @@ time_t parseHttpDate(const char*) { return 0; }
 void esp_task_wdt_reset() {}
 #include "telemetry_format.h"
 #include "gps_location.h"
+#include "drive_state.h"
 void gpsUnlatch() {
 #include "gps_unlatch.inc"
 }
@@ -113,7 +114,8 @@ struct FakeNetwork {
     return {responseCode, "{}"};
   }
 } network;
-bool gzipBody(const std::string&, std::string&) { return false; }
+#include "gzip_fake.h"
+GzipOutcome gzipBody(const std::string&, std::string&) { return GZIP_UNAVAILABLE; }
 int logging_errors = 0, g_last_http = 0, g_http0_streak = 0;
 unsigned long g_last_post_ms = 0;
 std::string g_last_status, tlm_push_token = "test-token", api_key = "test-key";
@@ -1446,6 +1448,16 @@ void uploadGate() {
   const auto marker = json::parse(bulkStringV2({obd_result_vector.back()}, T));
   check(marker.size() == 1 && marker[0].size() == 2 && marker[0]["drivingState"]["state"] == "PARK",
         "trip-end marker serializes to a PARK point");
+  // A trip end after a full buffer: the marker is frame MAX + 1 in the backlog, and the restore keeps the
+  // newest frames, as the loop's cap does (#49).
+  obd_result_vector.assign(MAX_UPLOAD_BUFFER, {{"utc", T}, {"soc", 49}, {"is_parked", 0}});
+  park_marker_owed = true;
+  queueParkMarker();
+  saveUploadBacklog();
+  obd_result_vector.clear();
+  loadUploadBacklog();
+  check(obd_result_vector.size() == MAX_UPLOAD_BUFFER && obd_result_vector.back().size() == 2,
+        "a backlog over the cap loses its oldest frame, never the trip-end marker");
   obd_result_vector = {parked};
   g_geo_accepted = g_geo_queued = {};
   saveUploadBacklog();
