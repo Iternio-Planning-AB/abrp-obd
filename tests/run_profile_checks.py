@@ -49,10 +49,19 @@ if find(apply, "ble.commitHash(hash, true);", what="config apply") < find(apply,
 
 # Both key resets forget the stored push; the BLE one after the session grant is revoked.
 gate = code((root / "baseLogger/Helpers/auth_gate.h").read_text(), 'if (j.contains("authreset")) {', "auth_gate.h")
-find(gate, 'forgetProfile("authreset");', find(gate, "ble.set_authenticated(false);", what="authreset"), "authreset")
+forget = find(gate, 'if (!forgetProfile("authreset") || !p.remove("secret")) {',
+             find(gate, "ble.set_authenticated(false);", what="authreset"), "authreset")
+failed = find(gate, 'authNotifyJson("{\\"auth\\":\\"error\\"}");', forget, "authreset")
+if failed > find(gate, 'authNotifyJson("{\\"auth\\":\\"reset\\"}");', forget, "authreset"):
+    raise SystemExit("FAIL: a key reset whose forget or key removal fails must answer error, not reset")
 console = (root / "baseLogger/Helpers/logging.h").read_text()
 clear = code(console, 'else if (cmd.equalsIgnoreCase("AUTHCLEAR")) {', "logging.h")
-find(clear, 'forgetProfile("authclear");', what="AUTHCLEAR")
+forget = find(clear, 'if (!forgetProfile("authclear")) {', find(clear, "ble.set_authenticated(false);", what="AUTHCLEAR"), "AUTHCLEAR")
+if find(clear, "ble.clearAuthSecrets();", what="AUTHCLEAR") < find(clear, "return;", forget, "AUTHCLEAR"):
+    raise SystemExit("FAIL: AUTHCLEAR must forget (and erase the log) first, and keep the secret when that fails")
+busy = console[find(console, "if ((g_ota_active || g_logdump_active) &&", what="logging.h"):]
+if busy.index('cmd.equalsIgnoreCase("AUTHCLEAR")') > busy.index("BUSY:"):
+    raise SystemExit("FAIL: serial AUTHCLEAR must be refused while an update or a BLE log dump runs, like CLEAR")
 
 compiler = shlex.split(os.environ.get("CXX", "clang++"))
 print(subprocess.check_output([*compiler, "--version"], text=True).splitlines()[0], flush=True)
@@ -69,8 +78,11 @@ with tempfile.TemporaryDirectory(prefix="obd-profile-checks-") as temporary:
     upload = (root / "baseLogger/Helpers/network_upload.h").read_text()
     backlog = find(upload, "static const char* UPLOAD_BACKLOG_PATH", what="network_upload.h")
     (build / "backlog_path.inc").write_text(upload[backlog:find(upload, "\n", backlog, "network_upload.h") + 1])
+    ota = (root / "baseLogger/Helpers/ota_update.h").read_text()
+    (build / "ota_codes.inc").write_text("".join(
+        line + "\n" for line in ota.splitlines() if line.startswith(("#define OTA_PH_ABORTED ", "#define OTA_ERR_NOAUTH "))))
     (build / "forget_profile.inc").write_text(
-        block((root / "baseLogger/Helpers/auth_gate.h").read_text(), "void forgetProfile(const char* why) {", "auth_gate.h"))
+        block((root / "baseLogger/Helpers/auth_gate.h").read_text(), "bool forgetProfile(const char* why) {", "auth_gate.h"))
     executable = build / "profile_checks"
     subprocess.run([
         *compiler, "-std=c++17", "-fsanitize=address,undefined", "-fno-omit-frame-pointer",

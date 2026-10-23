@@ -187,11 +187,38 @@ static void authSendNonce() {
 
 /* Loop-task service: consume one command per call. Cheap flag test when idle. */
 // AUTHCLEAR and the in-app key reset: the dongle forgets the vehicle it was paired to, so a re-paired dongle cannot
-// keep reporting to the previous account. Profile file, stored hash, the push token (RAM and its NVS copy), the
-// upload queue polled under it (in RAM and whatever a relay session parked in the backlog file), and any push
-// still waiting for the loop. Polling stops as on an unpaired dongle until the next full push. The OBD-alarm flag stays: it
-// belongs to the car. Loop task only.
-void forgetProfile(const char* why) {
+// keep reporting to the previous account, and the next owner cannot read the previous one's history. It ends the
+// log dump and the update the revoked session may have running, erases the flash log, then clears the profile file,
+// stored hash, push token (RAM and its NVS copy), the upload queue polled under it (in RAM, held for a gzip wake, and
+// whatever a relay session parked in the backlog file), the send-once geo marks, any push still waiting for the loop
+// and the frozen parked fix. Polling stops as on an unpaired dongle until the next full push. The OBD-alarm flag
+// stays: it belongs to the car.
+// The log goes first and false means it could not all be erased: nothing else is touched, so the caller keeps the
+// key and the reset can be repeated - as it can after a power cut part-way. The reason is then the first line of the
+// fresh log, after the header and FW build line every segment opens with.
+// Loop task only. The files are deleted, not scrubbed: a raw read of the flash chip can still recover them.
+bool forgetProfile(const char* why) {
+#if ENABLE_LOGGING
+  const char* ended_dump = g_logdump_active ? ", ended dump" : "";
+  const char* ended_ota = g_ota_active ? ", ended ota" : "";
+#endif
+#if ENABLE_BLE && ENABLE_LOGGING
+  logDumpEnd("forget"); // its next window request gets err:ended instead of bytes of the fresh log
+#endif
+#if ENABLE_OTA && ENABLE_BLE
+  if (g_ota_active) otaReset(OTA_PH_ABORTED, OTA_ERR_NOAUTH); // the session it belonged to just lost its grant
+#endif
+#if ENABLE_LOGGING
+  if (bleLogQueue) xQueueReset(bleLogQueue); // queued connect/write lines belong to the erased log
+#if ENABLE_MEMS
+  flushMotionStats(); // the partial minute too
+#endif
+  const int erased = datalogger.clearAll();
+  if (erased < 0) {
+    logEvent("PROFILE forget FAILED (%s) - log not erased, nothing cleared", why);
+    return false;
+  }
+#endif
   std::string dropped;
   portENTER_CRITICAL(&g_config_mux);
   dropped.swap(g_pending_config_str);
@@ -202,15 +229,30 @@ void forgetProfile(const char* why) {
   LittleFS.remove(PROFILE_PATH);
 #endif
 #if (ENABLE_NETWORK) && ENABLE_LOGGING // parenthesised: ENABLE_NETWORK is a bare `||`
-  if (!obd_result_vector.empty() || upload_spilled)
-    logEvent("UPLOAD discarded n=%lu reason=forget", obd_result_vector.size() + upload_spilled);
+  const unsigned long discarded = obd_result_vector.size() + g_upload_held.size() + upload_spilled;
   LittleFS.remove(UPLOAD_BACKLOG_PATH);
   upload_spilled = 0;
+#endif
+#if ENABLE_NETWORK
+  g_upload_held.clear();
+  upload_capped = 0;
+  resetGeoAccepted(false);
+  g_geo_queued = {};
 #endif
   obd_result_vector.clear();
   tlm_push_token.clear();
   g_no_profile = true;
-  logEvent("PROFILE forgotten (%s) - profile, hash and push token cleared", why);
+  frozen_valid = false; // RTC survives AUTHCLEAR: no position of the previous vehicle carries into the new log
+  frozen_lat = frozen_lon = 0.0;
+  resetFrozenGpsProvenance(false);
+#if ENABLE_LOGGING
+  logEvent("PROFILE forgotten (%s) - log erased (%d segments), profile and push token cleared%s%s", why, erased,
+    ended_dump, ended_ota);
+#endif
+#if (ENABLE_NETWORK) && ENABLE_LOGGING
+  if (discarded) logEvent("UPLOAD discarded n=%lu reason=forget", discarded);
+#endif
+  return true;
 }
 
 void authGateService() {
@@ -282,15 +324,19 @@ void authGateService() {
       authNotifyJson("{\"auth\":\"error\"}");
       return;
     }
-    p.remove("secret");
-    p.end();
     // The session grant dies with the key it was based on: whoever proved against the OLD key must
     // not keep telemetry/OTA/log-dump on the strength of a key that no longer exists.
     ble.set_authenticated(false);
     g_auth_nonce_valid = false;
+    // The next owner pushes their own profile. This session can still finish a push it had under way.
+    if (!forgetProfile("authreset") || !p.remove("secret")) {
+      p.end();
+      logEvent("AUTH2 reset failed (log erase or NVS remove) - key kept, repeat the reset");
+      authNotifyJson("{\"auth\":\"error\"}");
+      return;
+    }
+    p.end();
     logEvent("AUTH2 key reset over BLE - dongle is unprovisioned again");
-    // The next owner pushes their own. This session can still finish a push it had under way.
-    forgetProfile("authreset");
     authNotifyJson("{\"auth\":\"reset\"}");
     return;
   }

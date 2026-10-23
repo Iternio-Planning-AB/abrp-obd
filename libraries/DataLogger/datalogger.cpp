@@ -245,18 +245,22 @@ size_t DataLogger::readAt(size_t offset, uint8_t* buf, size_t len) {
   return done;
 }
 
-void DataLogger::clearAll() {
-  if (!mounted) return;
+int DataLogger::clearAll() {
+  if (!mounted) return 0;
   invalidateReadCursor();
   if (active) active.close();
-  int lo = lowestIndex(), hi = highestIndex();
-  for (int i = lo; i >= 0 && i <= hi; ++i) {
-    std::string p = pathFor(i);
-    if (LittleFS.exists(p.c_str())) LittleFS.remove(p.c_str());
+  // Newest first: a power cut part-way through drops the most recent history, not the oldest. remove() is
+  // false for an index gap, so no exists() (it logs an [E] line per missing path, see openSegment).
+  int lo = lowestIndex(), hi = highestIndex(), removed = 0;
+  for (int i = hi; lo >= 0 && i >= lo; --i) {
+    if (LittleFS.remove(pathFor(i).c_str())) ++removed;
   }
+  // Any segment left would be appended to (or, as log0000, be the head of) the fresh log: report it.
+  const bool all_gone = highestIndex() < 0;
   activeIndex = -1;
   openSegment(0);
-  Serial.printf("[log] cleared all segments\n");
+  Serial.printf("[log] cleared %d segment(s)%s\n", removed, all_gone ? "" : " - some could not be removed");
+  return all_gone ? removed : -1;
 }
 
 void DataLogger::printStats(Stream& out) {

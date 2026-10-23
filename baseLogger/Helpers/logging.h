@@ -194,7 +194,7 @@ void handleLogCommands() {
   const bool is_dump = cmd.equalsIgnoreCase("DUMP") ||
                        (cmd.length() > 5 && cmd.substring(0, 5).equalsIgnoreCase("DUMP "));
   if ((g_ota_active || g_logdump_active) &&
-      (is_dump || cmd.equalsIgnoreCase("CLEAR") || cmd.equalsIgnoreCase("PANIC") || cmd.equalsIgnoreCase("WDTHANG") ||
+      (is_dump || cmd.equalsIgnoreCase("CLEAR") || cmd.equalsIgnoreCase("AUTHCLEAR") || cmd.equalsIgnoreCase("PANIC") || cmd.equalsIgnoreCase("WDTHANG") ||
        cmd.equalsIgnoreCase("RADIO") || cmd.equalsIgnoreCase("CLKPROBE") || cmd.equalsIgnoreCase("TLSCHECK") ||
        cmd.substring(0, 6).equalsIgnoreCase("GZTEST") ||
        cmd.substring(0, 2).equalsIgnoreCase("AT"))) {
@@ -266,19 +266,22 @@ void handleLogCommands() {
   // Wipe the auth secret, returning the dongle to trust-on-first-use so the app can provision a fresh
   // one. THE rescue path for a lost or mismatched secret: no toolchain, no reflash. Kept separate from
   // BONDCLEAR on purpose - a full bond table is routine and must not cost authorization.
-  // Allowed at any time and it does NOT revoke the live session (the in-RAM unlock flag stands until
-  // disconnect), so it cannot interfere with a transfer in flight.
+  // Refused during an update or a BLE log dump, like CLEAR (it erases the log too); a phone mid-update must
+  // not be pushed into re-pairing and so win the "connect the keeper first" race below.
   else if (cmd.equalsIgnoreCase("AUTHCLEAR")) {
-    ble.clearAuthSecrets();
     ble.set_authenticated(false); // the open session proved against the wiped secret: it re-pairs like any other
+    if (!forgetProfile("authclear")) {
+      Serial.printf("AUTHCLEAR FAILED: the log could not be erased - secret and profile kept, try again\n");
+      return;
+    }
+    ble.clearAuthSecrets();
     // Say what this actually DOES: the next phone to connect provisions a brand-new secret and every
     // other phone holding the old one loses access. That is the point (revocation), but it also means
     // connect the phone that should keep access FIRST - whoever wins that race becomes the owner.
-    // The vehicle profile and push token go too: polling and upload wait for that phone's full push.
-    Serial.printf("AUTHCLEAR: auth secret, profile and push token wiped - the NEXT phone to connect sets a\n"
+    // The vehicle profile, push token and flash log go too: polling and upload wait for that phone's full push.
+    Serial.printf("AUTHCLEAR: auth secret, profile, push token and log wiped - the NEXT phone to connect sets a\n"
                   "           new secret and pushes the profile (revokes every other phone; connect the keeper first)\n");
     logEvent("AUTHCLEAR secret wiped - next phone to connect provisions a new one (revocation)");
-    forgetProfile("authclear");
   }
 #endif
   // Prove the profile-signature check discriminates: re-verify the last real signed profile intact,
