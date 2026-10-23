@@ -40,6 +40,9 @@ bool pollGpsData() {
   const GPSReadDiagnostics& read = sys.gpsReadDiagnostics();
   if (read.reanchored)   // no coordinates: the flash log is private, but the distance is enough
     logEvent("GPS reanchor dist=%lum rejects=%u", (unsigned long)read.reanchor_dist_m, (unsigned)read.reanchor_rejects);
+  if (read.confirmed) logEvent("GPS first fix confirmed held=%u", (unsigned)read.confirm_held);
+  else if (read.confirm_restarted && read.confirm_held == 2)   // once a wake: no agreeing second fix in time
+    logEvent("GPS first fix unconfirmed, holding the next");
 #endif
   if (accepted) {
     geo_accepted = gd ? *gd : GPS_DATA{};

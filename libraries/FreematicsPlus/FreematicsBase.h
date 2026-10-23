@@ -68,7 +68,8 @@ enum class GPSReadResult : uint8_t {
 	MarkerMissing,
 	RequiredFieldInvalid,
 	CoordinateRejected,
-	DirectNoData
+	DirectNoData,
+	Unconfirmed      // first fix of a wake, held until a second fresh fix agrees with it
 };
 
 struct GPSReadDiagnostics {
@@ -78,6 +79,9 @@ struct GPSReadDiagnostics {
 	bool reanchored = false;        // this read replaced a jump-filter anchor that was locking good fixes out
 	uint32_t reanchor_dist_m = 0;   // how far the new anchor is from the one it replaced
 	uint8_t reanchor_rejects = 0;   // consecutive fresh fixes rejected before it
+	bool confirmed = false;         // this read accepted the wake's first fix, confirmed by an agreeing second
+	bool confirm_restarted = false; // a held first fix had no agreeing successor; this one is held instead
+	uint8_t confirm_held = 0;       // fresh fixes held before the first fix, including the one confirmed
 };
 
 class CLink

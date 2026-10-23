@@ -12,13 +12,6 @@
 */
 
 #if ENABLE_NETWORK
-#if ENABLE_LOGGING
-#include <cmath>
-
-constexpr size_t UPLOAD_DIAGNOSTIC_MESSAGE_BYTES = 120;
-constexpr size_t UPLOAD_DIAGNOSTIC_SHA256_BYTES = 6;
-unsigned long g_upload_request_id = 0;
-
 bool uploadErrorContains(const std::string& body, const char* phrase) {
   const size_t n = strlen(phrase);
   for (size_t i = 0; i + n <= body.size(); ++i) {
@@ -32,6 +25,23 @@ bool uploadErrorContains(const std::string& body, const char* phrase) {
   }
   return false;
 }
+
+// The server's gzip complaints (Go's compress/gzip errors), for the log category and the failure budget.
+const char* uploadGzipCategory(const std::string& body) {
+  if (uploadErrorContains(body, "invalid header")) return "gzip_header";
+  if (uploadErrorContains(body, "checksum")) return "gzip_checksum";
+  if (uploadErrorContains(body, "length check")) return "gzip_length";
+  if (uploadErrorContains(body, "unexpected eof")) return "incomplete";
+  if (uploadErrorContains(body, "gzip")) return "gzip_other";
+  return nullptr;
+}
+
+#if ENABLE_LOGGING
+#include <cmath>
+
+constexpr size_t UPLOAD_DIAGNOSTIC_MESSAGE_BYTES = 120;
+constexpr size_t UPLOAD_DIAGNOSTIC_SHA256_BYTES = 6;
+unsigned long g_upload_request_id = 0;
 
 const char* uploadErrorCategory(const std::string& body) {
   if (body.empty()) return "empty";
@@ -51,12 +61,9 @@ const char* uploadErrorCategory(const std::string& body) {
   for (const char* marker : {"token", "api_key", "api-key", "authorization", "bearer", "password", "secret"})
     if (uploadErrorContains(body, marker)) return "redacted";
   if (uploadErrorContains(body, "<html") || uploadErrorContains(body, "<!doctype")) return "html";
-  if (uploadErrorContains(body, "invalid header")) return "gzip_header";
-  if (uploadErrorContains(body, "checksum")) return "gzip_checksum";
-  if (uploadErrorContains(body, "length check")) return "gzip_length";
-  if (uploadErrorContains(body, "unexpected eof")) return "incomplete";
-  if (uploadErrorContains(body, "gzip")) return "gzip_other";
+  if (const char* gzip = uploadGzipCategory(body)) return gzip;
   if (uploadErrorContains(body, "unauthorized") || uploadErrorContains(body, "forbidden")) return "auth";
+  if (uploadErrorContains(body, "too old")) return "too_old";
   if (uploadErrorContains(body, "validation")) return "validation";
   return "other";
 }
@@ -91,6 +98,8 @@ bool g_geo_queued_seeded = true;
 
 // The last logNetworkAt() failed before anything was sent - not a verdict on the bearer (see loop()).
 bool g_upload_local_fail = false;
+// Frames over the cap only because gzip is off this wake; saveUploadBacklog() puts them back first.
+std::vector<OBDVector> g_upload_held;
 
 // A batch that was not POSTed: the frames stay for the next attempt, and the reason is the status.
 static bool uploadNotSent(const char* status) {
@@ -135,8 +144,14 @@ static bool logNetworkAt(const std::vector<OBDVector>& obd_result_vector, double
   // PSRAM was unavailable would be a far bigger failure than losing the ratio.
   const size_t raw_bytes = payload.size();
   std::string gzipped;
-  const bool gzip_used = gzipBody(payload, gzipped);
+  const GzipOutcome gzip = gzipBody(payload, gzipped);
+  const bool gzip_used = gzip == GZIP_OK;
   if (gzip_used) payload.swap(gzipped);
+  // A failed member may be corruption, and the batch was sized for gzip: send neither, keep the frames.
+  else if (gzip == GZIP_FAIL) return uploadNotSent("gzip_fail");
+#if ENABLE_CELL
+  else if (payload.size() > CELL_MAX_POST_BYTES) return uploadNotSent("plain_too_big");
+#endif
 
   // Over the bytes exactly as sent - the gzip stream when compressed - for Content-Digest and the log
   // fingerprint alike.
@@ -219,6 +234,7 @@ static bool logNetworkAt(const std::vector<OBDVector>& obd_result_vector, double
 
   // HTTP error codes are reserved for severe (API key) issues.
   if (response.responseCode != 200) {
+    if (gzip_used && uploadGzipCategory(response.payload)) gzipNoteFailure();
     ++logging_errors; // tracked so the caller resets the network after too many failures in a row
     g_last_status = "http_err";
     Serial.printf("Failed to upload bulk tlm (HTTP %d): [body omitted]\n", response.responseCode);
@@ -264,6 +280,28 @@ bool logNetwork(const std::vector<OBDVector>& frames) {
   return logNetworkAt(frames, uploadSendUtc());
 }
 
+// Frames past BACKLOG_MAX_SEND_AGE_SECONDS are dropped (config.h); only on a trusted send clock, without which there
+// is no age. Judges the utc bulkStringV2 sends, the last one.
+static unsigned dropAgedFrames(double send_utc) {
+  if (!send_utc) return 0;
+  unsigned n = 0;
+  unsigned long first = 0, last = 0;
+  auto aged = [&](const OBDVector& frame) {
+    double utc = 0;
+    for (const auto& res : frame) if (res.first == "utc") utc = res.second;
+    if (!std::isfinite(utc) || utc <= 0 || send_utc - utc <= BACKLOG_MAX_SEND_AGE_SECONDS) return false;
+    if (!n++ || (unsigned long)utc < first) first = (unsigned long)utc;
+    if ((unsigned long)utc > last) last = (unsigned long)utc;
+    return true;
+  };
+  obd_result_vector.erase(std::remove_if(obd_result_vector.begin(), obd_result_vector.end(), aged),
+    obd_result_vector.end());
+#if ENABLE_LOGGING
+  if (n) logEvent("UPLOAD dropped n=%u reason=age sutc=%lu..%lu now=%lu", n, first, last, (unsigned long)send_utc);
+#endif
+  return n;
+}
+
 // Upload the RAM buffer in bounded batches (<= MAX_FRAMES_PER_POST per POST) so a backlog can't build a
 // giant, timeout-prone payload. Sent frames are erased on success. Assumes the link is already connected
 // (caller does network.connect()/disconnect()). Stops on the first failed POST (never hammers a dead link).
@@ -277,11 +315,16 @@ bool logNetwork(const std::vector<OBDVector>& frames) {
 //                before deep sleep wipes RAM). Returns true if every attempted POST succeeded.
 bool uploadBuffered(bool drain) {
   if (upload_spilled) return true; // older frames are parked in flash; these wait behind them for the next wake
-  bool ok = true;
+  bool ok = true, attempted = false;
   int batches = 0;
   while (!obd_result_vector.empty()) {
     esp_task_wdt_reset(); // a full drain (pre-sleep flush of a big backlog) is many sequential POSTs, each
                           // up to ~22s - legitimate, so feed per batch; a wedge INSIDE one POST still trips
+    const double send_utc = uploadSendUtc();
+    if (dropAgedFrames(send_utc) && obd_result_vector.empty()) {
+      if (!attempted) g_last_status = "ok_aged"; // no batch this call: not the last call's status
+      break;
+    }
     // After a connection-level failure, probe with a SMALL batch: in the field each retry grew the payload
     // (2->5->8->11->14->17 frames, ~4.5KB) with every POST timing out 15-22s - retrying BIGGER exactly when
     // the link is weakest. A ~800B probe has far better odds; once it succeeds the streak resets and the
@@ -290,23 +333,24 @@ bool uploadBuffered(bool drain) {
     size_t n = obd_result_vector.size();
     if (n > cap) n = cap;
     std::vector<OBDVector> batch(obd_result_vector.begin(), obd_result_vector.begin() + n);
-    const double send_utc = uploadSendUtc();
 #if ENABLE_CELL
     // Enforce the modem's per-POST body ceiling in BYTES, not frames: the SIM7070 session is configured
     // with SHCONF BODYLEN=1024 (its hard maximum), and an oversized body makes the POST undeliverable.
     //
     // Measured on what actually goes on the wire, which is the GZIPPED body - trimming against the raw
     // JSON would cut batches to a fifth of what fits and throw away the entire point of compressing.
-    // Compression is not free (a ~300 KB PSRAM compressor pass per call), so this shrinks by a ratio
-    // estimate first and only then verifies, instead of compressing once per popped frame.
-    auto wireSize = [send_utc](const std::vector<OBDVector>& b) {
+    // Compression is not free (a deflate pass per call), so this shrinks by a ratio estimate first and
+    // only then measures again, instead of compressing once per popped frame.
+    GzipOutcome sized = GZIP_OK;
+    auto wireSize = [send_utc, &sized](const std::vector<OBDVector>& b) {
       GeoMarks marks = g_geo_accepted;
       std::string body = bulkStringV2(b, send_utc, &marks);
       std::string gz;
-      return gzipBody(body, gz) ? gz.size() : body.size();
+      sized = gzipBody(body, gz);
+      return sized == GZIP_OK ? gz.size() : body.size();
     };
     size_t wire = wireSize(batch);
-    while (batch.size() > 1 && wire > CELL_MAX_POST_BYTES) {
+    while (sized != GZIP_FAIL && batch.size() > 1 && wire > CELL_MAX_POST_BYTES) {
       // Drop proportionally to the overshoot rather than one frame at a time: at 12 frames a
       // frame-at-a-time walk is up to 11 compressor passes for one POST.
       size_t keep = (batch.size() * CELL_MAX_POST_BYTES) / wire;
@@ -315,7 +359,19 @@ bool uploadBuffered(bool drain) {
       batch.resize(keep);
       wire = wireSize(batch);
     }
+    // A plain size is no measure of what fits once gzip is back: keep the frames for a later attempt.
+    if (sized == GZIP_FAIL) { uploadNotSent("gzip_fail"); ok = false; break; }
     n = batch.size();
+    if (n == 1 && wire > CELL_MAX_POST_BYTES && sized == GZIP_OFF) {
+      // Over the cap only because gzip is off this wake: park it for the backlog, send what is behind it.
+      g_upload_held.push_back(obd_result_vector.front());
+      if (g_upload_held.size() > MAX_UPLOAD_BUFFER) g_upload_held.erase(g_upload_held.begin());
+      obd_result_vector.erase(obd_result_vector.begin());
+#if ENABLE_LOGGING
+      logEvent("UPLOAD held plain_too_big frame for the next wake (%u held)", (unsigned)g_upload_held.size());
+#endif
+      continue;
+    }
     if (n == 1 && wire > CELL_MAX_POST_BYTES) {
       // A single frame alone exceeds the modem cap - it can never be delivered and would block the
       // queue forever. Drop it (logged) rather than stall all telemetry behind it.
@@ -335,6 +391,7 @@ bool uploadBuffered(bool drain) {
     logEvent("UPLOAD try frames=%d free=%lu maxblock=%lu ble=%d", (int)n,
       (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getMaxAllocHeap(), g_ble_up ? 1 : 0);
 #endif
+    attempted = true;
     if (!logNetworkAt(batch, send_utc)) { ok = false; break; }
     obd_result_vector.erase(obd_result_vector.begin(), obd_result_vector.begin() + n);
     if (!drain && ++batches >= UPLOAD_MAX_BATCHES_PER_CYCLE) break; // bounded burst; drain=true is unlimited
@@ -365,6 +422,8 @@ void logUploadCapped() {
 // Only a spill from this wake can still be in the file, and it is older than RAM, so RAM goes behind it.
 bool saveUploadBacklog() {
   logUploadCapped();
+  obd_result_vector.insert(obd_result_vector.begin(), g_upload_held.begin(), g_upload_held.end());
+  g_upload_held.clear();
   if (obd_result_vector.empty()) return true; // everything uploaded (or nothing polled) - leave no stale file
   File f = LittleFS.open(UPLOAD_BACKLOG_PATH, upload_spilled ? "a" : "w");
   if (!f) { Serial.printf("Backlog: open for write failed\n"); return false; }
@@ -385,6 +444,8 @@ void spillUploadBacklog() {
   obd_result_vector.clear();
   upload_spilled += n;
 }
+
+bool uploadBacklogPending() { return LittleFS.exists(UPLOAD_BACKLOG_PATH); }
 
 // Called at the end of setup() on polling wakes only (gate skips sleep before this, leaving the file for the
 // next real wake), and when a relay session that spilled ends. The file's frames are older than the RAM

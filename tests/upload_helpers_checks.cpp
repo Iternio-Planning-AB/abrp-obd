@@ -65,19 +65,29 @@ ResetReason reset_reason = ESP_RST_POWERON;
 ResetReason esp_reset_reason() { return reset_reason; }
 #include "telemetry_format.h"
 #include "geo_backlog.h"
+#include "gzip_fake.h"
 int gzip_calls = 0;
 bool gzip_enabled = false, force_oversized = false;
+// Overrides the outcome: scripted per call (front first), else on every call.
+GzipOutcome gzip_outcome = GZIP_OK;
+std::deque<GzipOutcome> gzip_script;
+std::vector<std::string> gzip_inputs;
+std::vector<size_t> gzip_inputs_at_post;
 int64_t clock_after_gzip = 0;
 time_t sync_after_gzip = -1;
-bool gzipBody(const std::string& raw, std::string& wire) {
+GzipOutcome gzipBody(const std::string& raw, std::string& wire) {
     ++gzip_calls;
+    gzip_inputs.push_back(raw);
     if (clock_after_gzip) rtc.epoch = clock_after_gzip;
     if (sync_after_gzip >= 0) last_clock_sync_epoch = sync_after_gzip;
-    if (!gzip_enabled) return false;
+    GzipOutcome outcome = gzip_outcome;
+    if (!gzip_script.empty()) { outcome = gzip_script.front(); gzip_script.pop_front(); }
+    if (outcome != GZIP_OK) return outcome;
+    if (!gzip_enabled) return GZIP_UNAVAILABLE;
     wire.assign(force_oversized ? 1025 : raw.size() / 5 + 16, '\0');
     wire[0] = '\x1f'; wire[1] = '\x8b'; wire[2] = '\x08'; wire[3] = '\r'; wire[4] = '\n';
     for (size_t i = 5; i < wire.size(); ++i) wire[i] = raw[(i - 5) % raw.size()];
-    return true;
+    return GZIP_OK;
 }
 
 struct FakeNetwork : NetworkWrapper {
@@ -106,6 +116,7 @@ struct FakeNetwork : NetworkWrapper {
     HttpResponse getEpoch() override { return {0, ""}; }
     HttpResponse sendBulk(std::string payload) override {
         sent.push_back(payload);
+        gzip_inputs_at_post.push_back(gzip_inputs.size());
         int status = code;
         if (!codes.empty()) { status = codes.front(); codes.pop_front(); }
         uart.replies = {{1, ">"}, {ack, ack == 1 ? "\r\nOK" : "\r\nERROR"},
@@ -144,6 +155,8 @@ void reset() {
     tlm_push_token = "test-token-actual";
     datalogger.lines.clear(); Serial.output.clear(); gzip_calls = 0;
     gzip_enabled = force_oversized = false;
+    gzip_outcome = GZIP_OK; gzip_script.clear(); gzip_inputs.clear(); gzip_inputs_at_post.clear();
+    gzip_noted_failures = 0; g_upload_held.clear();
     logging_errors = g_last_http = g_http0_streak = 0; g_last_status.clear(); obd_result_vector.clear();
     host_md_fail = 0;
     g_geo_accepted = g_geo_queued = {}; reset_reason = ESP_RST_POWERON;
@@ -236,6 +249,7 @@ void safeErrors() {
         {"gzip: checksum 12345678-abcd-abcd-abcd-123456789abc", "redacted"},
         {"gzip: invalid header " + std::string(300, ' ') + tlm_push_token, "redacted"},
         {"gzip: invalid header " + std::string(300, ' ') + "api-key=short", "redacted"},
+        {"{\"message\":\"TLM point time is too old (2026-09-01 10:00:00 +0000 UTC)\"}", "too_old"},
         {"arbitrary response content, not allowlisted", "other"},
     };
     for (const auto& c : cases) {
@@ -346,6 +360,51 @@ void bleHandover() {
     check(events("UPLOAD discarded n=2 reason=token").size() == 1, "and says how much");
 #endif
     tlm_push_token = token;
+}
+// On a trusted send clock the queue drops frames past the 6-day bound before sizing; otherwise it keeps them.
+OBDVector battery(double utc) { return {{"utc", utc}, {"soc", 40}, {"voltage", 350}}; }
+void frameAge() {
+    const double now = 1791112000, old = now - BACKLOG_MAX_SEND_AGE_SECONDS - 1;
+    OBDVector restamped = battery(now);
+    restamped.insert(restamped.begin(), {"utc", old}); // the serializer sends the last utc
+    const std::vector<OBDVector> mixed = {battery(old), {{"soc", 41}}, battery(now - BACKLOG_MAX_SEND_AGE_SECONDS),
+        battery(now + 300), restamped};
+    const std::vector<OBDVector> kept(mixed.begin() + 1, mixed.end());
+    reset(); obd_result_vector = mixed;
+    check(uploadBuffered(true) && obd_result_vector.empty() && network.sent == std::vector<std::string>{bulkStringV2(kept, now)},
+        "trusted clock drops the frame past 6 days; the bound, a future and a fresh frame go up");
+#if ENABLE_LOGGING
+    check(events("UPLOAD dropped") == std::vector<std::string>{"UPLOAD dropped n=1 reason=age sutc=1790593599..1790593599 now=1791112000"},
+        "only the aged frame is counted, not the one without a utc");
+#endif
+    reset(); obd_result_vector = mixed; last_clock_sync_epoch = 0;
+    check(uploadBuffered(true) && network.sent == std::vector<std::string>{bulkStringV2(mixed, 0)},
+        "an untrusted clock judges nothing: the aged frame still goes up");
+#if ENABLE_LOGGING
+    check(events("UPLOAD dropped").empty(), "nothing dropped, nothing logged");
+#endif
+    // Swept before the http=0 probe cap and over the whole queue, so the 3-frame probe is the fresh frames.
+    reset(); g_http0_streak = 1; network.code = 503;
+    const std::vector<OBDVector> fresh = {battery(now - 2), battery(now - 1), battery(now)};
+    obd_result_vector = {battery(old), battery(old - 2)};
+    obd_result_vector.insert(obd_result_vector.end(), fresh.begin(), fresh.end());
+    obd_result_vector.push_back(battery(old - 1));
+    check(!uploadBuffered(true) && network.sent == std::vector<std::string>{bulkStringV2(fresh, now)} && obd_result_vector == fresh,
+        "a failed send keeps the fresh frames in order and the aged ones stay dropped");
+#if ENABLE_LOGGING
+    check(events("UPLOAD dropped") == std::vector<std::string>{"UPLOAD dropped n=3 reason=age sutc=1790593597..1790593599 now=1791112000"},
+        "one line names the count, the dropped span and the judging clock");
+#endif
+    reset(); obd_result_vector = {battery(old - 5), battery(old)}; g_last_status = "http_err";
+    check(uploadBuffered(false) && obd_result_vector.empty() && network.sent.empty() && g_last_status == "ok_aged",
+        "an all-aged queue empties without a POST");
+#if ENABLE_LOGGING
+    reset(); obd_result_vector = {battery(old), battery(now)};
+    saveUploadBacklog(); obd_result_vector.clear(); loadUploadBacklog();
+    const auto restored = obd_result_vector;
+    check(restored.size() == 2 && uploadBuffered(true) && network.sent == std::vector<std::string>{bulkStringV2({restored[1]}, now)},
+        "a backlog restored from flash is judged at send like the RAM queue");
+#endif
 }
 void geoExpiry() {
     reset();
@@ -521,8 +580,8 @@ void geoPublicClockReads() {
     const std::vector<OBDVector> first(original.begin(), original.begin() + MAX_FRAMES_PER_POST);
     const std::vector<OBDVector> second(original.begin() + MAX_FRAMES_PER_POST, original.end());
     std::string first_wire, second_wire;
-    check(gzipBody(bulkStringV2(first, now), first_wire) && first_wire.size() <= CELL_MAX_POST_BYTES &&
-        gzipBody(bulkStringV2(second, 0), second_wire) && second_wire.size() <= CELL_MAX_POST_BYTES,
+    check(gzipBody(bulkStringV2(first, now), first_wire) == GZIP_OK && first_wire.size() <= CELL_MAX_POST_BYTES &&
+        gzipBody(bulkStringV2(second, 0), second_wire) == GZIP_OK && second_wire.size() <= CELL_MAX_POST_BYTES,
         "scripted multi-batch fixture respects modem cap without changing production batch sizing");
     const auto first_reads = rtc.scriptUploadReads(now, true);
     const auto second_reads = rtc.scriptUploadReads(now + CLOCK_RESYNC_SECONDS + 1, true);
@@ -628,7 +687,7 @@ void geoSizing() {
         reset(); gzip_enabled = compressed;
         const auto raw = bulkStringV2({cutoff}, now);
         std::string wire;
-        if (!gzipBody(raw, wire)) wire = raw;
+        if (gzipBody(raw, wire) != GZIP_OK) wire = raw;
         obd_result_vector = {cutoff}; clock_after_gzip = now + 1;
         check(uploadBuffered(true) && network.sent.size() == 1 && network.sent[0] == wire,
             "sizing/final body share snapshot across cutoff during compression");
@@ -639,7 +698,7 @@ void geoSizing() {
             last_clock_sync_epoch = initially_trusted ? now : 0;
             const auto raw = bulkStringV2({cutoff}, initially_trusted ? now : 0);
             std::string wire;
-            if (!gzipBody(raw, wire)) wire = raw;
+            if (gzipBody(raw, wire) != GZIP_OK) wire = raw;
             sync_after_gzip = initially_trusted ? 0 : now;
             obd_result_vector = {cutoff};
             check(uploadBuffered(true) && network.sent.size() == 1 && network.sent[0] == wire,
@@ -908,13 +967,85 @@ void signing() {
     streakAfterFailedUpload();
     check(g_http0_streak == 0, "an answer from the server clears the streak");
 }
+// A single frame whose plain JSON is over the modem cap, from mapped fields only.
+OBDVector oversizedFrame() {
+    OBDVector rich = frame(0);
+    for (const char* field : {"soh", "soe", "capacity", "kwh_charged", "power", "hvac_power", "batt_temp", "batt_temp_min",
+                              "batt_temp_max", "ext_temp", "cabin_temp", "odometer", "est_battery_range", "elevation"})
+        rich.emplace_back(field, 12345.678901);
+    check(bulkStringV2({rich}).size() > CELL_MAX_POST_BYTES, "fixture frame is over the cap as plain JSON");
+    return rich;
+}
+void gzipFallback() {
+    // Fails while sizing, or only on the send pass: no POST, nothing dropped, frames wait.
+    for (bool on_send : {false, true}) {
+        reset(); gzip_enabled = true;
+        if (on_send) gzip_script = {GZIP_OK, GZIP_FAIL}; else gzip_outcome = GZIP_FAIL;
+        for (unsigned i = 0; i < MAX_FRAMES_PER_POST; ++i) obd_result_vector.push_back(frame(i * 10));
+        check(!uploadBuffered(true) && network.sent.empty() && obd_result_vector.size() == MAX_FRAMES_PER_POST,
+            "a gzip failure sends nothing and keeps every frame");
+        check(g_last_status == "gzip_fail" && g_upload_local_fail, "gzip failure is a local not-sent, not a bearer verdict");
+    }
+    // Sized for gzip, then no compressor on the send pass: the plain body is over the cap, keep the frames.
+    reset(); gzip_enabled = true; gzip_script = {GZIP_OK, GZIP_UNAVAILABLE};
+    for (unsigned i = 0; i < MAX_FRAMES_PER_POST; ++i) obd_result_vector.push_back(frame(i * 10));
+    check(!uploadBuffered(true) && network.sent.empty() && obd_result_vector.size() == MAX_FRAMES_PER_POST &&
+        g_last_status == "plain_too_big", "an over-cap plain body is never sent");
+    // Off for the wake: a small frame still goes up, plain.
+    reset(); gzip_outcome = GZIP_OFF;
+    obd_result_vector = {frame(0)};
+    check(uploadBuffered(true) && network.sent.size() == 1 && network.sent[0] == bulkStringV2({frame(0)}),
+        "with gzip off a body that fits goes up plain");
+    // A single frame over the cap as plain JSON is dropped only when gzip is gone for the whole wake.
+    for (GzipOutcome outcome : {GZIP_FAIL, GZIP_UNAVAILABLE}) {
+        reset(); gzip_outcome = outcome;
+        obd_result_vector = {oversizedFrame()};
+        const bool dropped = outcome == GZIP_UNAVAILABLE;
+        check(uploadBuffered(true) == dropped && network.sent.empty() && obd_result_vector.size() == (dropped ? 0u : 1u),
+            "an oversized frame is never dropped because gzip failed");
+    }
+    // Off for the wake: an oversized head frame is held for the backlog and the frames behind it still go.
+    reset(); gzip_outcome = GZIP_OFF;
+    const auto big = oversizedFrame();
+    obd_result_vector = {big, frame(10), frame(20)};
+    check(uploadBuffered(true) && obd_result_vector.empty() && network.sent.size() == 1 &&
+        network.sent[0] == bulkStringV2({frame(10), frame(20)}), "frames behind a held frame are sent");
+    check(g_upload_held.size() == 1 && g_upload_held[0] == big, "the oversized frame is held, not dropped");
+#if ENABLE_LOGGING
+    obd_result_vector = {frame(30)};
+    saveUploadBacklog();
+    obd_result_vector.clear();
+    loadUploadBacklog();
+    check(g_upload_held.empty() && obd_result_vector.size() == 2 && bulkStringV2({obd_result_vector[1]}) == bulkStringV2({frame(30)}) &&
+        bulkStringV2({obd_result_vector[0]}) == bulkStringV2({big}), "held frames reach the backlog first, for the next wake");
+#endif
+    // The body sized is the body sent, byte for byte.
+    reset(); gzip_enabled = true;
+    for (unsigned i = 0; i < MAX_FRAMES_PER_POST + 3; ++i) obd_result_vector.push_back(frame(i * 10));
+    check(uploadBuffered(false) && obd_result_vector.empty() && gzip_inputs_at_post.size() == 2, "batches drain");
+    for (size_t at : gzip_inputs_at_post)
+        check(at >= 2 && gzip_inputs[at - 1] == gzip_inputs[at - 2], "the sent body is the last body sized");
+    // Every server gzip complaint about a gzip body counts against the wake's budget; others do not.
+    for (const char* message : {"gzip: invalid checksum", "gzip: invalid header", "flate: corrupt input: gzip",
+                                "unexpected EOF", "incorrect length check", "forbidden"}) {
+        for (bool compressed : {true, false}) {
+            reset(); gzip_enabled = compressed; network.code = 403;
+            network.body = std::string("{\"message\":\"") + message + "\"}";
+            obd_result_vector = {frame(0)};
+            check(!uploadBuffered(true) && obd_result_vector.size() == 1, "rejected batch kept");
+            const bool counts = compressed && std::string(message) != "forbidden";
+            check(gzip_noted_failures == (counts ? 1u : 0u), message);
+        }
+    }
+}
+
 int main(int argc, char** argv) {
     const std::string group = argc > 1 ? argv[1] : "all";
 #if ENABLE_LOGGING
     if (group == "all" || group == "fingerprint") fingerprint();
     if (group == "all" || group == "errors") safeErrors();
 #endif
-    if (group == "all" || group == "queue") { queue(); bleHandover(); }
+    if (group == "all" || group == "queue") { queue(); bleHandover(); frameAge(); }
     if (group == "all" || group == "geo-expiry") { geoExpiry(); geoClockQuality(); geoExplicitClock(); geoBoundaries(); }
     if (group == "all" || group == "geo-retry" || group == "geo-sizing") geoPublicClockReads();
     if (group == "all" || group == "geo-retry") geoTrustRetry();
@@ -924,5 +1055,6 @@ int main(int argc, char** argv) {
     if (group == "all" || group == "geo-sizing") geoSizing();
     if (group == "all" || group == "geo-dedup") geoDedup();
     if (group == "all" || group == "signing") signing();
+    if (group == "all" || group == "gzip-fallback") gzipFallback();
     std::cout << "PASS upload helpers " << group << " logging=" << ENABLE_LOGGING << '\n';
 }
