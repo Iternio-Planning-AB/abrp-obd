@@ -7,9 +7,16 @@ import subprocess
 import sys
 import tempfile
 
+
+def line(text, prefix):
+    found = [l for l in text.splitlines() if l.startswith(prefix)]
+    if len(found) != 1:
+        raise SystemExit(f"FAIL: expected one line starting {prefix!r}, found {len(found)}")
+    return found[0] + "\n"
+
 arguments = argparse.ArgumentParser()
 arguments.add_argument("group", nargs="?", default="all",
-                       choices=["all", "progress", "signal", "release", "corroboration", "wake-gate", "logging", "schema", "transport", "sleep-reason", "wdt-streak", "ble-frame", "profiles"])
+                       choices=["all", "progress", "signal", "release", "corroboration", "wake-gate", "logging", "schema", "transport", "sleep-reason", "wdt-streak", "ble-frame", "dc-awake", "profiles"])
 arguments.add_argument("--profiles", type=Path)
 args = arguments.parse_args()
 if args.group == "profiles" and args.profiles is None:
@@ -34,7 +41,13 @@ compiler = shlex.split(os.environ.get("CXX", "clang++"))
 WORST_EVENT_ARGS = {
     "SAMPLE_POLL ": (99, 1, 1, 255, 1, 99, 15.99, 15.99, 1, 255, 1, 15),
     "ATRVGATE atrv=": (15.99, 15.99, "ASLEEP", "poll(taper-confirm)", 9999999, 999999, 999999, 1, "ENFORCE"),
+    "DC_AWAKE on ": (15.99, 4294967295),
+    "DC_AWAKE off reason=motion": (15.99, 99.999, 99.999),
+    "DC_AWAKE off reason=%s": ("parked-uncorroborated", 15.99),
+    "DC_AWAKE refused ": ("motion", 15.99),
+    "DC_AWAKE poke promoted": (1, 1),
 }
+event_sources = logger + state_machine + sleep
 # The host stand-in for the streak store keeps its bytes across boots, as RTC_NOINIT_ATTR does and
 # RTC_DATA_ATTR (reloaded on every reset but a deep-sleep wake) does not.
 if not re.search(r"^RTC_NOINIT_ATTR WdtStreakStore wdt_streak_store;", streak, re.MULTILINE):
@@ -55,17 +68,31 @@ if not re.search(r"\n  if \(r == 1\) cellModemPowerOffHook\(\);", power_off[:pow
 if not re.search(r"wdtStreakEnd\(\);\n\s*esp_restart\(\);\s*// never returns", ota):
     raise SystemExit("FAIL: the OTA commit must end the WDT streak right before its esp_restart()")
 for prefix, values in WORST_EVENT_ARGS.items():
-    start = logger.index('logEvent("' + prefix) + len('logEvent("')
-    message = logger[start:logger.index('"', start)] % values
+    start = event_sources.index('logEvent("' + prefix) + len('logEvent("')
+    message = event_sources[start:event_sources.index('"', start)] % values
     if len(message) > 119:
         raise SystemExit(f"FAIL: {len(message)} > 119 characters, logEvent cuts: {message}")
+# A held DC charge sets the poll and upload cadence (dcAwakeDelay, checked below) and sends its first frame at once.
+for gate in ("( millis() - last_poll ) > dcAwakeDelay(current_state, polling_delay)) {",
+             "? getTransmissionDelay(ACTIVE) : dcAwakeDelay(current_state, transmission_delay);",
+             "const bool dc_first_upload = dcAwakeHeld(current_state) && last_broadcast == 0;",
+             "(ble_handoff_fire || dc_first_upload || ",
+             "  handleActivityState();\n  dcPromotePoke();\n  dcAwakeTrack();\n",
+             "    dcPromotePoke();\n    if (g_sample_poke && !maintenance_mode"):
+    if logger.count(gate) != 1:
+        raise SystemExit(f"FAIL: the loop's upload and poll gates must take the DC hold exactly once: {gate}")
+# Only detectMovement() stamps the motion that vetoes the hold (not the console or an unlatch, via last_active).
+mems = (root / "baseLogger/Helpers/mems.h").read_text()
+if mems.count("last_active = g_last_motion_ms = millis();") != 1 or (logger + state_machine).count("g_last_motion_ms = ") != 1:
+    raise SystemExit("FAIL: g_last_motion_ms must be stamped by detectMovement() alone")
 with tempfile.TemporaryDirectory(prefix="obd-energy-checks-") as temporary:
     build = Path(temporary)
     (build / "charge_config.inc").write_text("\n".join(re.findall(
         r"^#define (?:CHARGE_PROGRESS_\w+|CHARGING_CURRENT_THRESHOLD|CHARGE_DISCHARGE_AMPS|CHARGE_STREAM_CONFIRM_SECONDS|"
         r"CHARGE_RELEASE_POLLS|CHARGE_SILENT_HOLD_POLLS|CHARGE_STALE_RESET_MINUTES|CHARGE_CORROBORATE_MINUTES|WAKE_PARKED_MINUTES|"
         r"WAKE_CHARGING_MINUTES|WAKE_DC_CHARGING_MINUTES|WAKE_CHARGING_MAX_MINUTES|CLOCK_MAX_EPOCH|GEO_MAX_SEND_AGE_SECONDS|RAIL_AWAKE_VOLTS|RAIL_TAPER_FLOOR|"
-        r"CHARGE_END_POLL_FLOOR|MAX_AWAKE_MINUTES|TAPER_CONFIRM_MAX_WAKES|IO36_LOCKOUT_\w+|POST_DRIVE_\w+|OBD_ALARM_GATE|ENABLE_IO36_RAIL|DC_CHARGING_MIN_KW)\b.*(?:\n[ \t]+.*)*",
+        r"CHARGE_END_POLL_FLOOR|MAX_AWAKE_MINUTES|TAPER_CONFIRM_MAX_WAKES|IO36_LOCKOUT_\w+|POST_DRIVE_\w+|OBD_ALARM_GATE|ENABLE_IO36_RAIL|DC_CHARGING_MIN_KW|DC_CHARGING_AWAKE_SECONDS|"
+        r"SESSION_IDLE_MAX_MS|CHARGING_TIMER|ACTIVE_TIMER|DC_CHARGING_POLL_MARGIN_MS)\b.*(?:\n[ \t]+.*)*",
         config, re.MULTILINE)))
     start = logger.index("    // Feature A - is_charging")
     end = logger.index("\n    /*\n      CHARGE PROGRESS", start)
@@ -123,6 +150,19 @@ with tempfile.TemporaryDirectory(prefix="obd-energy-checks-") as temporary:
     (build / "reconnect.inc").write_text(block(logger, "if (!g_weak_rail_cold_boot && !bleRelaying() && !g_ota_active"))
     (build / "backstop_sleep.inc").write_text(block(state_machine, "if (!maintenance_mode && !g_ota_active && !g_logdump_active"))
     (build / "ble_frame_log.inc").write_text(block(logger, "if (ble_mtu != g_logged_ble_mtu"))
+    (build / "activity_state.inc").write_text(block(logger, "enum ActivityState {").rstrip() + ";\n")
+    (build / "dc_delay.inc").write_text("".join(block(state_machine, f) for f in (
+        "bool dcMotionRecent()", "const char* dcAwakeVeto(", "bool dcAwakeHeld(", "unsigned long dcAwakeDelay(",
+        "void dcAwakeTrack()")))
+    (build / "dc_promote.inc").write_text(block(logger, "void dcPromotePoke() {"))
+    (build / "dc_rail_refresh.inc").write_text(line(logger, "    if (g_sample_poke && g_dc_confirmed) g_rail_before_poke"))
+    (build / "dc_sleep_log.inc").write_text(line(sleep, "  if (g_dc_logged) logEvent(\"DC_AWAKE off"))
+    start = state_machine.index("  case CHARGING:\n", state_machine.index("void handleActivityState() {"))
+    end = state_machine.index("    break;\n", start) + len("    break;\n")
+    (build / "charging_case.inc").write_text(state_machine[start:end])
+    start = logger.index("    if (g_sample_poke && !maintenance_mode") + len("    if (")
+    end = logger.index(") {\n", start)
+    (build / "poke_sleeps.inc").write_text(f"bool sleeps() {{ return {logger[start:end]}; }}\n")
     executable = build / "energy_checks"
     subprocess.run([
         *compiler, "-std=c++17", "-fsanitize=address,undefined", "-fno-omit-frame-pointer",

@@ -265,6 +265,7 @@ during setup, and parked charge sampling is suppressed. The remaining limits for
 | `RAIL_AWAKE_VOLTS` | `13.3` | Rail voltage above which the car counts as awake/charging. **Per-vehicle — measure it.** |
 | `WAKE_PARKED_MINUTES` | `30` | Deep-sleep timer cadence while parked. |
 | `WAKE_CHARGING_MINUTES` / `WAKE_DC_CHARGING_MINUTES` | `3` / `1` | Faster cadence while AC / DC charging. |
+| `DC_CHARGING_AWAKE_SECONDS` | `30` s | Once a charge is confirmed DC, stay awake while the rail is up and poll and upload this often over one reused session instead of the 1-minute wake, through the taper and short silences. Motion, BLE, a low rail or the alarm flag pause it; the charge end, the cap or corroboration end it. Must stay under `SESSION_IDLE_MAX_MS` with a slow poll's margin. |
 | `MAX_AWAKE_MINUTES` | `60` | Hard backstop: force sleep after this even if something is holding it awake. |
 | `ACTIVE_TIMER` / `CHARGING_TIMER` | 5 / 5 min | Inactivity leashes between state transitions. |
 | `CHARGE_END_POLL_FLOOR` | `12.2` V | After a charge, a rail between this and 13.0 V gets one final read, so the charge end and final SoC reach ABRP. |

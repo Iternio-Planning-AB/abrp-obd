@@ -85,6 +85,10 @@ void enterDeepSleep(bool modem_on, const char* reason = nullptr) {
   // The dump's 30s inactivity guard bounds how long this can defer a sleep.
   if (g_ota_active || g_logdump_active) return;
   if (g_weak_rail_cold_boot) modem_on = false;
+#if ENABLE_LOGGING
+  // A sleep that ends a held DC charge with no poll to end it (the backstop, the NET-recover reboot).
+  if (g_dc_logged) logEvent("DC_AWAKE off reason=%s rail=%.2f", reason ? reason : "sleep", g_last_io36);
+#endif
   sleepCount++;
   Serial.printf("Entering deep sleep (sleep #%lu). WOM threshold %.4fg (%d LSB), wake on GPIO%d HIGH.\n",
     sleepCount, WOM_THRESHOLD_G, WOM_THRESHOLD_LSB, (int)WOM_INT_PIN);

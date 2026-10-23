@@ -279,6 +279,33 @@ awake.** Polling a sleeping EV wakes its ECUs, which then stay awake on the *car
   car before trusting anything that keys on it.
 - **Wake sources:** wake-on-motion (ICM-42627 interrupt, threshold ~0.158 g) and a timer
   (`WAKE_PARKED_MINUTES 30` / `WAKE_CHARGING_MINUTES 3`).
+- **A confirmed DC fast charge stays awake** (issue #51). A poll that reads DC (the car's `is_dcfc`, else at least
+  `DC_CHARGING_MIN_KW` inferred) holds the wake, and the car's `is_dcfc`, or two inferred DC polls in a row (one garbage
+  frame must not do it), latch `dc_session` (RTC) for that charge. While the rail
+  is at least `RAIL_AWAKE_VOLTS`, each poll that still shows charge evidence (the taper under 40 kW included), or
+  comes within `CHARGE_SILENT_HOLD_POLLS` x `WAKE_DC_CHARGING_MINUTES` (4 min) of unbroken silence, sets
+  `g_dc_confirmed`. Silence is counted by time, not by its 30 s polls: that is the tolerance a 1-minute DC wake had,
+  and a car silent on ~60 % of polls would otherwise drop to `parked-held` several times an hour. The dongle then stays awake and polls
+  and uploads every `DC_CHARGING_AWAKE_SECONDS` (30) over one reused session, and the ladder holds in `CHARGING`.
+  - `dcAwakeHeld()` vetoes the hold live, not only at a poll: the BLE state (it keeps its own cadence), a rail under
+    `RAIL_AWAKE_VOLTS`, an alarm-flagged car (§7), or motion within an `ACTIVE_TIMER` (`g_last_motion_ms`, stamped only
+    by `detectMovement`). A drive starting is therefore polled at ACTIVE's 5 s from its first motion.
+  - Motion on a held sample poke promotes the wake in place: BLE and GNSS come up, and from then on charging samples
+    need the streaming confirm (`CHARGE_STREAM_CONFIRM_SECONDS`), so regen is never a charge. Sleeping instead would
+    not bring a motion wake: `configureWOM()` clears motion already seen, and a person sitting still does not trip WOM.
+  - Ends: the charge end (an answered poll with no charge evidence), the rail drop, silence past the hold
+    (`parked-held`, as before), the cap, corroboration, the car's `is_dcfc` 0, a drive. The session itself ends at the
+    charge end (an answered poll with no charge evidence, so a DC plug swapped for AC starts fresh), a fresh latch, a
+    drive, the car's `is_dcfc` 0 or the stale reset. A sleep inside the session uses the 1-minute DC tier; the charge
+    end and the rail drop sleep as before (3 min while latched). AC charging never latches.
+  - Each held poll of a sample poke counts a whole `WAKE_DC_CHARGING_MINUTES` toward the cap, so it trips sooner (the
+    safe way). A streaming wake (motion, a promoted poke) counts its elapsed time, at most a tier per poll, so somebody
+    moving about the car for an hour costs an hour of budget, not a tier per 5 s poll. The
+    max-awake backstop is not exempt: after `MAX_AWAKE_MINUTES` of awake time the wake sleeps 1 min and the session's
+    next sample poke holds again, about a 1-minute gap per awake hour.
+  - BLE keeps its rules, but its windows move: a held motion wake keeps advertising up to the backstop instead of about
+    10 minutes, and a held sample poke has no BLE until something moves and promotes it.
+  - With `ENABLE_IO36_RAIL 0` the rail reads 0 and it never holds.
 - **Following a charge on a car that answers intermittently** (issue #7). Every extra poll is bounded, and
   a low-rail read needs proven charging. Three rules cover it:
   - A latched charge that goes silent at a rail ≥ `RAIL_AWAKE_VOLTS` never releases. After
@@ -665,6 +692,15 @@ session.
   cadence decisions the timer can't tell apart name themselves: `parked-held`, `parked-cap`,
   `parked-uncorroborated`, `pdw` and `followup` (below). An explicit sleep reason wins over a cadence
   label, which wins over the timer.
+- **`DC_AWAKE on rail=<v> fast=<min>`** and **`DC_AWAKE off reason=<r> rail=<v>`** bracket a DC charge held
+  awake (§6). In between, `UPLOAD ok` comes about every 30 s plus the poll, on a reused session; `NET diag ... idle=<ms>`
+  is the time since the last upload, to check against `SESSION_IDLE_MAX_MS` and the ~60 s drop (#8). `r` is the live
+  veto (`ble`, `rail`, `alarm`, `motion` with the window's `peak=`/`axmax=`), else the cadence label (`parked-cap`,
+  `parked-uncorroborated`, `parked-held`), else `not-dc`; a sleep that ends a hold logs its own reason (`backstop`,
+  `net-recover`). `DC_AWAKE refused reason=<veto>`, once per wake, is a DC poll that could not hold: a car whose DC-DC
+  sits under `RAIL_AWAKE_VOLTS` shows `rail`, charger vibration over the 0.1 g `detectMovement` threshold shows
+  `motion` (read the `MOTION` lines). `DC_AWAKE poke promoted` is motion on a held sample poke. During a held charge
+  `AWAKE_BACKSTOP` is expected once an awake hour (counted from boot, so sooner after a long drive).
 - **`<reset> reset recovered (streak=<n> retained=<0|1> owed=<0|1>)`** follows the `WAKE` of a panic, WDT
   or brownout reset (`<reset>` is the `WAKE` line's `reset=`). `streak` counts consecutive ones, brownouts
   included (#50: a battery that sags out on every modem start loops like a crash); a deep-sleep wake or any
