@@ -229,6 +229,9 @@ void loggingChecks() {
   sys.diagnostics.field = 5;
   const std::string failed = buildLogLine(frame, 1);
   check(column(failed, "gps_read") == "field" && column(failed, "gps_field") == "5", "rejection reason and field persist");
+  sys.diagnostics.result = GPSReadResult::Unconfirmed;
+  check(column(buildLogLine(frame, 1), "gps_read") == "unconfirmed", "a held first fix is named");
+  sys.diagnostics.result = GPSReadResult::RequiredFieldInvalid;
   check(column(failed, "gps_date") == "71026" && column(failed, "gps_time_age_ms") == "10000", "cached timestamp ages despite a failed read");
   gps_data.speed = 20;
   gps_data.time += 100;

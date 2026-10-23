@@ -605,6 +605,12 @@ bool FreematicsESP32::gpsBegin() {
   FIELD (Ioniq 5, 2026-10-16): the old fixed 0.1-degree box anchored on a bad 5-satellite cold-start fix and
   rejected every good fix for 17 min of driving. So GPS_JUMP_REANCHOR consecutive fresh rejected fixes, each
   plausible from the one before and at most GPS_JUMP_RUN_GAP_MS apart, replace the anchor.
+  FIELD (#59): after a fix loss, a car that was off got two fresh HDOP-255 fixes at ~181 km/h, consistent with
+  each other and inside the horizontal bound, but far off in altitude. So altitude is bounded too. Over nine
+  field logs from two cars it refused those and junk around one cold start, and no real fix.
+  A wake's first fix has no anchor, and cold-start junk is common (some of it with good HDOP), so it is held
+  until the next fresh fix agrees with it on the same bounds: GPS_JUMP_CONFIRM fixes, at most
+  GPS_JUMP_CONFIRM_GAP_MS apart. In the same logs that costs one poll on most wakes.
 */
 // Cold-start and multipath error. 2000 still rejects gross junk, and at 2.35 km per 5 s stays far stricter
 // than the old box over short gaps; the host fixtures also make instant 1-2 km moves.
@@ -612,20 +618,36 @@ static constexpr float GPS_JUMP_MARGIN_M = 2000;
 static constexpr float GPS_JUMP_MAX_MPS = 70;         // 252 km/h: faster than any road car
 static constexpr uint8_t GPS_JUMP_REANCHOR = 3;       // one spike, or a replayed one, never re-anchors
 static constexpr uint32_t GPS_JUMP_RUN_GAP_MS = 60000;
+static constexpr uint8_t GPS_JUMP_CONFIRM = 2;
+static constexpr uint32_t GPS_JUMP_CONFIRM_GAP_MS = 120000;  // twice the slowest awake poll (CHARGING, 60 s)
+// Vertical noise; real fixes in the field logs stayed well inside it.
+static constexpr float GPS_JUMP_ALT_MARGIN_M = 500;
+// A sustained 10% climb at 108 km/h: no road climbs faster for minutes, so the bound stays tight after a loss.
+static constexpr float GPS_JUMP_ALT_MAX_MPS = 3;
 static uint32_t gps_anchor_date = 0, gps_anchor_time = 0;
 static unsigned long gps_anchor_ms = 0;
+// The last nonzero accepted altitude: a 2D fix between must not clear the vertical reference.
+static float gps_alt_ref = 0;
+static unsigned long gps_alt_ref_ms = 0;
 static GPS_DATA gps_run_last{};
 static unsigned long gps_run_ms = 0;
 static uint8_t gps_run_n = 0;
+static uint8_t gps_unconfirmed_n = 0;
 
 // Only a real position anchors: (0,0), partial-zero and out-of-range records never do.
 static bool gpsJumpAnchor(float lat, float lng) {
   return lat != 0 && lng != 0 && lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180;
 }
 
-static bool gpsJumpPlausible(float lat1, float lng1, float lat2, float lng2, uint32_t elapsed_ms) {
-  return TinyGPS::distance_between(lat1, lng1, lat2, lng2) <=
+static bool gpsJumpNear(const GPS_DATA& from, const GPS_DATA& to, uint32_t elapsed_ms) {
+  return TinyGPS::distance_between(from.lat, from.lng, to.lat, to.lng) <=
     GPS_JUMP_MARGIN_M + GPS_JUMP_MAX_MPS * (elapsed_ms / 1000.0f);
+}
+
+// Altitude 0 is what a 2D fix may report, so it is not evidence either way.
+static bool gpsJumpClimb(float from_alt, float to_alt, uint32_t elapsed_ms) {
+  return from_alt == 0 || to_alt == 0 ||
+    fabsf(to_alt - from_alt) <= GPS_JUMP_ALT_MARGIN_M + GPS_JUMP_ALT_MAX_MPS * (elapsed_ms / 1000.0f);
 }
 // END gps-jump-filter
 
@@ -674,9 +696,9 @@ bool FreematicsESP32::gpsGetData(GPS_DATA** pgd) {
     m_gps_read_diagnostics.field = -1;
     candidate.date = fields[0];
     candidate.time = fields[1];
-    float lat = (float)fields[2] / 1000000;
-    float lng = (float)fields[3] / 1000000;
-    float alt = (float)fields[4] / 100;
+    candidate.lat = (float)fields[2] / 1000000;
+    candidate.lng = (float)fields[3] / 1000000;
+    candidate.alt = (float)fields[4] / 100;
     candidate.speed = (float)fields[5] / 100;
     do {
       if (*s != ',') break;
@@ -703,38 +725,57 @@ bool FreematicsESP32::gpsGetData(GPS_DATA** pgd) {
       candidate.hdop = hdop > 255 ? 255 : hdop < 0 ? 0 : hdop; // uint8_t: 300 must not wrap to a good 44
     } while (0);
     const unsigned long now = millis();
-    if (gpsJumpAnchor(gpsData.lat, gpsData.lng)) {
-      const bool usable = gpsJumpAnchor(lat, lng);
-      if (!usable || !gpsJumpPlausible(gpsData.lat, gpsData.lng, lat, lng, (uint32_t)(now - gps_anchor_ms))) {
-        // A replay (same date/time as the run's last fix) neither advances nor resets the run.
-        if (candidate.date != gps_run_last.date || candidate.time != gps_run_last.time) {
-          const bool extends = usable && gps_run_n && (uint32_t)(now - gps_run_ms) <= GPS_JUMP_RUN_GAP_MS &&
-            gpsJumpPlausible(gps_run_last.lat, gps_run_last.lng, lat, lng, (uint32_t)(now - gps_run_ms));
-          gps_run_n = extends ? gps_run_n + 1 : usable ? 1 : 0;
+    const bool anchored = gpsJumpAnchor(gpsData.lat, gpsData.lng);
+    const bool usable = gpsJumpAnchor(candidate.lat, candidate.lng);
+    // No anchor yet: a reply without a usable position is still accepted (it seeds the clock), a position is held.
+    if (anchored || usable) {
+      const bool near = anchored && usable && gpsJumpNear(gpsData, candidate, (uint32_t)(now - gps_anchor_ms));
+      const bool climb = gpsJumpClimb(gps_alt_ref, candidate.alt, (uint32_t)(now - gps_alt_ref_ms));
+      if (!near || !climb) {
+        // A replay (same date/time as the run's last fix) neither advances nor resets the run, and a no-fix
+        // reply is not evidence against it: in poor sky they interleave, and resetting would pin a bad anchor.
+        if (usable && (candidate.date != gps_run_last.date || candidate.time != gps_run_last.time)) {
+          const uint32_t run_ms = now - gps_run_ms;
+          const bool extends = gps_run_n && run_ms <= (anchored ? GPS_JUMP_RUN_GAP_MS : GPS_JUMP_CONFIRM_GAP_MS) &&
+            gpsJumpNear(gps_run_last, candidate, run_ms) && gpsJumpClimb(gps_run_last.alt, candidate.alt, run_ms);
+          gps_run_n = extends ? gps_run_n + 1 : 1;
           gps_run_last = candidate;
-          gps_run_last.lat = lat;
-          gps_run_last.lng = lng;
           gps_run_ms = now;
+          if (!anchored && gps_run_n < GPS_JUMP_CONFIRM && gps_unconfirmed_n < 255) {
+            gps_unconfirmed_n++;
+            m_gps_read_diagnostics.confirm_restarted = gps_unconfirmed_n > 1;
+          }
         }
-        if (gps_run_n < GPS_JUMP_REANCHOR) {
-          m_gps_read_diagnostics.result = GPSReadResult::CoordinateRejected;
+        m_gps_read_diagnostics.confirm_held = gps_unconfirmed_n;
+        if (gps_run_n < (anchored ? GPS_JUMP_REANCHOR : GPS_JUMP_CONFIRM)) {
+          m_gps_read_diagnostics.result = anchored ? GPSReadResult::CoordinateRejected : GPSReadResult::Unconfirmed;
+          if (near) m_gps_read_diagnostics.field = 4;   // refused on altitude alone
           return false;
         }
-        m_gps_read_diagnostics.reanchored = true;
-        m_gps_read_diagnostics.reanchor_dist_m = (uint32_t)TinyGPS::distance_between(gpsData.lat, gpsData.lng, lat, lng);
-        m_gps_read_diagnostics.reanchor_rejects = gps_run_n - 1;
+        if (anchored) {
+          m_gps_read_diagnostics.reanchored = true;
+          m_gps_read_diagnostics.reanchor_dist_m =
+            (uint32_t)TinyGPS::distance_between(gpsData.lat, gpsData.lng, candidate.lat, candidate.lng);
+          m_gps_read_diagnostics.reanchor_rejects = gps_run_n - 1;
+        } else {
+          m_gps_read_diagnostics.confirmed = true;
+          gps_unconfirmed_n = 0;
+        }
       }
     }
-    gps_run_n = 0;
-    gps_run_last = GPS_DATA{};
+    if (usable) {
+      gps_run_n = 0;
+      gps_run_last = GPS_DATA{};
+    }
     if (candidate.date != gps_anchor_date || candidate.time != gps_anchor_time) {
       gps_anchor_date = candidate.date;
       gps_anchor_time = candidate.time;
       gps_anchor_ms = now;
+      if (usable && candidate.alt != 0) {
+        gps_alt_ref = candidate.alt;
+        gps_alt_ref_ms = now;
+      }
     }
-    candidate.lat = lat;
-    candidate.lng = lng;
-    candidate.alt = alt;
     candidate.ts = millis();
     gpsData = candidate;
     m_gps_read_diagnostics.result = GPSReadResult::Accepted;

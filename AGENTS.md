@@ -104,7 +104,8 @@ emits live coordinates while still PARK, the next distinct moving fix unlatches 
 rejected replies do not create fresh movement, fresh zero-speed fixes still use the frozen parked
 position, and `gps-relocate` moves that position only once `PARK_ACC_MIN` fresh stationary fixes average
 beyond `PARK_RELOCATE_MIN_M`, and `gps-jump` covers the link-path jump filter (time-aware bound, re-anchor
-after three consistent fresh fixes, replays and sparse fixes never re-anchor). Each group starts from a reset fixture. These are not full state-machine,
+after three consistent fresh fixes, replays and sparse fixes never re-anchor; an altitude bound refuses a
+horizontally plausible fix far off vertically; a wake's first fix is held until a second fresh fix agrees). Each group starts from a reset fixture. These are not full state-machine,
 OBD-profile, power-gate or GNSS-hardware tests. The synthetic in-memory queue test verifies all 120 points arrive
 once, in order, with battery data intact; it does not exercise LittleFS restoration or the cellular
 modem.
@@ -236,7 +237,7 @@ that the sized body is the sent body.
 GPS CSV `gps_read=ok` means parsing accepted a reply, including replies with zero coordinates.
 `gps_fix` still means cached nonzero coordinates. Date/time and speed are the cached accepted record,
 not fields from a rejected reply. `gps_field` is 0=date, 1=time, 2=latitude, 3=longitude,
-4=altitude, 5=speed; -1 is not applicable. `gps_time_age_ms` measures elapsed time since
+4=altitude, 5=speed; -1 is not applicable. On `gps_read=coord`, 4 means the jump filter refused the altitude. `gps_read=unconfirmed` is a wake's first fix, held until a second fresh fix agrees. `gps_time_age_ms` measures elapsed time since
 receiver date/time changed, not proven position-observation age; blank means unknown. Reply bytes
 count only co-processor bytes, not direct UART bytes. `gps_source` records the GPS helper's actual
 coordinate selection (gnss/frozen/omitted), not final wire eligibility. The freshness serializer can
