@@ -90,6 +90,7 @@ bool logging_message_printed = false; // print message once
 // Latched state behind the is_parked telemetry parameter. Defaults to parked on every boot/wake;
 // unlatched to driving by speed > 0 in loop() and re-latched by the activity state machine once
 // motion has stopped (see changeState). This is the IMU "smart cheat" - there is no real gear PID.
+// Written only by the drive region (Helpers/drive_state.h), as are g_last_speed_ms and park_marker_owed.
 bool is_currently_parked = true;
 // Set when a DRIVE frame enters the upload buffer, cleared when the pre-sleep PARK marker is queued: the
 // server has been told DRIVE and not yet PARK. RTC so a trip end that straddles a reboot (the mid-drive
@@ -405,6 +406,8 @@ ActivityState current_state = UNINITIALIZED;
 */
 #if ENABLE_LOGGING
 void logEvent(const char* fmt, ...);           // Helpers/logging.h
+#else
+#define logEvent(...) ((void)0)                // helpers log unguarded; with logging off there is nowhere to write
 #endif
 #if ENABLE_NETWORK
 bool uploadBuffered(bool drain);               // Helpers/network_upload.h
@@ -417,6 +420,7 @@ void bleDeinitForSleep();                      // Helpers/ble.h (no-op stub when
 void changeState(ActivityState new_state);     // Helpers/state_machine.h
 
 #include "Helpers/motion_stats.h" // pure MOTION-line aggregation, used by mems.h
+#include "Helpers/drive_state.h"  // park/drive region: the only writer of the latch globals above
 #include "Helpers/mems.h"
 #include "Helpers/server_roots.h" // data only: the trust bundle setup() hands the cellular transport
 #include "Helpers/clock_sync.h"
@@ -1126,7 +1130,7 @@ void setup() {
   }
   config_initialized = true;
 
-#if ENABLE_NETWORK && ENABLE_LOGGING
+#if (ENABLE_NETWORK) && ENABLE_LOGGING // parenthesised: ENABLE_NETWORK is a bare `||`
   // Restore telemetry that couldn't be uploaded before the last sleep (wedged bearer / dead spot). Only
   // reachable on a polling wake - gate skips slept long before this - and the modem is freshly booted here,
   // so the normal upload path drains these with their original (correct) utc stamps.
@@ -1191,7 +1195,8 @@ void loop() {
   // Deferred while a firmware update is transferring: applying a profile runs obd.initialize() (a full ATZ +
   // ~10 init AT commands, seconds of blocking) plus a LittleFS profile write and possibly an NVS commit - all
   // of which would stall the sector ACKs and contend with esp_ota_write for the same flash chip. The flag is
-  // sticky, so nothing is lost: the push applies on the first iteration after the update finishes.
+  // sticky, so nothing is lost: the push applies on the first iteration after the update finishes (or, if
+  // the update ends in its reboot, otaFinalize drops it so the app pushes it again).
   // Deferred during a log dump for the same two reasons (window replies stall; the profile write mutates the
   // filesystem the dump is mid-way through reading).
   if (g_config_pending && !g_ota_active && !g_logdump_active) {
@@ -1220,36 +1225,36 @@ void loop() {
         last_applied_profile = profile_dump;
 #if ENABLE_LOGGING
         logEvent("CONFIG applied from BLE push (%d bytes, on loop task)", (int)profile_dump.size());
-        // Persist the accepted push (profile + token) so it survives sleep/reboot. This is what keeps the
-        // NVS hash truthful: boot restores THIS file (loadPersistedProfile) instead of reverting to factory,
-        // and standalone cellular wakes then run the pushed profile too.
-        File pf = LittleFS.open(PROFILE_PATH, "w");
-        if (pf) {
-          pf.print(g_pending_config_str.c_str());
-          pf.close();
-          logEvent("PROFILE persisted to flash (%d bytes)", (int)g_pending_config_str.size());
-        } else {
-          // Couldn't persist: the hash (already committed by the wrapper) would outlive the RAM-only profile.
-          // Invalidate it so the app re-pushes next connect instead of fast-pathing onto a stale factory boot.
-          ble.invalidateHash();
-          logEvent("PROFILE persist FAILED - hash invalidated (app will re-push)");
-        }
 #endif
       } else {
 #if ENABLE_LOGGING
         logEvent("CONFIG push identical to running profile - re-init skipped");
 #endif
       }
+#if ENABLE_LOGGING
+      // Persist the accepted push (profile + token) so it survives sleep/reboot. This is what keeps the
+      // NVS hash truthful: boot restores THIS file (loadPersistedProfile) instead of reverting to factory,
+      // and standalone cellular wakes then run the pushed profile too. Every full push is written, an
+      // identical profile included: the app's hash covers the token.
+      File pf = LittleFS.open(PROFILE_PATH, "w");
+      const bool saved = pf && pf.print(g_pending_config_str.c_str()) == g_pending_config_str.size();
+      if (pf) pf.close();
+      if (saved) {
+        logEvent("PROFILE persisted to flash (%d bytes)", (int)g_pending_config_str.size());
+      } else {
+        dropUnsavedPush("write");
+      }
+#endif
       config_initialized = true;
     }
     catch (const json::exception& err) {
       Serial.printf("CONFIG apply failed: %s\n", err.what());
-      // The wrapper committed the new hash at SETUP OK, but the profile never applied: invalidate so the
-      // fast path can't claim it - the app re-pushes on the next connect.
-      ble.invalidateHash();
+      // The wrapper committed the new hash at SETUP OK, but the profile never applied (the RAM token may
+      // already have moved): drop the hash and the file so no wake runs either half - the app re-pushes.
 #if ENABLE_LOGGING
-      logEvent("CONFIG apply FAILED: %.60s - hash invalidated (app will re-push)", err.what());
+      logEvent("CONFIG apply FAILED: %.60s", err.what());
 #endif
+      dropUnsavedPush("apply");
     }
   }
 #endif
@@ -1562,15 +1567,7 @@ void loop() {
         // smooth-road fix: on glassy asphalt detectMovement() sees no accel spikes, so last_active would go
         // stale and the state machine would sleep mid-drive (and changeState() would then mislabel the frame
         // is_parked:1). Feeding speed into the leash holds us awake as long as the car reports motion.
-        if (is_currently_parked) {
-          Serial.printf("LEASH: speed=%.1f -> driving (unlatch parked, hold awake)\n", res.second);
-#if ENABLE_LOGGING
-          logEvent("LEASH driving speed=%.1f -> unlatch parked + hold awake (smooth-road guard)", res.second);
-#endif
-        }
-        is_currently_parked = false;
-        last_active = millis();
-        g_last_speed_ms = millis();
+        driveSpeed(res.second);
         // Feed the OBD-alarm gate's speed-hold: a genuine road speed is independent proof the car is
         // in transit, and it carries an already-granted driving permit through a GNSS outage (tunnel,
         // multi-storey). Continuation only - reaching this line at all means a poll was permitted.
@@ -1595,15 +1592,7 @@ void loop() {
     // next slept. Requiring a recent fix makes the unlatch expire on its own when fixes stop, and
     // then the 5-minute re-latch does what it was written to do.
     if (gpsMovingFresh(GPS_MOVING_MAX_AGE_MS)) {
-      if (is_currently_parked) {
-        Serial.printf("LEASH: GNSS %.1f km/h -> driving (unlatch parked, hold awake)\n", gd->speed * 1.852f);
-#if ENABLE_LOGGING
-        logEvent("LEASH driving gnss=%.1fkm/h -> unlatch parked (no OBD speed needed)", gd->speed * 1.852f);
-#endif
-      }
-      is_currently_parked = false;
-      last_active = millis();
-      g_last_speed_ms = millis();
+      driveGnss(gd->speed * 1.852f);
     }
 #endif
     // TIME-BASED parked re-latch (state-machine independent). The changeState re-latch can't fire while a
@@ -1612,14 +1601,8 @@ void loop() {
     // machine (no reported speed for ACTIVE_TIMER -> parked), just not blocked by the BLE hold. With the
     // latch restored, a forgotten connected phone is genuinely bounded by MAX_AWAKE_MINUTES, and plugging in
     // at a charger with the phone connected still detects is_charging.
-    if (!is_currently_parked && ( millis() - g_last_speed_ms ) > (unsigned long)ACTIVE_TIMER) {
-      freezeParkedLocation(); // 0->1 transition: capture the stabilized last-driving fix, as changeState does
-      is_currently_parked = true;
-#if ENABLE_LOGGING
-      logEvent("LEASH no speed for %lus -> re-latch parked (time-based; BLE-hold safe)",
-        (unsigned long)(ACTIVE_TIMER / 1000UL));
-#endif
-    }
+    // The 0->1 transition freezes the stabilized last-driving fix, as changeState does.
+    drivePollEnd();
     // Before is_parked is appended: a frame whose only v2 field would be drivingState is not worth a POST.
     // utc is always present, so this asks the serializer. A location or heading already accepted, or already
     // buffered behind an unsent one, is not news; any other, frozen or live, is.
@@ -1938,7 +1921,7 @@ void loop() {
 #if ENABLE_NETWORK
       g_geo_queued = poll_geo;
 #endif
-      if (!is_currently_parked) park_marker_owed = true;
+      driveFrameBuffered();
       // Bound the RAM upload buffer so a long offline stretch can't grow it without limit (-> OOM). The
       // full history is already in flash; for live telemetry the freshest frames matter most, so drop the
       // oldest when over the cap.

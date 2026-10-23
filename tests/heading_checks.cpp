@@ -91,6 +91,7 @@ time_t parseHttpDate(const char*) { return 0; }
 void esp_task_wdt_reset() {}
 #include "telemetry_format.h"
 #include "gps_location.h"
+#include "drive_state.h"
 void gpsUnlatch() {
 #include "gps_unlatch.inc"
 }

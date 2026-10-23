@@ -46,10 +46,13 @@ multilib (`tools/pio_psram_libs.py`, #64): this ESP32 rev 1 can lose stores to P
 land.
 
 **CI runs the host checks only.** `.github/workflows/host-tests.yml` runs every `tests/run_*.py` on each
-pull request and on `main`, normally and with `CXX='clang++ -DNDEBUG'`. Nothing in CI builds the firmware
-or touches a device, so a green PR proves the host checks and nothing more. Merging needs its `ci` job,
+pull request and on `main`, normally and with `CXX='clang++ -DNDEBUG'`. Apart from the one job below, nothing in CI builds
+the firmware or touches a device, so a green PR proves the host checks and nothing more. Merging needs its `ci` job,
 the one check the `main` ruleset requires: a new job goes in that job's `needs`. See *Testing* below,
 because that gap is the single biggest difference from a normal repo.
+
+The `variants` job compiles the non-default `config.h` variants with `sh tools/check_variants.sh` from `baseLogger/`;
+it never builds the default image. `ENABLE_WIFI 1` (with `ENABLE_CELL 0`) only compiles, as it overflows IRAM, and its TLS is unverified: bench only.
 
 ## The rules that bite first
 
@@ -177,7 +180,10 @@ OTA and log-dump holds, a console session, both speed keys and a NaN speed, trip
 no-speed-PID drives). The fake clock advances inside every log line and freeze, as the device's does.
 After every event the latch, leash, hold time, marker debt, published `is_parked`, buffered frames,
 freezes, the GNSS age bound asked for, and the exact `logEvent` and Serial sequences must be equal; the
-weak-rail gate and the max-awake backstop are checked as properties, on the working tree's code. The pin rule and what the harness
+weak-rail gate and the max-awake backstop are checked as properties, on the working tree's code. Since step 1 (#24) the CUR side is the
+drive region in `Helpers/drive_state.h`, and the runner fails if anything outside that header assigns
+`is_currently_parked`, `g_last_speed_ms` or `park_marker_owed`, if `alarm_gate.h` names drive state, or if
+a call into the drive region sits outside the blocks it extracts. The pin rule and what the harness
 cannot prove (32-bit `millis()` wrap, other flag sets, code outside the extracted blocks) are in the
 runner's header. Energy and wake surfaces come in step 0b (#28).
 
@@ -336,6 +342,16 @@ replies, extracted from `obdwrapper.cpp`: a clean reply decodes to fixed bytes, 
 ahead of a single or first frame are dropped, a re-segmented reply under a foreign header and a wrong DID
 are refused, replies with no anchor line and non-`22xxxx` requests are left to the plain parser, and
 truncated replies decode their partial bytes. Fixtures are scrubbed co-processor replies; the co-processor itself is not exercised.
+
+## Profile push checks
+
+Run `python3 tests/run_profile_checks.py` for the BLE profile hand-off: the real config-apply block from `loop()`
+and `loadPersistedProfile()` against an in-memory LittleFS. A full push writes `/vehicle_profile.json` even when
+the profile is unchanged (a token-only re-push survives a reboot, with the re-init still skipped), and a failed
+write, or a push that does not apply, invalidates the hash and removes the file, so the next boot cannot restore an
+older token. The runner also checks that `otaFinalize` and `bleDeinitForSleep` drop a push still
+pending, after the boot-partition commit and after `ble.deinit()`, by position only. The BLE task, NVS and the reset
+itself are not exercised.
 
 ## Cellular TLS trust checks
 

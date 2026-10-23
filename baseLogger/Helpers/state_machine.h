@@ -108,8 +108,7 @@ void changeState(ActivityState new_state) {
   // (-> CHARGING/STANDBY). Pairs with the speed > 0 unlatch in loop() so the parked state is
   // restored without depending on a deep-sleep reboot to reset the global.
   if (new_state == CHARGING || new_state == STANDBY) {
-    if (!is_currently_parked) freezeParkedLocation(); // 0->1: capture the stabilized last-driving fix
-    is_currently_parked = true;
+    driveIdle(); // 0->1: freezes the stabilized last-driving fix
   }
   transmission_delay = getTransmissionDelay(new_state);
   polling_delay = getPollingDelay(new_state);
@@ -172,7 +171,7 @@ void handleActivityState() {
     // so no speed frames arrive and the driving leash would go stale: the time-based parked re-latch would
     // then fire on the first poll afterwards and mislabel a moving car as parked - freezing a bogus "parked
     // location" in the process. Hold the leash instead of letting unobserved time count against it.
-    if (!is_currently_parked) g_last_speed_ms = millis();
+    driveSessionHold();
   } else {
     active = detectMovement(500);
   }

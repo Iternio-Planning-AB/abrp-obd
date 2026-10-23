@@ -546,6 +546,7 @@ static void otaFinalize() {
   otaNvsPut("attempt", ota_img_version);
 
   otaSendStatus(OTA_PH_COMMITTED, 0, ota_img_version);
+  if (g_config_pending) dropUnsavedPush("ota"); // a push the transfer held back dies with the reboot
 #if ENABLE_LOGGING
   logEvent("OTA committed v%lu (%lu B) -> reboot into trial boot",
     (unsigned long)ota_img_version, (unsigned long)ota_img_size);
