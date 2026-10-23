@@ -30,6 +30,7 @@ import check_esptool_deps  # noqa: E402
 import fw_version  # noqa: E402
 import ota_keygen  # noqa: E402
 import ota_sign  # noqa: E402
+import psram_libs  # noqa: E402
 
 
 class VersionCode(unittest.TestCase):
@@ -840,6 +841,91 @@ class EsptoolDepsCheck(unittest.TestCase):
                 code, out = self.check(fx)
                 self.assertEqual(code, 1, out)
                 self.assertIn("::error title=esptool dependencies::", out)
+
+
+class PsramRuntimeLink(unittest.TestCase):
+    """The ESP32 rev 1 PSRAM workaround must reach the link: the plain libc/libstdc++ lost stores (#64)."""
+
+    LIB = "/p/packages/toolchain-xtensa-esp32/bin/../lib/gcc/xtensa-esp32-elf/8.4.0/../../../../xtensa-esp32-elf/lib"
+    GCC = "/p/packages/toolchain-xtensa-esp32/bin/../lib/gcc/xtensa-esp32-elf/8.4.0"
+
+    def map_text(self, multilib):
+        # Shapes copied from a real firmware.map: archive members, a wrapped member line, LOAD lines, crt objects.
+        return textwrap.dedent(f"""\
+            Archive member included to satisfy reference by file (symbol)
+
+            {self.LIB}/{multilib}/libc.a(lib_a-memcpy.o)
+                                          .pio/build/esp32dev/src/logger.ino.cpp.o (memcpy)
+            {self.LIB}/{multilib}/libc.a(lib_a-memset.o)
+                                          .pio/build/esp32dev/src/logger.ino.cpp.o (memset)
+            {self.LIB}/{multilib}/libstdc++.a(eh_catch.o)
+                                          {self.LIB}/{multilib}/libstdc++.a(del_opvnt.o) (__cxa_begin_catch)
+            .pio/build/esp32dev/lib5a0/libFreematicsPlus.a(FreematicsOBD.cpp.o)
+                                          .pio/build/esp32dev/src/logger.ino.cpp.o (_ZN7COBD4initEv)
+            LOAD {self.GCC}/{multilib}/crti.o
+            LOAD {self.LIB}/{multilib}/crt0.o
+            LOAD {self.LIB}/{multilib}/libm.a
+            LOAD {self.GCC}/{multilib}/libgcc.a
+            LOAD /p/packages/framework-arduinoespressif32/tools/sdk/esp32/lib/libheap.a
+            """)
+
+    def test_plain_multilib_names_every_toolchain_object(self):
+        unsafe = psram_libs.unsafe_objects(self.map_text("no-rtti"))
+        self.assertCountEqual([path.rsplit("/", 1)[-1] for path in unsafe],
+                         ["libc.a", "libstdc++.a", "crti.o", "crt0.o", "libm.a", "libgcc.a",
+                          "lib_a-memcpy.o not from the PSRAM libc", "lib_a-memset.o not from the PSRAM libc"])
+
+    def test_one_plain_archive_among_psram_ones_fails(self):
+        text = self.map_text("esp32-psram/no-rtti")
+        self.assertEqual(psram_libs.unsafe_objects(text), [])
+        text += f"LOAD {self.LIB}/no-rtti/libnosys.a\n"
+        self.assertEqual(psram_libs.unsafe_objects(text), [f"{self.LIB}/no-rtti/libnosys.a"])
+
+    def test_string_functions_from_rom_fail_though_libc_is_psram(self):
+        # A ROM newlib linker script resolves memcpy to ROM: libc.a then supplies other members, never memcpy.
+        text = self.map_text("esp32-psram/no-rtti").replace("libc.a(lib_a-memcpy.o)", "libc.a(lib_a-strlen.o)")
+        self.assertEqual(psram_libs.unsafe_objects(text), ["lib_a-memcpy.o not from the PSRAM libc"])
+
+    def test_psram_must_be_the_multilib_not_any_directory_above_it(self):
+        lib = self.LIB.replace("/p/packages/", "/esp32-psram/packages/")
+        text = self.map_text("no-rtti").replace(self.LIB, lib).replace(self.GCC, self.GCC.replace("/p/", "/esp32-psram/"))
+        self.assertIn(f"{lib}/no-rtti/libc.a", psram_libs.unsafe_objects(text))
+
+    def test_rom_newlib_linker_scripts_are_refused(self):
+        # ESP-IDF leaves these out when the workaround is on: ROM string and printf code has none.
+        core = ["-T", "esp32.rom.ld", "-T", "esp32.rom.libgcc.ld", "-T", "esp32.rom.newlib-data.ld"]
+        self.assertEqual(psram_libs.rom_newlib_scripts(core), [])
+        for script in ["esp32.rom.newlib-funcs.ld", "esp32.rom.newlib-nano.ld", "esp32.rom.newlib-time.ld"]:
+            with self.subTest(script=script):
+                self.assertEqual(psram_libs.rom_newlib_scripts([*core, "-T", script]), [script])
+
+    def test_command_line_check_for_the_release_workflow(self):
+        with tempfile.TemporaryDirectory() as td:
+            for multilib, code in [("esp32-psram/no-rtti", 0), ("no-rtti", 1)]:
+                with self.subTest(multilib=multilib):
+                    path = Path(td) / "firmware.map"
+                    path.write_text(self.map_text(multilib))
+                    result = subprocess.run([sys.executable, str(TOOLS / "psram_libs.py"), str(path)],
+                                            capture_output=True, text=True)
+                    self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+        steps = Workflow((ROOT / ".github/workflows/release.yml").read_text()).steps("build")
+        names = [step.splitlines()[0] for step in steps]
+        check = next(i for i, step in enumerate(steps) if "tools/psram_libs.py" in (Workflow.run_script(step) or ""))
+        self.assertGreater(check, next(i for i, name in enumerate(names) if "name: Build" in name),
+                           "the release checks the map the build wrote")
+
+    def test_map_without_toolchain_objects_is_an_error_not_a_pass(self):
+        # e.g. a toolchain that spells its target differently: fail, do not wave it through
+        text = self.map_text("esp32-psram/no-rtti").replace("xtensa-esp32-elf", "xtensa-esp-elf")
+        with self.assertRaises(ValueError):
+            psram_libs.unsafe_objects(text)
+
+    def test_platformio_ini_wires_the_link_check(self):
+        ini = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=("#", ";"))
+        ini.read(ROOT / "baseLogger" / "platformio.ini")
+        scripts = [s.strip() for s in ini["env:esp32dev"]["extra_scripts"].splitlines() if s.strip()]
+        self.assertIn("tools/pio_psram_libs.py", scripts)
+        self.assertIn(psram_libs.FLAG, ini["env:esp32dev"]["build_flags"].split())
 
 
 GIT_CLIFF = shlex.split(os.environ.get("GIT_CLIFF", "git-cliff"))

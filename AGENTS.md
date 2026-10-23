@@ -41,6 +41,10 @@ Flash and watch with `pio run -e esp32dev -t upload -t monitor` (115200 baud).
 A clean build prints two pre-existing `"PRINT" redefined` warnings, from `FreematicsOBD.cpp` and
 `mathparser/parser.cpp`. They are not yours; anything else probably is.
 
+Every build checks its linker map and fails unless the C/C++ runtime came from the toolchain's PSRAM-safe
+multilib (`tools/pio_psram_libs.py`, #64): this ESP32 rev 1 can lose stores to PSRAM, where mallocs over 4 KB
+land.
+
 **CI runs the host checks only.** `.github/workflows/host-tests.yml` runs every `tests/run_*.py` on each
 pull request and on `main`, normally and with `CXX='clang++ -DNDEBUG'`. Apart from the one job below, nothing in CI builds
 the firmware or touches a device, so a green PR proves the host checks and nothing more. Merging needs its `ci` job,
@@ -109,8 +113,9 @@ Pass a group name (`link-range`, `link-failures`, `link-truncated`, `link-requir
 `direct-range`, or `queue`) to run just that group.
 
 Run `python3 tests/run_release_checks.py` for the release tooling: version naming and selection, build-tag
-resolution, signing through a fake `aws` with throwaway keys, and the workflow's safety properties. The
-release-notes group needs `git-cliff` (or set `GIT_CLIFF`); without it, it is skipped, and with `CI` set it fails.
+resolution, signing through a fake `aws` with throwaway keys, the workflow's safety properties, and the
+linker-map check of `tools/psram_libs.py` (`PsramRuntimeLink`). The release-notes group needs `git-cliff` (or
+set `GIT_CLIFF`); without it, it is skipped, and with `CI` set it fails.
 
 Hardware verification still requires a real dongle, and the loop is:
 
