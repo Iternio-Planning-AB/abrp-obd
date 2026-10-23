@@ -84,6 +84,7 @@ void enterDeepSleep(bool modem_on, const char* reason = nullptr) {
   // car (no motion, no WOM), so the app could not even reconnect to retry until the next timer wake.
   // The dump's 30s inactivity guard bounds how long this can defer a sleep.
   if (g_ota_active || g_logdump_active) return;
+  if (g_weak_rail_cold_boot) modem_on = false;
   sleepCount++;
   Serial.printf("Entering deep sleep (sleep #%lu). WOM threshold %.4fg (%d LSB), wake on GPIO%d HIGH.\n",
     sleepCount, WOM_THRESHOLD_G, WOM_THRESHOLD_LSB, (int)WOM_INT_PIN);

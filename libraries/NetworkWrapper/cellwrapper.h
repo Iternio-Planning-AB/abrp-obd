@@ -15,6 +15,7 @@ public:
 
   /* Establish network connection (hologram) */
   bool init(const bool retry = false) override;
+  bool init(const bool retry, unsigned int registration_timeout_ms);
 
   /* Connect to network server (telemetry API) */
   bool connect() override;
@@ -80,12 +81,15 @@ public:
   void dumpRadioConfig();
 
 private:
+  bool finishInit(unsigned int registration_timeout_ms);
+
   /* Dead-RF revival ladder step (called from reconnect() when unregistered with csq=99). */
   void reviveDeadRadio();
 
   std::string apn;
   std::string api_page;
   HTTPClientSIM net;
+  bool m_initialized = false;
   bool m_ready = false;  // modem set up + APN attached; coarse "link up" flag for connected()
   const char* m_init_stage = "begin";
   char m_registration = '?';
@@ -100,4 +104,3 @@ private:
 };
 
 #endif
-
