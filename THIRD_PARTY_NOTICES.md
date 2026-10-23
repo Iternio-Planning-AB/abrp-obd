@@ -15,6 +15,7 @@ list is where to find them.
 | ESP32Time | `libraries/ESP32Time/` | MIT, text in [`libraries/ESP32Time/LICENSE`](libraries/ESP32Time/LICENSE) | (c) 2021 Felix Biego |
 | JSON for Modern C++ | `libraries/nlohmann/` | MIT, SPDX header in each file | (c) 2013-2023 Niels Lohmann |
 | mathparser | `libraries/mathparser/` | MIT, text in [`licenses/MIT-mathparser.txt`](licenses/MIT-mathparser.txt) | (c) 2023 Fatih Küçükkarakurt; extended for this project |
+| zlib 1.3.2 (unmodified subset) | `libraries/zlib/` | zlib, text in [`libraries/zlib/LICENSE`](libraries/zlib/LICENSE) | (C) 1995-2026 Jean-loup Gailly and Mark Adler |
 
 ## Linked at build time, not vendored
 

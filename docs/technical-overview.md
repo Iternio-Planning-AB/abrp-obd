@@ -143,7 +143,7 @@ order and share its globals. See [`AGENTS.md`](../AGENTS.md) before adding one.
 | `clock_sync.h` | Sets the RTC from GNSS / NITZ / NTP / the HTTP `Date` header, and on each wake removes the drift deep sleep added, at a rate learned from NITZ/NTP resyncs. |
 | `telemetry_format.h` | Builds the ABRP telemetry frame (cellular body plus the trimmed BLE frame). |
 | `network_upload.h` | Cellular upload, bulk POST, the offline backlog. |
-| `gzip_body.h` | gzip for the POST body, using the ESP32 boot ROM's deflate. |
+| `gzip_body.h` | gzip for the POST body: vendored zlib, state in PSRAM, each sent body verified by inflating it again. |
 | `geo_backlog.h` | Keeps location provenance in the backlog so stale positions are never uploaded as fresh. |
 | `ble.h` | The BLEWrapper instance, per-wake BLE bring-up/teardown, the persisted-profile loader, `bleRelaying()`. |
 | `log_dump.h` | BLE log-retrieval protocol (ABD7). |
@@ -180,6 +180,7 @@ order and share its globals. See [`AGENTS.md`](../AGENTS.md) before adding one.
 | `NetworkWrapper` | Abstract network class, implemented by `CellWrapper` and `WiFiWrapper`. The modem's network mode and LTE-M band list are set in `cellwrapper.cpp`. |
 | `DataLogger` | LittleFS CSV logging and segment rotation. |
 | `ESP32Time`, `mathparser`, `nlohmann` | RTC, PID equation evaluation, JSON. |
+| `zlib` | zlib 1.3.2, unmodified subset (deflate, inflate, CRC-32), for the gzip upload body. See its `README.md`. |
 
 ### `tests/` — host checks
 
@@ -305,6 +306,7 @@ USB only: physical access by design. Type these into the serial monitor (115200 
 | `AUTHCLEAR` | Erase the auth secret, revoking every phone. The next phone to connect provisions a new one. |
 | `OTARESET` | Clear the OTA anti-downgrade floor (after a bench flash to a lower version). |
 | `JWSTEST` | Self-test the profile-signature verifier. |
+| `GZTEST <bytes> [count]` | Compress and verify `count` (default 100, at most 2000) synthetic upload bodies of `bytes` and print pass/fail by cause. Holds the main loop (BLE requests and sleep wait) for at most 30 s; any key stops it sooner. |
 | `RESUME` | Hand back to normal duty (re-allow sleep) after a maintenance session. |
 
 > **One-sided bonds bite.** If you clear bonds on the dongle (or reflash with bonding disabled), also

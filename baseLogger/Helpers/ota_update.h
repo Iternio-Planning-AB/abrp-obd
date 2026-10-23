@@ -817,6 +817,9 @@ static bool otaSelfTest() {
 #if ENABLE_MEMS
   if (mems == 0) ok = false;                     // motion sensor absent -> sleep/wake logic would be broken
 #endif
+#if ENABLE_NETWORK
+  if (!gzipSelfTest()) ok = false;               // misbuilt compressor -> every upload body would fail
+#endif
   return ok;
 }
 

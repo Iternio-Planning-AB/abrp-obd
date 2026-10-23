@@ -158,6 +158,7 @@ void enterDeepSleep(bool modem_on, const char* reason = nullptr) {
 #if ENABLE_LOGGING
   // Persist whatever the flush could NOT send (dead bearer / no coverage) before RAM is wiped - previously
   // those frames were silently lost. Restored + uploaded on the next polling wake (see loadUploadBacklog).
+  gzipLogWakeSummary();
   saveUploadBacklog();
 #endif
 #endif
