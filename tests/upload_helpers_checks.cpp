@@ -232,6 +232,7 @@ void safeErrors() {
         {"gzip: checksum 12345678-abcd-abcd-abcd-123456789abc", "redacted"},
         {"gzip: invalid header " + std::string(300, ' ') + tlm_push_token, "redacted"},
         {"gzip: invalid header " + std::string(300, ' ') + "api-key=short", "redacted"},
+        {"{\"message\":\"TLM point time is too old (2026-09-01 10:00:00 +0000 UTC)\"}", "too_old"},
         {"arbitrary response content, not allowlisted", "other"},
     };
     for (const auto& c : cases) {
@@ -286,6 +287,51 @@ void queue() {
     check(uploadBuffered(true) && obd_result_vector.empty() && network.sent.empty(), "existing oversized single-frame drop unchanged");
 #if ENABLE_LOGGING
     check(g_upload_request_id == 0, "drop has no POST diagnostics");
+#endif
+}
+// On a trusted send clock the queue drops frames past the 6-day bound before sizing; otherwise it keeps them.
+OBDVector battery(double utc) { return {{"utc", utc}, {"soc", 40}, {"voltage", 350}}; }
+void frameAge() {
+    const double now = 1791112000, old = now - BACKLOG_MAX_SEND_AGE_SECONDS - 1;
+    OBDVector restamped = battery(now);
+    restamped.insert(restamped.begin(), {"utc", old}); // the serializer sends the last utc
+    const std::vector<OBDVector> mixed = {battery(old), {{"soc", 41}}, battery(now - BACKLOG_MAX_SEND_AGE_SECONDS),
+        battery(now + 300), restamped};
+    const std::vector<OBDVector> kept(mixed.begin() + 1, mixed.end());
+    reset(); obd_result_vector = mixed;
+    check(uploadBuffered(true) && obd_result_vector.empty() && network.sent == std::vector<std::string>{bulkStringV2(kept, now)},
+        "trusted clock drops the frame past 6 days; the bound, a future and a fresh frame go up");
+#if ENABLE_LOGGING
+    check(events("UPLOAD dropped") == std::vector<std::string>{"UPLOAD dropped n=1 reason=age sutc=1790593599..1790593599 now=1791112000"},
+        "only the aged frame is counted, not the one without a utc");
+#endif
+    reset(); obd_result_vector = mixed; last_clock_sync_epoch = 0;
+    check(uploadBuffered(true) && network.sent == std::vector<std::string>{bulkStringV2(mixed, 0)},
+        "an untrusted clock judges nothing: the aged frame still goes up");
+#if ENABLE_LOGGING
+    check(events("UPLOAD dropped").empty(), "nothing dropped, nothing logged");
+#endif
+    // Swept before the http=0 probe cap and over the whole queue, so the 3-frame probe is the fresh frames.
+    reset(); g_http0_streak = 1; network.code = 503;
+    const std::vector<OBDVector> fresh = {battery(now - 2), battery(now - 1), battery(now)};
+    obd_result_vector = {battery(old), battery(old - 2)};
+    obd_result_vector.insert(obd_result_vector.end(), fresh.begin(), fresh.end());
+    obd_result_vector.push_back(battery(old - 1));
+    check(!uploadBuffered(true) && network.sent == std::vector<std::string>{bulkStringV2(fresh, now)} && obd_result_vector == fresh,
+        "a failed send keeps the fresh frames in order and the aged ones stay dropped");
+#if ENABLE_LOGGING
+    check(events("UPLOAD dropped") == std::vector<std::string>{"UPLOAD dropped n=3 reason=age sutc=1790593597..1790593599 now=1791112000"},
+        "one line names the count, the dropped span and the judging clock");
+#endif
+    reset(); obd_result_vector = {battery(old - 5), battery(old)}; g_last_status = "http_err";
+    check(uploadBuffered(false) && obd_result_vector.empty() && network.sent.empty() && g_last_status == "ok_aged",
+        "an all-aged queue empties without a POST");
+#if ENABLE_LOGGING
+    reset(); obd_result_vector = {battery(old), battery(now)};
+    saveUploadBacklog(); obd_result_vector.clear(); loadUploadBacklog();
+    const auto restored = obd_result_vector;
+    check(restored.size() == 2 && uploadBuffered(true) && network.sent == std::vector<std::string>{bulkStringV2({restored[1]}, now)},
+        "a backlog restored from flash is judged at send like the RAM queue");
 #endif
 }
 void geoExpiry() {
@@ -855,7 +901,7 @@ int main(int argc, char** argv) {
     if (group == "all" || group == "fingerprint") fingerprint();
     if (group == "all" || group == "errors") safeErrors();
 #endif
-    if (group == "all" || group == "queue") queue();
+    if (group == "all" || group == "queue") { queue(); frameAge(); }
     if (group == "all" || group == "geo-expiry") { geoExpiry(); geoClockQuality(); geoExplicitClock(); geoBoundaries(); }
     if (group == "all" || group == "geo-retry" || group == "geo-sizing") geoPublicClockReads();
     if (group == "all" || group == "geo-retry") geoTrustRetry();

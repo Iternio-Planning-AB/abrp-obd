@@ -585,7 +585,16 @@
 // 1000 leaves margin). uploadBuffered() shrinks each batch until its serialized body fits, so richer
 // frames (more OBD PIDs) automatically mean fewer frames per POST instead of undeliverable POSTs.
 #define CELL_MAX_POST_BYTES 1000
+
+// The server refuses the whole POST if any point in it is older than 30 days by its own clock. Older than this
+// at send time, a location or heading is left out of the body; the day under 30 absorbs send-clock error.
 #define GEO_MAX_SEND_AGE_SECONDS (29UL * 24UL * 60UL * 60UL)
+
+// A queued or restored frame older than this at send time is dropped, not sent (uploadBuffered), inclusive: the data
+// is useful only fresh, and the server's 30 days would otherwise let one old frame fail every retry of its batch.
+// Judged only on a trusted send clock. A trusted clock wrongly stepped this far forward (bad NITZ/NTP, spoofed GNSS)
+// drops the queue; accepted, as unlikely.
+#define BACKLOG_MAX_SEND_AGE_SECONDS (6UL * 24UL * 60UL * 60UL)
 
 // Catch-up burst: how many capped POSTs the STEADY-STATE (in-loop) upload may fire back-to-back in one
 // transmission cycle. More SMALL posts, never bigger ones (see the hard per-POST size ceiling above).

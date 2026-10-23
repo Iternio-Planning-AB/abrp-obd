@@ -209,6 +209,8 @@ intended production values. Any change needs a reflash.
 | `CELL_APN` | `"hologram"` | The SIM provider's APN. |
 | `ENABLE_CELL` / `ENABLE_WIFI` | `1` / `0` | Transport select. This is the cellular build. |
 | `CATM_BANDS` (in `cellwrapper.cpp`) | `1,3,8,20,28` | LTE-M bands the modem scans: the European set. |
+| `BACKLOG_MAX_SEND_AGE_SECONDS` | 6 days | A queued or restored frame older than this when it would be sent is dropped (`UPLOAD dropped … reason=age`), judged only on a trusted clock. |
+| `GEO_MAX_SEND_AGE_SECONDS` | 29 days | A location or heading older than this is left out of the upload; the server refuses anything past 30 days. |
 
 `cellwrapper.cpp` also sets the modem to GSM+LTE (`CNMP=51`) with LTE-M only on the LTE side
 (`CMNB=1`). All three are written once and persist in the modem's NVM, so a matching value is never
