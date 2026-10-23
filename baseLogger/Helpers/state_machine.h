@@ -24,23 +24,28 @@ unsigned long getTransmissionDelay(ActivityState state) {
     delay = 0;
     break;
   case ACTIVE:
-    // 60s upload cadence while driving. The POLL stays at 5s (getPollingDelay below), so a minute's
-    // worth of points - about twelve - is buffered and shipped together. The points themselves are
+    // 50s upload cadence while driving. The POLL stays at 5s (getPollingDelay below), so 50 s worth
+    // of points - about ten - is buffered and shipped together. The points themselves are
     // unchanged: each carries the utc it was captured at, so the server still receives one sample per
     // 5s and the trip reconstructs identically. What changes is DELIVERY, and with it the cost: one
     // TLS session and a handful of POSTs per minute instead of a session every 5s.
     //
     // Was 5s, chosen so each point shipped the moment it was captured. The trade being made here is
-    // freshness of the NEWEST point - up to 60s old on arrival rather than ~0-1s - which is what the
+    // freshness of the NEWEST point - up to 50s old on arrival rather than ~0-1s - which is what the
     // app's "last seen" and live route planning read. Everything already tolerates a gap of this size
     // (an ordinary cell reconnect is longer), but it is the thing to watch if live planning starts
     // looking stale mid-drive.
     //
     // Catch-up after an outage is still uploadBuffered's burst, not this cadence - see
     // UPLOAD_MAX_BATCHES_PER_CYCLE, which had to grow to stay ahead of the new steady-state fill rate.
-    delay = 60000; // 1 minute
+    //
+    // 50 s, not 60 s (#8): the upload fires on the first poll past this delay, so delay + one poll must stay
+    // under the ~60 s at which the cellular path drops the reused session (SESSION_IDLE_MAX_MS). ~20 % more POSTs.
+    delay = 50000;
     break;
   case CHARGING:
+    // Its uploads come with its 60 s poll whatever this says, so each one reopens the session through
+    // SESSION_IDLE_MAX_MS instead of reusing it.
     delay = 60000; // 1 minute
     break;
   case STANDBY:
@@ -117,6 +122,51 @@ void changeState(ActivityState new_state) {
 #if OBD_ALARM_GATE
 bool alarmEnforced(); // alarm_gate.h is included after this file
 #endif
+
+// DC_CHARGING_AWAKE_SECONDS. Motion within an ACTIVE_TIMER suspends the hold, so a drive is polled at ACTIVE's
+// own cadence from the first motion.
+bool dcMotionRecent() { return g_last_motion_ms && millis() - g_last_motion_ms < (unsigned long)ACTIVE_TIMER; }
+// Why a confirmed DC charge does not hold the wake awake right now, read live on every use; null when it does.
+const char* dcAwakeVeto(ActivityState state) {
+  if (state == BLE) return "ble";                           // the phone's session keeps its own cadence
+  if (g_last_io36 < RAIL_AWAKE_VOLTS) return "rail";        // the DC-DC is not up
+#if OBD_ALARM_GATE
+  if (alarmEnforced()) return "alarm";                      // a flagged car is never held awake parked
+#endif
+  if (dcMotionRecent()) return "motion";
+  return nullptr;
+}
+bool dcAwakeHeld(ActivityState state) { return g_dc_confirmed && !dcAwakeVeto(state); }
+// A held charge polls and uploads every DC_CHARGING_AWAKE_SECONDS. Read at the poll and upload gates: the
+// state delays are snapshots taken at changeState(), and the hold changes between transitions.
+unsigned long dcAwakeDelay(ActivityState state, unsigned long state_delay) {
+  return dcAwakeHeld(state) ? (unsigned long)DC_CHARGING_AWAKE_SECONDS * 1000UL : state_delay;
+}
+// Log the hold's edges: on every loop pass and after every poll, so a live veto is seen when it fires.
+void dcAwakeTrack() {
+  const bool held = dcAwakeHeld(current_state);
+  const char* veto = dcAwakeVeto(current_state);
+#if ENABLE_LOGGING
+  if (held && !g_dc_logged) {
+    logEvent("DC_AWAKE on rail=%.2f fast=%lumin", g_last_io36, (unsigned long)charging_fast_minutes);
+  } else if (!held && g_dc_logged) {
+    g_dc_refused_logged = true;
+    const char* why = veto ? veto : g_cadence_reason ? g_cadence_reason : "not-dc";
+#if ENABLE_MEMS
+    if (veto && !strcmp(veto, "motion"))
+      logEvent("DC_AWAKE off reason=motion rail=%.2f peak=%.3f axmax=%.3f", g_last_io36, motion_window_peak,
+        motion_window_axmax);
+    else
+#endif
+      logEvent("DC_AWAKE off reason=%s rail=%.2f", why, g_last_io36);
+  } else if (!held && g_dc_confirmed && veto && !g_dc_refused_logged) {
+    logEvent("DC_AWAKE refused reason=%s rail=%.2f", veto, g_last_io36);
+    g_dc_refused_logged = true;
+  }
+#endif
+  g_dc_logged = held;
+}
+
 // Open the post-drive window (POST_DRIVE_WINDOW_MINUTES) if the rail is high now, once per wake. Only after an
 // awake period on the parked cadence: a latched, capped or recovery cadence was chosen for a reason.
 bool pdwOpenWindow() {
@@ -261,9 +311,10 @@ void handleActivityState() {
   case CHARGING:
     // Removed the "connected -> BLE" revive: a connection ALONE must not pull us back to the awake state (that
     // was the stay-awake-while-connected behaviour). Real motion still revives; otherwise progress to sleep.
+    // A confirmed DC charge holds here, awake (DC_CHARGING_AWAKE_SECONDS); the backstop still bounds it.
     if (active) {
       changeState(ACTIVE);
-    } else if (now - last_active > CHARGING_TIMER) {
+    } else if (now - last_active > CHARGING_TIMER && !dcAwakeHeld(current_state)) {
       changeState(STANDBY);
     }
     break;

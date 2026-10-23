@@ -4,6 +4,9 @@
 
 void enterDeepSleep(bool modem_on, const char* reason) {
   if (modem_on) sm_marker();
+  if (modem_on && sm_flush_ok) obd_result_vector.clear();  // the pre-sleep flush sent everything
+  sm_flush_ok = false;
+  sm_marker_clear();
   sm_asleep = true;
   sm_sleeps++;
   sm_sleep_reason = reason ? reason : "";
@@ -41,21 +44,32 @@ void restore(const Snap& s) {
 }
 
 #define SM_RESET(T, name, value) name = value;
-// A deep-sleep wake: RAM back to its initialisers, RTC kept, then the setup() gate.
-void wake(const SmEvent& e) {
+// A boot: RAM back to its initialisers, the setup() debt restore, then the setup() gate.
+void boot(const SmEvent& e, SmReset reset) {
   SM_RAM(SM_RESET)
   sm_now = 0;
   sm_asleep = false;
+  sm_reset = reset;
+  sm_restore();
   recently_charging = e.charge_latched;  // the charge latch is an input here; 0a models no charge poll
   sm_gate_weak = e.rail >= IO36_LOCKOUT_LOW && e.rail < IO36_LOCKOUT_HIGH;
   sm_gate_open = sm_gate(e.rail, e.cause == SM_COLD, e.cause == SM_MOTION, e.awake, false);
   if (!sm_gate_open) {
+    std::vector<OBDVector> backlog;
+    backlog.swap(obd_result_vector);
+    sm_backlog_file = !backlog.empty();
     enterDeepSleep(false, "gate");  // the skip path never powers the modem
+    backlog.swap(obd_result_vector);
+    sm_backlog_file = false;
     return;
   }
   changeState(ACTIVE);
 }
 
+// A deep-sleep wake keeps RTC.
+void wake(const SmEvent& e) { boot(e, ESP_RST_DEEPSLEEP); }
+
+// A power loss: the debt store is garbage, which reads as nothing owed.
 void powerOn(const SmEvent& e) {
   SM_RTC(SM_RESET)
   SM_STUB(SM_RESET)
@@ -63,7 +77,18 @@ void powerOn(const SmEvent& e) {
   obd_result_vector.clear();
   sm_log.clear();
   sm_serial.clear();
-  wake(e);
+  boot(e, ESP_RST_POWERON);
+}
+
+// A panic or WDT reset: the bootloader reloads .rtc.data, the unsent frames in RAM are lost (the worst case:
+// the backlog was already loaded), the clock is zeroed until a later poll syncs it (run_sm_checks.py pins that
+// line), the debt store is kept. A cold boot.
+void crash(SmEvent e, SmReset reset = ESP_RST_PANIC) {
+  SM_RTC(SM_RESET)
+  obd_result_vector.clear();
+  sm_clock_ok = false;
+  e.cause = SM_COLD;
+  boot(e, reset);
 }
 #undef SM_RESET
 
@@ -80,6 +105,7 @@ void poll(const SmEvent& e) {
   sm_emplace(current_frame);
   sm_published = current_frame.back().second;
   sm_buffer(current_frame, e.has_data);
+  sm_marker_set();
 }
 
 void ladder(const SmEvent& e) {
@@ -110,8 +136,15 @@ void step(const SmEvent& e) {
   case SmKind::LADDER: case SmKind::HOLD: ladder(e); break;
   case SmKind::SLEEP:
     sm_clock_ok = e.clock_ok;
+    if (e.crash) {  // a panic in the pre-sleep flush, after the marker block (#30's field crashes)
+      if (e.modem_on) sm_marker();
+      crash(e, ESP_RST_TASK_WDT);  // a hung upload
+      break;
+    }
+    sm_flush_ok = e.sent;
     enterDeepSleep(e.modem_on, e.reason);
     break;
+  case SmKind::CRASH: crash(e); break;
   default: break;
   }
 }
@@ -128,12 +161,17 @@ const char* propertyBroken(const Snap& pre, const SmEvent& e) {
   // The backstop is shared context but reads the latch: it must never take a driving car to sleep.
   if (e.k == SmKind::LADDER && !pre.sm_asleep && !pre.is_currently_parked && sm_asleep && sm_sleep_reason == "backstop")
     return "the backstop slept while driving";
+  const bool crashed = !pre.sm_asleep && (e.k == SmKind::CRASH || (e.k == SmKind::SLEEP && e.crash));
+  bool marker_buffered = false;
+  for (const auto& frame : pre.frames) marker_buffered |= frame.size() == 2 && frame[0].first == "is_parked";
+  if (crashed && (pre.park_marker_owed || marker_buffered) && !park_marker_owed)
+    return "a crash lost the trip-end marker debt";
   size_t unlatch_lines = 0;
   for (size_t i = pre.log.size(); i < sm_log.size(); ++i) {
     if (sm_log[i].size() > 119) return "a logEvent line is longer than the 119 characters logEvent keeps";
     unlatch_lines += sm_log[i].compare(0, 13, "LEASH driving") == 0;
   }
-  if (e.k == SmKind::WAKE) return nullptr;  // a wake resets the latch to its initialiser, by design
+  if (e.k == SmKind::WAKE || crashed) return nullptr;  // a boot resets the latch to its initialiser, by design
   const unsigned freezes = sm_freezes - pre.sm_freezes;
   if (pre.is_currently_parked && !is_currently_parked && unlatch_lines != 1) return "an unlatch without exactly one LEASH line";
   if (!pre.is_currently_parked && is_currently_parked && freezes != 1) return "a re-latch without exactly one freeze";

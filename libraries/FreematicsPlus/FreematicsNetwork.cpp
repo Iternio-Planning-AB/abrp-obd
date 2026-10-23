@@ -6,6 +6,7 @@ on
 * (C)2012-2021 Developed by Stanley Huang <stanley@freematics.com.au>
 *************************************************************************/
 
+#include <algorithm>
 #include <Arduino.h>
 #include <cerrno>
 #include <climits>
@@ -427,26 +428,38 @@ void HTTPClientSIM::end() {
 bool HTTPClientSIM::setup(const char* apn, unsigned int timeout) {
   uint32_t t = millis();
   bool success = false;
+  auto remaining = [&]() -> unsigned int {
+    if (!timeout) return UINT_MAX;
+    const uint32_t elapsed = (uint32_t)millis() - t;
+    return elapsed >= timeout ? 0 : timeout - elapsed;
+  };
+  auto registrationCommand = [&](const char* command, const char* expected = nullptr) -> bool {
+    const unsigned int left = remaining();
+    if (left <= 10) return false;
+    return sendCommand(command, std::min(1000U, left - 10), expected);
+  };
   //sendCommand("AT+CNMP=13\r"); // GSM only
   //sendCommand("AT+CNMP=14\r"); // WCDMA only
   //sendCommand("AT+CNMP=38\r"); // LTE only
   // Full functionality, per the canonical Freematics SIM7070 setup. A no-op when the radio is
   // already on (it is NOT CFUN=1,1, which would reset), but it recovers a modem left in minimum
   // functionality / airplane state by a previous run.
-  sendCommand("AT+CFUN=1\r");
+  registrationCommand("AT+CFUN=1\r");
   do {
     do {
+      const unsigned int left = remaining();
+      if (!left) break;
       m_device->xbWrite("AT+CPSI?\r");
       m_buffer[0] = 0;
       const char* answers [ ] = { "NO SERVICE", ",Online", ",Offline", ",Low Power Mode" };
-      int ret = m_device->xbReceive(m_buffer, RECV_BUF_SIZE, 500, answers, 4);
+      int ret = m_device->xbReceive(m_buffer, RECV_BUF_SIZE, std::min(500U, left), answers, 4);
       if (ret == 2) {
         success = true;
         break;
       }
       if (ret == -1 || ret == 4) break;
-      delay(500);
-    } while (millis() - t < timeout);
+      delay(std::min(500U, remaining()));
+    } while (timeout && remaining());
     if (!success) break;
 
     // Registration check across ALL radio access technologies. The stock code required CREG (2G/3G
@@ -457,20 +470,20 @@ bool HTTPClientSIM::setup(const char* apn, unsigned int timeout) {
     // or CREG (GSM); state 1 = registered home, 5 = registered roaming.
     success = false;
     do {
-      delay(100);
-      if (sendCommand("AT+CEREG?\r", 1000, "+CEREG: 0,")) {
+      delay(std::min(100U, remaining()));
+      if (registrationCommand("AT+CEREG?\r", "+CEREG: 0,")) {
         char* p = strstr(m_buffer, "+CEREG: 0,");
         if (p && ( *( p + 10 ) == '1' || *( p + 10 ) == '5' )) { success = true; break; }
       }
-      if (sendCommand("AT+CGREG?\r", 1000, "+CGREG: 0,")) {
+      if (registrationCommand("AT+CGREG?\r", "+CGREG: 0,")) {
         char* p = strstr(m_buffer, "+CGREG: 0,");
         if (p && ( *( p + 10 ) == '1' || *( p + 10 ) == '5' )) { success = true; break; }
       }
-      if (sendCommand("AT+CREG?\r", 1000, "+CREG: 0,")) {
+      if (registrationCommand("AT+CREG?\r", "+CREG: 0,")) {
         char* p = strstr(m_buffer, "+CREG: 0,");
         if (p && ( *( p + 9 ) == '1' || *( p + 9 ) == '5' )) { success = true; break; }
       }
-    } while (!success && millis() - t < timeout);
+    } while (!success && timeout && remaining());
     if (!success) break;
 
     if (apn && *apn) {
