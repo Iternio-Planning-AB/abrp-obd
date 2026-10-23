@@ -437,9 +437,10 @@ bool saveUploadBacklog() {
 }
 
 // A relaying phone's session (pairing, profile push, OTA, log dump) needs the internal heap the queue holds,
-// about 1 KB a frame, next to Bluedroid's: park the queue in the backlog file until relaying ends.
+// about 1 KB a frame, next to Bluedroid's: park the queue in the backlog file until relaying ends. Held frames
+// go too, first: they are older than RAM, and uploadBuffered() holds none while a spill is parked.
 void spillUploadBacklog() {
-  const size_t n = obd_result_vector.size();
+  const size_t n = g_upload_held.size() + obd_result_vector.size();
   if (!n || !saveUploadBacklog()) return;
   obd_result_vector.clear();
   upload_spilled += n;
@@ -452,12 +453,17 @@ bool uploadBacklogPending() { return LittleFS.exists(UPLOAD_BACKLOG_PATH); }
 // buffer's, so they go in front, bounded by MAX_UPLOAD_BUFFER; then the file is deleted - from here the
 // frames are RAM-owned and re-persisted at the next sleep if still unsent.
 void loadUploadBacklog() {
-  upload_spilled = 0;
-  if (!LittleFS.exists(UPLOAD_BACKLOG_PATH)) return;
+  if (!LittleFS.exists(UPLOAD_BACKLOG_PATH)) { upload_spilled = 0; return; }
+  // A parked file that will not open stays parked (cellular waits behind it): say so once, not every poll.
+  static bool open_failed = false;
+  auto openFailed = [] {
+    if (!open_failed) logEvent("BACKLOG open failed - %lu frame(s) kept parked", upload_spilled);
+    open_failed = true;
+  };
   // Over the cap the oldest lines go, as in RAM: a sleep in a relay session can append behind a full spill.
   size_t skip = 0;
   File f = LittleFS.open(UPLOAD_BACKLOG_PATH, "r");
-  if (!f) return;
+  if (!f) { openFailed(); return; }
   while (f.available()) {
     String line = f.readStringUntil('\n');
     line.trim();
@@ -465,9 +471,10 @@ void loadUploadBacklog() {
   }
   f.close();
   skip = skip > MAX_UPLOAD_BUFFER ? skip - MAX_UPLOAD_BUFFER : 0;
-  upload_capped += skip;
   f = LittleFS.open(UPLOAD_BACKLOG_PATH, "r");
-  if (!f) return;
+  if (!f) { openFailed(); return; }
+  open_failed = false;
+  upload_capped += skip;
   std::vector<OBDVector> restored;
   while (f.available()) {
     String line = f.readStringUntil('\n');
@@ -483,6 +490,7 @@ void loadUploadBacklog() {
   }
   f.close();
   LittleFS.remove(UPLOAD_BACKLOG_PATH);
+  upload_spilled = 0; // only now: a file that would not open stays parked, so nothing overwrites it
   const int n = (int)restored.size();
   obd_result_vector.insert(obd_result_vector.begin(), std::make_move_iterator(restored.begin()),
     std::make_move_iterator(restored.end()));

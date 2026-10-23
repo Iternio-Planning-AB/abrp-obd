@@ -345,19 +345,42 @@ void bleHandover() {
           utcs().back() == 1791112000 + MAX_UPLOAD_BUFFER && upload_capped == 1,
           "over the cap the oldest parked frame goes, not the trip-end marker");
     upload_capped = 0; obd_result_vector.clear(); LittleFS.files.clear();
+    // Held frames are older than RAM: they are parked too, ahead of it, even with RAM empty.
+    g_upload_held = {frame(0)};
+    spillUploadBacklog();
+    check(g_upload_held.empty() && upload_spilled == 1, "a held frame is parked with an empty queue");
+    loadUploadBacklog();
+    g_upload_held = {frame(0)};
+    obd_result_vector = {frame(1)};
+    spillUploadBacklog();
+    check(g_upload_held.empty() && obd_result_vector.empty() && upload_spilled == 2, "held and queued frames are parked and counted");
+    obd_result_vector = {frame(2)};
+    LittleFS.fail_open = true;
+    loadUploadBacklog();
+    check(upload_spilled == 2 && obd_result_vector.size() == 1, "a parked file that will not open stays parked");
+    loadUploadBacklog();
+    check(events("BACKLOG open failed").size() == 1, "and says so once");
+    LittleFS.fail_open = false;
+    loadUploadBacklog();
+    check(utcs() == parked_then_new, "held, then queued at the spill, then queued since");
+    obd_result_vector.clear(); LittleFS.files.clear();
+    upload_spilled = 1;
+    loadUploadBacklog();
+    check(upload_spilled == 0, "a parked count with no file left is cleared");
     obd_result_vector = {frame(0)};
     spillUploadBacklog();
 #endif
+    g_upload_held = {frame(3)};
     obd_result_vector.push_back(frame(1));
     pushToken({{"tlm_push_token", tlm_push_token}});
-    check(obd_result_vector.size() == 1 && upload_spilled == ENABLE_LOGGING &&
+    check(obd_result_vector.size() == 1 && g_upload_held.size() == 1 && upload_spilled == ENABLE_LOGGING &&
           LittleFS.exists("/upload_backlog.jsonl") == ENABLE_LOGGING, "a re-push for the same vehicle keeps the queue, parked or not");
     const std::string token = tlm_push_token;
     pushToken({{"tlm_push_token", "other-vehicle"}});
-    check(obd_result_vector.empty() && !LittleFS.exists("/upload_backlog.jsonl") && upload_spilled == 0 &&
-          tlm_push_token == "other-vehicle", "a new token drops what was polled under the old one, parked or not");
+    check(obd_result_vector.empty() && g_upload_held.empty() && !LittleFS.exists("/upload_backlog.jsonl") &&
+          upload_spilled == 0 && tlm_push_token == "other-vehicle", "a new token drops what was polled under the old one, parked, held or not");
 #if ENABLE_LOGGING
-    check(events("UPLOAD discarded n=2 reason=token").size() == 1, "and says how much");
+    check(events("UPLOAD discarded n=3 reason=token").size() == 1, "and says how much");
 #endif
     tlm_push_token = token;
 }

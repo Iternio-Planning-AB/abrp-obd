@@ -58,6 +58,7 @@ bool g_ota_active = false, g_logdump_active = false, g_obd_needs_init = false, g
      config_initialized = false;
 std::vector<OBDVector> obd_result_vector;
 unsigned long upload_spilled = 0;
+std::vector<OBDVector> g_upload_held;
 void alarmGrantSetupPermit() {}
 bool alarmEnforced() { return false; }
 
@@ -142,10 +143,12 @@ int main() {
   obd_result_vector = {{{"utc", 1}, {"soc", 50}}};
   LittleFS.files["/upload_backlog.jsonl"] = std::make_shared<std::string>("{}\n");
   upload_spilled = 1;
+  g_upload_held = {{{"utc", 2}, {"soc", 51}}};
   push(profile, "token-g", 19);
   forgetProfile("authclear");
   check(!LittleFS.exists("/vehicle_profile.json") && ble.forgotten && ble.nvs_hash == 0, "a key reset forgets the stored push");
-  check(tlm_push_token.empty() && g_no_profile && obd_result_vector.empty(), "and stops uploading and polling");
+  check(tlm_push_token.empty() && g_no_profile && obd_result_vector.empty() && g_upload_held.empty(),
+        "and stops uploading and polling");
   check(!LittleFS.exists("/upload_backlog.jsonl") && upload_spilled == 0, "and drops the frames parked in the backlog");
   check(!g_config_pending && g_pending_config_str.empty(), "and drops a push still waiting for the loop");
   reboot();
