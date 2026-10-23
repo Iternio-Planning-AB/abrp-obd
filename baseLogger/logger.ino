@@ -1244,10 +1244,14 @@ void loop() {
       // with this one.
       if (pushed_token != tlm_push_token) {
 #if (ENABLE_NETWORK) && ENABLE_LOGGING
-        if (!obd_result_vector.empty() || upload_spilled)
-          logEvent("UPLOAD discarded n=%lu reason=token", obd_result_vector.size() + upload_spilled);
+        if (!obd_result_vector.empty() || !g_upload_held.empty() || upload_spilled)
+          logEvent("UPLOAD discarded n=%lu reason=token",
+            obd_result_vector.size() + g_upload_held.size() + upload_spilled);
         LittleFS.remove(UPLOAD_BACKLOG_PATH); // what a relay session parked there
         upload_spilled = 0;
+#endif
+#if ENABLE_NETWORK
+        g_upload_held.clear();
 #endif
         obd_result_vector.clear();
       }

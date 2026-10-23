@@ -431,13 +431,14 @@ buffered, and its answer decides both: a relayed frame is not queued (the phone 
 frames already queued (failed-POST retries, a slow drain, a restored backlog) are kept while cellular stands
 down. They are not kept in RAM: a queued frame costs about 1 KB of internal heap, Bluedroid about 97 KB, and the
 session's pairing, profile push, OTA and log dump need what is left, so the first relayed poll parks them in the
-backlog file (`spillUploadBacklog`). The first poll after relaying ends puts them back in front of anything
+backlog file (`spillUploadBacklog`), behind any frames held for the next wake (older, so they go first). The
+first poll after relaying ends puts them back in front of anything
 queued since, and the handoff drains them oldest first, at most `UPLOAD_MAX_BATCHES_PER_CYCLE` x
 `MAX_FRAMES_PER_POST` per cycle. Nothing goes up over cellular while frames are parked, so a sleep or an OTA
 reboot in the session saves RAM behind them and the next wake sends them in order; over the cap the load drops
 the oldest. A frame the phone relayed never goes over cellular, including the dongle's own fix (BLE trims
 `lat`/`lon`/`heading`; the phone supplies its own). A profile push with a different (or, after an unreadable
-profile, an unknown) `tlm_push_token` discards the queue and the parked file (`UPLOAD discarded n=…
+profile, an unknown) `tlm_push_token` discards the queue, held frames and the parked file (`UPLOAD discarded n=…
 reason=token`): those frames may be another vehicle's history. The cap drops the oldest frame past
 `MAX_UPLOAD_BUFFER`, logged once per capped stretch (`UPLOAD discarded n=… reason=cap`, at the next accepted
 upload or the backlog save). `BLE relay spilled=` logs the parked count and the heap at the start of each relay
