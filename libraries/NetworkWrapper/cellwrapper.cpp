@@ -173,11 +173,10 @@ bool CellWrapper::connect() {
   // WiFiWrapper::connect (which returns true when https is already connected). The caller now disconnects
   // ONLY after a failed upload, so a healthy session is reused (no per-cycle TLS handshake); a dead session
   // fails once, gets closed, and the next connect() opens a fresh one.
-  m_idle_closed_s = -1;
-  if (net.state() == HTTP_CONNECTED && m_idle_max_ms && millis() - m_last_use_ms > m_idle_max_ms) {
-    m_idle_closed_s = (long)((millis() - m_last_use_ms) / 1000);
+  const unsigned long idle_ms = millis() - m_last_use_ms;
+  m_idle_s = net.state() == HTTP_CONNECTED ? (long)(idle_ms / 1000) : -1;
+  if (m_idle_s >= 0 && m_idle_max_ms && idle_ms > m_idle_max_ms)
     net.close(); // a long-idle session is dead server- or NAT-side; reusing it costs an ~8 s http=0
-  }
   m_reused = net.state() == HTTP_CONNECTED;
   if (m_reused) return true;
   bool ok = net.open(url.c_str(), 443);
@@ -611,9 +610,9 @@ HttpResponse CellWrapper::sendBulk(std::string payload) {
 }
 
 std::string CellWrapper::lastOpenTrace() {
-  if (m_reused) return "reused";
-  if (m_idle_closed_s < 0) return net.openTrace();
-  return "idle=" + std::to_string(m_idle_closed_s) + "s " + net.openTrace();
+  if (m_reused) return "reused idle=" + std::to_string(m_idle_s) + "s";
+  if (m_idle_s < 0) return net.openTrace();
+  return "idle=" + std::to_string(m_idle_s) + "s " + net.openTrace();
 }
 
 long CellWrapper::upForMs() {

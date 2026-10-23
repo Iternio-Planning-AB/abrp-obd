@@ -24,23 +24,28 @@ unsigned long getTransmissionDelay(ActivityState state) {
     delay = 0;
     break;
   case ACTIVE:
-    // 60s upload cadence while driving. The POLL stays at 5s (getPollingDelay below), so a minute's
-    // worth of points - about twelve - is buffered and shipped together. The points themselves are
+    // 50s upload cadence while driving. The POLL stays at 5s (getPollingDelay below), so 50 s worth
+    // of points - about ten - is buffered and shipped together. The points themselves are
     // unchanged: each carries the utc it was captured at, so the server still receives one sample per
     // 5s and the trip reconstructs identically. What changes is DELIVERY, and with it the cost: one
     // TLS session and a handful of POSTs per minute instead of a session every 5s.
     //
     // Was 5s, chosen so each point shipped the moment it was captured. The trade being made here is
-    // freshness of the NEWEST point - up to 60s old on arrival rather than ~0-1s - which is what the
+    // freshness of the NEWEST point - up to 50s old on arrival rather than ~0-1s - which is what the
     // app's "last seen" and live route planning read. Everything already tolerates a gap of this size
     // (an ordinary cell reconnect is longer), but it is the thing to watch if live planning starts
     // looking stale mid-drive.
     //
     // Catch-up after an outage is still uploadBuffered's burst, not this cadence - see
     // UPLOAD_MAX_BATCHES_PER_CYCLE, which had to grow to stay ahead of the new steady-state fill rate.
-    delay = 60000; // 1 minute
+    //
+    // 50 s, not 60 s (#8): the upload fires on the first poll past this delay, so delay + one poll must stay
+    // under the ~60 s at which the cellular path drops the reused session (SESSION_IDLE_MAX_MS). ~20 % more POSTs.
+    delay = 50000;
     break;
   case CHARGING:
+    // Its uploads come with its 60 s poll whatever this says, so each one reopens the session through
+    // SESSION_IDLE_MAX_MS instead of reusing it.
     delay = 60000; // 1 minute
     break;
   case STANDBY:

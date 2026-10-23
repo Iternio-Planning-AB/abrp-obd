@@ -324,10 +324,15 @@
 
 // A kept-alive SH/TLS session idle longer than this is closed and reopened instead of reused. Field log
 // (24-30 Sep): reuse at the normal 60-75 s cadence failed ~4%, but every reuse after >200 s idle failed
-// http=0 after ~8 s (13/13 after a phone session paused uploads, idle 3-34 min). 120 s keeps the normal
-// cadence on the reused session and costs one TLS handshake after any longer pause.
+// http=0 after ~8 s (13/13 after a phone session paused uploads, idle 3-34 min).
+// Field log (#8, Oct): the server keeps an idle session 200 s, but on the cellular path a flow dies at about 60 s
+// (most likely the carrier's NAT). Reused after 59-67 s, 29 of 421 POSTs got the prompt and body ACK and then
+// nothing; under 59 s 1 of 26, same-cycle bursts 0 of 89; the earliest failure was 61.3 s idle at the POST. The
+// 50 s driving cadence keeps normal cycles at 50-57 s when connect() checks this, and the POST follows within
+// 2 s (signing, headers), so 57 s reopens only what could reach the POST past ~59 s: a slow poll, and every
+// CHARGING upload (its poll is 60 s). Below the cadence it would cost a handshake (~5 KB) every cycle.
 #ifndef SESSION_IDLE_MAX_MS
-#define SESSION_IDLE_MAX_MS 120000UL
+#define SESSION_IDLE_MAX_MS 57000UL
 #endif
 
 // How long the clock may go without a real time source before re-acquiring one is worth the cost.
@@ -630,13 +635,13 @@
 // Self-limiting: uploadBuffered stops on the first failed POST, so a dead bearer is never hammered.
 //
 // A CEILING, not a schedule: uploadBuffered stops the moment the buffer is empty, so a normal driving
-// minute fires exactly ONE post (12 samples, one 12-frame batch) whatever this is set to. What it buys is
+// cycle (50 s) fires exactly ONE post (about 10 samples, one batch) whatever this is set to. What it buys is
 // recovery, and 1 would buy none - the drain rate would exactly equal the fill rate, so any backlog would
 // be permanent. Two ordinary events produce one: a failed POST (uploadBuffered stops on the first
 // failure), and a BLE session, during which cellular is suppressed entirely and frames just bank.
 //
-// 3 clears 36 frames a cycle against 12 arriving, so a five-minute phone session drains in about three
-// minutes and a single failed POST is absorbed by the next cycle. Unused budget costs nothing.
+// 3 clears 36 frames a cycle against about 10 arriving, so a five-minute phone session drains in three
+// cycles (2.5 minutes) and a single failed POST is absorbed by the next cycle. Unused budget costs nothing.
 #define UPLOAD_MAX_BATCHES_PER_CYCLE 3
 
 // Minimum GNSS speed (km/h) to emit heading (course-over-ground) on the API payload. A LOW "is it moving"
