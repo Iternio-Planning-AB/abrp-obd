@@ -355,6 +355,20 @@
 #define CLOCK_DRIFT_MIN_SLEEP_S 3600
 #define CLOCK_DRIFT_GAIN 2
 #define CLOCK_DRIFT_MAX_PPM 15000
+
+// Clock sources (clock_sync.h).
+//   REF_ERR_S:        two GNSS records teach the drift rate only if the GNSS time advanced as millis() did, to
+//                     within this. A frozen or replayed record cannot, so it never teaches.
+//   NTP_MIN_INTERVAL: AT+CCLK is the free resync, but on one test SIM it was minutes off, so it never teaches;
+//                     NTP is the non-GNSS teacher. It costs a DNS lookup and a round trip on the data bearer, so it
+//                     only follows an upload while the car is in use, at most once per wake and, unless nothing
+//                     else can set the clock, at most this often (doubling after each failure, to 4x).
+//   NTP_MAX_DISAGREE: NTP is unauthenticated, so with a valid clock it may step it at most this far from this
+//                     wake's AT+CCLK reading (field CCLK error: up to ~3 min), or, without one, this far beyond
+//                     what CLOCK_DRIFT_MAX_PPM over the sleep could explain. A spoofed reply cannot roll it days.
+#define CLOCK_REF_ERR_S 2
+#define CLOCK_NTP_MIN_INTERVAL_S (6 * 3600)
+#define CLOCK_NTP_MAX_DISAGREE_S 600
 #define CLOCK_MAX_EPOCH ((uint64_t)std::numeric_limits<time_t>::max() < UINT32_MAX ? \
                          (uint64_t)std::numeric_limits<time_t>::max() : (uint64_t)UINT32_MAX)
 
