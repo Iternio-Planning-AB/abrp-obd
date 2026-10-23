@@ -811,7 +811,8 @@
 
 
 #ifndef ENABLE_NETWORK
-#define ENABLE_NETWORK ENABLE_CELL || ENABLE_WIFI
+// Parenthesised: bare, `ENABLE_NETWORK && X` in an #if would bind as `CELL || (WIFI && X)`.
+#define ENABLE_NETWORK (ENABLE_CELL || ENABLE_WIFI)
 #endif
 
 #ifndef FILE_TEST
