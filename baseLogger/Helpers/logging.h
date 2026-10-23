@@ -157,6 +157,35 @@ void logEvent(const char* fmt, ...) {
 #endif
 }
 
+// The rest of `DUMP SINCE<text>`: one or more spaces, then a decimal epoch that fits 32 bits, as rtc.getEpoch().
+bool parseSinceEpoch(const char* text, uint32_t& since) {
+  if (*text != ' ') return false;
+  while (*text == ' ') ++text;
+  uint64_t value = 0;
+  const char* digits = text;
+  for (; *text >= '0' && *text <= '9'; ++text) {
+    value = value * 10 + (uint64_t)(*text - '0');
+    if (value > UINT32_MAX) return false;
+  }
+  if (text == digits || *text) return false;
+  since = (uint32_t)value;
+  return true;
+}
+
+// What follows "DUMP": nothing (everything), " <n>" (newest n) or " SINCE <utc>". False means print usage.
+bool parseDumpArgs(const char* args, int& newest, bool& by_time, uint32_t& since) {
+  newest = 0;
+  by_time = false;
+  if (!*args) return true;
+  static const char word[] = "SINCE";
+  by_time = true;
+  for (int i = 0; i < 5; ++i) by_time = by_time && toupper((unsigned char)args[1 + i]) == word[i];
+  if (by_time) return parseSinceEpoch(args + 6, since);
+  // atol (as toInt) is 0 for a typo, and 0 would mean everything: refuse it rather than start a 4-minute stream.
+  newest = (int)atol(args + 1);
+  return newest >= 1;
+}
+
 // Defined in ota_update.h (real or ENABLE_OTA=0 stub), which logger.ino includes after this file -
 // the forward declaration lets the console's OTARESET branch below compile.
 void otaBenchReset();
@@ -167,7 +196,8 @@ void profileSigSelfTest();
 
 void gzipBenchTest(const char* args); // gzip_body.h, included after this file
 
-// Non-blocking-ish serial console for retrieving the flash log: DUMP (stream all; DUMP n = newest n segments), STAT (usage), CLEAR.
+// Non-blocking-ish serial console for retrieving the flash log: DUMP (stream all; DUMP n = newest n segments;
+// DUMP SINCE <utc> = from that time), STAT (usage), CLEAR.
 void handleLogCommands() {
   if (!Serial.available()) return;
   String cmd = Serial.readStringUntil('\n');
@@ -204,13 +234,22 @@ void handleLogCommands() {
   }
 
   if (is_dump) {
-    // toInt() is 0 for a typo, and 0 would mean everything: refuse it rather than start a 4-minute stream.
-    const int newest = cmd.length() > 4 ? cmd.substring(5).toInt() : 0;
-    if (cmd.length() > 4 && newest < 1) { Serial.printf("usage: DUMP [n>=1]\n"); return; }
+    int newest;
+    bool by_time;
+    uint32_t since = 0;
+    // The host capture script keys on "usage: DUMP" to fall back from SINCE to DUMP n on older firmware.
+    if (!parseDumpArgs(cmd.c_str() + 4, newest, by_time, since)) { Serial.printf("usage: DUMP [n>=1 | SINCE <utc>]\n"); return; }
     // Streaming a full log at 115200 baud can exceed WEDGE_WDT_TIMEOUT_S - unsubscribe for the (bench-only,
     // human-attended) dump so the wedge guard can't reset mid-transfer, then re-arm.
     esp_task_wdt_delete(NULL);
-    datalogger.dump(Serial, newest);
+    if (by_time) {
+      const unsigned long started = millis();
+      const DataLogger::SinceStats stats = datalogger.dumpSince(Serial, since);
+      logEvent("DUMP since=%lu start=%d cut=%d sent=%u ms=%lu", (unsigned long)since, stats.start, stats.cut,
+               (unsigned)stats.sent, millis() - started);
+    } else {
+      datalogger.dump(Serial, newest);
+    }
     esp_task_wdt_add(NULL);
   }
   else if (cmd.equalsIgnoreCase("STAT")) datalogger.printStats(Serial);

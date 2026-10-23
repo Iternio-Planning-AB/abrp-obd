@@ -14,8 +14,9 @@ import tempfile
 root = Path(__file__).resolve().parents[1]
 compiler = shlex.split(os.environ.get("CXX", "clang++"))
 parser = argparse.ArgumentParser()
-parser.add_argument("group", nargs="?", default="all", choices=["all", "schema", "logging", "schema-failures", "ble-write", "motion", "fw-build"])
+parser.add_argument("group", nargs="?", default="all", choices=["all", "schema", "logging", "schema-failures", "ble-write", "motion", "fw-build", "dump-since"])
 parser.add_argument("--capture-helper", type=Path)
+parser.add_argument("--since-helper", type=Path, help="capture2.py: compare DUMP SINCE with its SinceFilter")
 arguments = parser.parse_args()
 # The ble-write group tests the summary; this keeps blewrapper.cpp using it. A log or print call that names a
 # raw write buffer (input/value) other than through bleWriteSummary(), or a client key other than through
@@ -37,6 +38,87 @@ if arguments.group in ("all", "fw-build"):
     boot = re.search(r"if \(esp_reset_reason\(\) != ESP_RST_DEEPSLEEP\) logFwBuild\(\);", setup_source)
     if not boot or boot.start() < setup_source.find('logEvent("WAKE '):
         raise AssertionError("setup() must log the build after WAKE on every boot that is not a deep-sleep wake")
+
+
+def synthetic_log(rng):
+    """Random boots in the firmware's line formats, split into small segments that each start with a FW line."""
+    epoch, lines, millis = 1_800_000_000, [], 0
+    for _ in range(rng.randint(3, 12)):
+        cold = rng.random() < 0.4
+        clock_at = rng.choice([0, 1, 2, 3, None]) if cold else 0  # index of the first clocked line; None = never
+        millis = rng.randint(1, 50)
+        utc = lambda i: 0 if clock_at is None or i < clock_at else epoch
+        boot = []
+        if rng.random() < 0.9:
+            boot.append(("EVT", "WAKE reason=timer reset=8"))
+            if cold:
+                boot.append(("EVT", "FW build=v0.0.0 v=0 elf=0 part=app0"))
+        boot += [("ROW", None)] * rng.randint(1, 8)
+        for i, (kind, text) in enumerate(boot):
+            epoch += rng.randint(1, 600) if utc(i) else 0
+            millis += rng.randint(1, 5000)
+            lines.append((kind, text, utc(i), millis))
+        epoch += rng.randint(60, 7200)
+    segments, current, limit = [], [], rng.randint(150, 600)
+    for kind, text, utc, ms in lines:
+        if not current or sum(map(len, current)) > limit:
+            current = [f"EVT,{utc},{ms},ACTIVE,12.00,12.10,FW build=v0.0.0 v=0 elf=0 part=app0\n"]
+            segments.append(current)
+        current.append(f"EVT,{utc},{ms},ACTIVE,12.00,12.10,{text}\n" if kind == "EVT" else f"{ms},{utc},50\n")
+    return ["millis,utc,soc\n" + "".join(segment) for segment in segments]
+
+
+def since_differential(helper_path, executable, environment, build):
+    """DUMP SINCE against capture2.py's SinceFilter on random synthetic logs. Through the host filter, the device's
+    output must equal the filter over DUMP of the segments it read, and lose no data line of a full DUMP; skipped
+    segments can only cost context (a WAKE/FW line from before the start segment) and the clockless boots at the
+    head of the log that the rule keeps for want of an earlier epoch."""
+    import random
+    spec = importlib.util.spec_from_file_location("dongle_capture2", helper_path)
+    helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helper)
+
+    def host(text, since, skipped=False):
+        out = io.StringIO()
+        sf = helper.SinceFilter(since, out)
+        if skipped:  # as the device seeds it: the segments before the start end before since
+            sf.prev_epoch = 0
+        for line in text.split("\n"):
+            if sf.feed_line(line):
+                break
+        return out.getvalue()
+
+    def dump(files):
+        return "".join(f"===== /{name} ({len(body)} bytes) =====\n{body}" for name, body in files) + "===== end of dump =====\n"
+
+    rng, cases = random.Random(76), 0
+    for trial in range(300):
+        segments = synthetic_log(rng)
+        folder = build / f"since-{trial}"
+        folder.mkdir()
+        files = [(f"log{i:04d}.csv", body) for i, body in enumerate(segments)]
+        for name, body in files:
+            (folder / name).write_text(body)
+        epochs = sorted({int(field) for body in segments for line in body.splitlines()
+                         for field in re.findall(r"\b(1\d{9})\b", line)})
+        for since in {0, epochs[-1] + 1, *rng.sample(epochs, min(6, len(epochs)))}:
+            run = subprocess.run([str(executable), "since-dir", str(folder), str(since)], env=environment,
+                                 capture_output=True, text=True, check=True)
+            start = int(re.search(r"start=(-?\d+)", run.stderr).group(1))
+            device, full = host(run.stdout, since), host(dump(files), since)
+            if device != host(dump(files[start:]), since, start > 0):
+                raise AssertionError(f"trial {trial} since {since}: device output differs from SinceFilter over the segments read")
+            # Lines the rule keeps only because no epoch precedes them, at the head of the log, are skipped too.
+            whole = dump(files)
+            clock_starts = re.search(r"^(?:EVT,1\d{9},|\d+,1\d{9},)", whole, re.M).start()
+            lost = [line for line in full.splitlines() if line not in device.splitlines()]
+            if any(not line.startswith(("=====", "millis,utc,")) and "WAKE reason=" not in line and "FW build=" not in line
+                   and whole.find(line + "\n") > clock_starts for line in lost):
+                raise AssertionError(f"trial {trial} since {since}: a skipped segment held kept lines: {lost}")
+            cases += 1
+    print(f"PASS dump-since against SinceFilter ({cases} cases)")
+
+
 with tempfile.TemporaryDirectory(prefix="obd-log-diagnostics-") as temporary:
     build = Path(temporary)
     source = (root / "libraries/DataLogger/datalogger.cpp").read_text()
@@ -79,6 +161,8 @@ with tempfile.TemporaryDirectory(prefix="obd-log-diagnostics-") as temporary:
     environment = dict(os.environ)
     environment["UBSAN_OPTIONS"] = environment.get("UBSAN_OPTIONS", "") + ":halt_on_error=1"
     subprocess.run([str(executable), arguments.group], env=environment, check=True)
+    if arguments.since_helper:
+        since_differential(arguments.since_helper, executable, environment, build)
     if arguments.capture_helper:
         spec = importlib.util.spec_from_file_location("dongle_capture", arguments.capture_helper)
         helper = importlib.util.module_from_spec(spec)

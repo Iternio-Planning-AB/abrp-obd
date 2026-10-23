@@ -8,6 +8,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include "ble_write_summary.h"
 #include "motion_stats.h"
@@ -86,6 +88,7 @@ struct File {
 struct Filesystem {
   std::map<std::string, std::string> files;
   std::set<std::string> failed_reads, failed_appends;
+  std::map<std::string, int> opens; // file opens per path, so a check can prove a segment was never read
   bool mount_ok = true;
   size_t capacity = 8 * 1024 * 1024;
   bool begin(bool) { return mount_ok; }
@@ -106,6 +109,7 @@ struct Filesystem {
       return directory;
     }
     const bool append = std::strcmp(mode, "a") == 0;
+    ++opens[path];
     if ((append ? failed_appends : failed_reads).count(path)) return {};
     if (!append && !exists(path)) return {};
     return File(path, &files[path]);
@@ -513,15 +517,181 @@ void motionChecks() {
   check(m.n == 0 && !motionStatsTake(m, out), "OTA/log-dump bypass windows are not counted");
 }
 
+
+const std::string END_OF_DUMP = "===== end of dump =====\n";
+// DUMP SINCE fixtures: synthetic rows and events in the firmware's line formats (no real log content).
+const std::string SINCE_HEADER = "millis,utc,soc";
+const unsigned long T0 = 1800000000UL;
+std::string sinceRow(unsigned long ms, unsigned long utc) { return std::to_string(ms) + "," + std::to_string(utc) + ",50\n"; }
+std::string sinceEvt(unsigned long utc, unsigned long ms, const std::string& msg) {
+  return "EVT," + std::to_string(utc) + "," + std::to_string(ms) + ",ACTIVE,12.00,12.10," + msg + "\n";
+}
+std::string sinceWake(unsigned long utc, unsigned long ms) { return sinceEvt(utc, ms, "WAKE reason=timer reset=8"); }
+std::string sinceFw(unsigned long utc, unsigned long ms) { return sinceEvt(utc, ms, "FW build=v0.0.0 v=0 elf=0 part=app0"); }
+std::string sincePath(int index) { char path[24]; snprintf(path, sizeof(path), "/log%04d.csv", index); return path; }
+void sinceSegments(const std::vector<std::string>& bodies) {
+  LittleFS = Filesystem{};
+  for (size_t i = 0; i < bodies.size(); ++i) LittleFS.files[sincePath(i)] = SINCE_HEADER + "\n" + bodies[i];
+}
+std::string sinceHead(int index) {
+  const std::string& file = LittleFS.files.at(sincePath(index));
+  return "===== " + sincePath(index) + " (" + std::to_string(file.size()) + " bytes) =====\n" + SINCE_HEADER + "\n";
+}
+std::string sinceWhole(int index) { return sinceHead(index) + LittleFS.files.at(sincePath(index)).substr(SINCE_HEADER.size() + 1); }
+std::string runSince(uint32_t since, DataLogger::SinceStats* stats = nullptr) {
+  DataLogger logger;
+  check(logger.begin(SINCE_HEADER), "since fixture mounts");
+  LittleFS.opens.clear();
+  Stream out;
+  const DataLogger::SinceStats result = logger.dumpSince(out, since);
+  if (stats) *stats = result;
+  check(result.sent + END_OF_DUMP.size() == out.bytes.size(), "sent counts every streamed byte but the end marker");
+  return out.bytes;
+}
+
+void dumpSinceChecks() {
+  // Two clocked boots over four segments; every new segment starts with its FW line.
+  const std::vector<std::string> clocked = {
+    sinceWake(T0, 10) + sinceRow(20, T0 + 10) + sinceRow(30, T0 + 20),
+    sinceFw(T0 + 30, 40) + sinceRow(50, T0 + 100),
+    sinceWake(T0 + 1000, 10) + sinceFw(T0 + 1000, 15) + sinceRow(20, T0 + 1010) + sinceRow(30, T0 + 1020),
+    sinceFw(T0 + 1030, 40) + sinceRow(50, T0 + 1100)};
+  sinceSegments(clocked);
+  std::string full;
+  { DataLogger logger; check(logger.begin(SINCE_HEADER), "since fixture mounts"); Stream out; logger.dump(out); full = out.bytes; }
+  check(full == sinceWhole(0) + sinceWhole(1) + sinceWhole(2) + sinceWhole(3) + END_OF_DUMP,
+        "DUMP is every segment, header then bytes, then the end marker");
+  check(runSince(0) == full && runSince(T0) == full, "a since older than everything streams exactly what DUMP does");
+
+  DataLogger::SinceStats stats;
+  check(runSince(T0 + 1015, &stats) == sinceHead(1) + sinceHead(2) + sinceWake(T0 + 1000, 10) + sinceFw(T0 + 1000, 15) +
+            sinceRow(30, T0 + 1020) + sinceWhole(3) + END_OF_DUMP,
+        "mid-boot since: the start segment is announced, the boot's WAKE/FW lines come ahead of its first kept line");
+  check(stats.start == 1 && stats.cut == 2, "the start is the newest segment ending before since");
+  check(LittleFS.opens["/log0000.csv"] == 0, "a segment older than the start segment is never opened");
+
+  check(runSince(T0 + 5000, &stats) == sinceHead(3) + END_OF_DUMP && stats.cut == -1 && stats.start == 3,
+        "a since newer than everything prints the newest header and the end marker only");
+  check(LittleFS.opens["/log0000.csv"] + LittleFS.opens["/log0001.csv"] + LittleFS.opens["/log0002.csv"] == 0,
+        "a since newer than everything reads only the newest segment");
+
+  // A boot spanning a segment boundary: its context lines come from the earlier segment, under its header.
+  check(runSince(T0 + 50) == sinceHead(0) + sinceWake(T0, 10) + sinceHead(1) + sinceFw(T0 + 30, 40) +
+            sinceRow(50, T0 + 100) + sinceWhole(2) + sinceWhole(3) + END_OF_DUMP,
+        "segment rollover: context from both segments of the boot, each under its own header");
+
+  // A cold boot: clockless lines (utc 0) take the boot's first real epoch, even one in the next segment.
+  sinceSegments({
+    sinceWake(T0, 10) + sinceRow(20, T0 + 10),
+    sinceFw(0, 5) + sinceWake(0, 60) + sinceRow(70, 0),
+    sinceFw(0, 80) + sinceRow(90, T0 + 2000) + sinceRow(100, T0 + 3500)});
+  check(runSince(T0 + 1000) == sinceHead(0) + sinceHead(1) + sinceWake(0, 60) + sinceRow(70, 0) + sinceWhole(2) + END_OF_DUMP,
+        "clockless lines before the boot's first epoch are kept with it, across a segment boundary");
+  check(runSince(T0 + 3000) == sinceHead(0) + sinceHead(1) + sinceWake(0, 60) + sinceHead(2) + sinceFw(0, 80) +
+            sinceRow(100, T0 + 3500) + END_OF_DUMP,
+        "clockless lines take the boot's first epoch, so a later since drops them but keeps them as context");
+
+  // A boot that never gets a clock takes the epoch before it; with none before it, it is kept.
+  sinceSegments({sinceWake(T0, 10) + sinceRow(20, T0 + 10) + sinceWake(0, 5) + sinceRow(15, 0) +
+                 sinceWake(T0 + 500, 5) + sinceRow(15, T0 + 510)});
+  check(runSince(T0 + 505) == sinceHead(0) + sinceWake(T0 + 500, 5) + sinceRow(15, T0 + 510) + END_OF_DUMP,
+        "a clockless boot after an older epoch is dropped");
+  check(runSince(T0 + 5) == sinceHead(0) + sinceWake(T0, 10) + sinceRow(20, T0 + 10) + sinceWake(0, 5) + sinceRow(15, 0) +
+            sinceWake(T0 + 500, 5) + sinceRow(15, T0 + 510) + END_OF_DUMP,
+        "a clockless boot after a kept epoch is kept");
+  sinceSegments({sinceWake(0, 5) + sinceRow(15, 0), sinceWake(T0, 5) + sinceRow(15, T0 + 10)});
+  check(runSince(T0 + 5) == sinceWhole(0) + sinceWhole(1) + END_OF_DUMP, "a clockless boot with no epoch before it is kept");
+
+  sinceSegments({sinceWake(0, 5) + sinceRow(15, 0)});
+  check(runSince(T0) == sinceWhole(0) + END_OF_DUMP, "a log that never had a clock is kept whole");
+  // A tail longer than the 512 bytes read: its torn first line is skipped, its last epoch still found.
+  std::string longTail = sinceWake(T0, 10);
+  for (unsigned long ms = 20; longTail.size() < 1500; ms += 10) longTail += sinceRow(ms, T0 + ms);
+  sinceSegments({longTail, sinceWake(T0 + 5000, 5) + sinceRow(15, T0 + 5010)});
+  check(runSince(T0 + 4000, &stats) == sinceHead(0) + sinceWhole(1) + END_OF_DUMP && stats.start == 0,
+        "a long segment's tail epoch is read from its last 512 bytes");
+
+  // A boot boundary is also a millis drop with no WAKE line, here at a segment edge.
+  sinceSegments({sinceWake(T0, 10) + sinceRow(1000, T0 + 10), sinceRow(5, 0) + sinceRow(15, T0 + 100)});
+  check(runSince(T0 + 50) == sinceHead(0) + sinceHead(1) + sinceRow(5, 0) + sinceRow(15, T0 + 100) + END_OF_DUMP,
+        "a millis drop starts a boot, so its clockless lines take the new boot's epoch");
+
+  // Past skipped segments there is an epoch before since, so a clockless boot opening the start segment is dropped.
+  sinceSegments({sinceWake(T0, 10) + sinceRow(20, T0 + 10),
+                 sinceWake(0, 5) + sinceRow(15, 0) + sinceWake(T0 + 100, 5) + sinceRow(15, T0 + 110),
+                 sinceWake(T0 + 500, 5) + sinceRow(15, T0 + 510)});
+  check(runSince(T0 + 200, &stats) == sinceHead(1) + sinceWhole(2) + END_OF_DUMP && stats.start == 1 &&
+            LittleFS.opens["/log0000.csv"] == 0,
+        "a clockless boot after skipped segments takes their older epoch");
+
+  // A segment whose tail has no epoch is not a start candidate: the walk goes on to an older one.
+  sinceSegments({sinceWake(T0, 10) + sinceRow(20, T0 + 10), sinceWake(0, 5) + sinceRow(15, 0)});
+  check(runSince(T0 + 150, &stats) == sinceHead(0) + END_OF_DUMP && stats.start == 0 && stats.cut == -1,
+        "a clockless tail keeps the walk going, and that clockless boot takes the older epoch");
+  // Lines are times only in the two formats SinceFilter matches; an overlong utc is still a real epoch.
+  sinceSegments({sinceWake(T0, 10) + sinceRow(20, T0 + 10) + "EVT,1800000200,30,ACTIVE\n"});
+  check(runSince(T0 + 150) == sinceHead(0) + END_OF_DUMP, "an EVT line with too few fields is not a time");
+  sinceSegments({sinceWake(T0, 10) + sinceRow(20, T0 + 10) + "30,99999999999999999999999,x\n"});
+  check(runSince(T0 + 150) == sinceHead(0) + sinceWake(T0, 10) + "30,99999999999999999999999,x\n" + END_OF_DUMP,
+        "a utc too long for 64 bits saturates and counts as a real epoch, as Python's int does");
+
+  // Streaming closes and reopens the append handle: logging continues in the newest segment afterwards.
+  sinceSegments(clocked);
+  {
+    DataLogger logger;
+    check(logger.begin(SINCE_HEADER), "since fixture mounts");
+    Stream out;
+    logger.dumpSince(out, T0 + 1015);
+    check(logger.writeLine("tail") && LittleFS.files.at("/log0003.csv").size() >= 5 &&
+              LittleFS.files.at("/log0003.csv").substr(LittleFS.files.at("/log0003.csv").size() - 5) == "tail\n",
+          "logging resumes in the active segment after DUMP SINCE");
+    DataLogger unmounted;
+    Stream none;
+    unmounted.dumpSince(none, 0);
+    check(none.bytes == "[log] not mounted\n", "an unmounted log says so, as DUMP does");
+  }
+
+  int newest = -1;
+  bool by_time = true;
+  uint32_t since = 7;
+  check(parseDumpArgs("", newest, by_time, since) && newest == 0 && !by_time, "DUMP is everything");
+  check(parseDumpArgs(" 3", newest, by_time, since) && newest == 3 && !by_time, "DUMP 3 is the newest three");
+  check(parseDumpArgs(" since 5", newest, by_time, since) && by_time && since == 5, "dump since 5, any case");
+  for (const char* bad : {" 0", " x", " SINCEX 5", " SINCE", " SINCE 5x"})
+    check(!parseDumpArgs(bad, newest, by_time, since), std::string("DUMP refuses '") + bad + "'");
+  check(parseSinceEpoch(" 0", since) && since == 0, "SINCE 0 parses");
+  check(parseSinceEpoch("  1800000000", since) && since == 1800000000UL, "SINCE <epoch> parses");
+  check(parseSinceEpoch(" 4294967295", since) && since == 4294967295UL, "the largest 32-bit epoch parses");
+  for (const char* bad : {"", " ", "1800000000", " 4294967296", " 18000000000", " 12x", " -1", " 1 2", "X 5"})
+    check(!parseSinceEpoch(bad, since), std::string("SINCE refuses '") + bad + "'");
+  LittleFS = Filesystem{};
+}
+
 int main(int argc, char** argv) {
   const std::string group = argc > 1 ? argv[1] : "all";
   if (group == "dump") { emitDump(); return 0; }
+  if (group == "since-dir" && argc == 4) { // DUMP SINCE over the segments in a directory, for --since-helper
+    LittleFS = Filesystem{};
+    for (const auto& entry : std::filesystem::directory_iterator(argv[2])) {
+      std::ifstream file(entry.path(), std::ios::binary);
+      LittleFS.files["/" + entry.path().filename().string()] = std::string(std::istreambuf_iterator<char>(file), {});
+    }
+    DataLogger logger;
+    check(logger.begin(SINCE_HEADER), "since-dir mounts");
+    Serial.bytes.clear();
+    Stream out;
+    const DataLogger::SinceStats stats = logger.dumpSince(out, (uint32_t)std::stoul(argv[3]));
+    std::cout << out.bytes;
+    std::cerr << "start=" << stats.start << "\n";
+    return 0;
+  }
   check(group == "all" || group == "schema" || group == "logging" || group == "schema-failures" || group == "ble-write" ||
-        group == "motion" || group == "fw-build", "known group");
+        group == "motion" || group == "fw-build" || group == "dump-since", "known group");
   if (group == "all" || group == "schema") { schemaChecks(); std::cout << "PASS schema\n"; }
   if (group == "all" || group == "logging") { loggingChecks(); std::cout << "PASS logging\n"; }
   if (group == "all" || group == "schema-failures") { schemaFailureChecks(); std::cout << "PASS schema-failures\n"; }
   if (group == "all" || group == "ble-write") { bleWriteChecks(); std::cout << "PASS ble-write\n"; }
   if (group == "all" || group == "motion") { motionChecks(); std::cout << "PASS motion\n"; }
   if (group == "all" || group == "fw-build") { fwBuildChecks(); std::cout << "PASS fw-build\n"; }
+  if (group == "all" || group == "dump-since") { dumpSinceChecks(); std::cout << "PASS dump-since\n"; }
 }

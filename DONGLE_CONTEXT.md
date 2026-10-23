@@ -236,6 +236,7 @@ streams it over BLE.
 ## 5. Log retrieval (ABD7)
 
 - App-driven pull; the dongle never streams unprompted.
+- Over USB serial the same log comes from `DUMP`, `DUMP n` or `DUMP SINCE <utc>` (§9).
 - `{"LOGDUMP":"START"}` → size/chunk/window header; `{"LOGDUMP":<offset>}` → a window of binary
   chunks then `{"eow","eof"}`; `{"LOGDUMP":"END"}`.
 - Frame: `[0xD7][u32 offset LE][payload]` — the magic byte disambiguates chunks from the JSON
@@ -703,6 +704,16 @@ session.
   unplugging the dongle from the car. A full dump takes about 4 minutes; `DUMP n` streams only the
   newest `n` segments (about 25 s each), and `DUMP 3` usually covers the last drive. It is genuinely "the tool that made every other bug in this
   project findable".
+- **`DUMP SINCE <utc>`** streams from the first line the host capture script's `--since` rule keeps, so the
+  part after a drive no longer costs the segments already analysed (`DataLogger::dumpSince`). The rule: a line's
+  time is its utc when that is >= 1e9; a clockless line takes its boot's first real epoch, a never-clocked boot the
+  epoch before it; a boot starts at `WAKE reason=` or a millis drop; the boot's `WAKE`/`FW build=` lines and the
+  segment's header come ahead of its first kept line. The device finds only that first line and then streams
+  verbatim, as `DUMP` does; the host filter trims the rest. It reads the last 512 bytes of each segment, newest
+  first, and starts at the newest one whose last epoch is before `<utc>`, printing its header straight away (the
+  capture script waits 3 s for a header before falling back to `DUMP n`). Older segments are never opened, so a
+  clock that steps backwards across segments, a boot's `WAKE` in a skipped segment, and clockless boots or
+  pattern-less lines at the very head of the log are the known differences from filtering a full `DUMP`.
 - **Clock lines.** The board has no 32 kHz crystal, so deep sleep keeps time on the internal RC, which runs
   ~0.6 % fast. Each wake takes that back at a learned rate; after each deep-sleep `WAKE`, `CLOCK wake slept <s>,
   adjusted <ms> at <ppm>` says what that wake corrected. `CLOCK drift <raw> raw, <residual> residual over <s>

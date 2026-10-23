@@ -36,6 +36,10 @@ public:
 
   // Serial maintenance/retrieval helpers (flash logs need an explicit way off the device).
   void dump(Stream& out, int newest = 0);  // stream segments oldest -> newest; newest > 0 keeps only the last N
+  // DUMP SINCE: stream from the first line the host capture script keeps for `since` (the rule is above
+  // dumpSince in datalogger.cpp). Segments that end before `since` are not read.
+  struct SinceStats { int start = -1; int cut = -1; size_t sent = 0; }; // segment indexes; -1 = none
+  SinceStats dumpSince(Stream& out, uint32_t since);
   void clearAll();         // delete all segments and start fresh
   void printStats(Stream& out);
 

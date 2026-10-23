@@ -307,6 +307,7 @@ USB only: physical access by design. Type these into the serial monitor (115200 
 |---|---|
 | `DUMP` | Stream the entire flash log over serial (about 2.7 MB, roughly 4 minutes). Each segment starts with an `FW build=…` line naming the firmware that wrote it. |
 | `DUMP n` | Stream only the newest `n` log segments (about 256 KB each, roughly 25 s apiece); `DUMP 3` usually covers the last drive. |
+| `DUMP SINCE <utc>` | Stream only the log from `<utc>` (epoch seconds) on: segments that end before it are skipped, and the first one read is announced at once. A boot's clockless lines (before the clock was set) go with that boot's first time, and the boot's `WAKE` and `FW build=` lines and each segment's header come along for context. Ends with the same end marker, also when nothing matched, and logs `DUMP since=… start=… cut=… sent=… ms=…`. |
 | `STAT` | Log storage usage. |
 | `CLEAR` | Erase the flash log. |
 | `RADIO` | Dump the cellular modem's persisted radio configuration. |
