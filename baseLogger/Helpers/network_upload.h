@@ -63,6 +63,7 @@ const char* uploadErrorCategory(const std::string& body) {
   if (uploadErrorContains(body, "<html") || uploadErrorContains(body, "<!doctype")) return "html";
   if (const char* gzip = uploadGzipCategory(body)) return gzip;
   if (uploadErrorContains(body, "unauthorized") || uploadErrorContains(body, "forbidden")) return "auth";
+  if (uploadErrorContains(body, "too old")) return "too_old";
   if (uploadErrorContains(body, "validation")) return "validation";
   return "other";
 }
@@ -279,6 +280,28 @@ bool logNetwork(const std::vector<OBDVector>& frames) {
   return logNetworkAt(frames, uploadSendUtc());
 }
 
+// Frames past BACKLOG_MAX_SEND_AGE_SECONDS are dropped (config.h); only on a trusted send clock, without which there
+// is no age. Judges the utc bulkStringV2 sends, the last one.
+static unsigned dropAgedFrames(double send_utc) {
+  if (!send_utc) return 0;
+  unsigned n = 0;
+  unsigned long first = 0, last = 0;
+  auto aged = [&](const OBDVector& frame) {
+    double utc = 0;
+    for (const auto& res : frame) if (res.first == "utc") utc = res.second;
+    if (!std::isfinite(utc) || utc <= 0 || send_utc - utc <= BACKLOG_MAX_SEND_AGE_SECONDS) return false;
+    if (!n++ || (unsigned long)utc < first) first = (unsigned long)utc;
+    if ((unsigned long)utc > last) last = (unsigned long)utc;
+    return true;
+  };
+  obd_result_vector.erase(std::remove_if(obd_result_vector.begin(), obd_result_vector.end(), aged),
+    obd_result_vector.end());
+#if ENABLE_LOGGING
+  if (n) logEvent("UPLOAD dropped n=%u reason=age sutc=%lu..%lu now=%lu", n, first, last, (unsigned long)send_utc);
+#endif
+  return n;
+}
+
 // Upload the RAM buffer in bounded batches (<= MAX_FRAMES_PER_POST per POST) so a backlog can't build a
 // giant, timeout-prone payload. Sent frames are erased on success. Assumes the link is already connected
 // (caller does network.connect()/disconnect()). Stops on the first failed POST (never hammers a dead link).
@@ -292,11 +315,16 @@ bool logNetwork(const std::vector<OBDVector>& frames) {
 //                before deep sleep wipes RAM). Returns true if every attempted POST succeeded.
 bool uploadBuffered(bool drain) {
   if (upload_spilled) return true; // older frames are parked in flash; these wait behind them for the next wake
-  bool ok = true;
+  bool ok = true, attempted = false;
   int batches = 0;
   while (!obd_result_vector.empty()) {
     esp_task_wdt_reset(); // a full drain (pre-sleep flush of a big backlog) is many sequential POSTs, each
                           // up to ~22s - legitimate, so feed per batch; a wedge INSIDE one POST still trips
+    const double send_utc = uploadSendUtc();
+    if (dropAgedFrames(send_utc) && obd_result_vector.empty()) {
+      if (!attempted) g_last_status = "ok_aged"; // no batch this call: not the last call's status
+      break;
+    }
     // After a connection-level failure, probe with a SMALL batch: in the field each retry grew the payload
     // (2->5->8->11->14->17 frames, ~4.5KB) with every POST timing out 15-22s - retrying BIGGER exactly when
     // the link is weakest. A ~800B probe has far better odds; once it succeeds the streak resets and the
@@ -305,7 +333,6 @@ bool uploadBuffered(bool drain) {
     size_t n = obd_result_vector.size();
     if (n > cap) n = cap;
     std::vector<OBDVector> batch(obd_result_vector.begin(), obd_result_vector.begin() + n);
-    const double send_utc = uploadSendUtc();
 #if ENABLE_CELL
     // Enforce the modem's per-POST body ceiling in BYTES, not frames: the SIM7070 session is configured
     // with SHCONF BODYLEN=1024 (its hard maximum), and an oversized body makes the POST undeliverable.
@@ -364,6 +391,7 @@ bool uploadBuffered(bool drain) {
     logEvent("UPLOAD try frames=%d free=%lu maxblock=%lu ble=%d", (int)n,
       (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getMaxAllocHeap(), g_ble_up ? 1 : 0);
 #endif
+    attempted = true;
     if (!logNetworkAt(batch, send_utc)) { ok = false; break; }
     obd_result_vector.erase(obd_result_vector.begin(), obd_result_vector.begin() + n);
     if (!drain && ++batches >= UPLOAD_MAX_BATCHES_PER_CYCLE) break; // bounded burst; drain=true is unlimited

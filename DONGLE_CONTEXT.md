@@ -415,7 +415,7 @@ every other boot (power-on, OTA, rollback, watchdog, panic) clears them, costing
 depending on another image's RTC layout. The poll gate asks the same question against the marks as of the
 newest buffered frame (`g_geo_queued`; after a backlog restore it is recomputed over the restored frames at the first poll with a
 trusted clock, since the restore itself runs before NITZ/NTP), so a geo-only
-poll is buffered once while its fix is unsent, not once per poll, and not at all once accepted. Frames and the backlog are untouched, so rolling back to
+poll is buffered once while its fix is unsent, not once per poll, and not at all once accepted. Send-once leaves frames and the backlog untouched, so rolling back to
 older firmware just resends as before. There is deliberately no periodic refresh: a parked car whose spot
 the backend has aged out stays off the map until it relocates, drives or reboots. A 200 whose location the
 backend silently dropped counts as sent until then too. `UPLOAD body` logs `loc=` (locations in the body) and
@@ -437,6 +437,15 @@ reason=token`): those frames may be another vehicle's history. The cap drops the
 `MAX_UPLOAD_BUFFER`, logged once per capped stretch (`UPLOAD discarded n=… reason=cap`, at the next accepted
 upload or the backlog save). `BLE relay spilled=` logs the parked count and the heap at the start of each relay
 stretch.
+
+**A frame older than 6 days is dropped from the queue** (#67). Parked history that old is worth little next to the
+frames queued behind it, and the server answers 400 for the whole POST if any point in it is older than 30 days, so
+one such frame would otherwise fail every retry of its batch. `uploadBuffered` judges each frame's `utc` against the
+batch's trusted send clock before sizing, drops those past `BACKLOG_MAX_SEND_AGE_SECONDS` (inclusive; geo keeps its
+own 29-day bound) and logs `UPLOAD dropped n=… reason=age sutc=first..last now=<send clock>`. A restored backlog
+goes through the same check. An untrusted clock drops nothing. A trusted clock wrongly stepped 6 days or more
+forward (bad NITZ/NTP, spoofed GNSS) drops the queue stamped before it; accepted, as unlikely, and the data is
+useful only fresh. A 400 for a point past the server's 30 days logs `err=too_old`.
 
 **Where the PID list / vehicle profile comes from:** the app fetches it from the ABRP backend by
 `typecode` (`getObdBlePids`), gets back `{ obdPids, jws }`, and pushes it to the dongle over ABD2.
@@ -523,6 +532,9 @@ bounded by `MAX_UPLOAD_BUFFER` (the oldest go first).
 | Passive listener on the cellular path | TLS only | nothing |
 | Active MITM with any certificate under the bundled roots (name and dates are not checked) | uploads: positions, battery, the api key, keyid, signatures | read; replay an exact earlier request, at any later time (no `created`); swallow uploads by answering 200, so the frames are dropped; not forge a new request or learn the token |
 | On-path network, DNS spoofer or NTP pool member (no certificate) | NTP replies | step the clock when NTP is asked and GPS is stale (only on a wake already uploading, at most once per wake): with a valid clock at most `CLOCK_NTP_MAX_DISAGREE_S` from this wake's AT+CCLK reading, or without one, beyond what `CLOCK_DRIFT_MAX_PPM` over the sleep explains; with no valid clock, freely (it is the fallback). It can nudge the drift rate within `CLOCK_DRIFT_MAX_PPM`, kept in NVS across a re-plug and halved toward the truth by each honest window after. The HTTP `Date` header is not read on cellular. It cannot roll a valid clock back days to defeat the send-time geo expiry |
+
+| Active MITM with any certificate under the bundled roots (name and dates are not checked) | uploads: positions, battery, the api key, keyid, signatures | read; replay an exact earlier request, at any later time (no `created`); swallow uploads by answering 200, so the frames are dropped; set the clock through unauthenticated NTP when a resync runs and GPS is stale (pre-existing; the HTTP `Date` header is not read on cellular), and if that resync ends an hour or more of sleep it also teaches a skewed drift rate (bounded by `CLOCK_DRIFT_MAX_PPM`, kept in NVS across a re-plug, halved toward the truth by each honest window after); not forge a new request or learn the token |
+| Anyone who can set the clock (GNSS in radio range, NTP on the path, a fake cell's NITZ); no certificate needed | — | step the clock 6 days or more forward so queued frames are dropped as too old (`UPLOAD dropped … now=`; the flash log keeps them) |
 | Anyone with the token | — | post as the car. The token reaches the dongle over BLE at pairing (ABD2 profile push; LESC Just Works: encrypted, not MITM-authenticated) and is held by the phone app; cellular signing does not change either |
 
 This assumes a high-entropy token (a UUIDv4, ~122 random bits): the keyid is an unsalted SHA-256 prefix

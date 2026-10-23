@@ -306,8 +306,9 @@ provenance/calendar acceptance is not narrowed by this wire-only eligibility bou
 
 Eligible location and heading retain their independent original observation UTC. Filtering never
 rewrites source frames or failed-send backlog provenance. Eligible battery/state retain original
-frame UTC, with stale-battery handling unchanged. Geo-only omitted batches keep the successful
-no-POST rule. Future-relative-to-corrected-send-clock normalization remains the backend's existing
+frame UTC; on a trusted send clock `uploadBuffered` drops a frame whose own UTC is more than
+`BACKLOG_MAX_SEND_AGE_SECONDS` (6 days, inclusive) old before sizing (upload group `queue`). Geo-only
+omitted batches keep the successful no-POST rule. Future-relative-to-corrected-send-clock normalization remains the backend's existing
 policy. Both host runners extract the production clock-quality predicates instead of faking them;
 UART, clocks, compression, and filesystems remain fakes. Real RTC retention, clock acquisition,
 modem timing, on-device gzip and hardware remain unverified; no device was flashed by these checks.
