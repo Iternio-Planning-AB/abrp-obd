@@ -160,9 +160,10 @@ void resetFixture() {
   g_gps_powered = is_currently_parked = frozen_valid = false;
   frozen_lat = frozen_lon = 0;
   gps_anchor_date = gps_anchor_time = 0;
-  gps_anchor_ms = gps_run_ms = 0;
+  gps_anchor_ms = gps_run_ms = gps_alt_ref_ms = 0;
+  gps_alt_ref = 0;
   gps_run_last = GPS_DATA{};
-  gps_run_n = 0;
+  gps_run_n = gps_unconfirmed_n = 0;
   gps_fix_date = gps_fix_time = gps_fix_seq = 0;
   gps_fix_changed_ms = park_last_ts = 0;
   park_acc_lat = park_acc_lon = 0;
@@ -175,11 +176,30 @@ void resetFixture() {
   g_last_status.clear();
 }
 
-GPS_DATA acceptLink(const std::string& reply, const std::string& label) {
+bool readLink(const std::string& reply) {
   sys.link = &link;
   link.response = reply;
+  return pollGpsData();
+}
+
+// The wake's first fix is held until a second fresh fix agrees, so a check about something else first sends
+// the same fix one receiver unit earlier. The first-fix rule itself is checked in gps-jump with readLink().
+void confirmFirstFix(const std::string reply, const std::string& label) {
+  if (gpsJumpAnchor(gpsData.lat, gpsData.lng) || reply.rfind("$GNIFO,", 0) != 0) return;
+  std::vector<std::string> fields;
+  std::stringstream stream(reply.substr(7));
+  for (std::string field; std::getline(stream, field, ',');) fields.push_back(field);
+  if (fields.size() < 4 || !gpsJumpAnchor(std::atol(fields[2].c_str()) / 1e6f, std::atol(fields[3].c_str()) / 1e6f))
+    return;
+  std::string echo = "$GNIFO," + fields[0] + "," + std::to_string(std::atol(fields[1].c_str()) - 1);
+  for (size_t i = 2; i < fields.size(); ++i) echo += "," + fields[i];
+  check(!readLink(echo) && sys.gpsReadDiagnostics().result == GPSReadResult::Unconfirmed, label + ": first fix held");
+}
+
+GPS_DATA acceptLink(const std::string& reply, const std::string& label) {
+  confirmFirstFix(reply, label);
   const unsigned commandCalls = link.commandCalls;
-  check(pollGpsData(), label + " accepted");
+  check(readLink(reply), label + " accepted");
   check(link.commandCalls == commandCalls + 1, label + " sends only one ATGPS request");
   return *gd;
 }
@@ -219,8 +239,9 @@ uint16_t linkHeading(const std::string& raw) {
   gpsData = GPS_DATA{};
   gpsData.heading = 123;
   sys.link = &link;
-  link.response = "$GNIFO,41026,110757,59329000,18068000,2500,2000," + raw + ",12,7\r";
-  check(pollGpsData(), "numeric reply retains position");
+  const std::string reply = "$GNIFO,41026,110757,59329000,18068000,2500,2000," + raw + ",12,7\r";
+  confirmFirstFix(reply, "heading " + raw);
+  check(readLink(reply), "numeric reply retains position");
   check(gpsData.sat == 12 && gpsData.hdop == 7, "fields after course retained");
   return gpsData.heading;
 }
@@ -643,11 +664,12 @@ void gpsRelocate() {
   check(frozen_valid && std::string(gpsLocationSource()) == "frozen", "cold-boot average becomes the frozen spot");
 }
 
-// A moving GNIFO record `second` receiver seconds after 11:10:00, coordinates in 1e6 units.
-std::string jumpFix(int second, long lat, long lng) {
+// A GNIFO record `second` receiver seconds after 11:10:00: coordinates in 1e6 units, altitude in cm, then
+// speed, course, satellites and HDOP. The default is a good moving fix.
+std::string jumpFix(int second, long lat, long lng, long alt = 2500, const std::string& rest = "2000,9000,12,7") {
   const int t = 11100000 + second / 60 * 10000 + second % 60 * 100;
-  return "$GNIFO,41026," + std::to_string(t) + "," + std::to_string(lat) + "," + std::to_string(lng) +
-         ",2500,2000,9000,12,7\r";
+  return "$GNIFO,41026," + std::to_string(t) + "," + std::to_string(lat) + "," + std::to_string(lng) + "," +
+         std::to_string(alt) + "," + rest + "\r";
 }
 
 int jumpReanchors = 0;
@@ -658,9 +680,9 @@ GPS_DATA jumpAccept(const std::string& reply, const std::string& label) {
   return fix;
 }
 
-void jumpReject(const std::string& reply, const GPS_DATA& lastGood, const std::string& label) {
+void jumpReject(const std::string& reply, const GPS_DATA& lastGood, const std::string& label, int8_t field = -1) {
   rejectLink(reply, lastGood, label);
-  checkDiagnostics(GPSReadResult::CoordinateRejected, reply.size(), -1, label);
+  checkDiagnostics(GPSReadResult::CoordinateRejected, reply.size(), field, label);
   check(!sys.gpsReadDiagnostics().reanchored, label + " does not re-anchor");
 }
 
@@ -742,6 +764,100 @@ void gpsJump() {
     jumpReject(jumpFix(5 * k, 55738990, lng), last, "spike consistent with the first");
   }
   check(jumpReanchors == 0, "an accepted fix restarts the re-anchor run");
+
+  // #59: after a fix loss, two fresh fixes at ~181 km/h, HDOP 255, horizontally plausible from the anchor and
+  // from each other, but far off vertically. Altitude is the only thing that gives them away.
+  const std::string bogus = "9773,9000,5,255";
+  fresh();
+  last = jumpAccept(jumpFix(0, 59330000, lng), "crawl anchor");
+  fake_ms += 90000;
+  jumpReject(jumpFix(90, 59348000, lng, 2500 + 240000, bogus), last, "bogus fix after a loss", 4);
+  fake_ms += 7000;
+  jumpReject(jumpFix(97, 59351400, lng, 2500 + 300000, "9759,9000,6,255"), last, "second bogus fix", 4);
+  fake_ms += 5000;
+  jumpReject(jumpFix(102, 59354800, lng, 2500 + 368000, "9760,9000,6,255"), last, "third bogus fix", 4);
+  fake_ms += 5000;
+  jumpAccept(jumpFix(107, 59330000 + step, lng), "good fix after the bogus run");
+  check(jumpReanchors == 0, "a run that is consistent only horizontally never re-anchors");
+
+  fresh();
+  last = jumpAccept(jumpFix(0, 59330000, lng), "anchor before a long loss");
+  fake_ms += 600000;
+  jumpReject(jumpFix(600, 59348000, lng, 2500 + 240000, bogus), last, "bogus fix after 10 min", 4);
+
+  fresh();
+  jumpAccept(jumpFix(0, 59330000, lng), "garage anchor");
+  fake_ms += 300000;
+  jumpAccept(jumpFix(300, 59340000, lng, 2500 + 130000), "fresh fix 1300 m higher after a 5-minute climb");
+  fake_ms += 5000;
+  last = jumpAccept(jumpFix(305, 59340000 + step, lng, 0), "2D fix reporting altitude 0");
+  fake_ms += 5000;
+  jumpReject(jumpFix(310, 59340000 + 2 * step, lng, 2500 + 230000), last, "far off vertically after a 2D fix", 4);
+  fake_ms += 5000;
+  jumpReject(jumpFix(315, 59340000 + 2 * step, 18209500, 2500 + 400000), last, "far off both ways", -1);
+  fake_ms += 5000;
+  jumpAccept(jumpFix(320, 59340000 + 2 * step, lng, 2500 + 130000), "3D fix after them");
+
+  fresh();
+  const auto high = jumpAccept(jumpFix(0, 59330000, lng, 1100000), "cold-start anchor far up");
+  for (int k = 1; k <= 2; ++k) {
+    fake_ms += 5000;
+    jumpReject(jumpFix(5 * k, 59330000 + step * k, lng), high, "good fix below a bad-altitude anchor", 4);
+  }
+  fake_ms += 5000;
+  jumpAccept(jumpFix(15, 59330000 + step * 3, lng), "third consistent fix");
+  check(sys.gpsReadDiagnostics().reanchored && sys.gpsReadDiagnostics().reanchor_rejects == 2,
+        "a bad-altitude anchor re-anchors on the third consistent fix");
+
+  fresh();
+  const auto sticky = jumpAccept(jumpFix(0, 59330000, lng, 150000), "cold-start anchor 1.5 km up");
+  for (int k = 1; k <= 3; ++k) {
+    fake_ms += 5000;
+    jumpReject(jumpFix(10 * k - 5, 0, 0, 0, "0,0,0,0"), sticky, "no-fix reply between real fixes");
+    fake_ms += 5000;
+    if (k < 3) jumpReject(jumpFix(10 * k, 59330000 + step * k, lng), sticky, "real fix in poor sky", 4);
+  }
+  jumpAccept(jumpFix(30, 59330000 + step * 3, lng), "third real fix");
+  check(jumpReanchors == 1, "no-fix replies between real fixes do not pin a bad-altitude anchor");
+
+  // The wake's first fix: held until the next fresh fix agrees with it on the same bounds.
+  auto held = [](const std::string& reply, const std::string& label) {
+    check(!readLink(reply) && sys.gpsReadDiagnostics().result == GPSReadResult::Unconfirmed && gd->lat == 0,
+          label + " is held, not accepted");
+  };
+  auto confirmed = [](const std::string& reply, unsigned held, const std::string& label) {
+    check(readLink(reply) && sys.gpsReadDiagnostics().confirmed && sys.gpsReadDiagnostics().confirm_held == held &&
+          !sys.gpsReadDiagnostics().reanchored && gd->time == std::stoul(reply.substr(13, 8)),
+          label + " confirms the first fix and is the one used");
+  };
+  fresh();
+  held(jumpFix(0, 59348000, lng, 2500 + 240000, bogus), "bogus fix at power-on");
+  fake_ms += 7000;
+  held(jumpFix(7, 59351400, lng, 2500 + 300000, "9759,9000,6,255"), "second bogus fix at power-on");
+  fake_ms += 5000;
+  held(jumpFix(12, 59330000, lng), "first real fix");
+  held(jumpFix(12, 59330000, lng), "its replay");
+  fake_ms += 5000;
+  check(readLink("$GNIFO,41026,11101500,0,0,200000,0,0,0,0\r") && gd->lat == 0, "no-fix reply still accepted");
+  fake_ms += 5000;
+  confirmed(jumpFix(22, 59330000 + step, lng, 0), 3, "an agreeing 2D fix");
+  fake_ms += 5000;
+  jumpAccept(jumpFix(27, 59330000 + 2 * step, lng), "3D fix after it, not judged against the no-fix altitude");
+
+  fresh();
+  held(jumpFix(0, 59430000, lng), "cold-start fix 11 km off, good HDOP");
+  fake_ms += 5000;
+  held(jumpFix(5, 59330000, lng), "real fix that disagrees only horizontally");
+  check(sys.gpsReadDiagnostics().confirm_restarted, "the dropped candidate is reported");
+  fake_ms += 60500;
+  confirmed(jumpFix(65, 59330000 + step, lng), 2, "the next real fix at the charging cadence");
+
+  fresh();
+  held(jumpFix(0, 59330000, lng), "first fix");
+  fake_ms += GPS_JUMP_CONFIRM_GAP_MS + 1000;
+  held(jumpFix(121, 59330000 + step, lng), "agreeing fix after the window");
+  fake_ms += 5000;
+  confirmed(jumpFix(126, 59330000 + 2 * step, lng), 2, "the next agreeing fix");
 }
 
 void feedRmc(const std::string& course, const std::string& latitude = "5920.000") {

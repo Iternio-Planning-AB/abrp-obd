@@ -55,6 +55,7 @@ static const char* gpsReadName(GPSReadResult result) {
   case GPSReadResult::RequiredFieldInvalid: return "field";
   case GPSReadResult::CoordinateRejected: return "coord";
   case GPSReadResult::DirectNoData: return "direct_none";
+  case GPSReadResult::Unconfirmed: return "unconfirmed";
   default: return "none";
   }
 }
