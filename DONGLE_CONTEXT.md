@@ -563,12 +563,19 @@ emulation. Bench results (2026-09-24, each command sent raw to the co-processor)
   dongle is on the bus.
 - **Monitor mode works.** Lines arrive as `$MON,<4 ID bytes, big-endian>,<DLC>,<data...>` (verified on
   an i3 by filtering on the ID). A request sent while in `ATM1` is processed and monitoring continues.
-- **A reply is not always the ECU's frames verbatim.** Seen on an Ioniq 5 (issue #10): a stray
-  headerless tail ahead of a clean 7EC reply, or the whole reply re-segmented behind 21 stale bytes
-  under a 5-digit "header". For protocol 6 and `22xxxx`, `genericProtocol` drops whole lines ahead of
-  the first single/first frame answering `62<DID>` and logs `OBD<pid> reason=skipped_prefix lines=<n>`
-  (no bytes; its own 3-per-power-on cap, 15 min apart). With no such line the re-segmented kind is refused
-  as `wrong_did`. Headers-off (`ATH0`) and 29-bit headers on protocol 6 are not parsed. Host checks: `tests/run_obd_reply_checks.py`.
+- **A reply is not always the ECU's frames verbatim.** Seen on an Ioniq 5 (issues #10, #45): a stray
+  headerless tail ahead of a clean 7EC reply, or our whole answer spliced behind another ECU's message
+  under one 5-digit "header" (`1785D`, `179E8`, `17BA5`). For protocol 6
+  and `22xxxx`, `genericProtocol` takes the first single/first frame answering `62<DID>` under the
+  expected ID (the profile's `ATCRA` filter; any 3-char ID when the profile sets none) and its
+  consecutive frames under that ID, in sequence, up to the first frame's length. Lines ahead are dropped
+  and logged `OBD<pid> reason=skipped_prefix lines=<n>`; frames under other IDs are never decoded.
+  Anything else is refused as `wrong_hdr`, `wrong_did`, `bad_seq`, `nrc` or `no_frame`. The first three
+  are sent once more in the same poll (not after a failed retry of that command, until it decodes again),
+  logged `OBD<pid> retry reason=<r> hdr=<id> ok=<0|1>`, and `OBD220105 reason=` carries `hdr=` and
+  `retry=`. Each line has its own 3-per-power-on cap, 15 min apart, no bytes except `OBDRAW`. The payload
+  inside a splice is not recovered: its shape is one car's. Headers-off (`ATH0`) and 29-bit headers on
+  protocol 6 are not parsed. Host checks: `tests/run_obd_reply_checks.py`.
 
 **Backend profiles this hardware cannot run** (checked against all 50 ABRP backend profiles, which are not public, as of 2026-09-24):
 

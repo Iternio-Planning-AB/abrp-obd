@@ -69,6 +69,8 @@ void OBDWrapper::setVehicleCommands(const json& newData) {
   catch (json::out_of_range e) {
     Serial.printf("%s at init_commands\n", e.what());
   }
+  reply_headers = expectedReplyHeaders(init_commands, pids);
+  retry_held.assign(pids.size(), false);
 }
 
 json OBDWrapper::getVehicleCommands() const {
@@ -83,45 +85,173 @@ std::vector<std::string> OBDWrapper::get_pids() const {
   return pids;
 }
 
+// A reply that is not our answer. reason: wrong_did (another DID), wrong_hdr (another ID), bad_seq (a frame missing
+// from our message), nrc (the ECU's negative response), no_frame (no CAN frame at all). header: the ID seen, hex.
 struct UnexpectedPidResponse : std::runtime_error {
-  UnexpectedPidResponse() : std::runtime_error("unexpected PID response") {}
+  std::string reason, header;
+  explicit UnexpectedPidResponse(std::string why, std::string seen = "")
+    : std::runtime_error("unexpected PID response"), reason(std::move(why)), header(std::move(seen)) {}
 };
 
-// Protocol 6, 22xxxx: the co-processor sometimes puts a stray tail ahead of a clean reply. Drops the
-// whole lines before the first single or first frame (HHH 0N / HHH 1N NN, spaces ignored) answering
-// 62<DID> and returns how many non-blank lines that was; with no such line the DID check refuses the
-// reply. Headers off (ATH0) and 29-bit headers are not handled.
-static int dropLinesBeforeUdsReply(std::string& data, const std::string& requested) {
-  const std::string expect = "62" + requested.substr(2);
-  int dropped = 0;
-  for (size_t at = 0; at < data.size(); ) {
+static bool isHex(const std::string& s) {
+  return !s.empty() && std::all_of(s.begin(), s.end(), [](char c) { return isxdigit((unsigned char)c); });
+}
+
+// A UDS ReadDataByIdentifier, 22 + four hex digits.
+static bool isUdsRead(const std::string& requested) {
+  return requested.size() == 6 && requested.compare(0, 2, "22") == 0 && isHex(requested.substr(2));
+}
+
+static std::string withoutSpaces(const std::string& line) {
+  std::string s;
+  for (char c : line) if (c != ' ') s += c;
+  return s;
+}
+
+// The ID a reply line carries, "" when it is not a CAN frame: the first token with spaces on (ATS1); without, the
+// chars ahead of 8 padded data bytes, or 3 ahead of a PCI that fits the line.
+static std::string frameHeader(const std::string& line) {
+  const size_t space = line.find(' ');
+  if (space != std::string::npos) {
+    const std::string token = line.substr(0, space);
+    const bool more = line.find_first_not_of(' ', space) != std::string::npos;
+    return more && token.size() >= 3 && token.size() <= 8 && isHex(token) ? token : "";
+  }
+  if (!isHex(line)) return "";
+  const size_t n = line.size();
+  if (n >= 19 && n <= 24) return line.substr(0, n - 16);
+  if (n >= 5 && line[3] == '0') {
+    const size_t len = std::stoul(line.substr(4, 1), nullptr, 16);
+    if (len >= 1 && len <= 7 && 5 + 2 * len <= n) return line.substr(0, 3);
+  }
+  if ((n >= 7 && line[3] == '1') || (n >= 5 && line[3] == '2')) return line.substr(0, 3);
+  return "";
+}
+
+static void appendBytes(std::vector<int>& bytes, const std::string& s, size_t from) {
+  for (size_t i = from; i + 1 < s.size(); i += 2) {
+    const std::string pair = s.substr(i, 2);
+    if (!isHex(pair)) throw std::runtime_error("bad byte");
+    bytes.push_back(std::stoi(pair, nullptr, 16));
+  }
+}
+
+// Protocol 6, 22xxxx. The co-processor sometimes puts a stray tail ahead of a clean reply (#10), or splices our
+// answer behind another ECU's message under a foreign ID (#45). The reply is the first single or first frame
+// (HHH 0N / HHH 1N NN, spaces ignored) under `expected` answering 62<DID>, any 3-char ID when expected is unknown;
+// lines ahead of it are dropped and counted in skipped_lines. Its consecutive frames are taken in sequence under
+// the same ID up to the first frame's length; other IDs are never decoded, and only refuse the reply when ours is
+// incomplete. A reply cut short decodes its whole bytes. Headers off (ATH0) and 29-bit IDs are not handled.
+static std::vector<int> udsReply(const std::string& data, const std::string& requested, const std::string& expected,
+                                 int& skipped_lines) {
+  const std::string did = "62" + requested.substr(2);
+  std::vector<std::string> lines;
+  for (size_t at = 0; at <= data.size(); ) {
     size_t eol = data.find_first_of("\r\n", at);
     if (eol == std::string::npos) eol = data.size();
-    std::string line;
-    for (size_t i = at; i < eol; ++i) if (data[i] != ' ') line += data[i];
-    if (line.size() >= 4 && (line[3] == '0' || line[3] == '1')) {
-      size_t payload = line[3] == '0' ? 5 : 7;
-      if (line.size() >= payload + expect.size() && line.compare(payload, expect.size(), expect) == 0) {
-        if (dropped) data.erase(0, at);
-        return dropped;
-      }
-    }
-    if (!line.empty()) dropped++;
+    const std::string line = data.substr(at, eol - at);
+    if (line.find_first_not_of(' ') != std::string::npos) lines.push_back(line);
     at = eol + 1;
   }
-  return 0;
+
+  size_t anchor = 0;
+  std::string id;
+  for (; anchor < lines.size(); ++anchor) {
+    const std::string s = withoutSpaces(lines[anchor]);
+    const std::string h = expected.empty() ? s.substr(0, 3) : expected;
+    if (s.size() < h.size() + 2 || s.compare(0, h.size(), h) != 0 || !isHex(h)) continue;
+    const char pci = s[h.size()];
+    const size_t payload = h.size() + (pci == '0' ? 2 : 4);
+    if ((pci == '0' || pci == '1') && s.size() >= payload + did.size() && s.compare(payload, did.size(), did) == 0) {
+      id = h;
+      break;
+    }
+  }
+  if (anchor == lines.size()) {
+    std::string first;
+    bool any = false;
+    for (const auto& line : lines) {
+      if (line == ">") continue;
+      any = true;
+      const std::string h = frameHeader(line);
+      if (h.empty()) continue;
+      const std::string s = withoutSpaces(line);
+      if (s.size() >= h.size() + 6 && s[h.size()] == '0' && s.compare(h.size() + 2, 4, "7F22") == 0)
+        throw UnexpectedPidResponse("nrc", h);
+      if (first.empty()) first = h;
+    }
+    if (!any) throw std::runtime_error("empty reply");
+    if (first.empty()) throw UnexpectedPidResponse("no_frame");
+    throw UnexpectedPidResponse(!expected.empty() && first != expected ? "wrong_hdr" : "wrong_did", first);
+  }
+  skipped_lines = (int)anchor;
+
+  std::vector<int> bytes;
+  const std::string s = withoutSpaces(lines[anchor]);
+  const size_t h = id.size();
+  if (s[h] == '0') {
+    appendBytes(bytes, s, h + 2);
+  } else {
+    const size_t length = std::stoul(s.substr(h + 1, 3), nullptr, 16);
+    appendBytes(bytes, s, h + 4);
+    unsigned seq = 1;
+    std::string foreign;
+    for (size_t i = anchor + 1; i < lines.size() && bytes.size() < length; ++i) {
+      const std::string l = withoutSpaces(lines[i]);
+      if (l.size() < h + 2 && (id + "2").compare(0, l.size(), l) == 0) continue;   // cut inside our ID
+      if (l.compare(0, h, id) != 0) {
+        const std::string other = frameHeader(lines[i]);
+        if (foreign.empty()) foreign = other;
+        continue;
+      }
+      if (l[h] != '2' || !isHex(l.substr(h + 1, 1)) || std::stoul(l.substr(h + 1, 1), nullptr, 16) != seq)
+        throw UnexpectedPidResponse("bad_seq", id);
+      appendBytes(bytes, l, h + 2);
+      seq = (seq + 1) & 0xF;
+    }
+    if (bytes.size() < length && !foreign.empty()) throw UnexpectedPidResponse("wrong_hdr", foreign);
+  }
+  return std::vector<int>(bytes.begin() + did.size() / 2, bytes.end());
+}
+
+// The reply ID each data command's profile filter admits, "" when unknown: ATCF<id> under ATCM7FF, the pair
+// setVehicleCommands puts in place of ATCRA<id>. Taken from the profile, not the co-processor: the join probe and
+// the standard fallback open the filter, and the intended ID still passes. From poll 2 on, a command ahead of the
+// list's first filter change runs under whatever the list ended with, so a part that differs from init is unknown.
+// ATZ clears the filter; ATAR, or an argument other than 3 hex digits, leaves that part unknown.
+std::vector<std::string> expectedReplyHeaders(const std::vector<std::string>& init,
+                                              const std::vector<std::string>& pids) {
+  struct Filter { std::string id, mask; };
+  auto apply = [](Filter& f, const std::string& command) {
+    std::string c;
+    for (char ch : command) if (ch != ' ') c += (char)toupper((unsigned char)ch);
+    const std::string arg = c.size() == 7 && isHex(c.substr(4)) ? c.substr(4) : "?";
+    if (c == "ATZ") f = Filter{};
+    else if (c == "ATAR") f.id = f.mask = "?";
+    else if (c.compare(0, 4, "ATCF") == 0) f.id = arg;
+    else if (c.compare(0, 4, "ATCM") == 0) f.mask = arg;
+  };
+  Filter start;
+  for (const auto& c : init) apply(start, c);
+  Filter end = start;
+  for (const auto& c : pids) apply(end, c);
+  Filter f{ end.id == start.id ? start.id : "?", end.mask == start.mask ? start.mask : "?" };
+  std::vector<std::string> headers;
+  for (const auto& c : pids) {
+    apply(f, c);
+    headers.push_back(f.mask == "7FF" && f.id.size() == 3 ? f.id : "");
+  }
+  return headers;
 }
 
 std::vector<int> genericProtocol(std::string data, std::string protocol, const std::string& requested,
-                                 int& skipped_lines) {
+                                 int& skipped_lines, const std::string& expected = "") {
 #if PRINT
   Serial.printf("Buffer in: %s\n", data.c_str());
   Serial.printf("Buffer len: %d\n", data.length());
 #endif
   skipped_lines = 0;
-  if (protocol == "6" && requested.size() == 6 && requested.compare(0, 2, "22") == 0 &&
-      std::all_of(requested.begin() + 2, requested.end(), [](char c) { return isxdigit((unsigned char)c); }))
-    skipped_lines = dropLinesBeforeUdsReply(data, requested);
+  if (protocol == "6" && isUdsRead(requested)) return udsReply(data, requested, expected, skipped_lines);
 
   std::vector<int> obdVariables{};
   data.erase(remove_if(data.begin(), data.end(), isspace), data.end());
@@ -160,9 +290,6 @@ std::vector<int> genericProtocol(std::string data, std::string protocol, const s
     } else {
       payload = data.substr(5);
     }
-    if (requested.size() == 6 && requested.compare(0, 2, "22") == 0 &&
-        payload.compare(0, 6, "62" + requested.substr(2)) != 0)
-      throw UnexpectedPidResponse();
     for (int i{}; i < payload.length() - 2; ) {
       if (
         payload[i] == identifier[0] &&
@@ -277,6 +404,9 @@ OBDVector OBDWrapper::readPIDs(bool print) {
   std::vector<std::pair<std::string, double>> results{};
   anomalous_220105_reply.clear();
   anomalous_220105_reason.clear();
+  anomalous_220105_header.clear();
+  anomalous_220105_retry = "no";
+  first_retry = ReplyRetry();
   good_220105_reply.clear();
   raw_220105_reply.clear();
   skipped_prefix_pid.clear();
@@ -288,8 +418,14 @@ OBDVector OBDWrapper::readPIDs(bool print) {
   // Multi-frame UDS replies (e.g. 220101) exceed 256 chars as text. static: off the loop task's
   // stack; safe because readPIDs only runs on the loop task.
   static char buffer[512];
+  // A profile that threw part-way through setVehicleCommands (its callers keep polling) leaves these behind pids.
+  if (reply_headers.size() != pids.size()) {
+    reply_headers.assign(pids.size(), "");
+    retry_held.assign(pids.size(), false);
+  }
 
-  for (auto pid_string : pids) {
+  for (size_t n = 0; n < pids.size(); ++n) {
+    const std::string& pid_string = pids[n];
     // Hard stop between reads (see setPollGuard): a revoked guard means "stop transmitting NOW" -
     // return what was read so far rather than finishing the frame. The switch-off-to-lock window
     // on an alarm car is seconds; a full frame blocks for seconds.
@@ -322,34 +458,69 @@ OBDVector OBDWrapper::readPIDs(bool print) {
       drop_eval += fields.size();
       continue;
     }
-    memset(buffer, 0, sizeof(buffer));
-    snprintf(buffer, sizeof(buffer), "%04s\r", pid_string.c_str());
-    if (!readBuffer(pid_string, buffer, sizeof(buffer), print) || fields.empty()) continue;
+    // The command, never the last reply, is what goes back out on a retry.
+    auto send = [&]() {
+      memset(buffer, 0, sizeof(buffer));
+      snprintf(buffer, sizeof(buffer), "%04s\r", pid_string.c_str());
+      return readBuffer(pid_string, buffer, sizeof(buffer), print);
+    };
+    if (!send() || fields.empty()) continue;
 
     // Decode once for all fields. genericProtocol throws on replies readBuffer lets through ("?",
     // "STOPPED", "CAN ERROR", short frames); uncaught, that is a reboot.
     std::vector<int> variables{};
     int skipped = 0;
-    try {
-      variables = genericProtocol(buffer, protocol, pid_string, skipped);
-      if (skipped > 0 && skipped_prefix_pid.empty()) {
-        skipped_prefix_pid = pid_string;
-        skipped_prefix_lines = (unsigned)skipped;
+    std::string refused;   // why the reply that ended this command was not decoded; empty = decoded
+    bool retried = false, logged = false, stop = false;
+    for (;;) {
+      std::string header;
+      try {
+        variables = genericProtocol(buffer, protocol, pid_string, skipped, reply_headers[n]);
+        refused.clear();
       }
+      catch (const UnexpectedPidResponse& e) {
+        refused = e.reason;
+        header = e.header;
+        if (pid_string == "220105" && !retried) {
+          anomalous_220105_reason = e.reason;
+          anomalous_220105_header = e.header;
+          anomalous_220105_reply = raw_220105_reply;
+        }
+      }
+      catch (...) {
+        refused = "undecodable";
+      }
+      // Not our answer (#45): sent once more, unless the reply was the car's own (nrc, no_frame), may still be
+      // arriving (no prompt), or this command's last retry failed too. At most one extra request per command.
+      if (retried || retry_held[n] || !strchr(buffer, '>') ||
+          (refused != "wrong_hdr" && refused != "wrong_did" && refused != "bad_seq"))
+        break;
+      if (poll_guard && !poll_guard()) { stop = true; break; }
+      if (first_retry.pid.empty()) {
+        first_retry.pid = pid_string;
+        first_retry.reason = refused;
+        first_retry.header = header;
+        logged = true;
+      }
+      retried = true;
+      if (!send()) { refused = "no_reply"; break; }
     }
-    catch (const UnexpectedPidResponse&) {
-      if (pid_string == "220105") {
-        anomalous_220105_reason = "wrong_did";
-        anomalous_220105_reply = raw_220105_reply;
-      }
+    if (retried) {
+      retry_held[n] = !refused.empty();
+      if (logged) first_retry.ok = refused.empty();
+      if (pid_string == "220105") anomalous_220105_retry = refused.empty() ? "ok" : "fail";
+    } else if (refused.empty()) {
+      retry_held[n] = false;
+    }
+    if (!refused.empty()) {
       Serial.printf("failed to decode reply to %s\n", pid_string.c_str());
       drop_eval += fields.size();
+      if (stop) break;
       continue;
     }
-    catch (...) {
-      Serial.printf("failed to decode reply to %s\n", pid_string.c_str());
-      drop_eval += fields.size();
-      continue;
+    if (skipped > 0 && skipped_prefix_pid.empty()) {
+      skipped_prefix_pid = pid_string;
+      skipped_prefix_lines = (unsigned)skipped;
     }
 #if PRINT
     Serial.printf("Variables, length: %d\n", variables.size());
@@ -404,6 +575,7 @@ OBDVector OBDWrapper::readPIDs(bool print) {
     if (pid_string == "220105") {
       if (low_soc && soh_bad) {
         anomalous_220105_reason = "soc0.5_soh_drop";
+        anomalous_220105_header.clear();
         anomalous_220105_reply = raw_220105_reply;
       } else if (have_soc && have_soh && !skipped) {  // the baseline must not carry the stray tail
         good_220105_reply = raw_220105_reply;
