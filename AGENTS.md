@@ -375,8 +375,11 @@ scrubbed co-processor replies; the co-processor itself is not exercised.
 
 ## Profile push checks
 
-Run `python3 tests/run_profile_checks.py` for the BLE profile hand-off: the real config-apply block from `loop()`
-and `loadPersistedProfile()` against an in-memory LittleFS. A full push writes `/vehicle_profile.json` even when
+Run `python3 tests/run_profile_checks.py` for the BLE profile hand-off: the real `configCallback` stash, config-apply
+block from `loop()`, `loadPersistedProfile()` and `forgetProfile()` against an in-memory LittleFS. A push's hash is
+committed only after its file is written; a push landing during the apply stays pending and is not the one persisted;
+a key reset forgets file, hash, token, queue and pending push. `completeSetup`, the per-connect `new_hash` reset and
+both key-reset call sites are checked by position. A full push writes `/vehicle_profile.json` even when
 the profile is unchanged (a token-only re-push survives a reboot, with the re-init still skipped), and a failed
 write, or a push that does not apply, invalidates the hash and removes the file, so the next boot cannot restore an
 older token. The runner also checks that `otaFinalize` and `bleDeinitForSleep` drop a push still

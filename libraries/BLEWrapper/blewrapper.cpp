@@ -496,10 +496,13 @@ bool BLEWrapper::authenticate(std::string token) {
   Set variables and activate callback function
 */
 void BLEWrapper::completeSetup() {
-  confirmHash();
+  // The hash goes with the push; the loop task commits it once the profile is on flash (commitHash). Taken,
+  // not copied: a later push in this session that sent no HASH (a wizard save) must carry 0, not this one.
   json data;
   data["configJson"] = configJson;
   data["tlm_push_token"] = tlm_push_token;
+  data["hash"] = new_hash;
+  new_hash = 0;
   configCallback(data);
 }
 
@@ -517,16 +520,6 @@ bool BLEWrapper::validate_hash(unsigned long hash) {
     new_hash = hash;
     return false;
   }
-}
-
-/*  
-  Store completed hash
-*/
-void BLEWrapper::confirmHash() {
-  crc_hash = new_hash;
-  preferences.begin("BLE");
-  preferences.putULong("hash", crc_hash);
-  preferences.end();
 }
 
 /*
@@ -755,6 +748,10 @@ void StartupCallbacks::onWrite(BLECharacteristic* pStartupCharacteristic) {
 void ServerCallbacks::onConnect(BLEServer* pServer, esp_ble_gatts_cb_param_t* param) {
   BLEAddress addr = BLEAddress(param->connect.remote_bda);
   wrapper->logEvt("CONNECT %s", addr.toString().c_str());
+  // A push is built from this session's packets only. The wizard sends CLEAN with no HASH, so without this it
+  // would carry an earlier session's hash - possibly another profile's - for the fast path to claim; and a stray
+  // packet with no clean must not complete a push from an earlier session's profile and token. RAM only.
+  wrapper->resetPushStaging();
   wrapper->set_device_connected(true);
 };
 

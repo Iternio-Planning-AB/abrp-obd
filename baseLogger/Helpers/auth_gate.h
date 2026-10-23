@@ -186,6 +186,33 @@ static void authSendNonce() {
 }
 
 /* Loop-task service: consume one command per call. Cheap flag test when idle. */
+// AUTHCLEAR and the in-app key reset: the dongle forgets the vehicle it was paired to, so a re-paired dongle cannot
+// keep reporting to the previous account. Profile file, stored hash, the push token (RAM and its NVS copy), the
+// upload queue polled under it (in RAM and whatever a relay session parked in the backlog file), and any push
+// still waiting for the loop. Polling stops as on an unpaired dongle until the next full push. The OBD-alarm flag stays: it
+// belongs to the car. Loop task only.
+void forgetProfile(const char* why) {
+  std::string dropped;
+  portENTER_CRITICAL(&g_config_mux);
+  dropped.swap(g_pending_config_str);
+  g_config_pending = false;
+  portEXIT_CRITICAL(&g_config_mux);
+  ble.forgetStoredPush(); // before the file: a reset between the two must not leave a hash with no file
+#if ENABLE_LOGGING
+  LittleFS.remove(PROFILE_PATH);
+#endif
+#if (ENABLE_NETWORK) && ENABLE_LOGGING // parenthesised: ENABLE_NETWORK is a bare `||`
+  if (!obd_result_vector.empty() || upload_spilled)
+    logEvent("UPLOAD discarded n=%lu reason=forget", obd_result_vector.size() + upload_spilled);
+  LittleFS.remove(UPLOAD_BACKLOG_PATH);
+  upload_spilled = 0;
+#endif
+  obd_result_vector.clear();
+  tlm_push_token.clear();
+  g_no_profile = true;
+  logEvent("PROFILE forgotten (%s) - profile, hash and push token cleared", why);
+}
+
 void authGateService() {
   // GREET on the rising edge of the ABD8 subscription: the dongle speaks FIRST. The app's monitor
   // registration returns before its CCCD write lands, so any app-initiated opening command can outrun
@@ -262,6 +289,8 @@ void authGateService() {
     ble.set_authenticated(false);
     g_auth_nonce_valid = false;
     logEvent("AUTH2 key reset over BLE - dongle is unprovisioned again");
+    // The next owner pushes their own. This session can still finish a push it had under way.
+    forgetProfile("authreset");
     authNotifyJson("{\"auth\":\"reset\"}");
     return;
   }
