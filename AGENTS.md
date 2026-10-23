@@ -313,8 +313,15 @@ filesystem and hardware are fakes, not on-device verification.
 Run `python3 tests/run_obd_reply_checks.py` for the real `genericProtocol()` on protocol-6 `22xxxx`
 replies, extracted from `obdwrapper.cpp`: a clean reply decodes to fixed bytes, stray, blank and short lines
 ahead of a single or first frame are dropped, a re-segmented reply under a foreign header and a wrong DID
-are refused, replies with no anchor line and non-`22xxxx` requests are left to the plain parser, and
-truncated replies decode their partial bytes. Fixtures are scrubbed co-processor replies; the co-processor itself is not exercised.
+are refused, non-`22xxxx` requests are left to the plain parser, and truncated replies decode their partial
+bytes. `header` covers the expected reply ID (the #45 splice, another ECU's answer to the same DID, foreign
+frames inside, after or instead of our consecutive frames, a lost frame, negative responses and non-frames,
+each with its refusal reason and the ID seen), `expected` the ID derived from the profile's filter commands,
+and `retry` the real `readPIDs()` against a scripted co-processor link: one resend of the command after a
+refused reply, none after a negative response, an unfinished reply or a closed alarm gate, none again after
+a failed retry until the command decodes, the 220105 capture keeping the first reply, and polling a profile
+that threw part-way through being applied. Fixtures are
+scrubbed co-processor replies; the co-processor itself is not exercised.
 
 ## Cellular TLS trust checks
 

@@ -19,6 +19,9 @@
 using json = nlohmann::json;
 using OBDVector = std::vector<std::pair<std::string, double>>;
 
+/* The reply ID each data command expects, "" when unknown (see obdwrapper.cpp) */
+std::vector<std::string> expectedReplyHeaders(const std::vector<std::string>& init,
+                                              const std::vector<std::string>& pids);
 
 class OBDWrapper : public COBD {
 public:
@@ -77,7 +80,11 @@ public:
   uint32_t drop_trunc{ 0 };
   std::string anomalous_220105_reply;
   std::string anomalous_220105_reason;
+  std::string anomalous_220105_header;        // the ID the refused reply carried, hex
+  std::string anomalous_220105_retry;         // no, ok or fail
   std::string good_220105_reply;
+  /* First command this poll that was sent again after its reply was refused (see readPIDs). Hex only, safe to log. */
+  struct ReplyRetry { std::string pid, reason, header; bool ok = false; } first_retry;
   /* First 22xxxx command this poll whose reply decoded only after dropping lines ahead of it (see
      genericProtocol), and how many lines. Hex-only by construction, safe to log. */
   std::string skipped_prefix_pid;
@@ -95,6 +102,9 @@ private:
   std::vector<std::string> pids{};
   std::map<std::string, json> car_models{};
   std::string raw_220105_reply;
+  /* Parallel to pids: the reply ID each command expects, and whether its last retry failed */
+  std::vector<std::string> reply_headers{};
+  std::vector<bool> retry_held{};
   /* See setPollGuard */
   bool (*poll_guard)(){ nullptr };
 

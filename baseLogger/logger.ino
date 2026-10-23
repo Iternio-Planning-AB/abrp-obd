@@ -302,6 +302,9 @@ RTC_DATA_ATTR uint64_t obd_anomaly_last_us = 0;
 // skipped_prefix has its own budget so recoveries never use up the raw captures above.
 RTC_DATA_ATTR uint8_t obd_skip_logs = 0;
 RTC_DATA_ATTR uint64_t obd_skip_last_us = 0;
+// A refused reply sent again (#45): same cap and spacing, own budget.
+RTC_DATA_ATTR uint8_t obd_retry_logs = 0;
+RTC_DATA_ATTR uint64_t obd_retry_last_us = 0;
 // Consecutive polls with no charge evidence while the charge latch was still set (CHARGE_RELEASE_POLLS).
 RTC_DATA_ATTR uint8_t charge_release_polls = 0;
 // Consecutive latched polls the car did not answer, held off the release up to CHARGE_SILENT_HOLD_POLLS.
@@ -1460,8 +1463,9 @@ void loop() {
           (!obd_anomaly_last_us || now_us < obd_anomaly_last_us ||
            now_us - obd_anomaly_last_us >= 15ULL * 60ULL * 1000000ULL)) {
         const size_t prev_len = strnlen(last_good_220105_reply, sizeof(last_good_220105_reply));
-        logEvent("OBD220105 reason=%s raw=%u prev=%u", obd.anomalous_220105_reason.c_str(),
-          (unsigned)obd.anomalous_220105_reply.size(), (unsigned)prev_len);
+        logEvent("OBD220105 reason=%s hdr=%s retry=%s raw=%u prev=%u", obd.anomalous_220105_reason.c_str(),
+          obd.anomalous_220105_header.empty() ? "-" : obd.anomalous_220105_header.c_str(),
+          obd.anomalous_220105_retry.c_str(), (unsigned)obd.anomalous_220105_reply.size(), (unsigned)prev_len);
         auto logRaw = [&](const char* kind, const char* data, size_t size) {
           for (size_t off = 0; off < size; off += 40) {
             size_t n = size - off;
@@ -1486,6 +1490,14 @@ void loop() {
           obd.skipped_prefix_lines);
         obd_skip_last_us = now_us;
         obd_skip_logs++;
+      }
+      if (!obd.first_retry.pid.empty() && obd_retry_logs < 3 &&
+          (!obd_retry_last_us || now_us < obd_retry_last_us ||
+           now_us - obd_retry_last_us >= 15ULL * 60ULL * 1000000ULL)) {
+        logEvent("OBD%s retry reason=%s hdr=%s ok=%d", obd.first_retry.pid.c_str(), obd.first_retry.reason.c_str(),
+          obd.first_retry.header.empty() ? "-" : obd.first_retry.header.c_str(), obd.first_retry.ok ? 1 : 0);
+        obd_retry_last_us = now_us;
+        obd_retry_logs++;
       }
       if (!obd.good_220105_reply.empty()) {
         size_t n = obd.good_220105_reply.size();
