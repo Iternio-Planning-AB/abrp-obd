@@ -557,6 +557,21 @@ void setup() {
   // same overnight 12V hazard as a wedge-loop either way.
   wdt_reset_count = wdtStreakAdvance(esp_reset_reason(), &g_wdt_streak_retained);
   if (esp_reset_reason() != ESP_RST_DEEPSLEEP && wdtStreakMarkerOwed()) driveMarkerRestored();
+#if ENABLE_SLEEP && ENABLE_MEMS
+  if (wdt_reset_count >= 3) {
+    Serial.begin(115200);
+    Serial.printf("EARLY crash reset=%s streak=%lu parked=%dmin timer-only; peripherals unchanged\n",
+      resetReasonStr(), (unsigned long)wdt_reset_count, WAKE_PARKED_MINUTES);
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+    esp_sleep_enable_timer_wakeup((uint64_t)WAKE_PARKED_MINUTES * 60ULL * 1000000ULL);
+    sleepCount++;
+    clean_sleep_marker = true;
+    clock_sleep_enter_epoch = 0;
+    rtc.setTime(0);
+    Serial.flush();
+    esp_deep_sleep_start();
+  }
+#endif
 #if PRINT
   // Only stall on a true power-on, so a serial monitor can attach in time to see boot output. Skip it on
   // every deep-sleep wake - periodic, motion, and especially the WiFi RF-flush recovery - so those reboots

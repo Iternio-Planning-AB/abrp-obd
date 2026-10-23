@@ -546,7 +546,9 @@ float g_last_io36 = 12.6f;
 int g_next_wake_minutes = 0;
 std::string last_log, sleep_reason;
 bool slept_modem_on = false;
+int log_event_calls = 0;
 void logEvent(const char* format, ...) {
+  log_event_calls++;
   char line[256];
   va_list args;
   va_start(args, format);
@@ -570,7 +572,68 @@ struct {
     else if (!dead) { on = !on; hung = false; }  // 2.5 s PWRKEY
   }
 } network;
-struct { void printf(const char*, ...) {} } Serial;
+std::string serial_output;
+unsigned serial_baud = 0;
+int serial_printf_calls = 0, serial_flush_calls = 0;
+struct {
+  void begin(unsigned baud) { serial_baud = baud; }
+  void flush() { serial_flush_calls++; }
+  void printf(const char* format, ...) {
+    char line[256];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(line, sizeof(line), format, args);
+    va_end(args);
+    serial_output += line;
+    serial_printf_calls++;
+  }
+} Serial;
+constexpr int ESP_SLEEP_WAKEUP_ALL = -1;
+constexpr int WAKE_SOURCE_TIMER = 1, WAKE_SOURCE_EXT0 = 2;
+int wake_source_disable_calls = 0, disabled_wake_source = 0;
+int timer_wakeup_calls = 0, wom_wakeup_calls = 0, deep_sleep_start_calls = 0;
+uint64_t timer_wakeup_us = 0;
+int active_wake_sources = 0, sleep_wake_sources = 0;
+uint64_t sleep_timer_wakeup_us = 0;
+void esp_sleep_disable_wakeup_source(int source) {
+  wake_source_disable_calls++;
+  disabled_wake_source = source;
+  if (source == ESP_SLEEP_WAKEUP_ALL) active_wake_sources = 0;
+}
+void esp_sleep_enable_timer_wakeup(uint64_t duration_us) {
+  timer_wakeup_calls++;
+  active_wake_sources |= WAKE_SOURCE_TIMER;
+  timer_wakeup_us = duration_us;
+}
+void esp_sleep_enable_ext0_wakeup(int, int) {
+  wom_wakeup_calls++;
+  active_wake_sources |= WAKE_SOURCE_EXT0;
+}
+struct DeepSleepStart {};
+[[noreturn]] void esp_deep_sleep_start() {
+  deep_sleep_start_calls++;
+  sleep_wake_sources = active_wake_sources;
+  sleep_timer_wakeup_us = timer_wakeup_us;
+  throw DeepSleepStart{};
+}
+uint32_t sleepCount = 0, clock_sleep_enter_epoch = 0;
+bool clean_sleep_marker = false;
+int marker_restore_calls = 0;
+void driveMarkerRestored() { marker_restore_calls++; }
+uint32_t rtc_epoch = 0;
+int rtc_set_calls = 0;
+struct {
+  void setTime(uint32_t epoch) {
+    rtc_epoch = epoch;
+    rtc_set_calls++;
+  }
+} rtc;
+#include "reset_reason.inc"
+struct {
+  int begins = 0;
+  void begin() { begins++; }
+} sys;
+int normal_sleep_calls = 0;
 bool bleRelaying() { return false; }
 unsigned long millis() { return 600000UL; }
 const unsigned long WIFI_RETRY_MS = 20000;
@@ -580,12 +643,53 @@ void offlineRetry() {
 }
 // The modem part of enterDeepSleep, then the sleep itself.
 void enterDeepSleep(bool modem_on, const char* reason = nullptr) {
+  normal_sleep_calls++;
 #define ENABLE_CELL 1
 #include "sleep_probe.inc"
 #undef ENABLE_CELL
 #include "sleep_modem.inc"
   sleep_reason = reason ? reason : "?";
   slept_modem_on = modem_on;
+}
+#define ENABLE_SLEEP 1
+#define ENABLE_MEMS 1
+#define ENABLE_PERIODIC_WAKE 0
+bool startupBoot(esp_reset_reason_t reason) {
+  reset_reason = reason;
+  try {
+#include "wdt_streak_startup.inc"
+    sys.begin();
+  } catch (const DeepSleepStart&) {
+    return false;
+  }
+  return true;
+}
+#undef ENABLE_PERIODIC_WAKE
+#undef ENABLE_MEMS
+#undef ENABLE_SLEEP
+void resetStartupTrace() {
+  serial_output.clear();
+  serial_baud = 0;
+  serial_printf_calls = 0;
+  serial_flush_calls = 0;
+  wake_source_disable_calls = 0;
+  disabled_wake_source = 0;
+  timer_wakeup_calls = 0;
+  wom_wakeup_calls = 0;
+  deep_sleep_start_calls = 0;
+  active_wake_sources = WAKE_SOURCE_TIMER | WAKE_SOURCE_EXT0;
+  timer_wakeup_us = 123456;
+  sleep_wake_sources = 0;
+  sleep_timer_wakeup_us = 0;
+  marker_restore_calls = 0;
+  rtc_set_calls = 0;
+  sys.begins = 0;
+  network.inits = 0;
+  network.power_offs = 0;
+  normal_sleep_calls = 0;
+  log_event_calls = 0;
+  last_log.clear();
+  sleep_reason.clear();
 }
 void wake() {
 #include "wdt_streak_wake.inc"
@@ -600,6 +704,109 @@ bool boot(esp_reset_reason_t reason) {
   wake();
   escalation();
   return sleep_reason == "wdt-streak";
+}
+
+void startupChecks() {
+  const struct { esp_reset_reason_t reason; const char* name; } crash_cases[] = {
+    {ESP_RST_PANIC, "PANIC"}, {ESP_RST_TASK_WDT, "TASK_WDT"}, {ESP_RST_INT_WDT, "INT_WDT"},
+    {ESP_RST_WDT, "WDT"}, {ESP_RST_BROWNOUT, "BROWNOUT"}
+  };
+  for (uint32_t prior_count : {2u, 3u}) {
+    for (bool modem_on : {false, true}) {
+      for (bool marker_owed : {false, true}) {
+        for (const auto& reset : crash_cases) {
+          resetStartupTrace();
+          wdtStreakWrite(prior_count, modem_on ? 1 : 0, marker_owed ? 1 : 0);
+          g_last_io36 = RAIL_AWAKE_VOLTS;
+          sleepCount = 7;
+          clean_sleep_marker = false;
+          clock_sleep_enter_epoch = 123456;
+          rtc_epoch = 1780663013;
+          check(!startupBoot(reset.reason), "a third or later crash reaches timer-only sleep before sys.begin");
+          check(rtc_epoch == 0 && rtc_set_calls == 1, "the emergency timer path zeros the invalid clock exactly once");
+          const uint32_t streak = prior_count + 1;
+          const uint64_t parked_us = (uint64_t)WAKE_PARKED_MINUTES * 60ULL * 1000000ULL;
+          check(wdt_reset_count == streak && sys.begins == 0, "the emergency path accounts the crash before initialization");
+          check(wake_source_disable_calls == 1 && disabled_wake_source == ESP_SLEEP_WAKEUP_ALL &&
+                timer_wakeup_calls == 1 && timer_wakeup_us == parked_us && wom_wakeup_calls == 0,
+                "the emergency path disables old sources and arms only the unconditional parked timer");
+          check(sleep_wake_sources == WAKE_SOURCE_TIMER && sleep_timer_wakeup_us == parked_us,
+                "the deep-sleep boundary has only the parked timer armed");
+          check(sleepCount == 8 && clean_sleep_marker && clock_sleep_enter_epoch == 0,
+                "the emergency timer sleep records its clean boundary without a clock stamp");
+          check(serial_baud == 115200 && serial_printf_calls == 1 && serial_flush_calls == 1 &&
+                serial_output.find(std::string("EARLY crash reset=") + reset.name) != std::string::npos &&
+                serial_output.find("streak=" + std::to_string(streak)) != std::string::npos &&
+                serial_output.find("parked=" + std::to_string(WAKE_PARKED_MINUTES) + "min") != std::string::npos &&
+                serial_output.find("timer-only; peripherals unchanged") != std::string::npos,
+                "the emergency path prints one complete serial-only diagnostic");
+          check(wdtStreakModemMayBeOn() == modem_on && wdtStreakMarkerOwed() == marker_owed &&
+                marker_restore_calls == (marker_owed ? 1 : 0),
+                "the emergency path preserves both retained flags and restores only owed marker debt");
+          check(normal_sleep_calls == 0 && network.inits == 0 && network.power_offs == 0 &&
+                log_event_calls == 0 && last_log.empty(),
+                "the emergency path avoids normal sleep, network work and flash logging");
+          check(deep_sleep_start_calls == 1, "the emergency sleep is a non-returning boundary");
+        }
+      }
+    }
+  }
+
+  resetStartupTrace();
+  wdtStreakWrite(0, 1, 1);
+  rtc_epoch = 1780663013;
+  sleepCount = 4;
+  clean_sleep_marker = false;
+  clock_sleep_enter_epoch = 789;
+  check(startupBoot(ESP_RST_POWERON) && wdt_reset_count == 0 && sys.begins == 1,
+        "a power-on continues through initialization at streak zero");
+  check(rtc_epoch == 1780663013 && rtc_set_calls == 0, "a non-emergency prefix preserves the existing clock");
+  check(startupBoot(ESP_RST_PANIC) && wdt_reset_count == 1 && sys.begins == 2,
+        "the first crash boot continues through initialization");
+  check(rtc_epoch == 1780663013 && rtc_set_calls == 0, "the first crash prefix leaves clock policy to normal setup");
+  check(startupBoot(ESP_RST_TASK_WDT) && wdt_reset_count == 2 && sys.begins == 3,
+        "the second crash boot continues through initialization");
+  check(rtc_epoch == 1780663013 && rtc_set_calls == 0, "the second crash prefix leaves clock policy to normal setup");
+  check(!startupBoot(ESP_RST_INT_WDT) && wdt_reset_count == 3 && sys.begins == 3,
+        "a crash during the third startup is stopped before sys.begin");
+  check(rtc_epoch == 0 && rtc_set_calls == 1, "the third crash invalidates the retained clock before sleeping");
+  check(deep_sleep_start_calls == 1 && sleepCount == 5 && clean_sleep_marker && clock_sleep_enter_epoch == 0,
+        "the third-reset emergency boot takes the timer-only sleep");
+  rtc_epoch += WAKE_PARKED_MINUTES * 60UL;
+  check(startupBoot(ESP_RST_DEEPSLEEP) && wdt_reset_count == 0 && sys.begins == 4 &&
+        wdtStreakMarkerOwed(),
+        "the emergency deep-sleep wake clears the streak, keeps marker debt and retries initialization");
+  check(rtc_epoch == WAKE_PARKED_MINUTES * 60UL && rtc_epoch < 1000000000UL && rtc_set_calls == 1,
+        "the parked timer wake remains below a valid epoch until clock acquisition");
+
+  const esp_reset_reason_t non_crashes[] = {ESP_RST_POWERON, ESP_RST_EXT, ESP_RST_SW, ESP_RST_DEEPSLEEP,
+                                            ESP_RST_UNKNOWN, ESP_RST_SDIO};
+  for (auto reason : non_crashes) {
+    resetStartupTrace();
+    wdtStreakWrite(4, 1, 1);
+    rtc_epoch = 1780663013;
+    check(startupBoot(reason) && wdt_reset_count == 0 && sys.begins == 1,
+          "a non-crash reset clears even a high retained streak and continues initialization");
+    check(rtc_epoch == 1780663013 && rtc_set_calls == 0,
+          "a non-emergency reset prefix leaves the RTC system time unchanged");
+    check(deep_sleep_start_calls == 0 && timer_wakeup_calls == 0,
+          "a non-crash reset never takes the emergency sleep");
+  }
+
+  const WdtStreakStore foreign[] = {
+    {0xA5A5A5A5u, 2, 1, 1, 0},
+    {WDT_STREAK_MAGIC ^ 1u, 2, 1, 1, ~(2u ^ 1u << 31 ^ 1u << 30)}
+  };
+  for (const auto& bytes : foreign) {
+    resetStartupTrace();
+    wdt_streak_store = bytes;
+    rtc_epoch = 1780663013;
+    check(startupBoot(ESP_RST_BROWNOUT) && wdt_reset_count == 1 && !g_wdt_streak_retained &&
+          sys.begins == 1 && deep_sleep_start_calls == 0,
+          "a brownout over a corrupt or foreign store restarts at one without emergency sleep");
+    check(rtc_epoch == 1780663013 && rtc_set_calls == 0,
+          "a rejected retained store does not take the emergency clock path");
+  }
 }
 
 void checks() {
@@ -754,6 +961,7 @@ void checks() {
   g_weak_rail_cold_boot = false;
   offlineRetry();
   check(network.inits == 1 && wdtStreakModemMayBeOn(), "any other offline wake retries, and flags the modem");
+  startupChecks();
 }
 }  // namespace wdt_streak
 #undef WOM_THRESHOLD_G
