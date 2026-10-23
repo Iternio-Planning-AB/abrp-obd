@@ -96,7 +96,12 @@ struct Filesystem {
     return size;
   }
   bool exists(const char* path) const { return files.count(path) != 0; }
-  bool remove(const char* path) { return files.erase(path) != 0; }
+  std::vector<std::string> removed;
+  std::set<std::string> failed_removes;
+  bool remove(const char* path) {
+    removed.push_back(path);
+    return !failed_removes.count(path) && files.erase(path) != 0;
+  }
   File open(const char* path, const char* mode = "r") {
     if (std::strcmp(path, "/") == 0) {
       File directory;
@@ -402,8 +407,16 @@ void fwBuildChecks() {
   check(datalogger.writeLine("z") && LittleFS.files.size() == 3 && LittleFS.files.at("/log0002.csv") == head + line + "z\n",
         "the next row rotates, and the build line is not undercounted");
 
-  datalogger.clearAll();
+  LittleFS.removed.clear();
+  check(datalogger.clearAll() == 3, "CLEAR counts the segments it removed");
+  check(LittleFS.removed == std::vector<std::string>{"/log0002.csv", "/log0001.csv", "/log0000.csv"},
+        "newest first, so a power cut part-way drops the recent history first");
   check(LittleFS.files.size() == 1 && LittleFS.files.at("/log0000.csv") == head + line, "CLEAR restarts with the build line");
+  datalogger.writeLine("x");
+  LittleFS.failed_removes = {"/log0000.csv"};
+  check(datalogger.clearAll() == -1, "a segment that cannot be removed fails the clear, so a key reset can keep its key");
+  LittleFS.failed_removes.clear();
+  datalogger.clearAll();
 
   host_running_partition = nullptr;
   logFwBuild();

@@ -21,7 +21,7 @@ bool alarmEnforced();
 extern bool g_obd_needs_init;
 extern bool g_no_profile;
 void dropUnsavedPush(const char* why); // defined with the persisted profile below
-void forgetProfile(const char* why);   // Helpers/auth_gate.h (after network_upload.h); AUTHCLEAR calls it too
+bool forgetProfile(const char* why);   // Helpers/auth_gate.h (after network_upload.h); AUTHCLEAR calls it too
 
 /*
   Callbackfunction for BLEWrapper. To be called when config has been completely transferred over BLE

@@ -36,7 +36,7 @@ public:
 
   // Serial maintenance/retrieval helpers (flash logs need an explicit way off the device).
   void dump(Stream& out, int newest = 0);  // stream segments oldest -> newest; newest > 0 keeps only the last N
-  void clearAll();         // delete all segments and start fresh
+  int clearAll();          // delete all segments (newest first) and start fresh; how many went, -1 if any stayed
   void printStats(Stream& out);
 
   // Random-access read view over the same oldest->newest byte stream dump() produces, for the BLE log

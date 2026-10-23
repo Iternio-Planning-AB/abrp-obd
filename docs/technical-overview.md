@@ -314,7 +314,7 @@ USB only: physical access by design. Type these into the serial monitor (115200 
 | `CLKPROBE` | Check RTC drift and whether an HTTP `Date` header is reachable (blocks ~30–60 s). |
 | `TLSCHECK` | Open a fresh verified TLS session to the server (no data sent) and log the result. |
 | `BONDCLEAR` | Erase all BLE bonds. Phones must also "forget" the dongle. |
-| `AUTHCLEAR` | Erase the auth secret, revoking every phone (a connected one included), and forget the vehicle profile and push token. The next phone to connect provisions a new secret and pushes the profile; until then the dongle neither polls nor uploads. The flash log is kept. |
+| `AUTHCLEAR` | Erase the auth secret, revoking every phone (a connected one included), and forget the vehicle profile and push token. The flash log is erased too; the fresh log starts with the reset. The next phone to connect provisions a new secret and pushes the profile; until then the dongle neither polls nor uploads. Refused during an update or a BLE log dump. |
 | `OTARESET` | Clear the OTA anti-downgrade floor (after a bench flash to a lower version). |
 | `JWSTEST` | Self-test the profile-signature verifier. |
 | `GZTEST <bytes> [count]` | Compress and verify `count` (default 100, at most 2000) synthetic upload bodies of `bytes` and print pass/fail by cause. Holds the main loop (BLE requests and sleep wait) for at most 30 s; any key stops it sooner. |
@@ -336,7 +336,7 @@ The secret is provisioned trust-on-first-use by ECDH (`auth_kex.h`): the first p
 setup owns the dongle, and the secret lives only on that phone. Until then there is no window: any
 phone in range can claim an unprovisioned dongle, including one just cleared with `AUTHCLEAR`. It
 can be reset over BLE within five minutes of a power-on (an unplug and replug, so it needs physical
-access), or with `AUTHCLEAR` over serial. Either reset also forgets the vehicle profile and push token. Design and phase history are in `DONGLE_CONTEXT.md` §3 and
+access), or with `AUTHCLEAR` over serial. Either reset also forgets the vehicle profile and push token and erases the flash log, so `DUMP` first if you need it. Design and phase history are in `DONGLE_CONTEXT.md` §3 and
 Appendix A.
 
 ## Releases and OTA
