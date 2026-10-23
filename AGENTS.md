@@ -316,6 +316,16 @@ ahead of a single or first frame are dropped, a re-segmented reply under a forei
 are refused, replies with no anchor line and non-`22xxxx` requests are left to the plain parser, and
 truncated replies decode their partial bytes. Fixtures are scrubbed co-processor replies; the co-processor itself is not exercised.
 
+## Profile push checks
+
+Run `python3 tests/run_profile_checks.py` for the BLE profile hand-off: the real config-apply block from `loop()`
+and `loadPersistedProfile()` against an in-memory LittleFS. A full push writes `/vehicle_profile.json` even when
+the profile is unchanged (a token-only re-push survives a reboot, with the re-init still skipped), and a failed
+write, or a push that does not apply, invalidates the hash and removes the file, so the next boot cannot restore an
+older token. The runner also checks that `otaFinalize` and `bleDeinitForSleep` drop a push still
+pending, after the boot-partition commit and after `ble.deinit()`, by position only. The BLE task, NVS and the reset
+itself are not exercised.
+
 ## Cellular TLS trust checks
 
 Run `python3 tests/run_server_roots_checks.py` (add `--require-live` to fail rather than skip when
