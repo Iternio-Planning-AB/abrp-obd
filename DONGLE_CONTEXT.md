@@ -327,7 +327,21 @@ itself is not sent. HTTP 200 *is* the acceptance — v2 has no `status` field in
 
 Compression is the reason for v2: the SIM7070 refuses a request body over `SHCONF BODYLEN=1024`, so
 body bytes are what limit points per POST — measured, 1000 bytes holds 5 points raw and ~21 gzipped.
-Deflate is the ESP32 boot ROM's miniz, driven from `gzip_body.h` with the ~300 KB compressor in PSRAM.
+Deflate is vendored zlib 1.3.2 (`libraries/zlib`, level 9, 4 KB window), driven from `gzip_body.h`, with
+~40 KB of compressor and verifier state in PSRAM. Each body that is sent is inflated again and compared with
+its input first. A body that fails is not sent, and its frames are kept. After `GZIP_FAILS_PER_WAKE`
+failures (verify or server gzip errors), or after a reset inside the compressor (an `RTC_NOINIT`
+breadcrumb), the rest of the wake goes plain where plain fits. A frame too big to send plain is held for
+the next wake's backlog, and the frames behind it still go. It must not go back to the boot-ROM miniz: ROM `tdefl` needs ~6.5 KB of stack, which overflowed the
+8 KB loop task on the pre-sleep drain, and ROM code has no PSRAM cache workaround (issue #21).
+
+Bodies over 4 KB are in PSRAM, which this rev 1 chip writes safely only through the `esp32-psram` runtime
+(§11 item 8, #64). Linked without it, the verifier refused up to every body over ~5 KB: header byte 9 came
+back zeroed after zlib's `memcpy` wrote next to it (field: 6 of 7; bench: 300 of 300 at 12 KB, none with the
+PSRAM runtime). The OTA self-test therefore compresses a 16 KB body, so the trial boot exercises PSRAM.
+`GZTEST <bytes> [count]` on the serial console runs the compressor and verifier on synthetic bodies; run it at
+9000 and 12000 B after a platform or toolchain bump. The per-wake `GZIP n= big= fail= raw_max=` line counts
+bodies with a buffer in PSRAM and gzip failures.
 
 Time sync has **three** sources, not four: GNSS (`CLK_GPS`, wins), the modem's `AT+CCLK` (`CLK_NITZ`),
 `AT+CNTP` (`CLK_NTP`), plus the `Date` header on each telemetry POST (`CLK_HTTP`) as a coarse anchor.
