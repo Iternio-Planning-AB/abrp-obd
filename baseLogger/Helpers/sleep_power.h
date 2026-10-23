@@ -162,6 +162,15 @@ void enterDeepSleep(bool modem_on, const char* reason = nullptr) {
   saveUploadBacklog();
 #endif
 #endif
+  // The crash copy of the debt is paid only once the marker is sent: one still in RAM or the backlog would be
+  // lost to a panic after the next wake loads it, where #30's upload crashes were.
+  bool unsent = !obd_result_vector.empty();
+#if ENABLE_NETWORK
+#if ENABLE_LOGGING
+  unsent = unsent || uploadBacklogPending();
+#endif
+#endif
+  if (!park_marker_owed && !unsent) wdtStreakMarker(false);
 
   bleDeinitForSleep(); // tear BLE down BEFORE the log flush + peripheral power-down (no-op if BLE wasn't up)
 

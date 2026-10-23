@@ -138,7 +138,7 @@ order and share its globals. See [`AGENTS.md`](../AGENTS.md) before adding one.
 |---|---|
 | `state_machine.h` | The activity state machine (BLE / ACTIVE / CHARGING / STANDBY). |
 | `sleep_power.h` | Deep sleep (the one `enterDeepSleep` primitive), the IO36 12 V rail read, wake-cause decoding, wake-on-motion arming. |
-| `wdt_streak.h` | The consecutive panic/WDT reset count behind the crash-loop escalation, and whether the modem may still be powered, kept in `RTC_NOINIT` memory so the resets they track don't wipe them. |
+| `wdt_streak.h` | The consecutive panic/WDT/brownout reset count behind the crash-loop escalation, whether the modem may still be powered, and whether a trip's closing PARK may be unsent, kept in `RTC_NOINIT` memory so the resets they track don't wipe them. |
 | `mems.h` | ICM-42627 motion sensor: movement detection and wake-on-motion. |
 | `icm42627_cal.h` | Accelerometer bias calibration and the WOM threshold. |
 | `gps_location.h` | GNSS position, the parked-location average, the movement-streak logic. |
