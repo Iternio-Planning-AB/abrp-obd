@@ -192,14 +192,19 @@ def defines(config):
 old_defines, cur_defines = defines(old_src["config"]), defines(cur_src["config"])
 NAME = r"\b[A-Z][A-Z0-9_]{2,}\b"
 used, pending = set(), set(re.findall(NAME, "".join(old_drive)))
-while pending:  # through the macros' own bodies: ENABLE_NETWORK is ENABLE_CELL || ENABLE_WIFI
+while pending:  # through the macros' own bodies: ENABLE_NETWORK is (ENABLE_CELL || ENABLE_WIFI)
     macro = pending.pop()
     if macro in used or macro not in cur_defines:
         continue
     used.add(macro)
     pending |= set(re.findall(NAME, re.sub(r"^#define \w+", "", cur_defines[macro])))
+# ENABLE_NETWORK gained its parentheses (#62). Every use OLD reaches is a bare `#if ENABLE_NETWORK`, where they
+# change nothing; strip them for this one macro so the compare stays byte-exact for all the others. Drop this
+# once SM_PIN moves past the commit that added them.
+def unwrapped(macro, text):
+    return text.replace("(ENABLE_CELL || ENABLE_WIFI)", "ENABLE_CELL || ENABLE_WIFI") if macro == "ENABLE_NETWORK" else text
 for macro in sorted(used):
-    if old_defines.get(macro) != cur_defines[macro]:
+    if unwrapped(macro, old_defines.get(macro, "")) != unwrapped(macro, cur_defines[macro]):
         sys.exit(f"FAIL: config.h {macro} differs between SM_PIN and the tree; the OLD side would run with the new value")
 
 # The harness resets each firmware global to a literal; that literal must be the firmware's initialiser: in

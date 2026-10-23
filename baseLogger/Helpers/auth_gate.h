@@ -201,7 +201,7 @@ void forgetProfile(const char* why) {
 #if ENABLE_LOGGING
   LittleFS.remove(PROFILE_PATH);
 #endif
-#if (ENABLE_NETWORK) && ENABLE_LOGGING // parenthesised: ENABLE_NETWORK is a bare `||`
+#if ENABLE_NETWORK && ENABLE_LOGGING
   if (!obd_result_vector.empty() || upload_spilled)
     logEvent("UPLOAD discarded n=%lu reason=forget", obd_result_vector.size() + upload_spilled);
   LittleFS.remove(UPLOAD_BACKLOG_PATH);

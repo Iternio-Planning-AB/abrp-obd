@@ -1157,7 +1157,7 @@ void setup() {
   }
   config_initialized = true;
 
-#if (ENABLE_NETWORK) && ENABLE_LOGGING // parenthesised: ENABLE_NETWORK is a bare `||`
+#if ENABLE_NETWORK && ENABLE_LOGGING
   // Restore telemetry that couldn't be uploaded before the last sleep (wedged bearer / dead spot). Only
   // reachable on a polling wake - gate skips slept long before this - and the modem is freshly booted here,
   // so the normal upload path drains these with their original (correct) utc stamps.
@@ -1243,7 +1243,7 @@ void loop() {
       // Frames polled under another (or an unknown) token may be another vehicle's history: never sign them
       // with this one.
       if (pushed_token != tlm_push_token) {
-#if (ENABLE_NETWORK) && ENABLE_LOGGING
+#if ENABLE_NETWORK && ENABLE_LOGGING
         if (!obd_result_vector.empty() || upload_spilled)
           logEvent("UPLOAD discarded n=%lu reason=token", obd_result_vector.size() + upload_spilled);
         LittleFS.remove(UPLOAD_BACKLOG_PATH); // what a relay session parked there
@@ -2051,7 +2051,7 @@ void loop() {
 #endif
 #if ENABLE_BLE
     if (ble_relayed) {
-#if (ENABLE_NETWORK) && ENABLE_LOGGING
+#if ENABLE_NETWORK && ENABLE_LOGGING
       spillUploadBacklog();
 #endif
       if (ble_mtu != g_logged_ble_mtu || ble_frame.dropped > g_logged_ble_drop) {
