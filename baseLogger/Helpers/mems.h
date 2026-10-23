@@ -175,7 +175,7 @@ bool detectMovement(unsigned long duration) {
     }
     if (mem_data.acc[0] > 0.1 || mem_data.acc[1] > 0.1 || mem_data.acc[2] > 0.1) {
       active = true;
-      last_active = millis();
+      last_active = g_last_motion_ms = millis();
       break;
     }
   }

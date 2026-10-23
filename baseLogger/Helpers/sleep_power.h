@@ -84,6 +84,11 @@ void enterDeepSleep(bool modem_on, const char* reason = nullptr) {
   // car (no motion, no WOM), so the app could not even reconnect to retry until the next timer wake.
   // The dump's 30s inactivity guard bounds how long this can defer a sleep.
   if (g_ota_active || g_logdump_active) return;
+  if (g_weak_rail_cold_boot) modem_on = false;
+#if ENABLE_LOGGING
+  // A sleep that ends a held DC charge with no poll to end it (the backstop, the NET-recover reboot).
+  if (g_dc_logged) logEvent("DC_AWAKE off reason=%s rail=%.2f", reason ? reason : "sleep", g_last_io36);
+#endif
   sleepCount++;
   Serial.printf("Entering deep sleep (sleep #%lu). WOM threshold %.4fg (%d LSB), wake on GPIO%d HIGH.\n",
     sleepCount, WOM_THRESHOLD_G, WOM_THRESHOLD_LSB, (int)WOM_INT_PIN);
@@ -114,7 +119,7 @@ void enterDeepSleep(bool modem_on, const char* reason = nullptr) {
   // (WiFi associated). In a dead spot - e.g. an underground garage - connected() is false, so we skip it
   // entirely instead of stalling for tens of seconds and draining the battery; the frames are safe in
   // LittleFS and go up on the next connected wake. (The POST itself is also bounded by the wrapper timeout.)
-  if (!obd_result_vector.empty() && upload_fail_count < MAX_UPLOAD_FAILS_PER_WAKE) {
+  if (!obd_result_vector.empty() && !upload_spilled && upload_fail_count < MAX_UPLOAD_FAILS_PER_WAKE) {
     // up= is seconds since NET init=up, sampled before connect(): parked flushes ~25 s in failed while ~50 s
     // succeeded. The open trace (see HTTPClientSIM::open) says which step failed and whether the bearer was up.
     if (!network.connected()) {
@@ -130,8 +135,8 @@ void enterDeepSleep(bool modem_on, const char* reason = nullptr) {
         Serial.printf("Pre-sleep flush skipped: open failed %s - %d frame(s) kept in flash\n", why.c_str(),
           obd_result_vector.size());
 #if ENABLE_LOGGING
-        logEvent("FLUSH skipped: open failed %s up=%ds - %d kept", why.c_str(), up_s,
-          (int)obd_result_vector.size());
+        logEvent("FLUSH skipped: open failed up=%ds - %d kept", up_s, (int)obd_result_vector.size());
+        logEvent("FLUSH open trace %s", why.c_str()); // own line, so a long trace can't push up=/kept past logEvent's 119 chars
         logEvent("FLUSH diag %s", network.netDiag().c_str()); // separates weak signal from slow TLS
 #endif
       } else {
@@ -146,6 +151,11 @@ void enterDeepSleep(bool modem_on, const char* reason = nullptr) {
         network.disconnect();
       }
     }
+  } else if (!obd_result_vector.empty() && upload_spilled) {
+    // Older frames are parked in flash from a relay session: these are saved behind them, unsent.
+#if ENABLE_LOGGING
+    logEvent("FLUSH skipped: %lu parked - %d kept behind them", upload_spilled, (int)obd_result_vector.size());
+#endif
   } else if (!obd_result_vector.empty()) {
     Serial.printf("Pre-sleep flush skipped: upload backed off - %d frame(s) kept in flash\n",
       obd_result_vector.size());
@@ -158,11 +168,33 @@ void enterDeepSleep(bool modem_on, const char* reason = nullptr) {
 #if ENABLE_LOGGING
   // Persist whatever the flush could NOT send (dead bearer / no coverage) before RAM is wiped - previously
   // those frames were silently lost. Restored + uploaded on the next polling wake (see loadUploadBacklog).
+  gzipLogWakeSummary();
   saveUploadBacklog();
 #endif
 #endif
+  // The crash copy of the debt is paid only once the marker is sent: one still in RAM or the backlog would be
+  // lost to a panic after the next wake loads it, where #30's upload crashes were.
+  bool unsent = !obd_result_vector.empty();
+#if ENABLE_NETWORK
+#if ENABLE_LOGGING
+  unsent = unsent || uploadBacklogPending();
+#endif
+#endif
+  if (!park_marker_owed && !unsent) wdtStreakMarker(false);
 
   bleDeinitForSleep(); // tear BLE down BEFORE the log flush + peripheral power-down (no-op if BLE wasn't up)
+
+  // Power the modem down too when this wake never did, if an earlier one may have left it on (wdt_streak.h:
+  // a crash, an unanswered CPOWD). Probe first: the flag can be stale after a PWRKEY fallback that did
+  // switch it off, and a CPOWD to an off modem ends in another PWRKEY that switches it back ON. Silent = off.
+  bool modem_down = modem_on;
+#if ENABLE_CELL
+  if (!modem_on && wdtStreakModemMayBeOn()) {
+    std::string at = network.sendRawAt("AT", 1000);
+    modem_down = at.find("OK") != std::string::npos || at.find("ERROR") != std::string::npos;
+    if (!modem_down) wdtStreakModem(false);
+  }
+#endif
 
 #if ENABLE_LOGGING
   // Last line before the radios/peripherals go dark and RAM is wiped. Pairs with the next wake's WAKE line;
@@ -182,7 +214,7 @@ void enterDeepSleep(bool modem_on, const char* reason = nullptr) {
   // pdw or followup wake is not a charge, and parked-held / parked-cap / parked-uncorroborated are a charge
   // held slow.
   logEvent("SLEEP enter -> %s+GPS off, timer=%dmin reason=%s rail=%.2f (WOM %.3fg)",
-    modem_on ? "modem" : "(modem already off)", g_next_wake_minutes,
+    modem_down ? "modem" : "(modem already off)", g_next_wake_minutes,
     reason ? reason
       : g_cadence_reason ? g_cadence_reason
       : (g_next_wake_minutes == WAKE_DC_CHARGING_MINUTES) ? "dc-charge"
@@ -190,7 +222,7 @@ void enterDeepSleep(bool modem_on, const char* reason = nullptr) {
     g_last_io36, WOM_THRESHOLD_G);
 #else
   logEvent("SLEEP enter -> %s+GPS off, deep sleep (WOM %.3fg only)",
-    modem_on ? "modem" : "(modem already off)", WOM_THRESHOLD_G);
+    modem_down ? "modem" : "(modem already off)", WOM_THRESHOLD_G);
 #endif
   datalogger.end(); // flush + close the log segment so no buffered rows are lost across the sleep reboot
 #endif
@@ -199,9 +231,9 @@ void enterDeepSleep(bool modem_on, const char* reason = nullptr) {
   // the CELLULAR MODEM down (AT+CPOWD) as well - it was previously left running through deep sleep, which
   // drained the car's 12V battery overnight (see POWER_MANAGEMENT.md). WiFi build: turns the radio off.
   // Skipped on a gate SKIP (modem_on=false): the modem was never powered this wake, and powerOff() would
-  // PWRKEY-toggle an already-off modem back ON.
+  // PWRKEY-toggle an already-off modem back ON - unless it answered the probe above.
 #if ENABLE_NETWORK
-  if (modem_on) network.powerOff();
+  if (modem_down) network.powerOff();
 #endif
 #if ENABLE_GPS
   if (g_gps_powered) sys.gpsEnd(true); // only if we actually powered GNSS this wake (skip/charging never did)

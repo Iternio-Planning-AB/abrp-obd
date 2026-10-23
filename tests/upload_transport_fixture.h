@@ -56,12 +56,14 @@ struct CFreematics {
         return reply.result;
     }
 };
+// The UART a default-constructed client talks to: CellWrapper builds its HTTPClientSIM with net{}.
+CFreematics* default_uart = nullptr;
 class CellSIMCOM {
 public:
     char storage[RECV_BUF_SIZE] = {};
     char* m_buffer = storage;
     CFreematics* m_device;
-    explicit CellSIMCOM(CFreematics* device = nullptr) : m_device(device) {}
+    explicit CellSIMCOM(CFreematics* device = default_uart) : m_device(device) {}
     commandResponse sendCommand(const char* cmd, unsigned int timeout = 1000, const char* expected = nullptr);
 };
 #ifdef TLS_CHECKS
@@ -81,6 +83,8 @@ public:
 #include "upload_getter.inc"
 #ifdef TLS_CHECKS
     bool open(const char* host = 0, uint16_t port = 0);
+    bool close();
+    HTTP_STATES state() { return m_state; }
     const char* openTrace() { return m_open_trace; }
     bool setHeaders(const HeaderVector& headers);
     bool writeCaFile(const char* ext, const uint8_t* data, size_t len);
@@ -104,4 +108,5 @@ private:
 #ifdef TLS_CHECKS
 bool HTTPClientSIM::trustRefused() const { return m_trust_refused; }
 #include "tls_open.inc"
+#include "tls_close.inc"
 #endif

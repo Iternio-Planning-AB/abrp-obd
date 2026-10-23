@@ -166,15 +166,15 @@ first setup, the dongle works without your phone.
 Turn off Bluetooth on your phone (or leave it at home) and go for a short drive.
 
 **✔ Check:** in ABRP (on the web, or on another device), your car's state of charge and position
-update while you drive. The dongle uploads about once a minute, and its first connection after
+update while you drive. The dongle uploads about every 50 seconds, and its first connection after
 being plugged in can take a few minutes, so give it a little time.
 
 **What to expect from here on:**
 
 | When the car is… | The dongle… |
 |---|---|
-| Driving | Reports about once a minute over LTE-M, or over Bluetooth while your phone is connected. |
-| Charging | Wakes every 3 minutes, takes a reading, uploads and goes back to sleep. On a DC fast charger it wakes every minute, if the car reports DC charging. |
+| Driving | Reports about every 50 seconds over LTE-M, or over Bluetooth while your phone is connected. |
+| Charging | Wakes every 3 minutes, takes a reading, uploads and goes back to sleep. On a DC fast charger it stays awake and updates about every 30 seconds while the car reports DC charging. |
 | Parked and asleep | Wakes every 30 minutes or when the car moves, checks whether the car is awake, and goes straight back to sleep if it isn't. It doesn't wake the car to read it, so ABRP keeps the last value until the car wakes up. The one exception is a single read right after a charge ends, so ABRP sees the charge finish. |
 
 If there's no signal (a parking garage, say), the dongle keeps its readings and sends them later.

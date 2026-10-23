@@ -19,6 +19,7 @@
     session hold  DRIVING  an OTA update or log dump is running        DRIVING   hold
     buffered      DRIVING  a frame entered the upload buffer           DRIVING   owe the PARK marker
     marker        any      the pre-sleep PARK marker was queued        -         debt paid
+    restored      any      a reset but deep sleep; the crash copy owes -         debt owed (#49)
 
   Still elsewhere: the awake ladder and its last_active leash (state_machine.h, #29), the charge latch
   (#25), the wake gates and RTC boot (#26). UNCONFIRMED and the DRIVE transition log line come with the #6
@@ -114,3 +115,5 @@ inline void driveFrameBuffered() {
   if (!is_currently_parked) park_marker_owed = true;
 }
 inline void driveMarkerQueued() { park_marker_owed = false; }
+// setup(): .rtc.data was reloaded, and wdt_streak.h's copy says the PARK may not have been sent.
+inline void driveMarkerRestored() { park_marker_owed = true; }

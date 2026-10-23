@@ -24,7 +24,15 @@
   X(uint32_t, taper_confirm_wakes, 0) \
   X(bool, charge_end_polled, false)
 // Harness-only state: the trace's inputs and what the stubs recorded. Not firmware globals, so not checked.
+// sm_store_marker is the RTC_NOINIT debt copy (wdt_streak.h; its own semantics are the energy wdt-streak
+// group's). The buffer stands for RAM and the upload backlog together, except on a gate skip, which sleeps
+// before the backlog loads: there it is the file (sm_backlog_file) and RAM is empty.
+enum SmReset { ESP_RST_POWERON = 1, ESP_RST_PANIC = 4, ESP_RST_TASK_WDT = 6, ESP_RST_DEEPSLEEP = 8 };
 #define SM_STUB(X) \
+  X(SmReset, sm_reset, ESP_RST_POWERON) \
+  X(bool, sm_store_marker, false) \
+  X(bool, sm_backlog_file, false) \
+  X(bool, sm_flush_ok, false) \
   X(unsigned long, sm_now, 0) \
   X(uint8_t, charge_followup, 0) \
   X(bool, g_ota_active, false) \
@@ -99,4 +107,8 @@ void resetChargeCorroboration() { sm_corr_resets++; }
 uint64_t esp_rtc_get_time_us() { return (uint64_t)sm_now * 1000ULL; }
 bool chargeStateStale(uint64_t) { return false; }
 void pdwArmAtLadderEnd() {}
+SmReset esp_reset_reason() { return sm_reset; }
+void wdtStreakMarker(bool owed) { sm_store_marker = owed; }
+bool wdtStreakMarkerOwed() { return sm_store_marker; }
+bool uploadBacklogPending() { return sm_backlog_file; }
 void enterDeepSleep(bool modem_on, const char* reason = nullptr);
