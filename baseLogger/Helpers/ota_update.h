@@ -550,6 +550,9 @@ static void otaFinalize() {
 #if ENABLE_LOGGING
   logEvent("OTA committed v%lu (%lu B) -> reboot into trial boot",
     (unsigned long)ota_img_version, (unsigned long)ota_img_size);
+#if ENABLE_NETWORK
+  saveUploadBacklog();   // frames kept through the session; the boot after the update uploads them
+#endif
   datalogger.end();      // flush + close the log segment; the reboot wipes RAM
 #endif
   Serial.printf("OTA: committed, rebooting into new firmware\n");

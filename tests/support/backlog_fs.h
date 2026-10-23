@@ -37,7 +37,7 @@ struct FakeLittleFS {
   bool exists(const char* path) const { return files.count(path); }
   File open(const char* path, const char* mode) {
     if (fail_open) return {};
-    if (*mode == 'w') files[path] = std::make_shared<std::string>();
+    if (*mode == 'w' || (*mode == 'a' && !exists(path))) files[path] = std::make_shared<std::string>();
     return exists(path) ? File{files.at(path)} : File{};
   }
   void remove(const char* path) { files.erase(path); }

@@ -114,7 +114,7 @@ void enterDeepSleep(bool modem_on, const char* reason = nullptr) {
   // (WiFi associated). In a dead spot - e.g. an underground garage - connected() is false, so we skip it
   // entirely instead of stalling for tens of seconds and draining the battery; the frames are safe in
   // LittleFS and go up on the next connected wake. (The POST itself is also bounded by the wrapper timeout.)
-  if (!obd_result_vector.empty() && upload_fail_count < MAX_UPLOAD_FAILS_PER_WAKE) {
+  if (!obd_result_vector.empty() && !upload_spilled && upload_fail_count < MAX_UPLOAD_FAILS_PER_WAKE) {
     // up= is seconds since NET init=up, sampled before connect(): parked flushes ~25 s in failed while ~50 s
     // succeeded. The open trace (see HTTPClientSIM::open) says which step failed and whether the bearer was up.
     if (!network.connected()) {
@@ -146,6 +146,11 @@ void enterDeepSleep(bool modem_on, const char* reason = nullptr) {
         network.disconnect();
       }
     }
+  } else if (!obd_result_vector.empty() && upload_spilled) {
+    // Older frames are parked in flash from a relay session: these are saved behind them, unsent.
+#if ENABLE_LOGGING
+    logEvent("FLUSH skipped: %lu parked - %d kept behind them", upload_spilled, (int)obd_result_vector.size());
+#endif
   } else if (!obd_result_vector.empty()) {
     Serial.printf("Pre-sleep flush skipped: upload backed off - %d frame(s) kept in flash\n",
       obd_result_vector.size());

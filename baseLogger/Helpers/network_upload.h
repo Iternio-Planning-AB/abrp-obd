@@ -276,6 +276,7 @@ bool logNetwork(const std::vector<OBDVector>& frames) {
 //   drain=true : keep sending until the buffer is empty or a POST fails (pre-sleep flush - last chance
 //                before deep sleep wipes RAM). Returns true if every attempted POST succeeded.
 bool uploadBuffered(bool drain) {
+  if (upload_spilled) return true; // older frames are parked in flash; these wait behind them for the next wake
   bool ok = true;
   int batches = 0;
   while (!obd_result_vector.empty()) {
@@ -351,41 +352,84 @@ bool uploadBuffered(bool drain) {
 */
 static const char* UPLOAD_BACKLOG_PATH = "/upload_backlog.jsonl";
 
-// Called from enterDeepSleep AFTER the flush attempt. Overwrite semantics are correct: the RAM buffer already
-// contains any previously-loaded backlog (the file is deleted at load), so the buffer is the full truth.
-void saveUploadBacklog() {
-  if (obd_result_vector.empty()) return; // everything uploaded (or nothing polled) - leave no stale file
-  File f = LittleFS.open(UPLOAD_BACKLOG_PATH, "w");
-  if (!f) { Serial.printf("Backlog: open for write failed\n"); return; }
+// Past the cap the oldest frame goes on every poll: one line per capped stretch, at the next accepted
+// upload or before the backlog is saved.
+void logUploadCapped() {
+  if (!upload_capped) return;
+  logEvent("UPLOAD discarded n=%lu reason=cap", upload_capped);
+  upload_capped = 0;
+}
+
+// Called from enterDeepSleep AFTER the flush attempt, before an OTA reboot, and to spill. Overwrite semantics
+// are correct: the RAM buffer already contains any previously-loaded backlog (the file is deleted at load).
+// Only a spill from this wake can still be in the file, and it is older than RAM, so RAM goes behind it.
+bool saveUploadBacklog() {
+  logUploadCapped();
+  if (obd_result_vector.empty()) return true; // everything uploaded (or nothing polled) - leave no stale file
+  File f = LittleFS.open(UPLOAD_BACKLOG_PATH, upload_spilled ? "a" : "w");
+  if (!f) { Serial.printf("Backlog: open for write failed\n"); return false; }
   for (const auto& frame : obd_result_vector) {
     f.println(encodeUploadFrame(frame).dump().c_str());
   }
   f.close();
   Serial.printf("Backlog: %d unsent frame(s) persisted to flash\n", (int)obd_result_vector.size());
   logEvent("BACKLOG saved %d unsent frame(s)", (int)obd_result_vector.size());
+  return true;
+}
+
+// A relaying phone's session (pairing, profile push, OTA, log dump) needs the internal heap the queue holds,
+// about 1 KB a frame, next to Bluedroid's: park the queue in the backlog file until relaying ends.
+void spillUploadBacklog() {
+  const size_t n = obd_result_vector.size();
+  if (!n || !saveUploadBacklog()) return;
+  obd_result_vector.clear();
+  upload_spilled += n;
 }
 
 // Called at the end of setup() on polling wakes only (gate skips sleep before this, leaving the file for the
-// next real wake). Loads into the normal RAM buffer, bounded by MAX_UPLOAD_BUFFER, then deletes the file -
-// from here the frames are RAM-owned and re-persisted at the next sleep if still unsent.
+// next real wake), and when a relay session that spilled ends. The file's frames are older than the RAM
+// buffer's, so they go in front, bounded by MAX_UPLOAD_BUFFER; then the file is deleted - from here the
+// frames are RAM-owned and re-persisted at the next sleep if still unsent.
 void loadUploadBacklog() {
+  upload_spilled = 0;
   if (!LittleFS.exists(UPLOAD_BACKLOG_PATH)) return;
+  // Over the cap the oldest lines go, as in RAM: a sleep in a relay session can append behind a full spill.
+  size_t skip = 0;
   File f = LittleFS.open(UPLOAD_BACKLOG_PATH, "r");
   if (!f) return;
-  int n = 0;
-  while (f.available() && obd_result_vector.size() < MAX_UPLOAD_BUFFER) {
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length()) skip++;
+  }
+  f.close();
+  skip = skip > MAX_UPLOAD_BUFFER ? skip - MAX_UPLOAD_BUFFER : 0;
+  upload_capped += skip;
+  f = LittleFS.open(UPLOAD_BACKLOG_PATH, "r");
+  if (!f) return;
+  std::vector<OBDVector> restored;
+  while (f.available()) {
     String line = f.readStringUntil('\n');
     line.trim();
     if (!line.length()) continue;
+    if (skip) { skip--; continue; }
     try {
       json tlm = json::parse(line.c_str());
       OBDVector frame = decodeUploadFrame(tlm);
-      if (!frame.empty()) { obd_result_vector.push_back(frame); n++; }
+      if (!frame.empty()) restored.push_back(std::move(frame));
     }
     catch (const json::exception&) { /* skip a corrupt line (e.g. power lost mid-write) */ }
   }
   f.close();
   LittleFS.remove(UPLOAD_BACKLOG_PATH);
+  const int n = (int)restored.size();
+  obd_result_vector.insert(obd_result_vector.begin(), std::make_move_iterator(restored.begin()),
+    std::make_move_iterator(restored.end()));
+  if (obd_result_vector.size() > MAX_UPLOAD_BUFFER) {
+    upload_capped += obd_result_vector.size() - MAX_UPLOAD_BUFFER;
+    obd_result_vector.erase(obd_result_vector.begin(),
+      obd_result_vector.begin() + (obd_result_vector.size() - MAX_UPLOAD_BUFFER));
+  }
   g_geo_queued_seeded = false;
   if (n) {
     Serial.printf("Backlog: restored %d frame(s) from flash for upload\n", n);

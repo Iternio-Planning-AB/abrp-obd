@@ -40,6 +40,7 @@ with tempfile.TemporaryDirectory(prefix="obd-upload-checks-") as temporary:
     (build / "upload_streak.inc").write_text(streak_line + "\n")
     (build / "geo_reset.inc").write_text(geo_reset_line + "\n")
     (build / "open_streak.inc").write_text(open_streak_line + "\n")
+    (build / "token_push.inc").write_text(section(logger, "      const std::string pushed_token", "      std::string profile_dump"))
     (build / "tls_defines.inc").write_text(section(header, "// Root-CA install (HTTPClientSIM::ensureCa)", "#define RECV_BUF_SIZE"))
     (build / "tls_members.inc").write_text(section(header, "    enum CaState", "    HTTPTransferDiagnostics m_transfer_diagnostics;") +
                                            section(header, "    char m_open_trace[", "\n};"))
