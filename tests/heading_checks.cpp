@@ -3,10 +3,12 @@
 #include <cctype>
 #include <climits>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <algorithm>
 #include <iostream>
 #include <limits>
 #include <sstream>
@@ -26,9 +28,19 @@
 #define FLAG_GNSS_USE_LINK 1
 
 using json = nlohmann::json;
-using OBDVector = std::vector<std::pair<std::string, double>>;
+#include "../libraries/OBDWrapper/obd_vector.h"
 using HeaderVector = std::vector<std::pair<std::string, std::string>>;
 #include "header_budget.inc"
+extern std::vector<OBDVector> obd_result_vector;
+extern std::vector<OBDVector> g_upload_held;
+
+struct ESPStub {
+  unsigned long getFreeHeap() const;
+  unsigned long getMaxAllocHeap() const;
+  unsigned long getMaxAllocPsram() const;
+  unsigned long getPsramSize() const;
+  unsigned long getFreePsram() const;
+} ESP;
 
 void check(bool condition, const std::string& message) {
   if (!condition) {
@@ -121,16 +133,31 @@ unsigned long g_last_post_ms = 0;
 std::string g_last_status, tlm_push_token = "test-token", api_key = "test-key";
 std::vector<OBDVector> obd_result_vector;
 unsigned long upload_capped = 0, upload_spilled = 0;
+unsigned long upload_heap_dropped = 0;
+#define MAX_UPLOAD_BUFFER 120
 #include "tlm_signature.h"
 #include "network_upload.h"
 #include "backlog_fs.h"
-#define MAX_UPLOAD_BUFFER 120
 #include "geo_backlog.h"
 #include "backlog.inc"
 namespace historical {
 std::vector<OBDVector> obd_result_vector;
 #include "historical_format.inc"
 #include "historical_backlog.inc"
+}
+
+#include "upload_heap_fixture.h"
+
+size_t backlog_read_count = 0;
+bool backlog_read_bounds_ok = true;
+bool backlog_queue_grew_during_read = false;
+void observeBacklogRead() {
+  if (!heap_fixture_enabled) return;
+  ++backlog_read_count;
+  if (obd_result_vector.size() > 40 || ESP.getFreeHeap() < 32768 ||
+      ESP.getMaxAllocHeap() < 16384) backlog_read_bounds_ok = false;
+  if (backlog_read_count > MAX_UPLOAD_BUFFER + 2 && obd_result_vector.size() >= 2)
+    backlog_queue_grew_during_read = true;
 }
 
 enum ResetReason { ESP_RST_POWERON, ESP_RST_SW, ESP_RST_PANIC, ESP_RST_WDT, ESP_RST_DEEPSLEEP };
@@ -142,6 +169,10 @@ void resetFixture() {
   gps_location_source = "omitted";
   LittleFS.files.clear();
   LittleFS.fail_open = false;
+  LittleFS.read_observer = nullptr;
+  backlog_read_count = 0;
+  backlog_read_bounds_ok = true;
+  backlog_queue_grew_during_read = false;
   historical::obd_result_vector.clear();
   clock_epoch = 0;
   last_clock_sync_epoch = 0;
@@ -173,7 +204,10 @@ void resetFixture() {
   park_acc_n = gps_moving_streak = 0;
   network.received.clear();
   network.responseCode = 200;
-  obd_result_vector.clear();
+  std::vector<OBDVector>().swap(obd_result_vector);
+  std::vector<OBDVector>().swap(g_upload_held);
+  upload_capped = upload_spilled = upload_heap_dropped = 0;
+  resetHeapFixture();
   logging_errors = g_last_http = g_http0_streak = 0;
   g_last_post_ms = 0;
   g_last_status.clear();
@@ -1509,6 +1543,25 @@ void queueParkMarker() {
 #include "park_marker.inc"
 }
 
+OBDVector richUploadFrame(double utc, unsigned index) {
+  OBDVector frame{{"utc", utc}, {"soc", 45 + index / 100.0}, {"voltage", 350},
+                  {"current", 12}, {"speed", 50}};
+  for (unsigned i = 0; i < 20; ++i)
+    frame.emplace_back("p" + std::to_string(i), index + i);
+  return frame;
+}
+
+size_t expectedQueueCopyBytes(const OBDVector& frame, size_t destination_size,
+                              size_t destination_capacity) {
+  // No PSRAM in these fixtures: the pairs are internal; keys past 15 characters are counted as on the ESP32.
+  size_t bytes = frame.size() * sizeof(OBDVector::value_type) + 16;
+  for (const auto& value : frame)
+    if (value.first.size() > 15) bytes += value.first.size() + 1 + 16;
+  if (destination_size == destination_capacity)
+    bytes += (destination_size + 1) * sizeof(OBDVector) + 16;
+  return bytes;
+}
+
 void uploadGate() {
   const double T = 1791500000;
   resetFixture();
@@ -1621,6 +1674,188 @@ void uploadGate() {
   for (int i = 0; i <= MAX_UPLOAD_BUFFER; ++i) bufferPoll({{"utc", T - MAX_UPLOAD_BUFFER + i}, {"soc", 50}});
   check(obd_result_vector.size() == MAX_UPLOAD_BUFFER && obd_result_vector[0][0].second == T - MAX_UPLOAD_BUFFER + 1 &&
         upload_capped == 1, "the cap drops the oldest frame and counts it for the log");
+
+  resetFixture();
+  setClock(CLK_HTTP, T);
+  heap_fixture_enabled = true;
+  heap_fixture_free = 42000;
+  heap_fixture_maxblock = 42000;
+  park_marker_owed = false;
+  size_t max_queued = 0;
+  for (unsigned i = 0; i < 160; ++i) {
+    bufferPoll(richUploadFrame(T + i, i));
+    max_queued = std::max(max_queued, obd_result_vector.size());
+    check(ESP.getFreeHeap() >= 32768, "offline queue leaves the configured internal-heap reserve");
+    check(ESP.getMaxAllocHeap() >= 16384, "offline queue leaves the configured largest-block reserve");
+  }
+  check(max_queued < 40 && obd_result_vector.size() < 40,
+        "sustained rich offline polls stay below the heap-driven frame budget");
+  check(upload_heap_dropped > 0 && obd_result_vector.back()[0].second == T + 159,
+        "heap evictions preserve the newest frame and count memory drops");
+  for (size_t i = 1; i < obd_result_vector.size(); ++i)
+    check(obd_result_vector[i - 1][0].second < obd_result_vector[i][0].second,
+          "adaptive queue remains FIFO after evicting older frames");
+  const unsigned first_retained = 160 - obd_result_vector.size();
+  for (size_t i = 0; i < obd_result_vector.size(); ++i) {
+    double utc = 0, soc = 0;
+    for (const auto& value : obd_result_vector[i]) {
+      if (value.first == "utc") utc = value.second;
+      if (value.first == "soc") soc = value.second;
+    }
+    const unsigned expected = first_retained + i;
+    check(utc == T + expected && soc == 45 + expected / 100.0,
+          "adaptive queue retains the exact newest UTC/SOC suffix");
+  }
+  check(obd_result_vector.back()[1].first == "soc" &&
+        obd_result_vector.back()[1].second == 45 + 159 / 100.0,
+        "adaptive queue retains battery telemetry on the newest frame");
+
+  resetFixture();
+  setClock(CLK_HTTP, T);
+  heap_fixture_enabled = true;
+  heap_fixture_free = 80000;
+  heap_fixture_maxblock = 16384;
+  const GeoMarks prior_marks = g_geo_queued;
+  OBDVector geo_poll{{"utc", T}, {"soc", 50}, {"lat", 59.33}, {"lon", 18.06},
+                     {"__geo_loc_utc", T}};
+  GeoMarks candidate_marks{};
+  bulkStringV2({geo_poll}, T, &candidate_marks);
+  check(candidate_marks.location.utc == T, "heap-refusal fixture carries a new location mark");
+  bufferPoll(geo_poll);
+  check(obd_result_vector.empty(), "fragmented heap refuses a frame below the largest-block reserve");
+  check(g_geo_queued.location.utc == prior_marks.location.utc &&
+        g_geo_queued.location.lat == prior_marks.location.lat &&
+        g_geo_queued.location.lon == prior_marks.location.lon,
+        "a refused frame does not advance the queued geo mark");
+
+  resetFixture();
+  setClock(CLK_HTTP, T);
+  heap_fixture_enabled = true;
+  heap_fixture_free = 32768;
+  heap_fixture_maxblock = 40000;
+  bufferPoll({{"utc", T}, {"soc", 50}});
+  check(obd_result_vector.empty(), "an already-low heap refuses even a small incoming frame");
+
+  OBDVector boundary{{"utc", T}, {"soc", 50}, {"is_parked", 0}};
+  const size_t boundary_cost = expectedQueueCopyBytes(boundary, 0, 0);
+  resetFixture();
+  setClock(CLK_HTTP, T);
+  heap_fixture_enabled = true;
+  heap_fixture_free = 32768 + boundary_cost;
+  heap_fixture_maxblock = 16384 + boundary_cost;
+  bufferPoll({{"utc", T}, {"soc", 50}});
+  check(obd_result_vector.size() == 1, "exact reserve plus estimated copy admits the frame");
+
+  resetFixture();
+  setClock(CLK_HTTP, T);
+  heap_fixture_enabled = true;
+  heap_fixture_free = 32768 + boundary_cost - 1;
+  heap_fixture_maxblock = 16384 + boundary_cost;
+  bufferPoll({{"utc", T}, {"soc", 50}});
+  check(obd_result_vector.empty(), "one byte under the heap reserve refuses the frame: cost=" +
+        std::to_string(boundary_cost) + " free=" + std::to_string(ESP.getFreeHeap()) +
+        " queued=" + std::to_string(obd_result_vector.size()));
+
+  resetFixture();
+  setClock(CLK_HTTP, T);
+  std::vector<OBDVector>().swap(obd_result_vector);
+  is_currently_parked = true;
+  park_marker_owed = true;
+  obd_result_vector.assign(MAX_UPLOAD_BUFFER, {{"utc", T}, {"soc", 49}, {"is_parked", 0}});
+  queueParkMarker();
+  check(obd_result_vector.size() == MAX_UPLOAD_BUFFER && obd_result_vector.back().size() == 2 &&
+        obd_result_vector.back()[0].first == "is_parked" && upload_capped == 1 && !park_marker_owed,
+        "the PARK marker is last and evicts the oldest frame at the count limit");
+
+  resetFixture();
+  setClock(CLK_HTTP, T);
+  heap_fixture_enabled = true;
+  heap_fixture_free = 32768;
+  heap_fixture_maxblock = 40000;
+  is_currently_parked = true;
+  park_marker_owed = true;
+  obd_result_vector.push_back({{"utc", T}, {"soc", 49}});
+  queueParkMarker();
+  check(obd_result_vector.empty() && park_marker_owed,
+        "an unqueueable PARK marker leaves its debt owed");
+
+  resetFixture();
+  setClock(CLK_HTTP, T);
+  heap_fixture_enabled = true;
+  heap_fixture_free = 42000;
+  heap_fixture_maxblock = 42000;
+  std::string rows;
+  for (unsigned i = 0; i < MAX_UPLOAD_BUFFER; ++i) {
+    OBDVector frame = richUploadFrame(T + i, i);
+    frame.emplace_back("lat", 59.33);
+    frame.emplace_back("lon", 18.06);
+    frame.emplace_back("__geo_loc_utc", T + i);
+    rows += encodeUploadFrame(frame).dump() + '\n';
+  }
+  LittleFS.seed(rows);
+  LittleFS.read_observer = observeBacklogRead;
+  OBDVector newer_ram = richUploadFrame(T + MAX_UPLOAD_BUFFER, MAX_UPLOAD_BUFFER);
+  newer_ram.emplace_back("lat", 59.33);
+  newer_ram.emplace_back("lon", 18.06);
+  newer_ram.emplace_back("__geo_loc_utc", T + MAX_UPLOAD_BUFFER);
+  obd_result_vector = {newer_ram};
+  loadUploadBacklog();
+  LittleFS.read_observer = nullptr;
+  check(backlog_read_count == 2 * MAX_UPLOAD_BUFFER && backlog_read_bounds_ok &&
+        backlog_queue_grew_during_read,
+        "the global queue stays bounded and grows during the file-row restore pass");
+  check(obd_result_vector.size() < 40 && ESP.getFreeHeap() >= 32768 &&
+        ESP.getMaxAllocHeap() >= 16384,
+        "backlog restore admits frames incrementally under the same heap reserves");
+  check(obd_result_vector.back()[0].second == T + MAX_UPLOAD_BUFFER &&
+        obd_result_vector.back()[1].first == "soc",
+        "backlog restore keeps the newest RAM frame and battery data");
+  bool retained_geo_provenance = false;
+  for (const auto& value : obd_result_vector.back())
+    if (value.first == "__geo_loc_utc") retained_geo_provenance = value.second == T + MAX_UPLOAD_BUFFER;
+  check(retained_geo_provenance, "backlog restore preserves numeric geo provenance");
+  const auto retained = obd_result_vector;
+  std::vector<json> retained_private_rows;
+  for (const auto& frame : retained) retained_private_rows.push_back(encodeUploadFrame(frame));
+  heap_fixture_enabled = false;
+  check(saveUploadBacklog() && obd_result_vector == retained,
+        "saving a restored queue keeps RAM unchanged");
+  obd_result_vector.clear();
+  loadUploadBacklog();
+  check(bulkStringV2(obd_result_vector) == bulkStringV2(retained),
+        "save and restore preserve retained frames and provenance");
+  std::vector<json> restored_private_rows;
+  for (const auto& frame : obd_result_vector) restored_private_rows.push_back(encodeUploadFrame(frame));
+  check(restored_private_rows == retained_private_rows,
+        "save and restore preserve each frame's private geo shadow values");
+
+  for (bool pending_ram : {false, true}) {
+    resetFixture();
+    setClock(CLK_HTTP, T);
+    is_currently_parked = true;
+    park_marker_owed = false;
+    heap_fixture_enabled = true;
+    heap_fixture_free = 32768;
+    heap_fixture_maxblock = 40000;
+    OBDVector marker{{"utc", T}, {"is_parked", 1}};
+    if (pending_ram) {
+      LittleFS.seed("\n");
+      obd_result_vector = {marker};
+    }
+    else {
+      LittleFS.seed(encodeUploadFrame(marker).dump() + '\n');
+    }
+    loadUploadBacklog();
+    check(obd_result_vector.empty() && park_marker_owed,
+          std::string(pending_ram ? "pending RAM" : "file") +
+          " PARK marker refusal restores its owed debt");
+    heap_fixture_enabled = false;
+    queueParkMarker();
+    check(obd_result_vector.size() == 1 && !park_marker_owed &&
+          obd_result_vector.back().size() == 2 && obd_result_vector.back()[0].first == "is_parked",
+          std::string(pending_ram ? "pending RAM" : "file") +
+          " PARK marker can be queued after heap recovers");
+  }
 }
 
 int main(int argc, char** argv) {

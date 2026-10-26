@@ -1,10 +1,12 @@
 #define PRINT 1
 #include "upload_transport_fixture.h"
 #include <cstdarg>
+#include <cstdint>
 #include <ctime>
 #include <algorithm>
 #include <limits>
 #include <sstream>
+#include <type_traits>
 #include "networkwrapper.h"
 #include "cellwrapper.h"
 #include "header_budget.inc"
@@ -15,7 +17,11 @@
 #endif
 #define ENABLE_CELL 1
 #include "../baseLogger/config.h"
+#ifndef MAX_UPLOAD_BUFFER // run_upload_checks.py passes logger.ino's
 #define MAX_UPLOAD_BUFFER 120
+#endif
+extern std::vector<OBDVector> obd_result_vector;
+extern std::vector<OBDVector> g_upload_held;
 
 struct RTCStub {
     uint32_t epoch = 1791112000;
@@ -52,8 +58,11 @@ struct LogStub {
 #endif
 #include "support/backlog_fs.h"
 struct ESPStub {
-    unsigned long getFreeHeap() { return 80000; }
-    unsigned long getMaxAllocHeap() { return 40000; }
+    unsigned long getFreeHeap() const;
+    unsigned long getMaxAllocHeap() const;
+    unsigned long getMaxAllocPsram() const;
+    unsigned long getPsramSize() const;
+    unsigned long getFreePsram() const;
 } ESP;
 bool g_ble_up = false;
 void esp_task_wdt_reset() {}
@@ -137,8 +146,13 @@ unsigned long g_last_post_ms = 0;
 std::string g_last_status, tlm_push_token = "test-token-actual", api_key = "test-key-actual";
 std::vector<OBDVector> obd_result_vector;
 unsigned long upload_capped = 0, upload_spilled = 0;
+unsigned long upload_heap_dropped = 0;
+bool park_marker_owed = false;
 #include "tlm_signature.h"
+#include "drive_marker_restored.inc"
 #include "network_upload.h"
+
+#include "support/upload_heap_fixture.h"
 void pushToken(json newConfig) {
 #include "token_push.inc"
 }
@@ -149,6 +163,9 @@ void reset() {
     last_clock_sync_epoch = rtc.epoch;
     clock_after_gzip = 0; sync_after_gzip = -1;
     LittleFS.files.clear(); LittleFS.fail_open = false;
+    LittleFS.other_used = 0; LittleFS.enforce_capacity = false;
+    LittleFS.write_lines = LittleFS.keep_lines = SIZE_MAX;
+    LittleFS.read_observer = nullptr;
     network.response_epochs.clear();
     network.sent.clear(); network.headers.clear(); network.codes.clear(); network.uart = CFreematics{};
     network.code = 200; network.ack = 1; network.body = "{}"; network.unknown_diagnostics = false; network.headers_ok = true;
@@ -156,8 +173,13 @@ void reset() {
     datalogger.lines.clear(); Serial.output.clear(); gzip_calls = 0;
     gzip_enabled = force_oversized = false;
     gzip_outcome = GZIP_OK; gzip_script.clear(); gzip_inputs.clear(); gzip_inputs_at_post.clear();
-    gzip_noted_failures = 0; g_upload_held.clear();
-    logging_errors = g_last_http = g_http0_streak = 0; g_last_status.clear(); obd_result_vector.clear();
+    gzip_noted_failures = 0;
+    std::vector<OBDVector>().swap(g_upload_held);
+    logging_errors = g_last_http = g_http0_streak = 0; g_last_status.clear();
+    std::vector<OBDVector>().swap(obd_result_vector);
+    upload_capped = upload_spilled = upload_heap_dropped = 0;
+    park_marker_owed = false;
+    resetHeapFixture();
     host_md_fail = 0;
     g_geo_accepted = g_geo_queued = {}; reset_reason = ESP_RST_POWERON;
 #if ENABLE_LOGGING
@@ -169,6 +191,16 @@ void sha256(const std::string& bytes, unsigned char digest[32]) {
                      bytes.size(), digest) == 0, "host SHA256");
 }
 OBDVector frame(unsigned index) { return {{"utc", 1791112000 + index}, {"soc", 50 + index / 100.0}, {"voltage", 350}, {"current", 12}, {"speed", 50}}; }
+OBDVector richUploadFrame(double utc, unsigned index) {
+    OBDVector result{{"utc", utc}, {"soc", 45 + index / 100.0}, {"voltage", 350},
+                     {"current", 12}, {"speed", 50}};
+    for (unsigned i = 0; i < 20; ++i) result.emplace_back("p" + std::to_string(i), index + i);
+    result.emplace_back("lat", 59.33);
+    result.emplace_back("lon", 18.06);
+    result.emplace_back("__geo_loc_utc", utc);
+    return result;
+}
+OBDVector oversizedFrame();
 #if ENABLE_LOGGING
 std::vector<std::string> events(const std::string& prefix) {
     std::vector<std::string> result;
@@ -305,6 +337,173 @@ void queue() {
 #if ENABLE_LOGGING
     check(g_upload_request_id == 0, "drop has no POST diagnostics");
 #endif
+
+    // Frames and their keys use the PSRAM-preferring allocator the heap fixture places in PSRAM.
+    static_assert(std::is_same<OBDVector::allocator_type, obd_alloc::PsramPreferred<OBDPair>>::value &&
+                  std::is_same<OBDKey::allocator_type, obd_alloc::PsramPreferred<char>>::value,
+                  "queued frames and keys use the PSRAM-preferring allocator");
+    // A key past the string's own buffer (15 characters on the ESP32, 22 here), as profiles have.
+    auto longKeyFrame = [](unsigned i) {
+        OBDVector f = richUploadFrame(1791112000 + i, i);
+        f.emplace_back("est_battery_range", 300);
+        f.emplace_back("hv_battery_cell_temperature_max", 31);
+        return f;
+    };
+
+    // #75 field case: an ID.5 offline for 47 minutes with BLE up had 10-15 KB free and a 2292 B largest internal
+    // block, and 4 MB of PSRAM. Frames and keys live in PSRAM, so the queue fills to its cap and costs no internal heap
+    // at any point of the fill.
+    reset();
+    heap_fixture_enabled = true;
+    heap_fixture_free = 12000;
+    heap_fixture_maxblock = 2292;
+    heap_fixture_psram = 4000000;
+    for (unsigned i = 0; i < MAX_UPLOAD_BUFFER + 10; ++i)
+        check(queueUploadFrame(obd_result_vector, longKeyFrame(i)) && fixtureUploadBytes() == 0,
+              "low internal heap with PSRAM free admits every offline frame and uses no internal heap: i=" +
+              std::to_string(i) + " internal=" + std::to_string(fixtureUploadBytes()));
+    check(obd_result_vector.size() == MAX_UPLOAD_BUFFER && upload_heap_dropped == 0 && upload_capped == 10 &&
+          obd_result_vector.front()[0].second == 1791112010,
+          "field heap: the queue fills to its cap in PSRAM and only the count cap drops");
+    check(MAX_UPLOAD_BUFFER * 7 >= 47 * 60, "the cap holds a 47-minute offline drive at the 7 s driving poll");
+
+    // PSRAM short: the oldest frames go, and the reserve gzip needs stays free.
+    reset();
+    heap_fixture_enabled = true;
+    heap_fixture_psram = UPLOAD_MIN_FREE_PSRAM + 40000;
+    for (unsigned i = 0; i < 200; ++i) {
+        check(queueUploadFrame(obd_result_vector, longKeyFrame(i)), "short PSRAM admits the newest frame");
+        check(ESP.getFreePsram() >= UPLOAD_MIN_FREE_PSRAM, "short PSRAM keeps the PSRAM reserve");
+    }
+    check(!obd_result_vector.empty() && obd_result_vector.size() < 200 && upload_heap_dropped > 0 &&
+          obd_result_vector.back()[0].second == 1791112199, "short PSRAM evicts the oldest and keeps the newest");
+
+    reset();
+    heap_fixture_enabled = true;
+    heap_fixture_psram = UPLOAD_MIN_FREE_PSRAM;
+    check(!queueUploadFrame(obd_result_vector, longKeyFrame(0)) && obd_result_vector.empty() &&
+          upload_heap_dropped == 1, "PSRAM at its reserve refuses the frame");
+
+    // No PSRAM: everything is internal, long keys included, and the internal reserves hold.
+    reset();
+    heap_fixture_enabled = true;
+    heap_fixture_free = 42000;
+    heap_fixture_maxblock = 42000;
+    for (unsigned i = 0; i < 160; ++i) {
+        check(queueUploadFrame(obd_result_vector, longKeyFrame(i)), "no PSRAM admits the newest frame");
+        check(ESP.getFreeHeap() >= UPLOAD_MIN_FREE_HEAP && ESP.getMaxAllocHeap() >= UPLOAD_MIN_MAX_BLOCK,
+              "no PSRAM keeps both internal reserves with long keys");
+    }
+    check(upload_heap_dropped > 0 && obd_result_vector.back()[0].second == 1791112159,
+          "no PSRAM evicts the oldest and keeps the newest");
+
+    reset();
+    for (unsigned i = 0; i <= MAX_UPLOAD_BUFFER; ++i)
+        check(queueUploadFrame(obd_result_vector, frame(i)), "high-memory count-cap helper admits each frame");
+    check(obd_result_vector.size() == MAX_UPLOAD_BUFFER && obd_result_vector.front()[0].second == 1791112001 &&
+          upload_capped == 1 && upload_heap_dropped == 0,
+          "high-memory queue behavior remains count-capped and separately counted");
+
+    reset();
+    obd_result_vector.push_back({{"is_parked", 1.0}, {"utc", 1791112000}});
+    for (unsigned i = 1; i < MAX_UPLOAD_BUFFER; ++i) obd_result_vector.push_back(frame(i));
+    check(queueUploadFrame(obd_result_vector, frame(MAX_UPLOAD_BUFFER)) &&
+          park_marker_owed && upload_capped == 1,
+          "count eviction of a synthetic PARK marker restores marker debt");
+
+    reset();
+    obd_result_vector.push_back({{"utc", 1791112000}, {"soc", 50}, {"is_parked", 1}});
+    for (unsigned i = 1; i < MAX_UPLOAD_BUFFER; ++i) obd_result_vector.push_back(frame(i));
+    check(queueUploadFrame(obd_result_vector, frame(MAX_UPLOAD_BUFFER)) && !park_marker_owed,
+          "rich PARK telemetry eviction is not mistaken for the synthetic marker");
+
+    reset();
+    heap_fixture_enabled = true;
+    obd_result_vector = {{{"utc", 1791112000}, {"is_parked", 1}}};
+    const OBDVector incoming = frame(1);
+    size_t copy_bytes = incoming.size() * sizeof(OBDVector::value_type) + 16;
+    for (const auto& value : incoming)
+        if (value.first.size() > 15) copy_bytes += value.first.size() + 1 + 16;
+    const size_t outer_bytes = obd_result_vector.capacity() * sizeof(OBDVector) + 16;
+    // Budget the conservative ABI-sized copy to fit exactly after the old marker is evicted.
+    heap_fixture_free = UPLOAD_MIN_FREE_HEAP + outer_bytes + copy_bytes;
+    heap_fixture_maxblock = 40000;
+    const bool marker_admitted = queueUploadFrame(obd_result_vector, incoming);
+    check(marker_admitted && park_marker_owed && obd_result_vector.size() == 1 &&
+          upload_heap_dropped == 1,
+          "heap marker eviction: admitted=" + std::to_string(marker_admitted) +
+          " owed=" + std::to_string(park_marker_owed) + " size=" +
+          std::to_string(obd_result_vector.size()) + " dropped=" +
+          std::to_string(upload_heap_dropped) + " free=" + std::to_string(ESP.getFreeHeap()));
+
+#if ENABLE_LOGGING
+    auto restoredUtcs = [] {
+        std::vector<double> result;
+        for (const auto& queued : obd_result_vector)
+            for (const auto& value : queued)
+                if (value.first == "utc") result.push_back(value.second);
+        return result;
+    };
+    for (bool with_main : {false, true}) {
+        reset();
+        g_upload_held = {frame(8)};
+        if (with_main) obd_result_vector = {frame(9)};
+        check(saveUploadBacklog(), "first save writes held frames and current RAM");
+        obd_result_vector.push_back(frame(10));
+        check(saveUploadBacklog(), "second save rewrites held frames and current RAM");
+        obd_result_vector.clear();
+        g_upload_held.clear();
+        loadUploadBacklog();
+        const std::vector<double> expected = with_main
+            ? std::vector<double>{1791112008, 1791112009, 1791112010}
+            : std::vector<double>{1791112008, 1791112010};
+        check(restoredUtcs() == expected, "repeated save and reboot retains held frames once in FIFO order");
+    }
+    reset();
+    g_upload_held = {frame(8)};
+    obd_result_vector = {frame(9)};
+    LittleFS.seed(encodeUploadFrame(frame(10)).dump() + '\n');
+    LittleFS.fail_open = true;
+    loadUploadBacklog();
+    check(g_upload_held.size() == 1 && obd_result_vector.size() == 1 &&
+          LittleFS.exists("/upload_backlog.jsonl"),
+          "a failed backlog load open retains file-owned held frames");
+    reset();
+#endif
+
+    reset();
+    gzip_outcome = GZIP_OFF;
+    heap_fixture_enabled = true;
+    heap_fixture_free = 34000;
+    heap_fixture_maxblock = 34000;
+    obd_result_vector = {oversizedFrame()};
+    const bool held_upload_ok = uploadBuffered(true);
+    check(!held_upload_ok && obd_result_vector.size() == 1 && g_upload_held.empty() &&
+          g_last_status == "heap" && upload_heap_dropped == 0,
+          "held admission: ok=" + std::to_string(held_upload_ok) + " main=" +
+          std::to_string(obd_result_vector.size()) + " held=" + std::to_string(g_upload_held.size()) +
+          " status=" + g_last_status + " dropped=" + std::to_string(upload_heap_dropped) +
+          " free=" + std::to_string(ESP.getFreeHeap()) + " maxblock=" + std::to_string(ESP.getMaxAllocHeap()));
+    heap_fixture_enabled = false;
+    const bool held_retry_ok = uploadBuffered(true);
+    check(held_retry_ok && obd_result_vector.empty() && g_upload_held.size() == 1 &&
+          upload_heap_dropped == 0,
+          "a retained held-path source can retry without becoming a heap discard");
+#if ENABLE_LOGGING
+    check(saveUploadBacklog() && LittleFS.exists("/upload_backlog.jsonl") &&
+          events("UPLOAD discarded n=1 reason=heap").empty(),
+          "successful retry and save do not fabricate a heap-discard log");
+#endif
+
+    reset();
+    gzip_outcome = GZIP_OFF;
+    for (unsigned i = 0; i < MAX_UPLOAD_BUFFER; ++i) g_upload_held.push_back(frame(i));
+    obd_result_vector = {oversizedFrame()};
+    check(uploadBuffered(true) && obd_result_vector.empty() &&
+          g_upload_held.size() == MAX_UPLOAD_BUFFER &&
+          g_upload_held.front()[0].second == 1791112001 &&
+          upload_capped == 1 && upload_heap_dropped == 0,
+          "held-path count eviction still drops only the oldest count-capped frame");
 }
 // A relay session parks the queue in flash and hands it back in order; a new token drops it from both (#58).
 void bleHandover() {
@@ -335,6 +534,84 @@ void bleHandover() {
     upload_capped = 3; saveUploadBacklog(); saveUploadBacklog();
     check(events("UPLOAD discarded n=3 reason=cap").size() == 1 && events("UPLOAD discarded").size() == 1,
           "a capped stretch logs once, before the backlog is saved");
+
+    reset();
+    g_upload_held = {frame(8)};
+    obd_result_vector = {frame(9)};
+    LittleFS.fail_open = true;
+    check(!saveUploadBacklog() && g_upload_held.size() == 1 && obd_result_vector.size() == 1,
+          "a failed backlog open retains held frames and leaves main RAM unchanged");
+    LittleFS.fail_open = false;
+    upload_capped = 3;
+    upload_heap_dropped = 4;
+    check(saveUploadBacklog() && g_upload_held.size() == 1 && obd_result_vector.size() == 1,
+          "a successful backlog save retains held ownership without merging into main RAM");
+    std::istringstream saved_held_rows(LittleFS.contents());
+    std::string held_line, main_line;
+    std::getline(saved_held_rows, held_line);
+    std::getline(saved_held_rows, main_line);
+    check(json::parse(held_line)["utc"] == 1791112008 &&
+          json::parse(main_line)["utc"] == 1791112009,
+          "held frames serialize before main RAM frames");
+    check(events("UPLOAD discarded n=4 reason=heap").size() == 1 &&
+          events("UPLOAD discarded n=4 reason=heap").back().find("free=1000000 maxblock=500000 psram=4000000") != std::string::npos &&
+          upload_heap_dropped == 0,
+          "heap drops flush once with aggregate free-heap diagnostics");
+
+    // Flash budget: the file takes at most what is free above BACKLOG_FS_RESERVE; the oldest frames go first, so the
+    // trip-end marker, queued last, is kept.
+    auto parkMarker = [] { return OBDVector{{"is_parked", 1.0}, {"utc", 1791112099}}; };
+    auto lineBytes = [](const OBDVector& f) { return encodeUploadFrame(f).dump().size() + 2; };
+    reset();
+    for (unsigned i = 0; i < 10; ++i) obd_result_vector.push_back(frame(i));
+    obd_result_vector.push_back(parkMarker());
+    LittleFS.other_used = LittleFS.capacity - BACKLOG_FS_RESERVE -
+        (lineBytes(frame(8)) + lineBytes(frame(9)) + lineBytes(parkMarker()));
+    LittleFS.enforce_capacity = true;
+    check(saveUploadBacklog() && !park_marker_owed, "an over-budget save keeps the marker");
+    auto fileUtcs = [] {
+        std::vector<double> u;
+        std::istringstream rows(LittleFS.contents());
+        for (std::string row; std::getline(rows, row);) u.push_back(json::parse(row)["utc"].get<double>());
+        return u;
+    };
+    check(fileUtcs() == std::vector<double>{1791112008, 1791112009, 1791112099},
+          "an over-budget save keeps only the newest frames, in order");
+    check(events("UPLOAD discarded n=8 reason=fs").size() == 1, "and logs what the budget left out");
+    check(LittleFS.usedBytes() + BACKLOG_FS_RESERVE <= LittleFS.capacity, "and leaves the reserve free");
+
+    reset();
+    for (unsigned i = 0; i < 4; ++i) obd_result_vector.push_back(frame(i));
+    obd_result_vector.push_back(parkMarker());
+    LittleFS.write_lines = 2;
+    check(saveUploadBacklog() && park_marker_owed && events("BACKLOG write failed at 2 of 5").size() == 1,
+          "a write that fails stops the save and re-arms a marker it lost");
+    LittleFS.write_lines = SIZE_MAX;
+
+    // A buffered File reports success for lines a failed flush loses: the size check after close finds them.
+    reset();
+    for (unsigned i = 0; i < 4; ++i) obd_result_vector.push_back(frame(i));
+    obd_result_vector.push_back(parkMarker());
+    LittleFS.keep_lines = 3;
+    check(saveUploadBacklog() && park_marker_owed && events("BACKLOG write failed at 3 of 5").size() == 1 &&
+          events("BACKLOG saved 3 unsent").size() == 1, "lines lost without an error are found after close");
+    LittleFS.keep_lines = SIZE_MAX;
+
+    // A relay spill is all or nothing: past the budget the queue stays in PSRAM.
+    reset();
+    for (unsigned i = 0; i < 10; ++i) obd_result_vector.push_back(frame(i));
+    LittleFS.other_used = LittleFS.capacity - BACKLOG_FS_RESERVE - lineBytes(frame(9));
+    spillUploadBacklog();
+    check(obd_result_vector.size() == 10 && upload_spilled == 0 && !LittleFS.exists("/upload_backlog.jsonl") &&
+          events("reason=fs").empty(), "a spill that does not fit leaves the queue in RAM");
+
+    reset();
+    g_upload_held = {frame(10)};
+    spillUploadBacklog();
+    check(g_upload_held.empty() && obd_result_vector.empty() && upload_spilled == 1 &&
+          LittleFS.exists("/upload_backlog.jsonl"),
+          "a held-only queue can spill to flash");
+
     LittleFS.files.clear();
     obd_result_vector.clear();
     for (unsigned i = 0; i < MAX_UPLOAD_BUFFER; ++i) obd_result_vector.push_back(frame(i));
@@ -353,11 +630,13 @@ void bleHandover() {
     check(obd_result_vector.size() == 1 && upload_spilled == ENABLE_LOGGING &&
           LittleFS.exists("/upload_backlog.jsonl") == ENABLE_LOGGING, "a re-push for the same vehicle keeps the queue, parked or not");
     const std::string token = tlm_push_token;
+    g_upload_held = {frame(2)};
     pushToken({{"tlm_push_token", "other-vehicle"}});
-    check(obd_result_vector.empty() && !LittleFS.exists("/upload_backlog.jsonl") && upload_spilled == 0 &&
-          tlm_push_token == "other-vehicle", "a new token drops what was polled under the old one, parked or not");
+    check(obd_result_vector.empty() && g_upload_held.empty() && !LittleFS.exists("/upload_backlog.jsonl") &&
+          upload_spilled == 0 && tlm_push_token == "other-vehicle",
+          "a new token drops what was polled under the old one, held or parked");
 #if ENABLE_LOGGING
-    check(events("UPLOAD discarded n=2 reason=token").size() == 1, "and says how much");
+    check(events("UPLOAD discarded n=3 reason=token").size() == 1, "and says how much");
 #endif
     tlm_push_token = token;
 }

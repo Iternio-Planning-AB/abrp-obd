@@ -202,8 +202,8 @@ edited by hand. A clean build prints two pre-existing `"PRINT" redefined` warnin
 
 ## Settings worth knowing
 
-All in `baseLogger/config.h`, which opens with a **CONFIGURATION MAP** block documenting the
-intended production values. Any change needs a reflash.
+Settings are in `baseLogger/config.h`, which opens with a **CONFIGURATION MAP** block documenting the
+intended production values. The upload count ceiling is `MAX_UPLOAD_BUFFER` in `logger.ino`. Any change needs a reflash.
 
 ### Connectivity
 
@@ -214,6 +214,10 @@ intended production values. Any change needs a reflash.
 | `CATM_BANDS` (in `cellwrapper.cpp`) | `1,3,8,20,28` | LTE-M bands the modem scans: the European set. |
 | `CELL_REGISTRATION_AWAKE_MS` / `CELL_REGISTRATION_PARKED_MS` | `30000` / `45000` ms | Initial registration-search allowance: normal multi-poll wakes / single-poll parked sampling. Modem startup, SIM checks, diagnostics and successful data setup are additional, not inside this budget. |
 | `BACKLOG_MAX_SEND_AGE_SECONDS` | 6 days | A queued or restored frame older than this when it would be sent is dropped (`UPLOAD dropped … reason=age`), judged only on a trusted clock. |
+| `MAX_UPLOAD_BUFFER` | 512 frames | Count ceiling for queued frames, about an hour of driving; past it the oldest go first. Queued frames live in PSRAM. |
+| `UPLOAD_MIN_FREE_PSRAM` | 131072 B | Free PSRAM a queued frame must leave, for gzip's state and bodies; below it the oldest frames go. |
+| `UPLOAD_MIN_FREE_HEAP` / `UPLOAD_MIN_MAX_BLOCK` | 32768 / 16384 B | The same for internal heap, on a board without PSRAM. |
+| `BACKLOG_FS_RESERVE` | 65536 B | Flash the upload backlog file leaves free; past it the oldest frames are not saved. |
 | `GEO_MAX_SEND_AGE_SECONDS` | 29 days | A location or heading older than this is left out of the upload; the server refuses anything past 30 days. |
 
 `cellwrapper.cpp` also sets the modem to GSM+LTE (`CNMP=51`) with LTE-M only on the LTE side

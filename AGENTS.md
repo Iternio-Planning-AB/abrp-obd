@@ -420,3 +420,19 @@ refused values, the header budget, abort on a refused `AT+SHAHEAD`) and the best
 Run `python3 tests/run_modem_checks.py` normally and with `CXX='clang++ -DNDEBUG'`.
 It exercises production cellular startup, registration/recovery and sleep against fake UART/time/hardware.
 Host checks do not verify real attachment timing, electrical sleep behavior or vehicle power/GPS.
+
+## Adaptive upload-queue checks (#75)
+
+Run `python3 tests/run_upload_checks.py queue` and `logging-off`, and `python3 tests/run_heading_checks.py upload-gate`,
+`geo-backlog-rows` and `geo-downgrade`, normally and with `CXX='clang++ -DNDEBUG'`, for the real queue helper, the poll
+buffer, the PARK marker, held-frame save/spill and the bounded backlog restore. The upload runner compiles with
+logger.ino's `MAX_UPLOAD_BUFFER`. `tests/support/upload_heap_fixture.h` measures the queue's real storage and places it
+as the firmware does (pairs and long keys in PSRAM while there is PSRAM, the outer array there from the 4 KB malloc
+threshold), independently of the estimator. `queue` covers the #75 field heap (2292 B largest internal block, PSRAM
+free: the queue fills to the cap with no internal heap at any step), short PSRAM, no PSRAM with long keys, and the
+backlog's flash budget and a failing write. It does not emulate ESP32 fragmentation or prove that unrelated
+allocations succeed; the PSRAM allocation itself only runs on a device.
+
+`python3 tests/run_sm_checks.py` keeps the extracted queue helper on the CUR side under high heap and compares
+the drive/marker behavior with the pinned side. It does not prove low-heap admission, LittleFS behavior or
+hardware heap characteristics.

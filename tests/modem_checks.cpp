@@ -1,4 +1,6 @@
 #include <iostream>
+#include <limits>
+#include <new>
 #include "cellwrapper.h"
 #include "modem_production.inc"
 #include "modem_config.inc"
@@ -9,7 +11,20 @@
 #define ENABLE_NETWORK 1
 #define ENABLE_GPS 0
 
-using OBDVector = std::vector<std::pair<std::string, double>>;
+#include "../libraries/OBDWrapper/obd_vector.h"
+#define MAX_UPLOAD_BUFFER 120
+unsigned long upload_capped = 0, upload_heap_dropped = 0;
+bool park_marker_owed = false;
+struct UploadHeapStub {
+    unsigned long getFreeHeap() const { return 500000; }
+    unsigned long getMaxAllocHeap() const { return 250000; }
+    unsigned long getMaxAllocPsram() const { return 4000000; }
+    unsigned long getPsramSize() const { return 4194304; }
+    unsigned long getFreePsram() const { return 4000000; }
+} ESP;
+#include "drive_marker_restored.inc"
+#include "drive_marker_queued.inc"
+#include "upload_queue.inc"
 struct ICM_42627 {};
 struct SleepReached {};
 
@@ -30,7 +45,7 @@ struct Wake {
     bool relaying = false;
     unsigned long last_reconnect_try = 0;
     unsigned long sleepCount = 0;
-    bool is_currently_parked = true, park_marker_owed = false, clean_sleep_marker = false;
+    bool is_currently_parked = true, clean_sleep_marker = false;
     std::vector<OBDVector> obd_result_vector;
     int upload_fail_count = 0, upload_attempts = 0, ble_teardowns = 0;
     uint32_t clock_sleep_enter_epoch = 0;
@@ -40,12 +55,11 @@ struct Wake {
     ICM_42627 sensor;
     void* mems = &sensor;
 
-    Wake() { fake_ms = 1000; overshoot_delays = false; Serial.output.clear(); Serial.messages.clear(); }
+    Wake() { fake_ms = 1000; overshoot_delays = false; park_marker_owed = false; Serial.output.clear(); Serial.messages.clear(); }
     bool bleRelaying() const { return relaying; }
     void esp_task_wdt_reset() {}
     bool uploadBuffered(bool) { ++upload_attempts; return false; }
     void bleDeinitForSleep() { ++ble_teardowns; }
-    void driveMarkerQueued() { park_marker_owed = false; }
     bool wdtStreakModemMayBeOn() { return false; }
     void wdtStreakModem(bool) {}
     void wdtStreakMarker(bool) {}

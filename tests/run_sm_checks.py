@@ -64,7 +64,8 @@ def line(text, prefix, what):
 
 
 PATHS = {"logger": "baseLogger/logger.ino", "machine": "baseLogger/Helpers/state_machine.h",
-         "sleep": "baseLogger/Helpers/sleep_power.h", "logging": "baseLogger/Helpers/logging.h",
+         "sleep": "baseLogger/Helpers/sleep_power.h", "upload": "baseLogger/Helpers/network_upload.h",
+         "logging": "baseLogger/Helpers/logging.h",
          "config": "baseLogger/config.h"}
 
 
@@ -78,9 +79,15 @@ def recipe(src, side):
     logger, machine = src["logger"], src["machine"]
     where = {k: f"{PATHS[k]} ({side})" for k in PATHS}
     start = find(logger, DRIVE_START, what=where["logger"])
+    queue_helper = ""
+    if side == "tree":
+        upload_start = find(src["upload"], "bool isSyntheticParkMarker(", what=where["upload"])
+        upload_end = find(src["upload"], "\n#if ENABLE_NETWORK", upload_start, where["upload"])
+        queue_helper = src["upload"][upload_start:upload_end]
     return {
         "enum": block(logger, "enum ActivityState {", where["logger"]).rstrip() + ";\n",
         "buffer_cap": line(logger, "const size_t MAX_UPLOAD_BUFFER = ", where["logger"]),
+        "queue_helper": queue_helper,
         "state_name": block(src["logging"], "static const char* stateName(ActivityState s) {", where["logging"]),
         "delays": block(machine, "unsigned long getTransmissionDelay(", where["machine"]) +
                   block(machine, "unsigned long getPollingDelay(", where["machine"]),
@@ -99,6 +106,7 @@ SIDE = """{enum}
 {buffer_cap}
 #include "adapter_pre.inc"
 {headers}
+{queue_helper}
 {state_name}
 {delays}
 {change_state}
@@ -110,7 +118,6 @@ void sm_buffer(OBDVector& current_frame, bool frame_has_data) {{
   int g_geo_queued = 0, poll_geo = 0;
   (void)g_geo_queued;
   const bool ble_relayed = false; // no phone in this harness; OLD ignores both
-  unsigned long upload_capped = 0;
 {buffer}}}
 void sm_marker() {{
 {marker}}}
@@ -169,6 +176,7 @@ line(logger, "  if (wake_cause == ESP_SLEEP_WAKEUP_UNDEFINED) rtc.setTime(0);", 
 # on both sides and cannot fail the differential.
 DRIVE_BLOCKS = ("drive", "emplace", "session", "marker", "change_state", "buffer")
 old = dict(cur)
+old["queue_helper"] = ""
 for name in DRIVE_BLOCKS:
     old[name] = pin[name]
 old["restore"] = ""

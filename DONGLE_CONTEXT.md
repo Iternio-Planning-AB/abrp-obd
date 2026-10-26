@@ -430,9 +430,8 @@ backend silently dropped counts as sent until then too. `UPLOAD body` logs `loc=
 **A phone taking the transport keeps the cellular queue** (#58). The BLE notify goes out before the frame is
 buffered, and its answer decides both: a relayed frame is not queued (the phone posts it as `APP_OBD`), and
 frames already queued (failed-POST retries, a slow drain, a restored backlog) are kept while cellular stands
-down. They are not kept in RAM: a queued frame costs about 1 KB of internal heap, Bluedroid about 97 KB, and the
-session's pairing, profile push, OTA and log dump need what is left, so the first relayed poll parks them in the
-backlog file (`spillUploadBacklog`). The first poll after relaying ends puts them back in front of anything
+down. The first relayed poll parks them in the backlog file (`spillUploadBacklog`); queued frames are in PSRAM, so
+this frees no internal heap, and a full queue costs about 6 s of flash writes. The first poll after relaying ends puts them back in front of anything
 queued since, and the handoff drains them oldest first, at most `UPLOAD_MAX_BATCHES_PER_CYCLE` x
 `MAX_FRAMES_PER_POST` per cycle. Nothing goes up over cellular while frames are parked, so a sleep or an OTA
 reboot in the session saves RAM behind them and the next wake sends them in order; over the cap the load drops
@@ -443,6 +442,28 @@ reason=token`): those frames may be another vehicle's history. The cap drops the
 `MAX_UPLOAD_BUFFER`, logged once per capped stretch (`UPLOAD discarded n=… reason=cap`, at the next accepted
 upload or the backlog save). `BLE relay spilled=` logs the parked count and the heap at the start of each relay
 stretch.
+
+**Queued frames live in PSRAM** (#75). A frame is about 1 KB of pairs, under the 4 KB threshold that sends a malloc to
+PSRAM by itself, so in internal heap the queue competed with Bluedroid and the modem: an ID.5 offline for 47 minutes
+with BLE up had 120 frames queued, a 2292 B largest internal block, and 4 MB of PSRAM free, and the 120-frame cap
+dropped 411 frames. The frame type (`OBDVector`, `libraries/OBDWrapper/obd_vector.h`) allocates its pairs and its
+keys in PSRAM first (a key past the string's own 15 characters, such as `est_battery_range`, would otherwise take
+internal heap in every frame), and the outer array is reserved for the whole cap, so a queued frame takes no internal
+heap. The cap is 512 frames, an hour at the 7 s driving poll. `queueUploadFrame` still checks room before each copy:
+free PSRAM must stay above `UPLOAD_MIN_FREE_PSRAM` (gzip's state and bodies; free, not the largest block, which a
+freed frame seldom grows), and on a board without
+PSRAM the internal heap must keep `UPLOAD_MIN_FREE_HEAP`/`UPLOAD_MIN_MAX_BLOCK`; otherwise the oldest frames go
+first (`UPLOAD discarded n=… reason=heap free= maxblock= psram=`). Bench (a ONE+ on USB, BLE up, internal heap ballasted
+below both reserves): 600 frames with long keys, 512 kept, no internal heap used, every frame read back exact; with
+PSRAM ballasted to ~80 KB above the reserve, 300 frames settle at ~50 kept, the newest, and the reserve holds.
+
+The backlog file shares LittleFS with the flash log, whose rotation keeps ~384 KB free. `saveUploadBacklog` writes
+at most what is free above `BACKLOG_FS_RESERVE`; past that the oldest frames are left out (`UPLOAD discarded n=…
+reason=fs`), so the trip-end marker, queued last, is kept. A write that still fails ends the save (`BACKLOG write
+failed at`), and since `File` buffers, the file's size is checked after close to catch a failed final flush; lost
+frames re-arm the marker debt if the marker was among them. A relay spill writes all of the queue or none of it, so
+a queue that does not fit stays in PSRAM. A full queue's file is ~260 KB: ~5.7 s to write at
+sleep and ~7.3 s to read at the next polling wake, which a parked offline car pays on every polling wake.
 
 **A frame older than 6 days is dropped from the queue** (#67). Parked history that old is worth little next to the
 frames queued behind it, and the server answers 400 for the whole POST if any point in it is older than 30 days, so

@@ -62,6 +62,14 @@ struct SmGps { float speed = 0; } sm_gps;  // knots, as GPS_DATA
 SmGps* gd = &sm_gps;
 std::vector<OBDVector> obd_result_vector;
 std::vector<std::string> sm_log, sm_serial;
+unsigned long upload_capped = 0, upload_heap_dropped = 0;
+struct SmHeap {
+  unsigned long getFreeHeap() const { return 500000; }
+  unsigned long getMaxAllocHeap() const { return 250000; }
+  unsigned long getMaxAllocPsram() const { return 4000000; }
+  unsigned long getPsramSize() const { return 4194304; }
+  unsigned long getFreePsram() const { return 4000000; }
+} ESP;
 
 unsigned long millis() { return sm_now; }
 // Logging and the freeze take real time on the device (UART, flash), so each moves the clock: a reordering of

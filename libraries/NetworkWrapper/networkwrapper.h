@@ -12,7 +12,7 @@
 
 using json = nlohmann::json;
 using HeaderVector = std::vector<std::pair<std::string, std::string>>;
-using OBDVector = std::vector<std::pair<std::string, double>>;
+#include "../OBDWrapper/obd_vector.h"
 
 struct HttpResponse {
   int responseCode;

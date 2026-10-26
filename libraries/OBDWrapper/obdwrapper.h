@@ -17,7 +17,7 @@
 // the backend over ABD2 now, so the vendored library is gone from the tree with it.
 
 using json = nlohmann::json;
-using OBDVector = std::vector<std::pair<std::string, double>>;
+#include "obd_vector.h"
 
 /* The reply ID each data command expects, "" when unknown (see obdwrapper.cpp) */
 std::vector<std::string> expectedReplyHeaders(const std::vector<std::string>& init,

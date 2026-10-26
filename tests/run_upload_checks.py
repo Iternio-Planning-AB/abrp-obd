@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import os
 from pathlib import Path
+import re
 import shlex
 import subprocess
 import sys
@@ -18,6 +19,7 @@ logger = (root / "baseLogger/logger.ino").read_text()
 cell = (root / "libraries/NetworkWrapper/cellwrapper.cpp").read_text()
 config = (root / "baseLogger/config.h").read_text()
 machine = (root / "baseLogger/Helpers/state_machine.h").read_text()
+drive_state = (root / "baseLogger/Helpers/drive_state.h").read_text()
 sys.path.insert(0, str(root / "tests/support"))
 from extract import block  # noqa: E402
 streak_line = next(line for line in logger.splitlines() if "if (!g_upload_local_fail)" in line)
@@ -43,6 +45,8 @@ with tempfile.TemporaryDirectory(prefix="obd-upload-checks-") as temporary:
     (build / "upload_send.inc").write_text(section(source, "commandResponse HTTPClientSIM::send(const char* api_page", "bool HTTPClientSIM::send(HTTP_METHOD"))
     (build / "upload_parse.inc").write_text(section(source, "std::pair<int, int> handlePair", "commandResponse HTTPClientSIM::getEpoch"))
     (build / "header_budget.inc").write_text(section(header, "// Request headers the SIM7070", "typedef enum {"))
+    (build / "drive_marker_restored.inc").write_text(
+        block(drive_state, "inline void driveMarkerRestored() {", "drive_state.h"))
     (build / "upload_streak.inc").write_text(streak_line + "\n")
     (build / "geo_reset.inc").write_text(geo_reset_line + "\n")
     (build / "open_streak.inc").write_text(open_streak_line + "\n")
@@ -66,11 +70,17 @@ with tempfile.TemporaryDirectory(prefix="obd-upload-checks-") as temporary:
     (build / "clock_quality.inc").write_text(section(clock, "bool clockValid(", "// UTC calendar time"))
     (build / "gzip_outcome.inc").write_text(section(gzip_body, "enum GzipOutcome", "\n};\n") + "\n};\n")
     (build / "FreematicsPlus.h").write_text('#pragma once\n#include "upload_transport_fixture.h"\nstruct FreematicsESP32 {};\n')
+    # The production queue cap, so the queue group checks the value the firmware ships.
+    cap_match = re.search(r"^const size_t MAX_UPLOAD_BUFFER = (\d+);", logger, re.M)
+    if not cap_match:
+        raise SystemExit("MAX_UPLOAD_BUFFER not found in logger.ino")
+    upload_cap = cap_match.group(1)
     flags = [
         *compiler, "-std=c++17", "-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-DNDEBUG",
         "-Wall", "-Wextra", "-Wno-unused-parameter", "-Wno-unused-variable", "-Wno-unused-function", "-Wno-deprecated-declarations",
         "-I", str(build), "-I", str(root / "tests"), "-I", str(root / "tests/support"), "-I", str(root / "libraries/nlohmann"),
         "-I", str(root / "libraries/NetworkWrapper"), "-I", str(root / "baseLogger/Helpers"),
+        f"-DMAX_UPLOAD_BUFFER={upload_cap}",
     ]
     targets = []
     if group in {"all", "body-ack", "stages", "responses"}:
