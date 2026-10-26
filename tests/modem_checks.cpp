@@ -64,7 +64,6 @@ struct Wake {
     void wdtStreakModem(bool) {}
     void wdtStreakMarker(bool) {}
     bool uploadBacklogPending() { return false; }
-    unsigned long upload_spilled = 0;
     void configureWOM(ICM_42627&) {}
     void esp_sleep_enable_ext0_wakeup(int, int) {}
     void esp_deep_sleep_start() { throw SleepReached{}; }
@@ -210,6 +209,15 @@ void parked() {
     Wake normal_sleep;
     check(normal_sleep.sleep(true) && normal_sleep.writes("AT+CPOWD=1\r") == 1,
           "normal sleeps still invoke the modem power-off path");
+    Wake relayed;
+    relayed.sys.uart->attach_at = 0;
+    check(relayed.boot() && relayed.network.connected(), "relay-session sleep fixture has a usable link");
+    relayed.relaying = true;
+    relayed.obd_result_vector = {{{"utc", 1}, {"soc", 50}}};
+    g_fixture_session_opens = true;
+    check(relayed.sleep(true) && relayed.upload_attempts == 1,
+          "a pre-sleep flush during a relay session still sends the queue over cellular (#91)");
+    g_fixture_session_opens = false;
     Wake legacy;
     const uint64_t legacy_before = fake_ms;
     check(!legacy.network.init(false), "existing init(bool) still returns offline without coverage");

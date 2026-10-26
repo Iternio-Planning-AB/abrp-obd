@@ -145,7 +145,7 @@ int logging_errors = 0, g_last_http = 0, g_http0_streak = 0;
 unsigned long g_last_post_ms = 0;
 std::string g_last_status, tlm_push_token = "test-token-actual", api_key = "test-key-actual";
 std::vector<OBDVector> obd_result_vector;
-unsigned long upload_capped = 0, upload_spilled = 0;
+unsigned long upload_capped = 0;
 unsigned long upload_heap_dropped = 0;
 bool park_marker_owed = false;
 #include "tlm_signature.h"
@@ -177,7 +177,7 @@ void reset() {
     std::vector<OBDVector>().swap(g_upload_held);
     logging_errors = g_last_http = g_http0_streak = 0; g_last_status.clear();
     std::vector<OBDVector>().swap(obd_result_vector);
-    upload_capped = upload_spilled = upload_heap_dropped = 0;
+    upload_capped = upload_heap_dropped = 0;
     park_marker_owed = false;
     resetHeapFixture();
     host_md_fail = 0;
@@ -505,32 +505,60 @@ void queue() {
           upload_capped == 1 && upload_heap_dropped == 0,
           "held-path count eviction still drops only the oldest count-capped frame");
 }
-// A relay session parks the queue in flash and hands it back in order; a new token drops it from both (#58).
+// A relay session leaves the queue in PSRAM and the loop's cellular upload drains it when the session ends (#91);
+// a new token drops it and the backlog file (#58). The relay block itself is pinned in run_heading_checks.py.
+unsigned backlog_reads = 0;
+void countBacklogRead() { ++backlog_reads; }
 void bleHandover() {
     reset();
     auto utcs = [] { std::vector<double> u; for (const auto& f : obd_result_vector) for (const auto& kv : f) if (kv.first == "utc") u.push_back(kv.second); return u; };
-    const std::vector<double> parked_then_new{1791112000, 1791112001, 1791112002};
 #if ENABLE_LOGGING
-    obd_result_vector = {frame(0), frame(1)};
-    spillUploadBacklog();
-    check(obd_result_vector.empty() && upload_spilled == 2, "a relay session parks the queue in flash");
-    obd_result_vector = {frame(2)};
-    loadUploadBacklog();
-    check(utcs() == parked_then_new && upload_spilled == 0 && !LittleFS.exists("/upload_backlog.jsonl"),
-          "the parked frames come back ahead of the ones queued since");
-    obd_result_vector = {frame(0), frame(1)};
-    spillUploadBacklog();
-    obd_result_vector = {frame(2)}; // the trip-end marker of a sleep during the session
-    check(uploadBuffered(true) && network.sent.empty() && obd_result_vector.size() == 1,
-          "nothing goes up ahead of the parked frames");
-    saveUploadBacklog();
+    // Relayed polls queue nothing and touch no file, so what was queued before stays, in order. The session's
+    // end hands the loop's upload the same queue: oldest first, and the backlog is never read.
+    obd_result_vector = {frame(0), frame(1), frame(2)};
+    LittleFS.read_observer = countBacklogRead;
+    backlog_reads = 0;
+    check(uploadBuffered(true) && obd_result_vector.empty() && backlog_reads == 0 && !LittleFS.exists("/upload_backlog.jsonl"),
+          "when relaying ends the queue drains over cellular with no backlog read");
+    LittleFS.read_observer = nullptr;
+    std::vector<std::string> sent_times;
+    for (const auto& body : network.sent)
+        for (const auto& point : json::parse(body)) sent_times.push_back(point["soc"]["time"].get<std::string>());
+    check(sent_times == std::vector<std::string>{v2Time(1791112000), v2Time(1791112001), v2Time(1791112002)},
+          "and it sends the oldest first");
+
+    // A pre-sleep flush during a session sends the queue over cellular; what it could not send is saved by the
+    // sleep save, over whatever file is there (overwrite, never append).
+    reset();
+    obd_result_vector = {frame(0), frame(1), frame(2)};
+    LittleFS.files["/upload_backlog.jsonl"] = std::make_shared<std::string>("stale\n");
+    network.code = 503;
+    check(!uploadBuffered(true) && obd_result_vector.size() == 3, "a flush that fails leaves the frames queued");
+    const bool saved = saveUploadBacklog();
+    const std::string file = LittleFS.contents();
+    check(saved && file.find("stale") == std::string::npos && std::count(file.begin(), file.end(), '\n') == 3,
+          "the sleep save overwrites the file with exactly the unsent frames");
+    network.code = 200;
     obd_result_vector.clear();
     loadUploadBacklog();
-    check(utcs() == parked_then_new, "a sleep during the session saves behind them, and the next wake restores all");
-    LittleFS.fail_open = true;
-    spillUploadBacklog();
-    check(obd_result_vector.size() == 3 && upload_spilled == 0, "a queue flash refused stays in RAM");
-    LittleFS.fail_open = false;
+    check(utcs() == std::vector<double>{1791112000, 1791112001, 1791112002}, "and the next wake restores them in order");
+
+    // A backlog file over the cap restores only the newest MAX_UPLOAD_BUFFER frames, in order.
+    reset();
+    std::string rows;
+    for (unsigned i = 0; i < MAX_UPLOAD_BUFFER + 3; ++i) rows += encodeUploadFrame(frame(i)).dump() + '\n';
+    LittleFS.seed(rows);
+    LittleFS.read_observer = countBacklogRead;
+    backlog_reads = 0;
+    loadUploadBacklog();
+    LittleFS.read_observer = nullptr;
+    check(backlog_reads == MAX_UPLOAD_BUFFER + 3, "the file is read once, not counted first: reads=" + std::to_string(backlog_reads));
+    check(utcs().size() == MAX_UPLOAD_BUFFER && utcs().front() == 1791112003 &&
+          utcs().back() == 1791112000 + MAX_UPLOAD_BUFFER + 2 && upload_capped == 3 && !LittleFS.exists("/upload_backlog.jsonl"),
+          "over the cap the oldest file frames go, the newest are restored in order");
+    upload_capped = 0;
+    reset();
+    obd_result_vector = {frame(0), frame(1), frame(2)};
     upload_capped = 3; saveUploadBacklog(); saveUploadBacklog();
     check(events("UPLOAD discarded n=3 reason=cap").size() == 1 && events("UPLOAD discarded").size() == 1,
           "a capped stretch logs once, before the backlog is saved");
@@ -596,45 +624,18 @@ void bleHandover() {
     check(saveUploadBacklog() && park_marker_owed && events("BACKLOG write failed at 3 of 5").size() == 1 &&
           events("BACKLOG saved 3 unsent").size() == 1, "lines lost without an error are found after close");
     LittleFS.keep_lines = SIZE_MAX;
-
-    // A relay spill is all or nothing: past the budget the queue stays in PSRAM.
-    reset();
-    for (unsigned i = 0; i < 10; ++i) obd_result_vector.push_back(frame(i));
-    LittleFS.other_used = LittleFS.capacity - BACKLOG_FS_RESERVE - lineBytes(frame(9));
-    spillUploadBacklog();
-    check(obd_result_vector.size() == 10 && upload_spilled == 0 && !LittleFS.exists("/upload_backlog.jsonl") &&
-          events("reason=fs").empty(), "a spill that does not fit leaves the queue in RAM");
-
-    reset();
-    g_upload_held = {frame(10)};
-    spillUploadBacklog();
-    check(g_upload_held.empty() && obd_result_vector.empty() && upload_spilled == 1 &&
-          LittleFS.exists("/upload_backlog.jsonl"),
-          "a held-only queue can spill to flash");
-
-    LittleFS.files.clear();
-    obd_result_vector.clear();
-    for (unsigned i = 0; i < MAX_UPLOAD_BUFFER; ++i) obd_result_vector.push_back(frame(i));
-    spillUploadBacklog();
-    obd_result_vector = {frame(MAX_UPLOAD_BUFFER)};
-    upload_capped = 0; saveUploadBacklog(); obd_result_vector.clear(); loadUploadBacklog();
-    check(utcs().size() == MAX_UPLOAD_BUFFER && utcs().front() == 1791112001 &&
-          utcs().back() == 1791112000 + MAX_UPLOAD_BUFFER && upload_capped == 1,
-          "over the cap the oldest parked frame goes, not the trip-end marker");
-    upload_capped = 0; obd_result_vector.clear(); LittleFS.files.clear();
-    obd_result_vector = {frame(0)};
-    spillUploadBacklog();
 #endif
-    obd_result_vector.push_back(frame(1));
+    reset();
+    obd_result_vector = {frame(0), frame(1)};
     pushToken({{"tlm_push_token", tlm_push_token}});
-    check(obd_result_vector.size() == 1 && upload_spilled == ENABLE_LOGGING &&
-          LittleFS.exists("/upload_backlog.jsonl") == ENABLE_LOGGING, "a re-push for the same vehicle keeps the queue, parked or not");
+    check(obd_result_vector.size() == 2, "a re-push for the same vehicle keeps the queue");
     const std::string token = tlm_push_token;
     g_upload_held = {frame(2)};
+    LittleFS.files["/upload_backlog.jsonl"] = std::make_shared<std::string>("{}\n");
     pushToken({{"tlm_push_token", "other-vehicle"}});
-    check(obd_result_vector.empty() && g_upload_held.empty() && !LittleFS.exists("/upload_backlog.jsonl") &&
-          upload_spilled == 0 && tlm_push_token == "other-vehicle",
-          "a new token drops what was polled under the old one, held or parked");
+    check(obd_result_vector.empty() && g_upload_held.empty() && LittleFS.exists("/upload_backlog.jsonl") == !ENABLE_LOGGING &&
+          tlm_push_token == "other-vehicle",
+          "a new token drops what was polled under the old one, held or saved, and the backlog file");
 #if ENABLE_LOGGING
     check(events("UPLOAD discarded n=3 reason=token").size() == 1, "and says how much");
 #endif

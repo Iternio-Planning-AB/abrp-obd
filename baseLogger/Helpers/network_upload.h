@@ -396,7 +396,6 @@ static unsigned dropAgedFrames(double send_utc) {
 //   drain=true : keep sending until the buffer is empty or a POST fails (pre-sleep flush - last chance
 //                before deep sleep wipes RAM). Returns true if every attempted POST succeeded.
 bool uploadBuffered(bool drain) {
-  if (upload_spilled) return true; // older frames are parked in flash; these wait behind them for the next wake
   bool ok = true, attempted = false;
   int batches = 0;
   while (!obd_result_vector.empty()) {
@@ -510,15 +509,14 @@ void logUploadCapped() {
   }
 }
 
-// Called from enterDeepSleep AFTER the flush attempt, before an OTA reboot, and to spill. Overwrite semantics
-// are correct: the RAM buffer already contains any previously-loaded backlog (the file is deleted at load).
-// Only a spill from this wake can still be in the file, and it is older than RAM, so RAM goes behind it.
+// Called from enterDeepSleep AFTER the flush attempt, and before an OTA reboot. Overwrite semantics are correct:
+// the RAM buffer already contains any previously-loaded backlog (the file is deleted at load).
 // The file takes at most what LittleFS has free above BACKLOG_FS_RESERVE (a file being overwritten still counts as
 // used: littlefs keeps its blocks until the new one is synced). Past that the oldest frames are not saved
-// (reason=fs), so the newest, the trip-end marker among them, are the ones kept; `whole` saves nothing then and
-// leaves RAM as it is. A write that fails ends the save, and the file's size is checked after close, since File
-// buffers and a failed final flush is not reported. Lost frames re-arm the marker debt if the marker is among them.
-static bool writeUploadBacklog(bool whole) {
+// (reason=fs), so the newest, the trip-end marker among them, are the ones kept. A write that fails ends the save,
+// and the file's size is checked after close, since File buffers and a failed final flush is not reported. Lost
+// frames re-arm the marker debt if the marker is among them.
+bool saveUploadBacklog() {
   logUploadCapped();
   const size_t held_count = g_upload_held.size();
   const size_t frame_count = held_count + obd_result_vector.size();
@@ -537,7 +535,6 @@ static bool writeUploadBacklog(bool whole) {
     bytes += line;
     --first;
   }
-  if (first && whole) return false;
   auto lost = [&](size_t from, size_t to) {
     for (size_t i = from; i < to; ++i) uploadFrameLost(frameAt(i));
   };
@@ -546,12 +543,7 @@ static bool writeUploadBacklog(bool whole) {
     logEvent("UPLOAD discarded n=%u reason=fs free=%u", (unsigned)first, (unsigned)free_bytes);
   }
   if (first == frame_count) return true;
-  size_t before = 0; // an appended file's bytes already there
-  if (upload_spilled && LittleFS.exists(UPLOAD_BACKLOG_PATH)) {
-    File old = LittleFS.open(UPLOAD_BACKLOG_PATH, "r");
-    if (old) { before = old.size(); old.close(); }
-  }
-  File f = LittleFS.open(UPLOAD_BACKLOG_PATH, upload_spilled ? "a" : "w");
+  File f = LittleFS.open(UPLOAD_BACKLOG_PATH, "w");
   if (!f) { Serial.printf("Backlog: open for write failed\n"); return false; }
   size_t written = first;
   for (; written < frame_count; ++written)
@@ -560,7 +552,7 @@ static bool writeUploadBacklog(bool whole) {
   size_t on_flash = 0;
   if (File check = LittleFS.open(UPLOAD_BACKLOG_PATH, "r")) { on_flash = check.size(); check.close(); }
   size_t kept = first;
-  for (size_t at = before; kept < written && at + lineBytes(kept) <= on_flash; ++kept) at += lineBytes(kept);
+  for (size_t at = 0; kept < written && at + lineBytes(kept) <= on_flash; ++kept) at += lineBytes(kept);
   if (kept < frame_count) {
     lost(kept, frame_count);
     logEvent("BACKLOG write failed at %u of %u", (unsigned)(kept - first), (unsigned)(frame_count - first));
@@ -570,40 +562,15 @@ static bool writeUploadBacklog(bool whole) {
   return true;
 }
 
-bool saveUploadBacklog() { return writeUploadBacklog(false); }
-
-// Parks the queue in the backlog file while a phone relays (pairing, profile push, OTA, log dump), only if all of it
-// fits. Frames are in PSRAM (obd_vector.h), so this frees no internal heap; a full queue costs ~6 s of flash writes.
-void spillUploadBacklog() {
-  const size_t n = obd_result_vector.size() + g_upload_held.size();
-  if (!n || !writeUploadBacklog(true)) return;
-  obd_result_vector.clear();
-  g_upload_held.clear();
-  upload_spilled += n;
-}
-
 bool uploadBacklogPending() { return LittleFS.exists(UPLOAD_BACKLOG_PATH); }
 
 // Called at the end of setup() on polling wakes only (gate skips sleep before this, leaving the file for the
-// next real wake), and when a relay session that spilled ends. The file's frames are older than the RAM
-// buffer's, so they go in front, bounded by MAX_UPLOAD_BUFFER; then the file is deleted - from here the
-// frames are RAM-owned and re-persisted at the next sleep if still unsent.
+// next real wake). The file's frames are older than the RAM buffer's, so they go in front; queueUploadFrame drops
+// the oldest past MAX_UPLOAD_BUFFER (counted in upload_capped). Then the file is deleted - from here the frames
+// are RAM-owned and re-persisted at the next sleep if still unsent.
 void loadUploadBacklog() {
-  upload_spilled = 0;
   if (!LittleFS.exists(UPLOAD_BACKLOG_PATH)) return;
-  // Over the cap the oldest lines go, as in RAM: a sleep in a relay session can append behind a full spill.
-  size_t skip = 0;
   File f = LittleFS.open(UPLOAD_BACKLOG_PATH, "r");
-  if (!f) return;
-  while (f.available()) {
-    String line = f.readStringUntil('\n');
-    line.trim();
-    if (line.length()) skip++;
-  }
-  f.close();
-  skip = skip > MAX_UPLOAD_BUFFER ? skip - MAX_UPLOAD_BUFFER : 0;
-  upload_capped += skip;
-  f = LittleFS.open(UPLOAD_BACKLOG_PATH, "r");
   if (!f) return;
   g_upload_held.clear();
   std::vector<OBDVector> pending;
@@ -613,7 +580,6 @@ void loadUploadBacklog() {
     String line = f.readStringUntil('\n');
     line.trim();
     if (!line.length()) continue;
-    if (skip) { skip--; continue; }
     try {
       json tlm = json::parse(line.c_str());
       OBDVector frame = decodeUploadFrame(tlm);

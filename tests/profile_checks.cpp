@@ -79,7 +79,6 @@ std::string tlm_push_token;
 bool g_ota_active = false, g_logdump_active = false, g_obd_needs_init = false, g_no_profile = true,
      config_initialized = false;
 std::vector<OBDVector> obd_result_vector, g_upload_held;
-unsigned long upload_spilled = 0;
 void alarmGrantSetupPermit() {}
 bool alarmEnforced() { return false; }
 bool frozen_valid = false;
@@ -184,7 +183,6 @@ int main() {
   obd_result_vector = {{{"utc", 1}, {"soc", 50}}};
   g_upload_held = {{{"utc", 2}, {"soc", 51}}};
   LittleFS.files["/upload_backlog.jsonl"] = std::make_shared<std::string>("{}\n");
-  upload_spilled = 1;
   push(profile, "token-g", 19);
   events.clear();
   check(forgetProfile("authclear"), "a forget that erases the log succeeds");
@@ -192,7 +190,7 @@ int main() {
   check(!LittleFS.exists("/vehicle_profile.json") && ble.forgotten && ble.nvs_hash == 0, "a key reset forgets the stored push");
   check(tlm_push_token.empty() && g_no_profile && obd_result_vector.empty() && g_upload_held.empty(),
         "and stops uploading and polling, held frames included");
-  check(!LittleFS.exists("/upload_backlog.jsonl") && upload_spilled == 0, "and drops the frames parked in the backlog");
+  check(!LittleFS.exists("/upload_backlog.jsonl"), "and removes the backlog file");
   check(!g_config_pending && g_pending_config_str.empty(), "and drops a push still waiting for the loop");
   reboot();
   check(tlm_push_token.empty(), "and the next boot restores nothing");
@@ -202,7 +200,6 @@ int main() {
   applyPending();
   obd_result_vector = {{{"utc", 1}, {"soc", 50}}};
   g_upload_held = obd_result_vector;
-  upload_spilled = 1;
   g_logdump_active = g_ota_active = frozen_valid = true;
   frozen_lat = 1;
   g_geo_queued.lat = 1;
@@ -220,8 +217,8 @@ int main() {
   check(first < events.size() && events[first] ==
         "PROFILE forgotten (authreset) - log erased (3 segments), profile and push token cleared, ended dump, ended ota",
         "the reset reason is the first line of the fresh log");
-  check(indexOf("UPLOAD discarded n=3 reason=forget") > erase && upload_capped == 0,
-        "every queued frame is dropped and counted: in RAM, held for gzip and parked in the backlog");
+  check(indexOf("UPLOAD discarded n=2 reason=forget") > erase && upload_capped == 0,
+        "every queued frame is dropped and counted: in RAM and held for gzip");
   check(obd_fail_logged == 0 && !last_good_220105_reply[0], "the fresh log names OBD failures again, without the old reply");
   check(!frozen_valid && frozen_lat == 0, "the frozen parked fix is dropped too");
   indexOf("<frozen fix reset>");
@@ -240,7 +237,6 @@ int main() {
     applyPending();
     obd_result_vector = {{{"utc", 1}, {"soc", 50}}};
     LittleFS.files["/upload_backlog.jsonl"] = std::make_shared<std::string>("{}\n");
-    upload_spilled = 1;
     frozen_valid = true;
     push(profile, "token-k", 23); // waiting for the loop
     datalogger.result = *stuck ? 3 : -1;
@@ -252,7 +248,7 @@ int main() {
     check(std::find(events.begin(), events.end(), *stuck ? "PROFILE forget FAILED (authreset) - profile or backlog file not removed"
                                                          : "PROFILE forget FAILED (authreset) - log not erased, nothing cleared") != events.end(),
           "and says why");
-    check(tlm_push_token == "token-j" && !obd_result_vector.empty() && upload_spilled == 1 && frozen_valid,
+    check(tlm_push_token == "token-j" && !obd_result_vector.empty() && frozen_valid,
           "and keeps the token, the queue and the frozen fix");
     if (!*stuck)
       check(LittleFS.exists("/vehicle_profile.json") && LittleFS.exists("/upload_backlog.jsonl") && ble.nvs_hash == 22 &&

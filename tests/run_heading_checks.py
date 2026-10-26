@@ -1,4 +1,5 @@
 import os
+import re
 from pathlib import Path
 import shlex
 import subprocess
@@ -49,10 +50,8 @@ with tempfile.TemporaryDirectory(prefix="obd-heading-checks-") as temporary:
     (build / "upload_buffer.inc").write_text(logger[buffer_start:buffer_end])
     relay_start = logger.index("    if (ble_relayed) {")
     relay = logger[relay_start:logger.index("\n    } else {", relay_start)]
-    if "obd_result_vector" in relay or "spillUploadBacklog();" not in relay:
-        raise RuntimeError("the BLE relay branch must park the cellular upload buffer in flash, never drop it (#58)")
-    if "if (upload_spilled && !bleRelaying()) loadUploadBacklog();" not in logger[gate_start:buffer_start]:
-        raise RuntimeError("the poll after a relay session must restore the parked frames before buffering (#58)")
+    if re.search(r"(obd_result_vector|g_upload_held)\.(clear|erase|swap)|BacklogPath|[sS]pill|saveUploadBacklog|loadUploadBacklog|queueUploadFrame", relay):
+        raise RuntimeError("the BLE relay branch must leave the cellular upload queue in PSRAM, untouched (#91)")
     ota = (root / "baseLogger/Helpers/ota_update.h").read_text()
     ota_commit = ota[ota.index("static void otaFinalize()"):]
     if not 0 <= ota_commit.find("saveUploadBacklog();") < ota_commit.index("esp_restart();"):
