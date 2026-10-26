@@ -453,7 +453,7 @@ heap. The cap is 512 frames, an hour at the 7 s driving poll. `queueUploadFrame`
 free PSRAM must stay above `UPLOAD_MIN_FREE_PSRAM` (gzip's state and bodies; free, not the largest block, which a
 freed frame seldom grows), and on a board without
 PSRAM the internal heap must keep `UPLOAD_MIN_FREE_HEAP`/`UPLOAD_MIN_MAX_BLOCK`; otherwise the oldest frames go
-first (`UPLOAD discarded n=… reason=heap free= maxblock= psram=`). Bench (Fabbe, BLE up, internal heap ballasted
+first (`UPLOAD discarded n=… reason=heap free= maxblock= psram=`). Bench (a ONE+ on USB, BLE up, internal heap ballasted
 below both reserves): 600 frames with long keys, 512 kept, no internal heap used, every frame read back exact; with
 PSRAM ballasted to ~80 KB above the reserve, 300 frames settle at ~50 kept, the newest, and the reserve holds.
 
