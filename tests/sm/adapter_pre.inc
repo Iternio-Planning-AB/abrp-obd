@@ -7,6 +7,11 @@
 // SM_RAM is reset on every wake (deep sleep is a reboot); SM_RTC survives a wake and is reset on power-on.
 #define SM_RAM(X) \
   X(bool, is_currently_parked, true) \
+  X(bool, drive_unconfirmed, false) \
+  X(bool, g_drive_gnss_refused, false) \
+  X(float, g_last_io36, 0.0f) \
+  X(unsigned long, g_last_motion_ms, 0) \
+  X(unsigned long, g_last_obd_answer_ms, 0) \
   X(unsigned long, g_last_speed_ms, 0) \
   X(unsigned long, last_active, 0) \
   X(ActivityState, current_state, UNINITIALIZED) \

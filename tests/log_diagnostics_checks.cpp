@@ -164,7 +164,7 @@ struct EspStub {
 } ESP;
 GPS_DATA gps_data{}, last_gd{};
 GPS_DATA* gd = &gps_data;
-bool g_gps_powered = true, is_currently_parked = true, frozen_valid = true;
+bool g_gps_powered = true, is_currently_parked = true, drive_unconfirmed = false, frozen_valid = true;
 double frozen_lat = 11, frozen_lon = 21;
 struct SysStub {
   GPSReadDiagnostics diagnostics;
@@ -541,6 +541,25 @@ void motionChecks() {
   for (int i = 0; i < 240; ++i, now += 500)
     check(!motionStatsWindow(m, false, true, 500, 0.5f, 0.5f, now, out), "a bypassed window never emits");
   check(m.n == 0 && !motionStatsTake(m, out), "OTA/log-dump bypass windows are not counted");
+
+  // The drive rules' sustained verdict: >= DRIVE_SUSTAINED_ACT_PCT of the sampled time over >= MIN_SAMPLED_MS.
+  auto sustained = [](int windows, int active_windows, unsigned window_ms, unsigned long later = 0, unsigned* act = nullptr) {
+    DriveMotion dm;
+    unsigned long at = 100000;
+    for (int i = 0; i < windows; ++i, at += window_ms) motionAccumulate(dm, true, i < active_windows, window_ms, at);
+    return motionSustained(dm, at - window_ms + later, DRIVE_SUSTAINED_WINDOW_MS, DRIVE_SUSTAINED_MIN_SAMPLED_MS,
+                                DRIVE_SUSTAINED_ACT_PCT, act);
+  };
+  unsigned act = 0;
+  check(sustained(100, 30, 200, 0, &act) && act == 30, "30 % of 20 s sampled is sustained: act=" + std::to_string(act));
+  check(!sustained(100, 29, 200), "29 % of 20 s sampled is not sustained");
+  check(sustained(20, 20, 1000), "20 s sampled is enough");
+  check(!sustained(19, 19, 1000), "19 s sampled is not enough, however active");
+  check(!sustained(20, 20, 1000, 40000), "windows older than the rolling window do not count");
+  DriveMotion bypassed;
+  for (int i = 0; i < 40; ++i) motionAccumulate(bypassed, false, true, 1000, 100000 + 1000 * i);
+  check(!motionSustained(bypassed, 140000, DRIVE_SUSTAINED_WINDOW_MS, DRIVE_SUSTAINED_MIN_SAMPLED_MS,
+                              DRIVE_SUSTAINED_ACT_PCT), "bypassed windows are not sampled time");
 }
 
 

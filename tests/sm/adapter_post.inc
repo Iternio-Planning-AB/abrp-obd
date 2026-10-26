@@ -102,9 +102,23 @@ void poll(const SmEvent& e) {
   sm_gnss_fresh = e.gnss;
   sm_gps.speed = (float)(e.gnss_kmh / 1.852);
   sm_clock_ok = e.clock_ok;
+  if (!std::isnan(e.power)) current_frame.emplace_back("power", e.power);
+  if (!std::isnan(e.current)) current_frame.emplace_back("current", e.current);
+  if (!std::isnan(e.voltage)) current_frame.emplace_back("voltage", e.voltage);
+  // The drive rules' inputs (CUR only reads them; the defaults agree with OLD): the rail and the last OBD
+  // answer say whether the car is on, the motion stamp and the rolling accumulator say what the sensor saw.
+  g_last_io36 = e.car == SM_CAR_RAIL ? 13.5f : 12.0f;
+  g_last_obd_answer_ms = e.car == SM_CAR_OBD ? sm_now : 0;
+  if (e.motion == SM_MOVE_NOW) g_last_motion_ms = sm_now;
+  else if (e.motion == SM_MOVE_NONE) g_last_motion_ms = 0;
+  sm_motion_inputs(e);
+  const bool latch = recently_charging;
+  recently_charging = e.charge_block;
   sm_drive_poll(current_frame);
+  recently_charging = latch;
   sm_emplace(current_frame);
-  sm_published = current_frame.back().second;
+  sm_published = -1;
+  for (const auto& res : current_frame) if (res.first == "is_parked") sm_published = res.second;
   sm_buffer(current_frame, e.has_data);
   sm_marker_set();
 }

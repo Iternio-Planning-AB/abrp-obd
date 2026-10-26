@@ -18,7 +18,7 @@ compiler = shlex.split(os.environ.get("CXX", "clang++"))
 logger = (root / "baseLogger/logger.ino").read_text()
 count = logger.index("    int obd_count = (int)current_frame.size();")
 strip = logger.index('[](const std::pair<std::string, double>& r) { return r.first == "is_parked"; }), current_frame.end());')
-if not count < strip < logger.index('    current_frame.emplace_back("is_parked"') or logger.count('return r.first == "is_parked";') != 1:
+if not count < strip < logger.index('current_frame.emplace_back("is_parked"') or logger.count('return r.first == "is_parked";') != 1:
     raise SystemExit("FAIL: logger.ino must drop the profile's is_parked once, after obd_count and before the latch's")
 with tempfile.TemporaryDirectory(prefix="obd-reply-checks-") as temporary:
     build = Path(temporary)

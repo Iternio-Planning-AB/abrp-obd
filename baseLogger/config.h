@@ -688,6 +688,32 @@
 // way: OBD speed refreshes the same leash and never goes stale while the ECUs are awake.
 #define GPS_MOVING_MAX_AGE_MS 45000UL
 
+// The driving rules (#6, step 2 of #23). A fresh GNSS fix with speed no longer unlatches PARK on its own: a
+// car parked at a desk or in a garage reports "moving" fixes from drift (issue #6 saw a false DRIVE that way),
+// so it also needs the car on, an accelerometer hit within DRIVE_MOTION_RECENT_MS and no charge in progress.
+// A drive's late first fix, or a profile with no speed PID, is then covered by the accelerometer alone:
+// sustained motion on a car that is on enters UNCONFIRMED (live location, no drivingState) and a discharge
+// over DRIVE_DISCHARGE_KW confirms DRIVING without waiting for a fix.
+//
+// FIELD DATA (#5, MOTION lines): drives read act 58-78 % per minute with window peaks up to 0.73 g; a parked
+// car read act 0 % with peaks under 0.04 g. The 0.1 g axis threshold in detectMovement() is already well clear
+// of the parked noise, so the only job of these is to tell a drive from a passing bump.
+//   DRIVE_MOTION_RECENT_MS         the last detectMovement hit must be this fresh for the GNSS rule: ~6 poll
+//                                  cycles, long enough for a stop at a light to keep it, short enough that
+//                                  desk drift after one bump is refused.
+//   DRIVE_SUSTAINED_WINDOW_MS      the rolling window "sustained" is judged over.
+//   DRIVE_SUSTAINED_MIN_SAMPLED_MS the least sampled time in that window before a verdict: detectMovement
+//                                  windows are ~500 ms and the loop blocks on polls and uploads, so a few
+//                                  lucky windows prove nothing.
+//   DRIVE_SUSTAINED_ACT_PCT        motion share of the sampled time; half the lowest drive minute seen (58 %).
+//   DRIVE_DISCHARGE_KW             battery discharge (positive power, or current x voltage) that only a moving
+//                                  car draws; picked above a typical parked HVAC load, not yet field-tuned.
+#define DRIVE_MOTION_RECENT_MS 30000UL
+#define DRIVE_SUSTAINED_WINDOW_MS 30000UL
+#define DRIVE_SUSTAINED_MIN_SAMPLED_MS 20000UL
+#define DRIVE_SUSTAINED_ACT_PCT 30
+#define DRIVE_DISCHARGE_KW 4.0f
+
 // How many stationary GNSS samples must be averaged before the parking freeze prefers the average over a
 // single instantaneous fix. At the 5s ACTIVE poll cadence 12 samples ~= 1 minute; the car normally sits still
 // ~5 min before latching parked, so ~60 samples are typically available. FIELD EVIDENCE for why this exists:

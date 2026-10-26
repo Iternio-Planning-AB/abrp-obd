@@ -39,7 +39,7 @@ import time
 
 SM_PIN = "6457b2a1a355a43b57ae877d40bae2481afad49c"
 # Headers the CUR side includes ahead of its extracted blocks (inside namespace sm_cur).
-CUR_HEADERS = ["drive_state.h"]
+CUR_HEADERS = ["motion_stats.h", "drive_state.h"]
 
 root = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(root / "tests/support"))
@@ -75,6 +75,11 @@ DRIVE_START = ('    for (const auto& res : current_frame) {\n'
 DRIVE_END = "#if ENABLE_NETWORK\n    const double poll_utc = uploadSendUtc();"
 
 
+# The is_parked publish: unconditional at the pin, withheld while UNCONFIRMED (#6) in the tree.
+EMPLACE = {"SM_PIN": '    current_frame.emplace_back("is_parked"',
+           "tree": '    if (!drive_unconfirmed) current_frame.emplace_back("is_parked"'}
+
+
 def recipe(src, side):
     logger, machine = src["logger"], src["machine"]
     where = {k: f"{PATHS[k]} ({side})" for k in PATHS}
@@ -93,7 +98,7 @@ def recipe(src, side):
                   block(machine, "unsigned long getPollingDelay(", where["machine"]),
         "change_state": block(machine, "void changeState(ActivityState new_state) {", where["machine"]),
         "drive": logger[start:find(logger, DRIVE_END, start, where["logger"])],
-        "emplace": line(logger, '    current_frame.emplace_back("is_parked"', where["logger"]),
+        "emplace": line(logger, EMPLACE[side], where["logger"]),
         "buffer": block(logger, "    if (frame_has_data) {", where["logger"]),
         "marker": block(src["sleep"], "  if (rtc.getEpoch() > 1e9 && is_currently_parked", where["sleep"]),
         "session": block(machine, "if (g_ota_active || g_logdump_active) {", where["machine"]),
@@ -106,6 +111,7 @@ SIDE = """{enum}
 {buffer_cap}
 #include "adapter_pre.inc"
 {headers}
+{motion_inputs}
 {queue_helper}
 {state_name}
 {delays}
@@ -136,6 +142,19 @@ bool sm_gate(float rail, bool is_cold, bool is_motion, bool awake, bool heartbea
 }}
 #include "adapter_post.inc"
 """
+
+# The rolling accumulator the drive rules read: CUR only, as OLD has no sustained rule. A poll that says
+# `sustained` holds 20 s of motion windows ending now (every window active, exactly the minimum sampled time).
+MOTION_INPUTS = {
+    "old": "void sm_motion_inputs(const SmEvent&) {}",
+    "cur": """DriveMotion g_drive_motion;
+void sm_motion_inputs(const SmEvent& e) {
+  g_drive_motion = DriveMotion{};
+  if (!e.sustained) return;
+  if (sm_now < 20000) { fprintf(stderr, "harness: advance the clock 20 s before a sustained poll\\n"); abort(); }
+  for (unsigned i = 0; i < 40; ++i) motionAccumulate(g_drive_motion, true, true, 500, sm_now - 19500 + 500UL * i);
+}""",
+}
 
 old_src = {k: pinned(p) for k, p in PATHS.items()}
 cur_src = {k: tree(p) for k, p in PATHS.items()}
@@ -217,7 +236,8 @@ for macro in sorted(used):
 
 # The harness resets each firmware global to a literal; that literal must be the firmware's initialiser: in
 # the tree for all of them, and at SM_PIN too except for those only the shared context reads.
-CONTEXT_GLOBALS = {"recently_charging", "taper_confirm_wakes", "charge_end_polled", "g_taper_confirm", "maintenance_mode"}
+CONTEXT_GLOBALS = {"recently_charging", "taper_confirm_wakes", "charge_end_polled", "g_taper_confirm", "maintenance_mode",
+                   "drive_unconfirmed", "g_drive_gnss_refused", "g_last_io36", "g_last_motion_ms", "g_last_obd_answer_ms"}
 adapter = tree("tests/sm/adapter_pre.inc")
 for region, prefix in (("SM_RAM", ""), ("SM_RTC", "RTC_DATA_ATTR ")):
     body = re.search(rf"^#define {region}\(X\) \\\n((?:.*\\\n)*.*)", adapter, re.M).group(1)
@@ -237,10 +257,10 @@ def code_only(text):
                   lambda m: re.sub(r"[^\n]", " ", m.group(0)), text, flags=re.S)
 
 
-# Step 1 (#24): drive_state.h is the only code that assigns the park/drive storage. An assignment here is
+# Step 1 (#24), extended by #6 to drive_unconfirmed and the refusal-streak flag: drive_state.h is the only code that assigns the park/drive storage. An assignment here is
 # =, a compound assignment, ++/--, taking the address or binding a reference (an alias could assign), or
 # swap(); matched on the whole file, so a statement split over lines is still seen.
-DRIVE_STORAGE = ("is_currently_parked", "g_last_speed_ms", "park_marker_owed")
+DRIVE_STORAGE = ("is_currently_parked", "g_last_speed_ms", "park_marker_owed", "drive_unconfirmed", "g_drive_gnss_refused")
 DECLARATION = re.compile(r"(?:^|\n)\s*(?:RTC_DATA_ATTR\s+)?(?:bool|unsigned\s+long)\s*$")
 helpers = sorted((root / "baseLogger/Helpers").glob("*.h"))
 for path in [root / "baseLogger/logger.ino", *helpers]:
@@ -284,9 +304,9 @@ field = "".join(block(energy, f"const std::vector<Sample> {n} = ", "tests/energy
 compiler = shlex.split(os.environ.get("CXX", "clang++"))
 with tempfile.TemporaryDirectory(prefix="obd-sm-checks-") as temporary:
     build = Path(temporary)
-    (build / "old_side.inc").write_text(SIDE.format(headers="", **old))
+    (build / "old_side.inc").write_text(SIDE.format(headers="", motion_inputs=MOTION_INPUTS["old"], **old))
     cur_headers = "".join(f'#include "{h}"\n' for h in CUR_HEADERS)
-    (build / "cur_side.inc").write_text(SIDE.format(headers=cur_headers, **cur))
+    (build / "cur_side.inc").write_text(SIDE.format(headers=cur_headers, motion_inputs=MOTION_INPUTS["cur"], **cur))
     (build / "field.inc").write_text(field)
     executable = build / "sm_checks"
     subprocess.run([

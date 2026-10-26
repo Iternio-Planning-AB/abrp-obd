@@ -421,6 +421,19 @@ come from GNSS. Note `bleTlmString()` **trims `lat`/`lon`/`utc`/`heading` from t
 phone supplies its own position — so a BLE frame is smaller than the cellular body, and a frame that is
 *only* position (no PID answered) serialises to `{"tlm":{"is_parked":…,"is_charging":…}}`.
 
+**Park / drive / unconfirmed** (`Helpers/drive_state.h`, #6). The drive latch has three states. A speed key above 0
+is DRIVING, as always. A fresh moving GNSS fix starts DRIVING only with the car on (rail ≥ `RAIL_AWAKE_VOLTS`, or an
+OBD answer within `ACTIVE_TIMER`), an accelerometer hit within `DRIVE_MOTION_RECENT_MS` and no charge latch; a fix
+without them (desk drift, a garage) is refused and logged once per streak (`LEASH gnss=… refused reason=motion|car-off|charging`).
+Sustained motion (`DRIVE_SUSTAINED_ACT_PCT` of at least `DRIVE_SUSTAINED_MIN_SAMPLED_MS` sampled, over
+`DRIVE_SUSTAINED_WINDOW_MS`) on a car that is on, with no charge latch, is UNCONFIRMED; with a discharge above
+`DRIVE_DISCHARGE_KW` (the frame's `power`, else current × voltage) it is DRIVING. UNCONFIRMED keeps
+`is_currently_parked` true (every parked-gated guard, the backstop included, treats it as parked) but the frame has no
+`is_parked` key (so no `drivingState`, no `chargingState`, an empty CSV cell), the live location replaces the frozen
+spot and no PARK marker is owed. It leaves for DRIVING on a speed key, a GNSS fix with the evidence above, or discharge;
+for PARKED when the charge latch sets, `ACTIVE_TIMER` passes with no motion, or the ladder goes idle, never with a freeze.
+The OBD-alarm gate takes none of this.
+
 **A location or heading goes up once per GPS observation** (#14). `bulkStringV2` omits a `location` equal to
 the last one sent — same `lat`, `lon` and observation time, the whole tuple, since the single-fix fallback
 can move coordinates without moving their time — and a `heading` equal in degrees and observation time.
@@ -913,6 +926,10 @@ Everything below except `README.md` and `docs/` is embedded verbatim in **Part I
    image's bytes after a rollback, so it needs a check that rejects both (`wdt_streak.h`: a magic and an
    inverted copy). That store holds the crash-loop streak, the "modem may be on" flag and a copy of the
    park-marker debt that is cleared only once the marker is sent, since the backlog is deleted when it loads.
+10. **UNCONFIRMED is parked to every reader except the frame's `is_parked`, `addGpsData` and the marker.** `drive_unconfirmed` (written only by `drive_state.h`, like
+   the latch) withholds the frame's `is_parked`, switches `addGpsData` to the live fix and owes no marker; everything
+   else keeps reading `is_currently_parked`. A new parked-gated guard needs no change; one that must tell the states
+   apart reads `drive_unconfirmed`. `tests/run_sm_checks.py rules` pins the transitions.
 
 
 ---

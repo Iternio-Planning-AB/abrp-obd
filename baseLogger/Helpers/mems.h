@@ -188,6 +188,14 @@ bool detectMovement(unsigned long duration) {
   return active;
 }
 
+// The rolling window the drive rules judge "sustained motion" by (drive_state.h). Not logging: it is a decision input.
+DriveMotion g_drive_motion;
+
+// Called after every handleActivityState() window, with the same sampled/bypass rule as noteMotionWindow.
+void noteDriveMotionWindow(bool sampled, bool active) {
+  motionAccumulate(g_drive_motion, sampled, active, motion_window_ms, millis());
+}
+
 #if ENABLE_LOGGING
 MotionStats motion_stats;
 

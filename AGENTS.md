@@ -168,7 +168,7 @@ and upload cycle), `Helpers/state_machine.h` (activity states and cadences), `He
 
 ## State-machine differential harness
 
-Run `python3 tests/run_sm_checks.py` (groups `scenarios`, `random`, `enumerate`, `crash`; `--depth N`, default 5) for
+Run `python3 tests/run_sm_checks.py` (groups `scenarios`, `random`, `enumerate`, `crash`, `rules`; `--depth N`, default 5) for
 the park/drive decision. The differential covers the drive region; shared context comes from the working
 tree. The blocks that write drive state (the poll-time unlatch and re-latch, the `is_parked` publish, the
 OTA/dump hold, `changeState`, the buffer block and the pre-sleep marker) come from the pinned `main` commit
@@ -188,10 +188,10 @@ have: a panic mid-drive, in the pre-sleep flush and after a backlog load, plus e
 alphabet with a crash, a flush crash and a sent flush added, must never lose the debt or an unsent marker.
 On the differential's boots the restore is a no-op, so a restore that fires there fails it. Since step 1 (#24) the CUR side is the
 drive region in `Helpers/drive_state.h`, and the runner fails if anything outside that header assigns
-`is_currently_parked`, `g_last_speed_ms` or `park_marker_owed`, if `alarm_gate.h` names drive state, or if
+`is_currently_parked`, `g_last_speed_ms`, `park_marker_owed`, `drive_unconfirmed` or `g_drive_gnss_refused`, if `alarm_gate.h` names drive state, or if
 a call into the drive region sits outside the blocks it extracts. The pin rule and what the harness
 cannot prove (32-bit `millis()` wrap, other flag sets, code outside the extracted blocks) are in the
-runner's header. Energy and wake surfaces come in step 0b (#28).
+runner's header. Energy and wake surfaces come in step 0b (#28). The `rules` group (#6) also runs CUR alone, as OLD has no UNCONFIRMED: the named driving-rule scenarios (desk drift, late-fix drive, discharge, charge block, UNCONFIRMED exit) over Poll inputs for the car, motion, sustained motion, power and charge latch, whose defaults make CUR agree with OLD.
 
 ## Diagnostic host checks
 
