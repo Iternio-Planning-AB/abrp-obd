@@ -81,7 +81,7 @@ def recipe(src, side):
     start = find(logger, DRIVE_START, what=where["logger"])
     queue_helper = ""
     if side == "tree":
-        upload_start = find(src["upload"], "bool queueUploadFrame(", what=where["upload"])
+        upload_start = find(src["upload"], "bool isSyntheticParkMarker(", what=where["upload"])
         upload_end = find(src["upload"], "\n#if ENABLE_NETWORK", upload_start, where["upload"])
         queue_helper = src["upload"][upload_start:upload_end]
     return {

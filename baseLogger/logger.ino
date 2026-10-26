@@ -148,7 +148,7 @@ OBDWrapper obd;
 std::vector<OBDVector> obd_result_vector{};
 // Cap on the in-RAM upload buffer (frames awaiting upload); the oldest go first, and the full log stays in flash.
 // An hour of driving at the 7 s poll. 120 held 14 minutes and dropped 411 frames of a 47-minute offline drive in the
-// field (#75). Frames are in PSRAM, ~1 KB each, and the backlog file at sleep is ~600 B a frame (~300 KB).
+// field (#75). Frames are in PSRAM, ~1 KB each; the backlog file for a full queue is ~260 KB (BACKLOG_FS_RESERVE).
 const size_t MAX_UPLOAD_BUFFER = 512;
 // Frames the cap dropped since the last UPLOAD discarded line (see logUploadCapped).
 unsigned long upload_capped = 0;
@@ -1250,10 +1250,14 @@ void loop() {
       // with this one.
       if (pushed_token != tlm_push_token) {
 #if ENABLE_NETWORK && ENABLE_LOGGING
-        if (!obd_result_vector.empty() || upload_spilled)
-          logEvent("UPLOAD discarded n=%lu reason=token", obd_result_vector.size() + upload_spilled);
+        if (!obd_result_vector.empty() || !g_upload_held.empty() || upload_spilled)
+          logEvent("UPLOAD discarded n=%lu reason=token",
+            obd_result_vector.size() + g_upload_held.size() + upload_spilled);
         LittleFS.remove(UPLOAD_BACKLOG_PATH); // what a relay session parked there
         upload_spilled = 0;
+#endif
+#if ENABLE_NETWORK
+        g_upload_held.clear(); // held frames are under the old token too, and the next save writes them first
 #endif
         obd_result_vector.clear();
       }

@@ -25,7 +25,6 @@
 #define ENABLE_NETWORK 1
 #define ENABLE_CELL 0
 #include "../baseLogger/config.h"
-#define CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL 4096 // the Arduino core's sdkconfig: larger mallocs go to PSRAM
 #define FLAG_GNSS_USE_LINK 1
 
 using json = nlohmann::json;
@@ -39,6 +38,8 @@ struct ESPStub {
   unsigned long getFreeHeap() const;
   unsigned long getMaxAllocHeap() const;
   unsigned long getMaxAllocPsram() const;
+  unsigned long getPsramSize() const;
+  unsigned long getFreePsram() const;
 } ESP;
 
 void check(bool condition, const std::string& message) {

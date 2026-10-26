@@ -440,20 +440,28 @@ the oldest. A frame the phone relayed never goes over cellular, including the do
 profile, an unknown) `tlm_push_token` discards the queue and the parked file (`UPLOAD discarded n=…
 reason=token`): those frames may be another vehicle's history. The cap drops the oldest frame past
 `MAX_UPLOAD_BUFFER`, logged once per capped stretch (`UPLOAD discarded n=… reason=cap`, at the next accepted
-upload or the backlog save).
+upload or the backlog save). `BLE relay spilled=` logs the parked count and the heap at the start of each relay
+stretch.
 
 **Queued frames live in PSRAM** (#75). A frame is about 1 KB of pairs, under the 4 KB threshold that sends a malloc to
 PSRAM by itself, so in internal heap the queue competed with Bluedroid and the modem: an ID.5 offline for 47 minutes
 with BLE up had 120 frames queued, a 2292 B largest internal block, and 4 MB of PSRAM free, and the 120-frame cap
-dropped 411 frames. The frame type (`OBDVector`, `libraries/OBDWrapper/obd_vector.h`) allocates its pairs in PSRAM
-first, keys up to 15 characters live inside their strings, and the outer array is reserved for the whole cap, so a
-queued frame takes no internal heap. The cap is 512 frames, an hour at the 7 s driving poll. `queueUploadFrame`
-still checks room before each copy: the PSRAM block must stay above `UPLOAD_MIN_PSRAM_BLOCK`, and whatever would land
-in internal heap must leave `UPLOAD_MIN_FREE_HEAP`/`UPLOAD_MIN_MAX_BLOCK`; otherwise the oldest frames go first
-(`UPLOAD discarded n=… reason=heap free= maxblock= psram=`). Bench (Fabbe, BLE up, internal heap ballasted below
-both reserves): 600 frames, 512 kept, no internal heap used, every frame read back exact. The backlog file for
-512 frames is ~260 KB, written in ~5.7 s at sleep and read in ~7.3 s at the next wake. `BLE relay spilled=` logs the parked count and the heap at the start of each relay
-stretch.
+dropped 411 frames. The frame type (`OBDVector`, `libraries/OBDWrapper/obd_vector.h`) allocates its pairs and its
+keys in PSRAM first (a key past the string's own 15 characters, such as `est_battery_range`, would otherwise take
+internal heap in every frame), and the outer array is reserved for the whole cap, so a queued frame takes no internal
+heap. The cap is 512 frames, an hour at the 7 s driving poll. `queueUploadFrame` still checks room before each copy:
+free PSRAM must stay above `UPLOAD_MIN_FREE_PSRAM` (gzip's state and bodies; free, not the largest block, which a
+freed frame seldom grows), and on a board without
+PSRAM the internal heap must keep `UPLOAD_MIN_FREE_HEAP`/`UPLOAD_MIN_MAX_BLOCK`; otherwise the oldest frames go
+first (`UPLOAD discarded n=… reason=heap free= maxblock= psram=`). Bench (Fabbe, BLE up, internal heap ballasted
+below both reserves): 600 frames with long keys, 512 kept, no internal heap used, every frame read back exact; with
+PSRAM ballasted to ~80 KB above the reserve, 300 frames settle at ~50 kept, the newest, and the reserve holds.
+
+The backlog file shares LittleFS with the flash log, whose rotation keeps ~384 KB free. `saveUploadBacklog` writes
+at most what is free above `BACKLOG_FS_RESERVE`; past that the oldest frames are left out (`UPLOAD discarded n=…
+reason=fs`), so the trip-end marker, queued last, is kept, and a write that still fails ends the save (`BACKLOG write
+failed at`), re-arming the marker debt if the marker was lost. A full queue's file is ~260 KB: ~5.7 s to write at
+sleep and ~7.3 s to read at the next polling wake, which a parked offline car pays on every polling wake.
 
 **A frame older than 6 days is dropped from the queue** (#67). Parked history that old is worth little next to the
 frames queued behind it, and the server answers 400 for the whole POST if any point in it is older than 30 days, so

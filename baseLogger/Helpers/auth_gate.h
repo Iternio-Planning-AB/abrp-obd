@@ -202,10 +202,14 @@ void forgetProfile(const char* why) {
   LittleFS.remove(PROFILE_PATH);
 #endif
 #if ENABLE_NETWORK && ENABLE_LOGGING
-  if (!obd_result_vector.empty() || upload_spilled)
-    logEvent("UPLOAD discarded n=%lu reason=forget", obd_result_vector.size() + upload_spilled);
+  if (!obd_result_vector.empty() || !g_upload_held.empty() || upload_spilled)
+    logEvent("UPLOAD discarded n=%lu reason=forget",
+      obd_result_vector.size() + g_upload_held.size() + upload_spilled);
   LittleFS.remove(UPLOAD_BACKLOG_PATH);
   upload_spilled = 0;
+#endif
+#if ENABLE_NETWORK
+  g_upload_held.clear(); // held frames are this vehicle's too, and the next save writes them first
 #endif
   obd_result_vector.clear();
   tlm_push_token.clear();

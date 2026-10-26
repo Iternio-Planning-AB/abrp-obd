@@ -1,11 +1,11 @@
 #pragma once
 // Heap model for the upload queue checks: ESP.getFreeHeap()/getMaxAllocHeap()/getMaxAllocPsram() shrink by the
 // storage the queue and the held frames really hold, measured independently of the production estimator.
-// Include after obd_result_vector, g_upload_held and the ESPStub declaration (with all three methods).
+// Include after obd_result_vector, g_upload_held and the ESPStub declaration (with all five methods).
 //
-// Placement follows the firmware: a frame's pairs go to PSRAM while the fixture has some (PsramPreferred), the outer
-// array goes to PSRAM from the malloc threshold up, and keys too long for the string's own buffer stay internal.
-// heap_fixture_psram = 0 is a board with no PSRAM free: everything lands internal.
+// Placement follows the firmware: a frame's pairs and long keys go to PSRAM while the fixture has some
+// (PsramPreferred), and the outer array goes there from the malloc threshold up. heap_fixture_psram is the largest
+// PSRAM block with nothing queued; 0 is a board with no PSRAM, where everything lands internal.
 
 #include <cstdint>
 
@@ -37,7 +37,7 @@ void fixtureUploadVectorBytes(const std::vector<OBDVector>& frames, size_t& inte
       const auto data = reinterpret_cast<std::uintptr_t>(value.first.data());
       const auto object = reinterpret_cast<std::uintptr_t>(&value.first);
       if (!value.first.empty() && (data < object || data >= object + sizeof(std::string)))
-        internal += value.first.capacity() + 1 + 16;
+        (has_psram ? psram : internal) += value.first.capacity() + 1 + 16;
     }
   }
 }
@@ -60,6 +60,14 @@ unsigned long ESPStub::getMaxAllocHeap() const {
   const size_t used = fixtureUploadBytes();
   return used >= heap_fixture_maxblock ? 0 : heap_fixture_maxblock - used;
 }
+
+unsigned long ESPStub::getPsramSize() const {
+  if (!heap_fixture_enabled) return 4194304;
+  return heap_fixture_psram ? 4194304 : 0;
+}
+
+// One free block in the fixture: free PSRAM and the largest block are the same.
+unsigned long ESPStub::getFreePsram() const { return getMaxAllocPsram(); }
 
 unsigned long ESPStub::getMaxAllocPsram() const {
   if (!heap_fixture_enabled) return 4000000;

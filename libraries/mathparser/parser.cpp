@@ -89,7 +89,7 @@ std::vector<Token> Parser::tokenize(const std::string& expression, const std::ve
       const size_t close = expression.find('}', i + 4);
       if (close == std::string::npos) throw std::runtime_error("Unclosed VAL{");
       const std::string name = expression.substr(i + 4, close - i - 4);
-      const std::pair<std::string, double>* found = nullptr;
+      const ParserValues::value_type* found = nullptr;
       if (values)
         for (const auto& v : *values) if (v.first == name) found = &v;
       if (!found) throw std::runtime_error("val not available: " + name);

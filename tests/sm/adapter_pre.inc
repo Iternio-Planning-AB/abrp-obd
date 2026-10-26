@@ -63,13 +63,12 @@ SmGps* gd = &sm_gps;
 std::vector<OBDVector> obd_result_vector;
 std::vector<std::string> sm_log, sm_serial;
 unsigned long upload_capped = 0, upload_heap_dropped = 0;
-#ifndef CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL
-#define CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL 4096 // the Arduino core's sdkconfig: larger mallocs go to PSRAM
-#endif
 struct SmHeap {
   unsigned long getFreeHeap() const { return 500000; }
   unsigned long getMaxAllocHeap() const { return 250000; }
   unsigned long getMaxAllocPsram() const { return 4000000; }
+  unsigned long getPsramSize() const { return 4194304; }
+  unsigned long getFreePsram() const { return 4000000; }
 } ESP;
 
 unsigned long millis() { return sm_now; }

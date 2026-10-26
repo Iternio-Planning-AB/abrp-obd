@@ -637,11 +637,14 @@
 // Judged only on a trusted send clock. A trusted clock wrongly stepped this far forward (bad NITZ/NTP, spoofed GNSS)
 // drops the queue; accepted, as unlikely.
 #define BACKLOG_MAX_SEND_AGE_SECONDS (6UL * 24UL * 60UL * 60UL)
-// Reserves a queued frame must leave (queueUploadFrame). Frames live in PSRAM (obd_vector.h), so normally a frame
-// takes no internal heap and only the PSRAM reserve applies: it keeps room for gzip's ~40 KB of state and its
-// bodies. The internal reserves apply to whatever would land internal (no PSRAM, PSRAM at its reserve, keys over 15
-// characters); conservative initial values from ~42 KB free after BLE, which guarantee no other allocation site.
-#define UPLOAD_MIN_PSRAM_BLOCK 131072UL
+// Reserves a queued frame must leave (queueUploadFrame). Frames and their keys live in PSRAM (obd_vector.h), so with
+// PSRAM only its reserve of free PSRAM applies: room for gzip's ~40 KB of state and its bodies. The internal reserves apply only on
+// a board without PSRAM; conservative initial values from ~42 KB free after BLE, which guarantee no other allocation.
+#define UPLOAD_MIN_FREE_PSRAM 131072UL
+// Flash the upload backlog file leaves free on LittleFS, which it shares with the flash log (its rotation keeps ~384 KB
+// free) and the vehicle profile (~3 KB): room for the profile, a push and LittleFS's own metadata. A full queue is
+// ~260 KB of file; past the budget the oldest frames are not saved (saveUploadBacklog).
+#define BACKLOG_FS_RESERVE 65536UL
 #define UPLOAD_MIN_FREE_HEAP 32768UL
 #define UPLOAD_MIN_MAX_BLOCK 16384UL
 

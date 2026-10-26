@@ -13,39 +13,50 @@
 
 #include <new>
 
+// The trip-end marker enterDeepSleep queues; uploadFrameLost re-arms its debt when it is lost.
+bool isSyntheticParkMarker(const OBDVector& candidate) {
+  if (candidate.size() != 2) return false;
+  bool has_parked = false, has_utc = false;
+  for (const auto& value : candidate) {
+    if (value.first == "is_parked" && value.second == 1.0 && !has_parked) has_parked = true;
+    else if (value.first == "utc" && !has_utc) has_utc = true;
+    else return false;
+  }
+  return has_parked && has_utc;
+}
+
+// Every path that drops a queued frame unsent calls this.
+void uploadFrameLost(const OBDVector& frame) {
+  if (isSyntheticParkMarker(frame)) driveMarkerRestored();
+}
+
+#ifdef ESP_PLATFORM
+static_assert(MAX_UPLOAD_BUFFER * sizeof(OBDVector) >= CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL,
+  "the queue's outer array, reserved for the whole cap, must be big enough for malloc to put it in PSRAM");
+#endif
+
 bool queueUploadFrame(std::vector<OBDVector>& frames, const OBDVector& frame) {
-  auto isSyntheticParkMarker = [](const OBDVector& candidate) {
-    if (candidate.size() != 2) return false;
-    bool has_parked = false, has_utc = false;
-    for (const auto& value : candidate) {
-      if (value.first == "is_parked" && value.second == 1.0 && !has_parked) has_parked = true;
-      else if (value.first == "utc" && !has_utc) has_utc = true;
-      else return false;
-    }
-    return has_parked && has_utc;
-  };
-  auto markerLost = [&](const OBDVector& discarded) {
-    if (isSyntheticParkMarker(discarded)) driveMarkerRestored();
-  };
-  // Where a copy of the frame lands, as obd_vector.h and malloc place it: the pairs in PSRAM while it has room above
-  // UPLOAD_MIN_PSRAM_BLOCK, keys past the string's own 15 characters internal. With PSRAM the outer array is reserved
-  // for the whole cap at once, so from the malloc threshold up it is in PSRAM too and never grows a frame at a time
-  // in internal heap; without, it grows by one, as small as it can.
+  auto markerLost = uploadFrameLost;
+  // A copy's pairs and keys go to PSRAM (obd_vector.h). With PSRAM the outer array is reserved for the whole cap at
+  // once, which puts it in PSRAM too, so only the PSRAM reserve applies. It is judged on free PSRAM, which evicting
+  // the oldest raises: a freed frame seldom grows the largest block, and judging that emptied the queue on the bench.
+  // Without PSRAM all of it is internal and the outer array grows by one.
+  const bool psram = ESP.getPsramSize() > 0;
   size_t grow_to = 0;
-  auto internalBytes = [&]() {
-    const size_t pairs = frame.size() * sizeof(OBDPair) + 16;
-    const size_t whole = frames.capacity() < MAX_UPLOAD_BUFFER ? MAX_UPLOAD_BUFFER * sizeof(OBDVector) + 16 : 0;
-    const unsigned long psram_block = ESP.getMaxAllocPsram();
-    const bool psram = psram_block >= UPLOAD_MIN_PSRAM_BLOCK && pairs + whole <= psram_block - UPLOAD_MIN_PSRAM_BLOCK;
-    grow_to = frames.size() < frames.capacity() ? 0 : psram ? MAX_UPLOAD_BUFFER : frames.size() + 1;
-    size_t bytes = psram ? 0 : pairs;
-    if (grow_to && (!psram || whole < CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL)) bytes += grow_to * sizeof(OBDVector) + 16;
+  auto copyBytes = [&]() {
+    size_t bytes = frame.size() * sizeof(OBDPair) + 16;
     for (const auto& value : frame)
       if (value.first.size() > 15) bytes += value.first.size() + 1 + 16;
+    grow_to = frames.size() < frames.capacity() ? 0 : psram ? MAX_UPLOAD_BUFFER : frames.size() + 1;
+    if (grow_to) bytes += grow_to * sizeof(OBDVector) + 16;
     return bytes;
   };
   auto hasHeadroom = [&](size_t bytes) {
-    if (!bytes) return true;
+    if (psram) {
+      const unsigned long free_psram = ESP.getFreePsram();
+      return free_psram >= UPLOAD_MIN_FREE_PSRAM && bytes <= free_psram - UPLOAD_MIN_FREE_PSRAM &&
+        bytes <= ESP.getMaxAllocPsram();
+    }
     const unsigned long free_heap = ESP.getFreeHeap();
     const unsigned long max_block = ESP.getMaxAllocHeap();
     if (free_heap < UPLOAD_MIN_FREE_HEAP || max_block < UPLOAD_MIN_MAX_BLOCK) return false;
@@ -59,7 +70,7 @@ bool queueUploadFrame(std::vector<OBDVector>& frames, const OBDVector& frame) {
       ++upload_capped;
       continue;
     }
-    if (hasHeadroom(internalBytes())) {
+    if (hasHeadroom(copyBytes())) {
       try {
         if (grow_to) frames.reserve(grow_to);
         frames.push_back(frame);
@@ -494,7 +505,7 @@ void logUploadCapped() {
   }
   if (upload_heap_dropped) {
     logEvent("UPLOAD discarded n=%lu reason=heap free=%lu maxblock=%lu psram=%lu", upload_heap_dropped,
-      (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getMaxAllocHeap(), (unsigned long)ESP.getMaxAllocPsram());
+      (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getMaxAllocHeap(), (unsigned long)ESP.getFreePsram());
     upload_heap_dropped = 0;
   }
 }
@@ -502,22 +513,53 @@ void logUploadCapped() {
 // Called from enterDeepSleep AFTER the flush attempt, before an OTA reboot, and to spill. Overwrite semantics
 // are correct: the RAM buffer already contains any previously-loaded backlog (the file is deleted at load).
 // Only a spill from this wake can still be in the file, and it is older than RAM, so RAM goes behind it.
+// The file takes at most what LittleFS has free above BACKLOG_FS_RESERVE. Past that the oldest frames are not saved
+// (reason=fs), so the newest, the trip-end marker among them, are the ones kept; a write that still fails ends the
+// save there. Lost frames re-arm the marker debt if the marker is among them.
 bool saveUploadBacklog() {
   logUploadCapped();
   const size_t held_count = g_upload_held.size();
   const size_t frame_count = held_count + obd_result_vector.size();
   if (!frame_count) return true; // everything uploaded (or nothing polled) - leave no stale file
+  auto frameAt = [&](size_t i) -> const OBDVector& {
+    return i < held_count ? g_upload_held[i] : obd_result_vector[i - held_count];
+  };
+  size_t replaced = 0; // an older file this save overwrites: its bytes count as free
+  if (!upload_spilled && LittleFS.exists(UPLOAD_BACKLOG_PATH)) {
+    File old = LittleFS.open(UPLOAD_BACKLOG_PATH, "r");
+    if (old) { replaced = old.size(); old.close(); }
+  }
+  const size_t total = LittleFS.totalBytes(), used = LittleFS.usedBytes();
+  const size_t free_bytes = (total > used ? total - used : 0) + replaced;
+  const size_t budget = free_bytes > BACKLOG_FS_RESERVE ? free_bytes - BACKLOG_FS_RESERVE : 0;
+  size_t first = frame_count, bytes = 0;
+  while (first) {
+    const size_t line = encodeUploadFrame(frameAt(first - 1)).dump().size() + 2; // println's CR LF
+    if (bytes + line > budget) break;
+    bytes += line;
+    --first;
+  }
+  auto lost = [&](size_t from, size_t to) {
+    for (size_t i = from; i < to; ++i)
+      uploadFrameLost(frameAt(i));
+  };
+  if (first) {
+    lost(0, first);
+    logEvent("UPLOAD discarded n=%u reason=fs free=%u", (unsigned)first, (unsigned)free_bytes);
+  }
+  if (first == frame_count) return true;
   File f = LittleFS.open(UPLOAD_BACKLOG_PATH, upload_spilled ? "a" : "w");
   if (!f) { Serial.printf("Backlog: open for write failed\n"); return false; }
-  for (const auto& frame : g_upload_held) {
-    f.println(encodeUploadFrame(frame).dump().c_str());
-  }
-  for (const auto& frame : obd_result_vector) {
-    f.println(encodeUploadFrame(frame).dump().c_str());
-  }
+  size_t written = first;
+  for (; written < frame_count; ++written)
+    if (!f.println(encodeUploadFrame(frameAt(written)).dump().c_str())) break;
   f.close();
-  Serial.printf("Backlog: %d unsent frame(s) persisted to flash\n", (int)frame_count);
-  logEvent("BACKLOG saved %d unsent frame(s)", (int)frame_count);
+  if (written < frame_count) {
+    lost(written, frame_count);
+    logEvent("BACKLOG write failed at %u of %u", (unsigned)(written - first), (unsigned)(frame_count - first));
+  }
+  Serial.printf("Backlog: %d unsent frame(s) persisted to flash\n", (int)(written - first));
+  logEvent("BACKLOG saved %d unsent frame(s)", (int)(written - first));
   return true;
 }
 
