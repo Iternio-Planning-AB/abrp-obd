@@ -186,15 +186,27 @@ no-speed-PID drives). The fake clock advances inside every log line and freeze, 
 After every event the latch, leash, hold time, marker debt, published `is_parked`, buffered frames,
 freezes, the GNSS age bound asked for, and the exact `logEvent` and Serial sequences must be equal; the
 weak-rail gate and the max-awake backstop are checked as properties, on the working tree's code. The `crash`
-group (#49) runs CUR alone, because the setup() restore of the marker debt is a drive writer SM_PIN does not
-have: a panic mid-drive, in the pre-sleep flush and after a backlog load, plus every 5-event sequence over the
-alphabet with a crash, a flush crash and a sent flush added, must never lose the debt or an unsent marker.
+group (#49) runs CUR alone, because what it checks is absolute: a panic mid-drive, in the pre-sleep flush and
+after a backlog load, plus every 5-event sequence over the alphabet with a crash, a flush crash and a sent flush added, must never lose the debt or an unsent marker.
 On the differential's boots the restore is a no-op, so a restore that fires there fails it. Since step 1 (#24) the CUR side is the
 drive region in `Helpers/drive_state.h`, and the runner fails if anything outside that header assigns
 `is_currently_parked`, `g_last_speed_ms`, `park_marker_owed`, `drive_unconfirmed` or `g_drive_gnss_refused`, if `alarm_gate.h` names drive state, or if
 a call into the drive region sits outside the blocks it extracts. The pin rule and what the harness
 cannot prove (32-bit `millis()` wrap, other flag sets, code outside the extracted blocks) are in the
-runner's header. Energy and wake surfaces come in step 0b (#28). The `rules` group (#6) also runs CUR alone, as OLD has no UNCONFIRMED: the named driving-rule scenarios (desk drift, late-fix drive, discharge, charge block, UNCONFIRMED exit) over Poll inputs for the car, motion, sustained motion, power and charge latch, whose defaults make CUR agree with OLD.
+runner's header. The `rules` group (#6) also runs CUR alone, as absolute checks: the named driving-rule scenarios (desk drift, late-fix drive, discharge, charge block, UNCONFIRMED exit) over Poll inputs for the car, motion, sustained motion, power and charge latch, whose defaults make CUR agree with OLD.
+
+Since 0b-1 (#81) the differential also covers the poll-side energy block: the rail refresh and `loop()`'s block from
+the `is_charging` verdict through `dcAwakeTrack()` (release latch and silent hold, taper stall count, DC session,
+next-wake cadence, fast budget and cap, corroboration, the stale guard) with the helpers it calls, from `SM_PIN`
+for OLD. Polls carry a scripted car answer (current, voltage, soc/kwh/soe steps, `is_dcfc`, the rail, or silence),
+the RTC microsecond clock runs through sleeps, and every energy RTC field, RAM output and the next-wake minutes are
+compared; a sample poke the DC hold does not keep sleeps after its one poll. An energy alphabet (16 symbols, about
+1 M sequences at depth 5, soc-less kwh and soe profiles among them) is enumerated beside the drive one, the random
+group mixes charge polls in, and named scenarios cover an AC charge and its release, DC by power through a taper and
+the car's `is_dcfc=0`, the silent hold and parked-held, the stale reset after `CHARGE_STALE_RESET_MINUTES` (held, on
+an answered poke and on a skip wake), the post-drive window's polls and expiry, the stream-trust delay, the fast-budget cap,
+corroboration, and a DC session released silent on a streaming wake. The setup() sanitize, the gate with its skip
+path, the post-drive window at the ladder end and the poke's sleep stay shared context until #82.
 
 ## Diagnostic host checks
 
