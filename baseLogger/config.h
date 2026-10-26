@@ -637,6 +637,10 @@
 // Judged only on a trusted send clock. A trusted clock wrongly stepped this far forward (bad NITZ/NTP, spoofed GNSS)
 // drops the queue; accepted, as unlikely.
 #define BACKLOG_MAX_SEND_AGE_SECONDS (6UL * 24UL * 60UL * 60UL)
+// Preserve internal free and largest-contiguous-block reserves before copying a frame. Conservative initial values
+// reflect ~42 KB free after BLE (~1 KB/frame); validate on hardware, as these do not guarantee other allocation sites.
+#define UPLOAD_MIN_FREE_HEAP 32768UL
+#define UPLOAD_MIN_MAX_BLOCK 16384UL
 
 // Catch-up burst: how many capped POSTs the STEADY-STATE (in-loop) upload may fire back-to-back in one
 // transmission cycle. More SMALL posts, never bigger ones (see the hard per-POST size ceiling above).

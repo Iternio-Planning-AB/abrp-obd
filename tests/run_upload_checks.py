@@ -18,6 +18,7 @@ logger = (root / "baseLogger/logger.ino").read_text()
 cell = (root / "libraries/NetworkWrapper/cellwrapper.cpp").read_text()
 config = (root / "baseLogger/config.h").read_text()
 machine = (root / "baseLogger/Helpers/state_machine.h").read_text()
+drive_state = (root / "baseLogger/Helpers/drive_state.h").read_text()
 sys.path.insert(0, str(root / "tests/support"))
 from extract import block  # noqa: E402
 streak_line = next(line for line in logger.splitlines() if "if (!g_upload_local_fail)" in line)
@@ -43,6 +44,8 @@ with tempfile.TemporaryDirectory(prefix="obd-upload-checks-") as temporary:
     (build / "upload_send.inc").write_text(section(source, "commandResponse HTTPClientSIM::send(const char* api_page", "bool HTTPClientSIM::send(HTTP_METHOD"))
     (build / "upload_parse.inc").write_text(section(source, "std::pair<int, int> handlePair", "commandResponse HTTPClientSIM::getEpoch"))
     (build / "header_budget.inc").write_text(section(header, "// Request headers the SIM7070", "typedef enum {"))
+    (build / "drive_marker_restored.inc").write_text(
+        block(drive_state, "inline void driveMarkerRestored() {", "drive_state.h"))
     (build / "upload_streak.inc").write_text(streak_line + "\n")
     (build / "geo_reset.inc").write_text(geo_reset_line + "\n")
     (build / "open_streak.inc").write_text(open_streak_line + "\n")

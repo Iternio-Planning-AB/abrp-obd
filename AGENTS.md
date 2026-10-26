@@ -420,3 +420,18 @@ refused values, the header budget, abort on a refused `AT+SHAHEAD`) and the best
 Run `python3 tests/run_modem_checks.py` normally and with `CXX='clang++ -DNDEBUG'`.
 It exercises production cellular startup, registration/recovery and sleep against fake UART/time/hardware.
 Host checks do not verify real attachment timing, electrical sleep behavior or vehicle power/GPS.
+
+## Adaptive upload-queue checks (#75)
+
+Run `python3 tests/run_upload_checks.py queue` and `python3 tests/run_upload_checks.py logging-off` for the
+real queue helper, held-frame save/spill, and bounded backlog restore. Run
+`python3 tests/run_heading_checks.py upload-gate`, `geo-backlog-rows` and `geo-downgrade`, normally and with
+`CXX='clang++ -DNDEBUG'`, for the extracted poll buffer, geo admission gate, PARK marker and backlog paths.
+The fixture models allocated global queue/held vector and string storage independently of the production estimator;
+its row-read observer checks the global queue remains bounded as rows are processed. It does not account for the
+local pending vector or transient decoded/JSON copies, emulate real ESP32 fragmentation, or prove peak headroom or
+that unrelated allocations will succeed.
+
+`python3 tests/run_sm_checks.py` keeps the extracted queue helper on the CUR side under high heap and compares
+the drive/marker behavior with the pinned side. It does not prove low-heap admission, LittleFS behavior or
+hardware heap characteristics.

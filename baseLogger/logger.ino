@@ -147,11 +147,12 @@ GPS_DATA last_gd{};
 OBDWrapper obd;
 using OBDVector = std::vector<std::pair<std::string, double>>;
 std::vector<OBDVector> obd_result_vector{};
-// Cap on the in-RAM upload buffer (frames awaiting upload). Prevents unbounded growth -> OOM during long
-// offline periods; oldest frames are dropped (the full log is preserved in flash regardless).
+// Cap on the in-RAM upload buffer (frames awaiting upload). It remains the absolute count safety cap; oldest
+// frames go first and the full log remains in flash.
 const size_t MAX_UPLOAD_BUFFER = 120;
 // Frames the cap dropped since the last UPLOAD discarded line (see logUploadCapped).
 unsigned long upload_capped = 0;
+unsigned long upload_heap_dropped = 0;
 // Frames parked in the backlog file for a BLE session (see spillUploadBacklog).
 unsigned long upload_spilled = 0;
 // How often the loop kicks a WiFi reconnect while offline. Kept comfortably longer than a normal
@@ -436,6 +437,7 @@ void logEvent(const char* fmt, ...);           // Helpers/logging.h
 #else
 #define logEvent(...) ((void)0)                // helpers log unguarded; with logging off there is nowhere to write
 #endif
+bool queueUploadFrame(std::vector<OBDVector>& frames, const OBDVector& frame);
 #if ENABLE_NETWORK
 bool uploadBuffered(bool drain);               // Helpers/network_upload.h
 #if ENABLE_LOGGING
@@ -2054,18 +2056,10 @@ void loop() {
       // A relayed frame is not queued too (no second post as ABRP_OTA); the frames already queued stay and
       // drain over cellular once the session ends.
       if (!ble_relayed) {
-        obd_result_vector.push_back(current_frame); // store multiple frames to send at the same time, lowers cellular usage
+        const bool queued = queueUploadFrame(obd_result_vector, current_frame);
 #if ENABLE_NETWORK
-        g_geo_queued = poll_geo;
+        if (queued) g_geo_queued = poll_geo;
 #endif
-        // Bound the RAM upload buffer so a long offline stretch can't grow it without limit (-> OOM). The
-        // full history is already in flash; for live telemetry the freshest frames matter most, so drop the
-        // oldest when over the cap.
-        if (obd_result_vector.size() > MAX_UPLOAD_BUFFER) {
-          upload_capped += obd_result_vector.size() - MAX_UPLOAD_BUFFER;
-          obd_result_vector.erase(obd_result_vector.begin(),
-            obd_result_vector.begin() + (obd_result_vector.size() - MAX_UPLOAD_BUFFER));
-        }
       }
     }
 #if PRINT

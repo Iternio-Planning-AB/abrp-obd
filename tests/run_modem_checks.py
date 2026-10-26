@@ -26,6 +26,7 @@ header = (root / "libraries/FreematicsPlus/FreematicsNetwork.h").read_text()
 logger = (root / "baseLogger/logger.ino").read_text()
 sleep = (root / "baseLogger/Helpers/sleep_power.h").read_text()
 config = (root / "baseLogger/config.h").read_text()
+drive_state = (root / "baseLogger/Helpers/drive_state.h").read_text()
 compiler = shlex.split(os.environ.get("CXX", "clang++"))
 
 with tempfile.TemporaryDirectory(prefix="obd-modem-checks-") as temporary:
@@ -41,7 +42,16 @@ with tempfile.TemporaryDirectory(prefix="obd-modem-checks-") as temporary:
     (build / "modem_boot.inc").write_text(logger[start:find(logger, "#if ENABLE_WIFI", start, "logger.ino")])
     (build / "modem_sleep.inc").write_text(block(sleep, "void enterDeepSleep(", "sleep_power.h"))
     (build / "modem_config.inc").write_text("\n".join(re.findall(
-        r"^#define CELL_REGISTRATION_\w+.*", config, re.MULTILINE)))
+        r"^#define (?:CELL_REGISTRATION_\w+|UPLOAD_MIN_FREE_HEAP|UPLOAD_MIN_MAX_BLOCK)\b.*",
+        config, re.MULTILINE)))
+    upload = (root / "baseLogger/Helpers/network_upload.h").read_text()
+    upload_start = find(upload, "bool queueUploadFrame(", what="network_upload.h")
+    upload_end = find(upload, "\n#if ENABLE_NETWORK", upload_start, "network_upload.h")
+    (build / "upload_queue.inc").write_text(upload[upload_start:upload_end])
+    (build / "drive_marker_restored.inc").write_text(
+        block(drive_state, "inline void driveMarkerRestored() {", "drive_state.h"))
+    (build / "drive_marker_queued.inc").write_text(
+        block(drive_state, "inline void driveMarkerQueued() {", "drive_state.h"))
     reconnect = re.findall(r"^  if \(.*!network\.connected\(\).* \{", logger, re.MULTILINE)
     if len(reconnect) != 1:
         sys.exit("FAIL: expected one production offline reconnect gate")

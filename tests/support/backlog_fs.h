@@ -16,6 +16,7 @@ struct String {
 struct File {
   std::shared_ptr<std::string> data;
   size_t offset = 0;
+  void (*read_observer)() = nullptr;
   explicit operator bool() const { return bool(data); }
   bool available() const { return data && offset < data->size(); }
   String readStringUntil(char delimiter) {
@@ -23,6 +24,7 @@ struct File {
     if (end == std::string::npos) end = data->size();
     String result{data->substr(offset, end - offset)};
     offset = end + (end < data->size());
+    if (read_observer) read_observer();
     return result;
   }
   void println(const char* value) { *data += std::string(value) + '\n'; }
@@ -34,11 +36,12 @@ struct File {
 struct FakeLittleFS {
   std::map<std::string, std::shared_ptr<std::string>> files;
   bool fail_open = false;
+  void (*read_observer)() = nullptr;
   bool exists(const char* path) const { return files.count(path); }
   File open(const char* path, const char* mode) {
     if (fail_open) return {};
     if (*mode == 'w' || (*mode == 'a' && !exists(path))) files[path] = std::make_shared<std::string>();
-    return exists(path) ? File{files.at(path)} : File{};
+    return exists(path) ? File{files.at(path), 0, read_observer} : File{};
   }
   void remove(const char* path) { files.erase(path); }
   void seed(const std::string& value) { files["/upload_backlog.jsonl"] = std::make_shared<std::string>(value); }

@@ -47,6 +47,7 @@ void restore(const Snap& s) {
 // A boot: RAM back to its initialisers, the setup() debt restore, then the setup() gate.
 void boot(const SmEvent& e, SmReset reset) {
   SM_RAM(SM_RESET)
+  upload_capped = upload_heap_dropped = 0;
   sm_now = 0;
   sm_asleep = false;
   sm_reset = reset;

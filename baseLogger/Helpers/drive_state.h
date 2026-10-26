@@ -115,5 +115,5 @@ inline void driveFrameBuffered() {
   if (!is_currently_parked) park_marker_owed = true;
 }
 inline void driveMarkerQueued() { park_marker_owed = false; }
-// setup(): .rtc.data was reloaded, and wdt_streak.h's copy says the PARK may not have been sent.
+// setup(): .rtc.data was reloaded, and wdt_streak.h's copy says the PARK may not have been sent. Queue loss uses this re-arm too.
 inline void driveMarkerRestored() { park_marker_owed = true; }

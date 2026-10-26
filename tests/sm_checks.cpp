@@ -8,6 +8,8 @@
 #include <cstring>
 #include <chrono>
 #include <iostream>
+#include <limits>
+#include <new>
 #include <random>
 #include <sstream>
 #include <string>

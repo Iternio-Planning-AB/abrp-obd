@@ -11,6 +11,88 @@
   compilation unit - so it shares logger.ino's globals and the config.h feature flags.
 */
 
+#include <limits>
+#include <new>
+
+bool queueUploadFrame(std::vector<OBDVector>& frames, const OBDVector& frame) {
+  auto isSyntheticParkMarker = [](const OBDVector& candidate) {
+    if (candidate.size() != 2) return false;
+    bool has_parked = false, has_utc = false;
+    for (const auto& value : candidate) {
+      if (value.first == "is_parked" && value.second == 1.0 && !has_parked) has_parked = true;
+      else if (value.first == "utc" && !has_utc) has_utc = true;
+      else return false;
+    }
+    return has_parked && has_utc;
+  };
+  auto markerLost = [&](const OBDVector& discarded) {
+    if (isSyntheticParkMarker(discarded)) driveMarkerRestored();
+  };
+  auto estimateCopyBytes = [&](size_t& bytes) {
+    bytes = 0;
+    auto add = [&](size_t amount) {
+      if (amount > std::numeric_limits<size_t>::max() - bytes) return false;
+      bytes += amount;
+      return true;
+    };
+    auto multiply = [](size_t count, size_t width, size_t& product) {
+      if (count && width > std::numeric_limits<size_t>::max() / count) return false;
+      product = count * width;
+      return true;
+    };
+    size_t pair_bytes = 0;
+    if (!multiply(frame.size(), sizeof(OBDVector::value_type), pair_bytes)) return false;
+    if (frame.size() && (!add(pair_bytes) || !add(16))) return false;
+    for (const auto& value : frame) {
+      if (value.first.size() == std::numeric_limits<size_t>::max() ||
+          !add(value.first.size() + 1) || !add(16)) return false;
+    }
+    if (frames.size() == frames.capacity()) {
+      if (frames.size() == std::numeric_limits<size_t>::max()) return false;
+      size_t outer_bytes = 0;
+      if (!multiply(frames.size() + 1, sizeof(OBDVector), outer_bytes) ||
+          !add(outer_bytes) || !add(16)) return false;
+    }
+    return true;
+  };
+  auto hasHeadroom = [&](size_t bytes) {
+    const unsigned long free_heap = ESP.getFreeHeap();
+    const unsigned long max_block = ESP.getMaxAllocHeap();
+    if (free_heap < UPLOAD_MIN_FREE_HEAP || max_block < UPLOAD_MIN_MAX_BLOCK) return false;
+    return bytes <= free_heap - UPLOAD_MIN_FREE_HEAP &&
+      bytes <= max_block - UPLOAD_MIN_MAX_BLOCK;
+  };
+  while (true) {
+    if (frames.size() >= MAX_UPLOAD_BUFFER) {
+      markerLost(frames.front());
+      frames.erase(frames.begin());
+      ++upload_capped;
+      continue;
+    }
+    size_t bytes = 0;
+    if (estimateCopyBytes(bytes) && hasHeadroom(bytes)) {
+      try {
+        if (frames.size() == frames.capacity()) frames.reserve(frames.size() + 1);
+        frames.push_back(frame);
+        return true;
+      }
+      catch (const std::bad_alloc&) {
+        markerLost(frame);
+        ++upload_heap_dropped;
+        return false;
+      }
+    }
+    if (frames.empty()) {
+      markerLost(frame);
+      ++upload_heap_dropped;
+      return false;
+    }
+    markerLost(frames.front());
+    frames.erase(frames.begin());
+    ++upload_heap_dropped;
+  }
+}
+
 #if ENABLE_NETWORK
 bool uploadErrorContains(const std::string& body, const char* phrase) {
   const size_t n = strlen(phrase);
@@ -364,8 +446,13 @@ bool uploadBuffered(bool drain) {
     n = batch.size();
     if (n == 1 && wire > CELL_MAX_POST_BYTES && sized == GZIP_OFF) {
       // Over the cap only because gzip is off this wake: park it for the backlog, send what is behind it.
-      g_upload_held.push_back(obd_result_vector.front());
-      if (g_upload_held.size() > MAX_UPLOAD_BUFFER) g_upload_held.erase(g_upload_held.begin());
+      if (!queueUploadFrame(g_upload_held, obd_result_vector.front())) {
+        --upload_heap_dropped;
+        // The source stays in main RAM, so this rejected copy is not a discarded frame.
+        uploadNotSent("heap");
+        ok = false;
+        break;
+      }
       obd_result_vector.erase(obd_result_vector.begin());
 #if ENABLE_LOGGING
       logEvent("UPLOAD held plain_too_big frame for the next wake (%u held)", (unsigned)g_upload_held.size());
@@ -409,12 +496,18 @@ bool uploadBuffered(bool drain) {
 */
 static const char* UPLOAD_BACKLOG_PATH = "/upload_backlog.jsonl";
 
-// Past the cap the oldest frame goes on every poll: one line per capped stretch, at the next accepted
-// upload or before the backlog is saved.
+// At the count cap the oldest frame still goes. Count-cap and heap drops are aggregated until an accepted upload or
+// backlog save.
 void logUploadCapped() {
-  if (!upload_capped) return;
-  logEvent("UPLOAD discarded n=%lu reason=cap", upload_capped);
-  upload_capped = 0;
+  if (upload_capped) {
+    logEvent("UPLOAD discarded n=%lu reason=cap", upload_capped);
+    upload_capped = 0;
+  }
+  if (upload_heap_dropped) {
+    logEvent("UPLOAD discarded n=%lu reason=heap free=%lu maxblock=%lu", upload_heap_dropped,
+      (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getMaxAllocHeap());
+    upload_heap_dropped = 0;
+  }
 }
 
 // Called from enterDeepSleep AFTER the flush attempt, before an OTA reboot, and to spill. Overwrite semantics
@@ -422,26 +515,30 @@ void logUploadCapped() {
 // Only a spill from this wake can still be in the file, and it is older than RAM, so RAM goes behind it.
 bool saveUploadBacklog() {
   logUploadCapped();
-  obd_result_vector.insert(obd_result_vector.begin(), g_upload_held.begin(), g_upload_held.end());
-  g_upload_held.clear();
-  if (obd_result_vector.empty()) return true; // everything uploaded (or nothing polled) - leave no stale file
+  const size_t held_count = g_upload_held.size();
+  const size_t frame_count = held_count + obd_result_vector.size();
+  if (!frame_count) return true; // everything uploaded (or nothing polled) - leave no stale file
   File f = LittleFS.open(UPLOAD_BACKLOG_PATH, upload_spilled ? "a" : "w");
   if (!f) { Serial.printf("Backlog: open for write failed\n"); return false; }
+  for (const auto& frame : g_upload_held) {
+    f.println(encodeUploadFrame(frame).dump().c_str());
+  }
   for (const auto& frame : obd_result_vector) {
     f.println(encodeUploadFrame(frame).dump().c_str());
   }
   f.close();
-  Serial.printf("Backlog: %d unsent frame(s) persisted to flash\n", (int)obd_result_vector.size());
-  logEvent("BACKLOG saved %d unsent frame(s)", (int)obd_result_vector.size());
+  Serial.printf("Backlog: %d unsent frame(s) persisted to flash\n", (int)frame_count);
+  logEvent("BACKLOG saved %d unsent frame(s)", (int)frame_count);
   return true;
 }
 
 // A relaying phone's session (pairing, profile push, OTA, log dump) needs the internal heap the queue holds,
 // about 1 KB a frame, next to Bluedroid's: park the queue in the backlog file until relaying ends.
 void spillUploadBacklog() {
-  const size_t n = obd_result_vector.size();
+  const size_t n = obd_result_vector.size() + g_upload_held.size();
   if (!n || !saveUploadBacklog()) return;
   obd_result_vector.clear();
+  g_upload_held.clear();
   upload_spilled += n;
 }
 
@@ -468,7 +565,10 @@ void loadUploadBacklog() {
   upload_capped += skip;
   f = LittleFS.open(UPLOAD_BACKLOG_PATH, "r");
   if (!f) return;
-  std::vector<OBDVector> restored;
+  g_upload_held.clear();
+  std::vector<OBDVector> pending;
+  pending.swap(obd_result_vector);
+  size_t restored = 0;
   while (f.available()) {
     String line = f.readStringUntil('\n');
     line.trim();
@@ -477,24 +577,24 @@ void loadUploadBacklog() {
     try {
       json tlm = json::parse(line.c_str());
       OBDVector frame = decodeUploadFrame(tlm);
-      if (!frame.empty()) restored.push_back(std::move(frame));
+      if (!frame.empty()) {
+        ++restored;
+        queueUploadFrame(obd_result_vector, frame);
+      }
     }
     catch (const json::exception&) { /* skip a corrupt line (e.g. power lost mid-write) */ }
   }
   f.close();
   LittleFS.remove(UPLOAD_BACKLOG_PATH);
-  const int n = (int)restored.size();
-  obd_result_vector.insert(obd_result_vector.begin(), std::make_move_iterator(restored.begin()),
-    std::make_move_iterator(restored.end()));
-  if (obd_result_vector.size() > MAX_UPLOAD_BUFFER) {
-    upload_capped += obd_result_vector.size() - MAX_UPLOAD_BUFFER;
-    obd_result_vector.erase(obd_result_vector.begin(),
-      obd_result_vector.begin() + (obd_result_vector.size() - MAX_UPLOAD_BUFFER));
+  while (!pending.empty()) {
+    queueUploadFrame(obd_result_vector, pending.front());
+    OBDVector().swap(pending.front());
+    pending.erase(pending.begin());
   }
   g_geo_queued_seeded = false;
-  if (n) {
-    Serial.printf("Backlog: restored %d frame(s) from flash for upload\n", n);
-    logEvent("BACKLOG restored %d frame(s) from flash", n);
+  if (restored) {
+    Serial.printf("Backlog: restored %d frame(s) from flash for upload\n", (int)restored);
+    logEvent("BACKLOG restored %d frame(s) from flash", (int)restored);
   }
 }
 #endif
