@@ -1044,7 +1044,9 @@ class ReleaseNotes(unittest.TestCase):
         script = script.replace("baseLogger/tools/fw_version.py", str(TOOLS / "fw_version.py"))
         shim = Path(self.repo.path) / ".bin"
         shim.mkdir()
-        (shim / "git-cliff").write_text('#!/bin/sh\nexec %s --config "%s" "$@"\n' % (shlex.join(GIT_CLIFF), CLIFF_TOML))
+        # The real binary by absolute path: a bare "git-cliff" would find this shim again and exec itself forever.
+        real = [shutil.which(GIT_CLIFF[0]) or GIT_CLIFF[0], *GIT_CLIFF[1:]]
+        (shim / "git-cliff").write_text('#!/bin/sh\nexec %s --config "%s" "$@"\n' % (shlex.join(real), CLIFF_TOML))
         (shim / "git-cliff").chmod(0o755)
         env = {**os.environ, "PATH": f"{shim}{os.pathsep}{os.environ['PATH']}", "NAME": name,
                "PRERELEASE": "true" if prerelease else "false"}
