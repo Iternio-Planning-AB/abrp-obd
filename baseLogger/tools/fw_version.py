@@ -106,6 +106,24 @@ def next_release(repo, bumped, override=None, prerelease=False):
     return f"{target}-rc.{max(rcs, default=0) + 1}"
 
 
+def notes_pattern(repo):
+    """
+    The git-cliff tag pattern for a release candidate's notes: the nearest release tag of either kind below HEAD,
+    so the notes cover only what came after the previous candidate, or after the stable release if that is newer.
+    A pattern matching every tag is not enough: git-cliff then picks its boundary by tag name, not by history, and
+    v1.0.0-rc.1 outranks v1.0.0. Empty when nothing is tagged, which leaves cliff.toml's whole-history default.
+    """
+    behind = {}
+    for name in _released(repo, "--merged", "HEAD"):
+        count = _git(repo, "rev-list", "--count", f"v{name}..HEAD")
+        if count is not None:
+            behind[name] = int(count)
+    if not behind:
+        return ""
+    nearest = min(behind, key=lambda n: (behind[n], tuple(-x for x in parse(n)[:3]), -(parse(n)[3] or 10**9)))
+    return "^" + re.escape("v" + nearest) + "$"
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -114,12 +132,16 @@ def main(argv=None):
     nxt.add_argument("--bumped", required=True, help="git cliff --bumped-version output")
     nxt.add_argument("--override", default="", help="explicit X.Y.Z; empty means use --bumped")
     nxt.add_argument("--prerelease", action="store_true")
+    pat = sub.add_parser("notes-pattern", help="print the git-cliff tag pattern for a candidate's release notes")
+    pat.add_argument("--repo", default=".")
     bld = sub.add_parser("build", help="print name, code and build tag a build of this checkout would get")
     bld.add_argument("--repo", default=".")
     args = ap.parse_args(argv)
     try:
         if args.cmd == "next":
             print(next_release(args.repo, args.bumped, args.override or None, args.prerelease))
+        elif args.cmd == "notes-pattern":
+            print(notes_pattern(args.repo))
         else:
             print(*build_version(args.repo, os.environ))
     except ValueError as e:

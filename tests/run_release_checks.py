@@ -1035,6 +1035,85 @@ class ReleaseNotes(unittest.TestCase):
         self.assertNotIn("tidy", notes)
         self.assertLess(notes.index("Features"), notes.index("Bug Fixes"))
 
+    def notes(self, name, prerelease):
+        """What the workflow's Release notes step writes to notes.md, run for real against the repo."""
+        steps = Workflow(WORKFLOW.read_text()).steps("build")
+        script = next(Workflow.run_script(st) for st in steps if "name: Release notes" in st)
+        lines = [l.strip() for l in script.splitlines()[1:]]
+        script = "\n".join(lines[:next(i for i, l in enumerate(lines) if "notes.md" in l) + 1])
+        script = script.replace("baseLogger/tools/fw_version.py", str(TOOLS / "fw_version.py"))
+        shim = Path(self.repo.path) / ".bin"
+        shim.mkdir()
+        (shim / "git-cliff").write_text('#!/bin/sh\nexec %s --config "%s" "$@"\n' % (shlex.join(GIT_CLIFF), CLIFF_TOML))
+        (shim / "git-cliff").chmod(0o755)
+        env = {**os.environ, "PATH": f"{shim}{os.pathsep}{os.environ['PATH']}", "NAME": name,
+               "PRERELEASE": "true" if prerelease else "false"}
+        subprocess.run(["bash", "-e", "-c", script], cwd=self.repo.path, env=env, check=True, capture_output=True)
+        return (self.repo.path / "out" / "notes.md").read_text() if (self.repo.path / "out").exists() else None
+
+    def cycle(self):
+        r = self.repo
+        r.commit("feat: first")
+        r.commit("fix: second")
+
+    def test_candidate_notes_start_at_the_previous_candidate(self):
+        self.cycle()
+        self.repo.tag("v0.1.0-rc.3")
+        self.repo.commit("fix(upload): after the candidate")
+        self.repo.commit("docs: not in the notes")
+        notes = self.notes("0.1.0-rc.4", True)
+        self.assertIn("After the candidate", notes)
+        self.assertNotIn("First", notes)
+        self.assertNotIn("Second", notes)
+
+    def test_candidate_after_a_stable_release_starts_there_not_at_older_candidates(self):
+        self.cycle()
+        self.repo.tag("v0.1.0-rc.1")
+        self.repo.commit("feat: ships in 0.1.0")
+        self.repo.tag("v0.1.0")
+        self.repo.commit("fix(gps): for 0.1.1")
+        notes = self.notes("0.1.1-rc.1", True)
+        self.assertIn("For 0.1.1", notes)
+        self.assertNotIn("Ships in 0.1.0", notes)
+        self.assertNotIn("First", notes)
+
+    def test_candidate_keeps_breaking_changes_in_their_own_section(self):
+        self.cycle()
+        self.repo.tag("v0.1.0-rc.1")
+        self.repo.commit("refactor(ble)!: renumber the status frame")
+        self.assertIn("### Breaking Changes\n\n- **ble:** Renumber the status frame", self.notes("0.1.0-rc.2", True))
+
+    def test_stable_release_after_candidates_covers_the_whole_cycle(self):
+        self.cycle()
+        self.repo.tag("v0.1.0-rc.1")
+        self.repo.commit("fix(upload): between candidates")
+        self.repo.tag("v0.1.0-rc.2")
+        self.repo.commit("fix(gps): after the last candidate")
+        notes = self.notes("0.1.0", False)
+        for text in ("First", "Second", "Between candidates", "After the last candidate"):
+            self.assertIn(text, notes)
+
+    def test_stable_release_starts_at_the_previous_stable_release_skipping_candidates(self):
+        self.repo.commit("feat: old")
+        self.repo.tag("v1.0.0")
+        self.repo.commit("feat(gps): new in 1.1")
+        self.repo.tag("v1.1.0-rc.1")
+        self.repo.commit("fix(upload): later")
+        notes = self.notes("1.1.0", False)
+        self.assertIn("New in 1.1", notes)
+        self.assertIn("Later", notes)
+        self.assertNotIn("Old", notes)
+
+    def test_first_candidate_and_first_release_cover_the_whole_history(self):
+        self.cycle()
+        for name, rc in (("0.1.0-rc.1", True), ("0.1.0", False)):
+            with self.subTest(name=name):
+                notes = self.notes(name, rc)
+                self.assertIn("First", notes)
+                self.assertIn("Second", notes)
+                shutil.rmtree(self.repo.path / "out")
+                shutil.rmtree(self.repo.path / ".bin")
+
 
 if __name__ == "__main__":
     unittest.main()

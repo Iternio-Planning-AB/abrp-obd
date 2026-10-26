@@ -48,7 +48,11 @@ Building and USB-flashing locally never needs the signing key; only BLE OTA chec
 Only commits that change the image appear in the notes and count toward a release: breaking changes of any type,
 `feat`, `fix`, `perf` and `revert`. `docs`, `chore`, non-breaking `refactor`, `test` and anything that isn't a Conventional
 Commit don't. Every release raises the floor on each dongle that installs it, so a docs-only history doesn't mint
-one: the run stops with "nothing to release". Give `version` to release anyway. Preview locally:
+one: the run stops with "nothing to release". Give `version` to release anyway.
+
+The notes cover the commits since the previous tag: a release candidate since the previous tag of either kind (the last
+candidate, or the last stable release if that is newer), a stable release since the previous stable release, skipping
+candidates, so its notes span the whole cycle. The first release covers the whole history. Preview locally:
 
 ```sh
 git cliff --unreleased --tag v1.2.0      # notes
