@@ -213,6 +213,59 @@ static void checkPartialProfile() {
   CHECK(hasSoc(p));
 }
 
+// ---- commands with no usable answer (#85): what readPIDs keeps for the log ----
+
+static void checkFailures() {
+  // MEB's second ECU, the shape #85 needs: a filter the co-processor refuses, then silence, a value out of range and
+  // a reply too short for its equation.
+  static const char* ECU = R"P({
+    "obd_protocol": "7",
+    "init_commands": { "command": ["ATZ"] },
+    "data_commands": { "command": ["ATCRA17FE0076", "22295A", "222609", "22210E"] },
+    "odometer": { "command": "22295A", "equation": "INT24(A:B:C)" },
+    "ext_temp": { "command": "222609", "equation": "A/2-50", "minValue": -40, "maxValue": 80 },
+    "gear": { "command": "22210E", "equation": "D" }
+  })P";
+  OBDWrapper obd;
+  ScriptedLink link;
+  setUp(obd, link, ECU);
+  // ATCRA becomes ATCM7FF + ATCF<id>: five commands.
+  Poll p = poll(obd, link, { "OK" + PROMPT, "?" + PROMPT, "NO DATA" + PROMPT, "62260900" + PROMPT, "62210E01" + PROMPT });
+  CHECK(p.results.empty());
+  const std::vector<std::pair<std::string, std::string>> want = {
+    { "ATCF17FE0076", "at_reply" }, { "22295A", "no_data" }, { "222609", "range" }, { "22210E", "eval" } };
+  CHECK(obd.failures.size() == want.size());
+  for (size_t i = 0; i < want.size() && i < obd.failures.size(); ++i) {
+    const auto& f = obd.failures[i];
+    CHECK(f.pid == want[i].first && f.reason == want[i].second);
+    CHECK(f.index < obd.get_pids().size() && obd.get_pids()[f.index] == f.pid);
+  }
+  if (obd.failures.size() == want.size()) {
+    CHECK(obd.failures[1].reply.find("NO DATA") != std::string::npos);
+    CHECK(obd.failures[3].reply.find("62210E01") != std::string::npos);
+  }
+  // Answered next time: nothing kept, and the list is per poll.
+  Poll ok = poll(obd, link, { "OK" + PROMPT, "OK" + PROMPT, "62295A001234" + PROMPT, "62260964" + PROMPT, "62210E01020304" + PROMPT });
+  CHECK(ok.results.size() == 3 && obd.failures.empty());
+  // The hash names the command list: the same list hashes the same, another one differently.
+  const uint32_t hash = obd.pids_hash;
+  OBDWrapper same;
+  ScriptedLink other_link;
+  setUp(same, other_link, ECU);
+  CHECK(same.pids_hash == hash && hash != 0);
+  setUp(same, other_link, PROFILE);
+  CHECK(same.pids_hash != hash);
+  // A refused reply keeps its refusal reason; the reply kept is the last one, the retry's.
+  OBDWrapper uds;
+  ScriptedLink uds_link;
+  setUp(uds, uds_link);
+  std::string other = GOOD;
+  other.replace(other.find("620105"), 6, "620101");
+  poll(uds, uds_link, { SPLICE, other });
+  CHECK(uds.failures.size() == 1 && uds.failures[0].pid == "220105" && uds.failures[0].reason == "wrong_did");
+  CHECK(uds.failures.size() == 1 && uds.failures[0].reply.size() == 120);
+}
+
 int main(int argc, char** argv) {
   const std::string group = argc > 1 ? argv[1] : "all";
   if (group == "all" || group == "retry") {
@@ -221,6 +274,11 @@ int main(int argc, char** argv) {
     checkTwo();
     checkPartialProfile();
     std::printf("%s retry\n", failures == before ? "ok  " : "FAIL");
+  }
+  if (group == "all" || group == "failures") {
+    const int before = failures;
+    checkFailures();
+    std::printf("%s failures\n", failures == before ? "ok  " : "FAIL");
   }
   return failures ? 1 : 0;
 }

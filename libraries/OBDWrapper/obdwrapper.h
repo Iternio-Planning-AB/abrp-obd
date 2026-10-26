@@ -89,6 +89,13 @@ public:
      genericProtocol), and how many lines. Hex-only by construction, safe to log. */
   std::string skipped_prefix_pid;
   unsigned skipped_prefix_lines{ 0 };
+  /* Commands this poll that got no usable answer (#85), in poll order, at most 8: the command's index in get_pids(),
+     why (no_data, no_connect, nrc, no_link, at_reply, a refusal reason as in UnexpectedPidResponse, eval or range)
+     and the reply's first 120 bytes as received. Co-processor text, safe to log. */
+  struct CommandFailure { size_t index; std::string pid, reason, reply; };
+  std::vector<CommandFailure> failures;
+  /* FNV-1a over get_pids(), set by setVehicleCommands(): which profile the indices above belong to. */
+  uint32_t pids_hash{ 0 };
 
   /* Generate fake values from above */
   OBDVector getFakeReading() const;

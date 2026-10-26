@@ -375,7 +375,10 @@ each with its refusal reason and the ID seen), `expected` the ID derived from th
 and `retry` the real `readPIDs()` against a scripted co-processor link: one resend of the command after a
 refused reply, none after a negative response, an unfinished reply or a closed alarm gate, none again after
 a failed retry until the command decodes, the 220105 capture keeping the first reply, and polling a profile
-that threw part-way through being applied. Fixtures are
+that threw part-way through being applied. `failures` covers what `readPIDs()` keeps for the `OBDFAIL` log (#85): a
+refused AT filter, no data, a refusal, an out-of-range value and a reply too short for its equation, each with the
+command's index and reply, cleared each poll. It also covers `loop()`'s logging block, compiled from `logger.ino`:
+once per command, 4 a poll, again after a new profile. Fixtures are
 scrubbed co-processor replies; the co-processor itself is not exercised.
 
 ## Profile push checks

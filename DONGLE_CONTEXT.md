@@ -582,6 +582,17 @@ emulation. Bench results (2026-09-24, each command sent raw to the co-processor)
   `retry=`. Each line has its own 3-per-power-on cap, 15 min apart, no bytes except `OBDRAW`. The payload
   inside a splice is not recovered: its shape is one car's. Headers-off (`ATH0`) and 29-bit headers on
   protocol 6 are not parsed. Host checks: `tests/run_obd_reply_checks.py`.
+- **A command that gets no usable answer is logged once, with its reply** (#85): `OBDFAIL <cmd> reason=<r> len=<n>`
+  and up to three `OBDRAW fail` lines with its first 120 bytes as received. The reason is one of:
+  - `no_data`, `no_connect`, `nrc`: the co-processor's own answer;
+  - `at_reply`: an AT command not answered `OK`, such as a filter it refused;
+  - a refusal reason as above;
+  - `eval`: no field could be computed from the reply;
+  - `range`: the fields were out of range.
+
+  It's logged once per command until a reset other than a deep-sleep wake, or a new profile, and at most 4 commands
+  a poll. Written for the MEB cars, where the second ECU on each bus (`FC0076`, `746`) never answers. One poll's
+  lines show whether its filter was refused or the ECU stayed silent.
 
 **Backend profiles this hardware cannot run** (checked against all 50 ABRP backend profiles, which are not public, as of 2026-09-24):
 
