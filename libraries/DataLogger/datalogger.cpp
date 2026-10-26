@@ -467,18 +467,25 @@ size_t DataLogger::readAt(size_t offset, uint8_t* buf, size_t len) {
   return done;
 }
 
-void DataLogger::clearAll() {
-  if (!mounted) return;
+int DataLogger::clearAll() {
+  if (!mounted) return -1; // whatever is on the flash may mount at a later boot
   invalidateReadCursor();
   if (active) active.close();
-  int lo = lowestIndex(), hi = highestIndex();
-  for (int i = lo; i >= 0 && i <= hi; ++i) {
-    std::string p = pathFor(i);
-    if (LittleFS.exists(p.c_str())) LittleFS.remove(p.c_str());
+  // An unreadable directory looks empty to the index scans, so it never counts as erased.
+  auto listable = [] { File dir = LittleFS.open("/"); const bool ok = !!dir; dir.close(); return ok; };
+  const bool listed = listable();
+  int removed = 0;
+  // Newest first: a power cut part-way through drops the most recent history, not the oldest.
+  for (int lo = listed ? lowestIndex() : -1, i = listed ? highestIndex() : -1; lo >= 0 && i >= lo; --i) {
+    if (LittleFS.remove(pathFor(i).c_str())) ++removed;
   }
+  // Any segment left would be appended to (or, as log0000, be the head of) the fresh log: report it.
+  const int left = highestIndex();
+  const bool all_gone = listed && listable() && left < 0;
   activeIndex = -1;
-  openSegment(0);
-  Serial.printf("[log] cleared all segments\n");
+  openSegment(left >= 0 ? left : 0); // a failed erase keeps appending where the log was, so it stays in order
+  Serial.printf("[log] cleared %d segment(s)%s\n", removed, all_gone ? "" : " - some could not be removed");
+  return all_gone ? removed : -1;
 }
 
 void DataLogger::printStats(Stream& out) {
