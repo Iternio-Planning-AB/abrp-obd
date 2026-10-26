@@ -55,7 +55,9 @@ jobs:
           clang++ --version
           git-cliff --version
 
+      # All runners take about a minute; a hung one fails here instead of holding the runner for the job's 30.
       - name: Run every host runner
+        timeout-minutes: 10
         run: |
           failed=()
           for runner in tests/run_*.py; do
