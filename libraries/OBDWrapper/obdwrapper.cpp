@@ -441,7 +441,7 @@ static double jsonToDouble(const json& j) {
 }
 
 OBDVector OBDWrapper::readPIDs(bool print) {
-  std::vector<std::pair<std::string, double>> results{};
+  OBDVector results{};
   anomalous_220105_reply.clear();
   anomalous_220105_reason.clear();
   anomalous_220105_header.clear();
@@ -829,7 +829,7 @@ void OBDWrapper::pollStandardFallback(OBDVector& results, const std::string& pro
 }
 
 OBDVector OBDWrapper::getFakeReading() const {
-  std::vector<std::pair<std::string, double>> results{};
+  OBDVector results{};
   int i = 10;
   for (auto pid_string : pids) {
     std::pair<std::string, double> result_pair = std::make_pair(pid_string, i);

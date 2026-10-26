@@ -214,9 +214,10 @@ intended production values. The upload count ceiling is `MAX_UPLOAD_BUFFER` in `
 | `CATM_BANDS` (in `cellwrapper.cpp`) | `1,3,8,20,28` | LTE-M bands the modem scans: the European set. |
 | `CELL_REGISTRATION_AWAKE_MS` / `CELL_REGISTRATION_PARKED_MS` | `30000` / `45000` ms | Initial registration-search allowance: normal multi-poll wakes / single-poll parked sampling. Modem startup, SIM checks, diagnostics and successful data setup are additional, not inside this budget. |
 | `BACKLOG_MAX_SEND_AGE_SECONDS` | 6 days | A queued or restored frame older than this when it would be sent is dropped (`UPLOAD dropped … reason=age`), judged only on a trusted clock. |
-| `MAX_UPLOAD_BUFFER` | 120 frames | Absolute count ceiling for queued frames; heap pressure can reduce the retained count sooner, evicting the oldest frames first. |
-| `UPLOAD_MIN_FREE_HEAP` | 32768 B | Minimum internal free heap to retain after the estimated incoming queue copy. |
-| `UPLOAD_MIN_MAX_BLOCK` | 16384 B | Minimum largest internal allocation block to retain after the estimated incoming queue copy. |
+| `MAX_UPLOAD_BUFFER` | 512 frames | Count ceiling for queued frames, about an hour of driving; past it the oldest go first. Queued frames live in PSRAM. |
+| `UPLOAD_MIN_PSRAM_BLOCK` | 131072 B | Largest PSRAM block a queued frame must leave, for gzip's state and bodies. Past it, frames would land in internal heap. |
+| `UPLOAD_MIN_FREE_HEAP` | 32768 B | Minimum internal free heap to retain when a queued frame would take internal heap (no PSRAM room, keys over 15 characters). |
+| `UPLOAD_MIN_MAX_BLOCK` | 16384 B | Minimum largest internal block to retain in the same case. |
 | `GEO_MAX_SEND_AGE_SECONDS` | 29 days | A location or heading older than this is left out of the upload; the server refuses anything past 30 days. |
 
 The heap reserves are conservative initial thresholds motivated by about 42 KB free internal heap after BLE

@@ -11,7 +11,6 @@
   compilation unit - so it shares logger.ino's globals and the config.h feature flags.
 */
 
-#include <limits>
 #include <new>
 
 bool queueUploadFrame(std::vector<OBDVector>& frames, const OBDVector& frame) {
@@ -28,34 +27,25 @@ bool queueUploadFrame(std::vector<OBDVector>& frames, const OBDVector& frame) {
   auto markerLost = [&](const OBDVector& discarded) {
     if (isSyntheticParkMarker(discarded)) driveMarkerRestored();
   };
-  auto estimateCopyBytes = [&](size_t& bytes) {
-    bytes = 0;
-    auto add = [&](size_t amount) {
-      if (amount > std::numeric_limits<size_t>::max() - bytes) return false;
-      bytes += amount;
-      return true;
-    };
-    auto multiply = [](size_t count, size_t width, size_t& product) {
-      if (count && width > std::numeric_limits<size_t>::max() / count) return false;
-      product = count * width;
-      return true;
-    };
-    size_t pair_bytes = 0;
-    if (!multiply(frame.size(), sizeof(OBDVector::value_type), pair_bytes)) return false;
-    if (frame.size() && (!add(pair_bytes) || !add(16))) return false;
-    for (const auto& value : frame) {
-      if (value.first.size() == std::numeric_limits<size_t>::max() ||
-          !add(value.first.size() + 1) || !add(16)) return false;
-    }
-    if (frames.size() == frames.capacity()) {
-      if (frames.size() == std::numeric_limits<size_t>::max()) return false;
-      size_t outer_bytes = 0;
-      if (!multiply(frames.size() + 1, sizeof(OBDVector), outer_bytes) ||
-          !add(outer_bytes) || !add(16)) return false;
-    }
-    return true;
+  // Where a copy of the frame lands, as obd_vector.h and malloc place it: the pairs in PSRAM while it has room above
+  // UPLOAD_MIN_PSRAM_BLOCK, keys past the string's own 15 characters internal. With PSRAM the outer array is reserved
+  // for the whole cap at once, so from the malloc threshold up it is in PSRAM too and never grows a frame at a time
+  // in internal heap; without, it grows by one, as small as it can.
+  size_t grow_to = 0;
+  auto internalBytes = [&]() {
+    const size_t pairs = frame.size() * sizeof(OBDPair) + 16;
+    const size_t whole = frames.capacity() < MAX_UPLOAD_BUFFER ? MAX_UPLOAD_BUFFER * sizeof(OBDVector) + 16 : 0;
+    const unsigned long psram_block = ESP.getMaxAllocPsram();
+    const bool psram = psram_block >= UPLOAD_MIN_PSRAM_BLOCK && pairs + whole <= psram_block - UPLOAD_MIN_PSRAM_BLOCK;
+    grow_to = frames.size() < frames.capacity() ? 0 : psram ? MAX_UPLOAD_BUFFER : frames.size() + 1;
+    size_t bytes = psram ? 0 : pairs;
+    if (grow_to && (!psram || whole < CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL)) bytes += grow_to * sizeof(OBDVector) + 16;
+    for (const auto& value : frame)
+      if (value.first.size() > 15) bytes += value.first.size() + 1 + 16;
+    return bytes;
   };
   auto hasHeadroom = [&](size_t bytes) {
+    if (!bytes) return true;
     const unsigned long free_heap = ESP.getFreeHeap();
     const unsigned long max_block = ESP.getMaxAllocHeap();
     if (free_heap < UPLOAD_MIN_FREE_HEAP || max_block < UPLOAD_MIN_MAX_BLOCK) return false;
@@ -69,10 +59,9 @@ bool queueUploadFrame(std::vector<OBDVector>& frames, const OBDVector& frame) {
       ++upload_capped;
       continue;
     }
-    size_t bytes = 0;
-    if (estimateCopyBytes(bytes) && hasHeadroom(bytes)) {
+    if (hasHeadroom(internalBytes())) {
       try {
-        if (frames.size() == frames.capacity()) frames.reserve(frames.size() + 1);
+        if (grow_to) frames.reserve(grow_to);
         frames.push_back(frame);
         return true;
       }
@@ -504,8 +493,8 @@ void logUploadCapped() {
     upload_capped = 0;
   }
   if (upload_heap_dropped) {
-    logEvent("UPLOAD discarded n=%lu reason=heap free=%lu maxblock=%lu", upload_heap_dropped,
-      (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getMaxAllocHeap());
+    logEvent("UPLOAD discarded n=%lu reason=heap free=%lu maxblock=%lu psram=%lu", upload_heap_dropped,
+      (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getMaxAllocHeap(), (unsigned long)ESP.getMaxAllocPsram());
     upload_heap_dropped = 0;
   }
 }
@@ -532,8 +521,8 @@ bool saveUploadBacklog() {
   return true;
 }
 
-// A relaying phone's session (pairing, profile push, OTA, log dump) needs the internal heap the queue holds,
-// about 1 KB a frame, next to Bluedroid's: park the queue in the backlog file until relaying ends.
+// Parks the queue in the backlog file while a phone relays (pairing, profile push, OTA, log dump). Frames are in PSRAM
+// (obd_vector.h), so this frees no internal heap; a full queue costs ~6 s of flash writes.
 void spillUploadBacklog() {
   const size_t n = obd_result_vector.size() + g_upload_held.size();
   if (!n || !saveUploadBacklog()) return;

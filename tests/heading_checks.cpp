@@ -25,22 +25,20 @@
 #define ENABLE_NETWORK 1
 #define ENABLE_CELL 0
 #include "../baseLogger/config.h"
+#define CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL 4096 // the Arduino core's sdkconfig: larger mallocs go to PSRAM
 #define FLAG_GNSS_USE_LINK 1
 
 using json = nlohmann::json;
-using OBDVector = std::vector<std::pair<std::string, double>>;
+#include "../libraries/OBDWrapper/obd_vector.h"
 using HeaderVector = std::vector<std::pair<std::string, std::string>>;
 #include "header_budget.inc"
 extern std::vector<OBDVector> obd_result_vector;
 extern std::vector<OBDVector> g_upload_held;
 
-bool heap_fixture_enabled = false;
-unsigned long heap_fixture_free = 1000000;
-unsigned long heap_fixture_maxblock = 500000;
-size_t fixtureUploadBytes();
 struct ESPStub {
   unsigned long getFreeHeap() const;
   unsigned long getMaxAllocHeap() const;
+  unsigned long getMaxAllocPsram() const;
 } ESP;
 
 void check(bool condition, const std::string& message) {
@@ -147,35 +145,7 @@ std::vector<OBDVector> obd_result_vector;
 #include "historical_backlog.inc"
 }
 
-size_t fixtureUploadVectorBytes(const std::vector<OBDVector>& frames) {
-  size_t bytes = frames.capacity() ? frames.capacity() * sizeof(OBDVector) + 16 : 0;
-  for (const auto& frame : frames) {
-    if (frame.capacity()) bytes += frame.capacity() * sizeof(OBDVector::value_type) + 16;
-    for (const auto& value : frame) {
-      const auto data = reinterpret_cast<std::uintptr_t>(value.first.data());
-      const auto object = reinterpret_cast<std::uintptr_t>(&value.first);
-      if (!value.first.empty() && (data < object || data >= object + sizeof(std::string)))
-        bytes += value.first.capacity() + 1 + 16;
-    }
-  }
-  return bytes;
-}
-
-size_t fixtureUploadBytes() {
-  return fixtureUploadVectorBytes(obd_result_vector) + fixtureUploadVectorBytes(g_upload_held);
-}
-
-unsigned long ESPStub::getFreeHeap() const {
-  if (!heap_fixture_enabled) return 1000000;
-  const size_t used = fixtureUploadBytes();
-  return used >= heap_fixture_free ? 0 : heap_fixture_free - used;
-}
-
-unsigned long ESPStub::getMaxAllocHeap() const {
-  if (!heap_fixture_enabled) return 500000;
-  const size_t used = fixtureUploadBytes();
-  return used >= heap_fixture_maxblock ? 0 : heap_fixture_maxblock - used;
-}
+#include "upload_heap_fixture.h"
 
 size_t backlog_read_count = 0;
 bool backlog_read_bounds_ok = true;
@@ -236,9 +206,7 @@ void resetFixture() {
   std::vector<OBDVector>().swap(obd_result_vector);
   std::vector<OBDVector>().swap(g_upload_held);
   upload_capped = upload_spilled = upload_heap_dropped = 0;
-  heap_fixture_enabled = false;
-  heap_fixture_free = 1000000;
-  heap_fixture_maxblock = 500000;
+  resetHeapFixture();
   logging_errors = g_last_http = g_http0_streak = 0;
   g_last_post_ms = 0;
   g_last_status.clear();
@@ -1584,8 +1552,10 @@ OBDVector richUploadFrame(double utc, unsigned index) {
 
 size_t expectedQueueCopyBytes(const OBDVector& frame, size_t destination_size,
                               size_t destination_capacity) {
+  // No PSRAM in these fixtures: the pairs are internal; keys past 15 characters are counted as on the ESP32.
   size_t bytes = frame.size() * sizeof(OBDVector::value_type) + 16;
-  for (const auto& value : frame) bytes += value.first.size() + 1 + 16;
+  for (const auto& value : frame)
+    if (value.first.size() > 15) bytes += value.first.size() + 1 + 16;
   if (destination_size == destination_capacity)
     bytes += (destination_size + 1) * sizeof(OBDVector) + 16;
   return bytes;

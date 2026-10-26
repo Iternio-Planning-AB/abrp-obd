@@ -20,7 +20,7 @@
 #include "parser.h"
 #include "FreematicsBase.h"
 
-using OBDVector = std::vector<std::pair<std::string, double>>;
+#include "../libraries/OBDWrapper/obd_vector.h"
 #include "charge_config.inc"
 #include "activity_state.inc"
 

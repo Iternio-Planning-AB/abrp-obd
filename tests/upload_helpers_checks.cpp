@@ -16,13 +16,12 @@
 #endif
 #define ENABLE_CELL 1
 #include "../baseLogger/config.h"
+#define CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL 4096 // the Arduino core's sdkconfig: larger mallocs go to PSRAM
+#ifndef MAX_UPLOAD_BUFFER // run_upload_checks.py passes logger.ino's
 #define MAX_UPLOAD_BUFFER 120
+#endif
 extern std::vector<OBDVector> obd_result_vector;
 extern std::vector<OBDVector> g_upload_held;
-bool heap_fixture_enabled = false;
-unsigned long heap_fixture_free = 500000;
-unsigned long heap_fixture_maxblock = 250000;
-size_t fixtureUploadBytes();
 
 struct RTCStub {
     uint32_t epoch = 1791112000;
@@ -61,6 +60,7 @@ struct LogStub {
 struct ESPStub {
     unsigned long getFreeHeap() const;
     unsigned long getMaxAllocHeap() const;
+    unsigned long getMaxAllocPsram() const;
 } ESP;
 bool g_ble_up = false;
 void esp_task_wdt_reset() {}
@@ -150,35 +150,7 @@ bool park_marker_owed = false;
 #include "drive_marker_restored.inc"
 #include "network_upload.h"
 
-size_t fixtureUploadVectorBytes(const std::vector<OBDVector>& frames) {
-    size_t bytes = frames.capacity() ? frames.capacity() * sizeof(OBDVector) + 16 : 0;
-    for (const auto& frame : frames) {
-        if (frame.capacity()) bytes += frame.capacity() * sizeof(OBDVector::value_type) + 16;
-        for (const auto& value : frame) {
-            const auto data = reinterpret_cast<std::uintptr_t>(value.first.data());
-            const auto object = reinterpret_cast<std::uintptr_t>(&value.first);
-            if (!value.first.empty() && (data < object || data >= object + sizeof(std::string)))
-                bytes += value.first.capacity() + 1 + 16;
-        }
-    }
-    return bytes;
-}
-
-size_t fixtureUploadBytes() {
-    return fixtureUploadVectorBytes(obd_result_vector) + fixtureUploadVectorBytes(g_upload_held);
-}
-
-unsigned long ESPStub::getFreeHeap() const {
-    if (!heap_fixture_enabled) return 500000;
-    const size_t used = fixtureUploadBytes();
-    return used >= heap_fixture_free ? 0 : heap_fixture_free - used;
-}
-
-unsigned long ESPStub::getMaxAllocHeap() const {
-    if (!heap_fixture_enabled) return 250000;
-    const size_t used = fixtureUploadBytes();
-    return used >= heap_fixture_maxblock ? 0 : heap_fixture_maxblock - used;
-}
+#include "support/upload_heap_fixture.h"
 void pushToken(json newConfig) {
 #include "token_push.inc"
 }
@@ -203,9 +175,7 @@ void reset() {
     std::vector<OBDVector>().swap(obd_result_vector);
     upload_capped = upload_spilled = upload_heap_dropped = 0;
     park_marker_owed = false;
-    heap_fixture_enabled = false;
-    heap_fixture_free = 500000;
-    heap_fixture_maxblock = 250000;
+    resetHeapFixture();
     host_md_fail = 0;
     g_geo_accepted = g_geo_queued = {}; reset_reason = ESP_RST_POWERON;
 #if ENABLE_LOGGING
@@ -391,6 +361,32 @@ void queue() {
               "heap-bounded helper retains the exact newest UTC/SOC suffix");
     }
 
+    // #75 field case: an ID.5 offline for 47 minutes with BLE up had 10-15 KB free and a 2292 B largest internal
+    // block, and 4 MB of PSRAM. Frames live in PSRAM, so the queue fills to its cap and costs no internal heap.
+    reset();
+    heap_fixture_enabled = true;
+    heap_fixture_free = 12000;
+    heap_fixture_maxblock = 2292;
+    heap_fixture_psram = 4000000;
+    for (unsigned i = 0; i < MAX_UPLOAD_BUFFER + 10; ++i)
+        check(queueUploadFrame(obd_result_vector, richUploadFrame(1791112000 + i, i)),
+              "low internal heap with PSRAM free admits every offline frame");
+    check(obd_result_vector.size() == MAX_UPLOAD_BUFFER && upload_heap_dropped == 0 && upload_capped == 10 &&
+          obd_result_vector.front()[0].second == 1791112010 && fixtureUploadBytes() == 0,
+          "field heap: the queue fills to its cap in PSRAM, only the count cap drops, no internal heap used: size=" +
+          std::to_string(obd_result_vector.size()) + " heap_dropped=" + std::to_string(upload_heap_dropped) +
+          " internal=" + std::to_string(fixtureUploadBytes()));
+    check(MAX_UPLOAD_BUFFER * 7 >= 47 * 60, "the cap holds a 47-minute offline drive at the 7 s driving poll");
+
+    // PSRAM nearly full: the pairs would fall back to internal heap, where the reserves still apply.
+    reset();
+    heap_fixture_enabled = true;
+    heap_fixture_free = 12000;
+    heap_fixture_maxblock = 2292;
+    heap_fixture_psram = UPLOAD_MIN_PSRAM_BLOCK;
+    check(!queueUploadFrame(obd_result_vector, richUploadFrame(1791112000, 0)) && obd_result_vector.empty() &&
+          upload_heap_dropped == 1, "PSRAM at its reserve and internal heap low refuses the frame");
+
     reset();
     for (unsigned i = 0; i <= MAX_UPLOAD_BUFFER; ++i)
         check(queueUploadFrame(obd_result_vector, frame(i)), "high-memory count-cap helper admits each frame");
@@ -547,7 +543,7 @@ void bleHandover() {
           json::parse(main_line)["utc"] == 1791112009,
           "held frames serialize before main RAM frames");
     check(events("UPLOAD discarded n=4 reason=heap").size() == 1 &&
-          events("UPLOAD discarded n=4 reason=heap").back().find("free=500000 maxblock=250000") != std::string::npos &&
+          events("UPLOAD discarded n=4 reason=heap").back().find("free=1000000 maxblock=500000 psram=4000000") != std::string::npos &&
           upload_heap_dropped == 0,
           "heap drops flush once with aggregate free-heap diagnostics");
 

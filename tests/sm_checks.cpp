@@ -19,7 +19,7 @@
 
 #include "../baseLogger/config.h"
 
-using OBDVector = std::vector<std::pair<std::string, double>>;
+#include "../libraries/OBDWrapper/obd_vector.h"
 
 enum class SmKind { POLL, ADVANCE, LADDER, HOLD, SLEEP, WAKE, MAINT, CRASH };
 enum class SmTo { ACTIVE, BLE, CHARGING, STANDBY };

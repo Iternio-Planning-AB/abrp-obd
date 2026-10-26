@@ -137,7 +137,7 @@ File File::openNextFile() {
 
 #define RTC_DATA_ATTR
 using json = nlohmann::json;
-using OBDVector = std::vector<std::pair<std::string, double>>;
+#include "../libraries/OBDWrapper/obd_vector.h"
 enum ActivityState { BLE, ACTIVE, CHARGING, STANDBY };
 ActivityState current_state = ACTIVE;
 float g_last_voltage = 12.5, g_last_io36 = 12.6;

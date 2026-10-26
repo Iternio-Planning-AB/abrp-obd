@@ -13,7 +13,7 @@
 #include "backlog_fs.h"
 
 using json = nlohmann::json;
-using OBDVector = std::vector<std::pair<std::string, double>>;
+#include "../libraries/OBDWrapper/obd_vector.h"
 // Single-threaded host: the lock is a no-op, so these checks prove what is taken and when, not mutual exclusion.
 using portMUX_TYPE = int;
 #define portMUX_INITIALIZER_UNLOCKED 0

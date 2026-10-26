@@ -427,7 +427,10 @@ Run `python3 tests/run_upload_checks.py queue` and `python3 tests/run_upload_che
 real queue helper, held-frame save/spill, and bounded backlog restore. Run
 `python3 tests/run_heading_checks.py upload-gate`, `geo-backlog-rows` and `geo-downgrade`, normally and with
 `CXX='clang++ -DNDEBUG'`, for the extracted poll buffer, geo admission gate, PARK marker and backlog paths.
-The fixture models allocated global queue/held vector and string storage independently of the production estimator;
+The upload runner compiles with logger.ino's `MAX_UPLOAD_BUFFER`. The shared fixture (`tests/support/upload_heap_fixture.h`)
+places storage as the firmware does: frame pairs in PSRAM while it has some, the outer array there from the 4 KB malloc
+threshold, long keys internal; `queue` covers the #75 field heap (2292 B largest internal block, PSRAM free: the queue
+fills to the cap with no internal heap) and PSRAM at its reserve. The fixture models allocated global queue/held vector and string storage independently of the production estimator;
 its row-read observer checks the global queue remains bounded as rows are processed. It does not account for the
 local pending vector or transient decoded/JSON copies, emulate real ESP32 fragmentation, or prove peak headroom or
 that unrelated allocations will succeed.

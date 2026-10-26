@@ -430,9 +430,8 @@ backend silently dropped counts as sent until then too. `UPLOAD body` logs `loc=
 **A phone taking the transport keeps the cellular queue** (#58). The BLE notify goes out before the frame is
 buffered, and its answer decides both: a relayed frame is not queued (the phone posts it as `APP_OBD`), and
 frames already queued (failed-POST retries, a slow drain, a restored backlog) are kept while cellular stands
-down. They are not kept in RAM: a queued frame costs about 1 KB of internal heap, Bluedroid about 97 KB, and the
-session's pairing, profile push, OTA and log dump need what is left, so the first relayed poll parks them in the
-backlog file (`spillUploadBacklog`). The first poll after relaying ends puts them back in front of anything
+down. The first relayed poll parks them in the backlog file (`spillUploadBacklog`); queued frames are in PSRAM, so
+this frees no internal heap, and a full queue costs about 6 s of flash writes. The first poll after relaying ends puts them back in front of anything
 queued since, and the handoff drains them oldest first, at most `UPLOAD_MAX_BATCHES_PER_CYCLE` x
 `MAX_FRAMES_PER_POST` per cycle. Nothing goes up over cellular while frames are parked, so a sleep or an OTA
 reboot in the session saves RAM behind them and the next wake sends them in order; over the cap the load drops
@@ -441,7 +440,19 @@ the oldest. A frame the phone relayed never goes over cellular, including the do
 profile, an unknown) `tlm_push_token` discards the queue and the parked file (`UPLOAD discarded n=…
 reason=token`): those frames may be another vehicle's history. The cap drops the oldest frame past
 `MAX_UPLOAD_BUFFER`, logged once per capped stretch (`UPLOAD discarded n=… reason=cap`, at the next accepted
-upload or the backlog save). `BLE relay spilled=` logs the parked count and the heap at the start of each relay
+upload or the backlog save).
+
+**Queued frames live in PSRAM** (#75). A frame is about 1 KB of pairs, under the 4 KB threshold that sends a malloc to
+PSRAM by itself, so in internal heap the queue competed with Bluedroid and the modem: an ID.5 offline for 47 minutes
+with BLE up had 120 frames queued, a 2292 B largest internal block, and 4 MB of PSRAM free, and the 120-frame cap
+dropped 411 frames. The frame type (`OBDVector`, `libraries/OBDWrapper/obd_vector.h`) allocates its pairs in PSRAM
+first, keys up to 15 characters live inside their strings, and the outer array is reserved for the whole cap, so a
+queued frame takes no internal heap. The cap is 512 frames, an hour at the 7 s driving poll. `queueUploadFrame`
+still checks room before each copy: the PSRAM block must stay above `UPLOAD_MIN_PSRAM_BLOCK`, and whatever would land
+in internal heap must leave `UPLOAD_MIN_FREE_HEAP`/`UPLOAD_MIN_MAX_BLOCK`; otherwise the oldest frames go first
+(`UPLOAD discarded n=… reason=heap free= maxblock= psram=`). Bench (Fabbe, BLE up, internal heap ballasted below
+both reserves): 600 frames, 512 kept, no internal heap used, every frame read back exact. The backlog file for
+512 frames is ~260 KB, written in ~5.7 s at sleep and read in ~7.3 s at the next wake. `BLE relay spilled=` logs the parked count and the heap at the start of each relay
 stretch.
 
 **A frame older than 6 days is dropped from the queue** (#67). Parked history that old is worth little next to the

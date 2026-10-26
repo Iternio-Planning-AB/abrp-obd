@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import os
 from pathlib import Path
+import re
 import shlex
 import subprocess
 import sys
@@ -69,11 +70,17 @@ with tempfile.TemporaryDirectory(prefix="obd-upload-checks-") as temporary:
     (build / "clock_quality.inc").write_text(section(clock, "bool clockValid(", "// UTC calendar time"))
     (build / "gzip_outcome.inc").write_text(section(gzip_body, "enum GzipOutcome", "\n};\n") + "\n};\n")
     (build / "FreematicsPlus.h").write_text('#pragma once\n#include "upload_transport_fixture.h"\nstruct FreematicsESP32 {};\n')
+    # The production queue cap, so the queue group checks the value the firmware ships.
+    cap_match = re.search(r"^const size_t MAX_UPLOAD_BUFFER = (\d+);", logger, re.M)
+    if not cap_match:
+        raise SystemExit("MAX_UPLOAD_BUFFER not found in logger.ino")
+    upload_cap = cap_match.group(1)
     flags = [
         *compiler, "-std=c++17", "-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-DNDEBUG",
         "-Wall", "-Wextra", "-Wno-unused-parameter", "-Wno-unused-variable", "-Wno-unused-function", "-Wno-deprecated-declarations",
         "-I", str(build), "-I", str(root / "tests"), "-I", str(root / "tests/support"), "-I", str(root / "libraries/nlohmann"),
         "-I", str(root / "libraries/NetworkWrapper"), "-I", str(root / "baseLogger/Helpers"),
+        f"-DMAX_UPLOAD_BUFFER={upload_cap}",
     ]
     targets = []
     if group in {"all", "body-ack", "stages", "responses"}:

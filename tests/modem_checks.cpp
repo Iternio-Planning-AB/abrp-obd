@@ -11,13 +11,17 @@
 #define ENABLE_NETWORK 1
 #define ENABLE_GPS 0
 
-using OBDVector = std::vector<std::pair<std::string, double>>;
+#include "../libraries/OBDWrapper/obd_vector.h"
 #define MAX_UPLOAD_BUFFER 120
+#ifndef CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL
+#define CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL 4096 // the Arduino core's sdkconfig: larger mallocs go to PSRAM
+#endif
 unsigned long upload_capped = 0, upload_heap_dropped = 0;
 bool park_marker_owed = false;
 struct UploadHeapStub {
     unsigned long getFreeHeap() const { return 500000; }
     unsigned long getMaxAllocHeap() const { return 250000; }
+    unsigned long getMaxAllocPsram() const { return 4000000; }
 } ESP;
 #include "drive_marker_restored.inc"
 #include "drive_marker_queued.inc"

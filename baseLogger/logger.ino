@@ -145,11 +145,11 @@ GPS_DATA* gd = 0;
 GPS_DATA last_gd{};
 
 OBDWrapper obd;
-using OBDVector = std::vector<std::pair<std::string, double>>;
 std::vector<OBDVector> obd_result_vector{};
-// Cap on the in-RAM upload buffer (frames awaiting upload). It remains the absolute count safety cap; oldest
-// frames go first and the full log remains in flash.
-const size_t MAX_UPLOAD_BUFFER = 120;
+// Cap on the in-RAM upload buffer (frames awaiting upload); the oldest go first, and the full log stays in flash.
+// An hour of driving at the 7 s poll. 120 held 14 minutes and dropped 411 frames of a 47-minute offline drive in the
+// field (#75). Frames are in PSRAM, ~1 KB each, and the backlog file at sleep is ~600 B a frame (~300 KB).
+const size_t MAX_UPLOAD_BUFFER = 512;
 // Frames the cap dropped since the last UPLOAD discarded line (see logUploadCapped).
 unsigned long upload_capped = 0;
 unsigned long upload_heap_dropped = 0;

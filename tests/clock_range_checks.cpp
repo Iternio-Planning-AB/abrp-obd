@@ -18,7 +18,7 @@
 #include "../baseLogger/config.h"
 
 using json = nlohmann::json;
-using OBDVector = std::vector<std::pair<std::string, double>>;
+#include "../libraries/OBDWrapper/obd_vector.h"
 
 void check(bool condition, const std::string& message) {
     if (!condition) { std::cerr << "FAIL: " << message << '\n'; std::exit(1); }

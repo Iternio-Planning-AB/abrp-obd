@@ -14,9 +14,10 @@
 #include "expression_tree.h"
 #include <utility>
 #include <vector>
+#include "../OBDWrapper/obd_vector.h"
 
 // Named values VAL{name} reads: a poll's results so far, the newest last.
-using ParserValues = std::vector<std::pair<std::string, double>>;
+using ParserValues = OBDVector;
 
 struct Token {
   enum TYPE {

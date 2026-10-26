@@ -42,7 +42,7 @@ with tempfile.TemporaryDirectory(prefix="obd-modem-checks-") as temporary:
     (build / "modem_boot.inc").write_text(logger[start:find(logger, "#if ENABLE_WIFI", start, "logger.ino")])
     (build / "modem_sleep.inc").write_text(block(sleep, "void enterDeepSleep(", "sleep_power.h"))
     (build / "modem_config.inc").write_text("\n".join(re.findall(
-        r"^#define (?:CELL_REGISTRATION_\w+|UPLOAD_MIN_FREE_HEAP|UPLOAD_MIN_MAX_BLOCK)\b.*",
+        r"^#define (?:CELL_REGISTRATION_\w+|UPLOAD_MIN_FREE_HEAP|UPLOAD_MIN_MAX_BLOCK|UPLOAD_MIN_PSRAM_BLOCK)\b.*",
         config, re.MULTILINE)))
     upload = (root / "baseLogger/Helpers/network_upload.h").read_text()
     upload_start = find(upload, "bool queueUploadFrame(", what="network_upload.h")

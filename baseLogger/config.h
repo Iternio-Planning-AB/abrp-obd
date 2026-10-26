@@ -637,8 +637,11 @@
 // Judged only on a trusted send clock. A trusted clock wrongly stepped this far forward (bad NITZ/NTP, spoofed GNSS)
 // drops the queue; accepted, as unlikely.
 #define BACKLOG_MAX_SEND_AGE_SECONDS (6UL * 24UL * 60UL * 60UL)
-// Preserve internal free and largest-contiguous-block reserves before copying a frame. Conservative initial values
-// reflect ~42 KB free after BLE (~1 KB/frame); validate on hardware, as these do not guarantee other allocation sites.
+// Reserves a queued frame must leave (queueUploadFrame). Frames live in PSRAM (obd_vector.h), so normally a frame
+// takes no internal heap and only the PSRAM reserve applies: it keeps room for gzip's ~40 KB of state and its
+// bodies. The internal reserves apply to whatever would land internal (no PSRAM, PSRAM at its reserve, keys over 15
+// characters); conservative initial values from ~42 KB free after BLE, which guarantee no other allocation site.
+#define UPLOAD_MIN_PSRAM_BLOCK 131072UL
 #define UPLOAD_MIN_FREE_HEAP 32768UL
 #define UPLOAD_MIN_MAX_BLOCK 16384UL
 
