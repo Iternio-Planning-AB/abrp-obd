@@ -153,8 +153,6 @@ const size_t MAX_UPLOAD_BUFFER = 512;
 // Frames the cap dropped since the last UPLOAD discarded line (see logUploadCapped).
 unsigned long upload_capped = 0;
 unsigned long upload_heap_dropped = 0;
-// Frames parked in the backlog file for a BLE session (see spillUploadBacklog).
-unsigned long upload_spilled = 0;
 // How often the loop kicks a WiFi reconnect while offline. Kept comfortably longer than a normal
 // association (a cold-boot connect can take ~10-15s) so a retry never aborts an attempt mid-flight.
 const unsigned long WIFI_RETRY_MS = 20000;
@@ -1265,11 +1263,9 @@ void loop() {
       // with this one.
       if (pushed_token != tlm_push_token) {
 #if ENABLE_NETWORK && ENABLE_LOGGING
-        if (!obd_result_vector.empty() || !g_upload_held.empty() || upload_spilled)
-          logEvent("UPLOAD discarded n=%lu reason=token",
-            obd_result_vector.size() + g_upload_held.size() + upload_spilled);
-        LittleFS.remove(UPLOAD_BACKLOG_PATH); // what a relay session parked there
-        upload_spilled = 0;
+        if (!obd_result_vector.empty() || !g_upload_held.empty())
+          logEvent("UPLOAD discarded n=%lu reason=token", obd_result_vector.size() + g_upload_held.size());
+        LittleFS.remove(UPLOAD_BACKLOG_PATH); // a save left there is the old vehicle's too
 #endif
 #if ENABLE_NETWORK
         g_upload_held.clear(); // held frames are under the old token too, and the next save writes them first
@@ -1707,9 +1703,6 @@ void loop() {
     // buffered behind an unsent one, is not news; any other, frozen or live, is.
 #if ENABLE_NETWORK
     const double poll_utc = uploadSendUtc();
-#if ENABLE_LOGGING
-    if (upload_spilled && !bleRelaying()) loadUploadBacklog(); // the session ended: its parked frames go first
-#endif
     seedGeoQueued(poll_utc);
     GeoMarks poll_geo = obd_result_vector.empty() ? g_geo_accepted : g_geo_queued;
     bool frame_has_data = v2HasTelemetry(current_frame, poll_utc, &poll_geo);
@@ -2094,9 +2087,6 @@ void loop() {
 #endif
 #if ENABLE_BLE
     if (ble_relayed) {
-#if ENABLE_NETWORK && ENABLE_LOGGING
-      spillUploadBacklog();
-#endif
       if (ble_mtu != g_logged_ble_mtu || ble_frame.dropped > g_logged_ble_drop) {
         g_logged_ble_mtu = ble_mtu;
         g_logged_ble_drop = ble_frame.dropped;
@@ -2111,8 +2101,8 @@ void loop() {
         Serial.printf("Logging data over BLE: ");
         logging_message_printed = true;
 #if ENABLE_LOGGING
-        logEvent("BLE relay spilled=%lu free=%lu maxblock=%lu", upload_spilled,
-          (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getMaxAllocHeap());
+        logEvent("BLE relay queued=%u free=%lu maxblock=%lu",
+          (unsigned)(obd_result_vector.size() + g_upload_held.size()), (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getMaxAllocHeap());
 #endif
       } else {
         Serial.printf("."); // Add a dot (show that something is happening)
@@ -2174,7 +2164,7 @@ void loop() {
       // No token, no upload. Belt-and-braces since an unpaired dongle also never polls, so the buffer
       // should be empty anyway - but the alternative is powering the modem for a POST the API can only
       // answer 401, and this is the one condition where that is knowable in advance.
-      if (!bleRelaying() && !upload_spilled && !g_ota_active && !ble_upload_grace && !obd_result_vector.empty() &&
+      if (!bleRelaying() && !g_ota_active && !ble_upload_grace && !obd_result_vector.empty() &&
           !tlm_push_token.empty() &&
           (ble_handoff_fire || dc_first_upload || ( millis() - last_broadcast ) > upload_delay)) {
         // Awake-aware backoff. The fail cap exists to stop the modem thrashing a SLEEPING car's 12V when

@@ -440,17 +440,16 @@ backend silently dropped counts as sent until then too. `UPLOAD body` logs `loc=
 **A phone taking the transport keeps the cellular queue** (#58). The BLE notify goes out before the frame is
 buffered, and its answer decides both: a relayed frame is not queued (the phone posts it as `APP_OBD`), and
 frames already queued (failed-POST retries, a slow drain, a restored backlog) are kept while cellular stands
-down. The first relayed poll parks them in the backlog file (`spillUploadBacklog`); queued frames are in PSRAM, so
-this frees no internal heap, and a full queue costs about 6 s of flash writes. The first poll after relaying ends puts them back in front of anything
-queued since, and the handoff drains them oldest first, at most `UPLOAD_MAX_BATCHES_PER_CYCLE` x
-`MAX_FRAMES_PER_POST` per cycle. Nothing goes up over cellular while frames are parked, so a sleep or an OTA
-reboot in the session saves RAM behind them and the next wake sends them in order; over the cap the load drops
-the oldest. A frame the phone relayed never goes over cellular, including the dongle's own fix (BLE trims
+down. They stay in PSRAM for the whole session (an earlier version spilled them to the backlog file, which freed no
+internal heap and cost about 6 s of flash writes; #91 removed it). Cellular stands down while the phone relays;
+when relaying ends the loop's upload drains them oldest first, at most `UPLOAD_MAX_BATCHES_PER_CYCLE` x
+`MAX_FRAMES_PER_POST` per cycle, and a sleep in the session flushes them over cellular first and saves what is
+left (an overwrite of the backlog file). A backlog file over the cap restores only the newest frames. A frame the phone relayed never goes over cellular, including the dongle's own fix (BLE trims
 `lat`/`lon`/`heading`; the phone supplies its own). A profile push with a different (or, after an unreadable
-profile, an unknown) `tlm_push_token` discards the queue and the parked file (`UPLOAD discarded n=…
+profile, an unknown) `tlm_push_token` discards the queue and the backlog file (`UPLOAD discarded n=…
 reason=token`): those frames may be another vehicle's history. The cap drops the oldest frame past
 `MAX_UPLOAD_BUFFER`, logged once per capped stretch (`UPLOAD discarded n=… reason=cap`, at the next accepted
-upload or the backlog save). `BLE relay spilled=` logs the parked count and the heap at the start of each relay
+upload or the backlog save). `BLE relay queued=` logs the queued count and the heap at the start of each relay
 stretch.
 
 **Queued frames live in PSRAM** (#75). A frame is about 1 KB of pairs, under the 4 KB threshold that sends a malloc to
@@ -471,8 +470,7 @@ The backlog file shares LittleFS with the flash log, whose rotation keeps ~384 K
 at most what is free above `BACKLOG_FS_RESERVE`; past that the oldest frames are left out (`UPLOAD discarded n=…
 reason=fs`), so the trip-end marker, queued last, is kept. A write that still fails ends the save (`BACKLOG write
 failed at`), and since `File` buffers, the file's size is checked after close to catch a failed final flush; lost
-frames re-arm the marker debt if the marker was among them. A relay spill writes all of the queue or none of it, so
-a queue that does not fit stays in PSRAM. A full queue's file is ~260 KB: ~5.7 s to write at
+frames re-arm the marker debt if the marker was among them. A full queue's file is ~260 KB: ~5.7 s to write at
 sleep and ~7.3 s to read at the next polling wake, which a parked offline car pays on every polling wake.
 
 **A frame older than 6 days is dropped from the queue** (#67). Parked history that old is worth little next to the

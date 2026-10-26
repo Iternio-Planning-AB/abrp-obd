@@ -132,7 +132,7 @@ int logging_errors = 0, g_last_http = 0, g_http0_streak = 0;
 unsigned long g_last_post_ms = 0;
 std::string g_last_status, tlm_push_token = "test-token", api_key = "test-key";
 std::vector<OBDVector> obd_result_vector;
-unsigned long upload_capped = 0, upload_spilled = 0;
+unsigned long upload_capped = 0;
 unsigned long upload_heap_dropped = 0;
 #define MAX_UPLOAD_BUFFER 120
 #include "tlm_signature.h"
@@ -156,7 +156,7 @@ void observeBacklogRead() {
   ++backlog_read_count;
   if (obd_result_vector.size() > 40 || ESP.getFreeHeap() < 32768 ||
       ESP.getMaxAllocHeap() < 16384) backlog_read_bounds_ok = false;
-  if (backlog_read_count > MAX_UPLOAD_BUFFER + 2 && obd_result_vector.size() >= 2)
+  if (backlog_read_count > 2 && obd_result_vector.size() >= 2)
     backlog_queue_grew_during_read = true;
 }
 
@@ -206,7 +206,7 @@ void resetFixture() {
   network.responseCode = 200;
   std::vector<OBDVector>().swap(obd_result_vector);
   std::vector<OBDVector>().swap(g_upload_held);
-  upload_capped = upload_spilled = upload_heap_dropped = 0;
+  upload_capped = upload_heap_dropped = 0;
   resetHeapFixture();
   logging_errors = g_last_http = g_http0_streak = 0;
   g_last_post_ms = 0;
@@ -1801,7 +1801,7 @@ void uploadGate() {
   obd_result_vector = {newer_ram};
   loadUploadBacklog();
   LittleFS.read_observer = nullptr;
-  check(backlog_read_count == 2 * MAX_UPLOAD_BUFFER && backlog_read_bounds_ok &&
+  check(backlog_read_count == MAX_UPLOAD_BUFFER && backlog_read_bounds_ok &&
         backlog_queue_grew_during_read,
         "the global queue stays bounded and grows during the file-row restore pass");
   check(obd_result_vector.size() < 40 && ESP.getFreeHeap() >= 32768 &&

@@ -64,7 +64,6 @@ struct Wake {
     void wdtStreakModem(bool) {}
     void wdtStreakMarker(bool) {}
     bool uploadBacklogPending() { return false; }
-    unsigned long upload_spilled = 0;
     void configureWOM(ICM_42627&) {}
     void esp_sleep_enable_ext0_wakeup(int, int) {}
     void esp_deep_sleep_start() { throw SleepReached{}; }

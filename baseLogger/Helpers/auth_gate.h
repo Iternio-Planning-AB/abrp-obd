@@ -225,7 +225,7 @@ bool forgetProfile(const char* why) {
   LittleFS.remove(PROFILE_PATH);
 #endif
 #if ENABLE_NETWORK && ENABLE_LOGGING
-  const unsigned long discarded = obd_result_vector.size() + g_upload_held.size() + upload_spilled;
+  const unsigned long discarded = obd_result_vector.size() + g_upload_held.size();
   LittleFS.remove(UPLOAD_BACKLOG_PATH);
 #endif
 #if ENABLE_LOGGING
@@ -238,9 +238,6 @@ bool forgetProfile(const char* why) {
     logEvent("PROFILE forget FAILED (%s) - profile or backlog file not removed", why);
     return false;
   }
-#endif
-#if ENABLE_NETWORK && ENABLE_LOGGING
-  upload_spilled = 0;
 #endif
 #if ENABLE_NETWORK
   g_upload_held.clear(); // held frames are this vehicle's too, and the next save writes them first

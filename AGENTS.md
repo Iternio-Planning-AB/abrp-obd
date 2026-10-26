@@ -432,7 +432,7 @@ Host checks do not verify real attachment timing, electrical sleep behavior or v
 
 Run `python3 tests/run_upload_checks.py queue` and `logging-off`, and `python3 tests/run_heading_checks.py upload-gate`,
 `geo-backlog-rows` and `geo-downgrade`, normally and with `CXX='clang++ -DNDEBUG'`, for the real queue helper, the poll
-buffer, the PARK marker, held-frame save/spill and the bounded backlog restore. The upload runner compiles with
+buffer, the PARK marker, held-frame save and the bounded backlog restore. The upload runner compiles with
 logger.ino's `MAX_UPLOAD_BUFFER`. `tests/support/upload_heap_fixture.h` measures the queue's real storage and places it
 as the firmware does (pairs and long keys in PSRAM while there is PSRAM, the outer array there from the 4 KB malloc
 threshold), independently of the estimator. `queue` covers the #75 field heap (2292 B largest internal block, PSRAM
