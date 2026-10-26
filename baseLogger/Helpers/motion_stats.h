@@ -64,7 +64,9 @@ void motionStatsLine(char* buf, size_t len, const MotionStats& m, bool parked, b
 // active time, fed by every sampled detectMovement window (the same dt rule as MotionStats), judged over the
 // last window_ms. Independent of ENABLE_LOGGING; a bucket from an earlier lap is skipped by its id.
 static const unsigned long DRIVE_MOTION_BUCKET_MS = 5000UL;
-static const unsigned DRIVE_MOTION_BUCKETS = 12;  // up to a 60 s window
+// The +1: the current bucket is partly filled, so the window still has a full DRIVE_SUSTAINED_WINDOW_MS behind it.
+static const unsigned DRIVE_MOTION_BUCKETS = DRIVE_SUSTAINED_WINDOW_MS / DRIVE_MOTION_BUCKET_MS + 1;
+static_assert(DRIVE_SUSTAINED_WINDOW_MS % DRIVE_MOTION_BUCKET_MS == 0, "the window is a whole number of buckets");
 
 struct DriveMotion {
   uint32_t id[DRIVE_MOTION_BUCKETS] = {};  // now / DRIVE_MOTION_BUCKET_MS of the bucket's contents
@@ -90,19 +92,16 @@ void motionAccumulate(DriveMotion& m, bool sampled, bool active, uint32_t window
   if (active) m.active_ms[slot] += dt;
 }
 
-// Sustained: at least min_sampled_ms sampled in the last window_ms (to the bucket), and act_pct of it active.
+// Sustained: at least DRIVE_SUSTAINED_MIN_SAMPLED_MS sampled over the window, DRIVE_SUSTAINED_ACT_PCT of it active.
 // act_out gets the active share, rounded, for the log line.
-bool motionSustained(const DriveMotion& m, unsigned long now, unsigned long window_ms,
-                     unsigned long min_sampled_ms, unsigned act_pct, unsigned* act_out = nullptr) {
+bool motionSustained(const DriveMotion& m, unsigned long now, unsigned* act_out = nullptr) {
   const uint32_t id = (uint32_t)(now / DRIVE_MOTION_BUCKET_MS);
-  unsigned long buckets = window_ms / DRIVE_MOTION_BUCKET_MS;
-  if (buckets > DRIVE_MOTION_BUCKETS) buckets = DRIVE_MOTION_BUCKETS;
   uint64_t sampled = 0, active = 0;
   for (unsigned slot = 0; slot < DRIVE_MOTION_BUCKETS; ++slot) {
-    if (id - m.id[slot] >= buckets) continue;
+    if (id - m.id[slot] >= DRIVE_MOTION_BUCKETS) continue;
     sampled += m.total_ms[slot];
     active += m.active_ms[slot];
   }
   if (act_out) *act_out = sampled ? (unsigned)((active * 100 + sampled / 2) / sampled) : 0U;
-  return sampled >= min_sampled_ms && active * 100 >= (uint64_t)act_pct * sampled;
+  return sampled >= DRIVE_SUSTAINED_MIN_SAMPLED_MS && active * 100 >= (uint64_t)DRIVE_SUSTAINED_ACT_PCT * sampled;
 }

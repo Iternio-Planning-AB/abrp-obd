@@ -25,7 +25,7 @@
     gnss          DRIVING               gpsMovingFresh                                  DRIVING      hold, leash (no new gate)
     accel         PARKED                car on, sustained motion, no charge latch       UNCONFIRMED  hold = now, LEASH line
     accel         PARKED, UNCONFIRMED   ... and discharge > DRIVE_DISCHARGE_KW          DRIVING      hold, LEASH line
-    accel         DRIVING               car on, sustained motion, discharge             DRIVING      hold (continuation)
+    accel         DRIVING               car on, sustained motion, no charge latch       DRIVING      hold (continuation, no log)
     accel         UNCONFIRMED           charge latch set                                PARKED       LEASH line, no freeze
     poll end      UNCONFIRMED           hold = last motion; now - hold > ACTIVE_TIMER   PARKED       LEASH line, no freeze
     poll end      DRIVING               now - last hold > ACTIVE_TIMER                  PARKED       freeze, LEASH re-latch line
@@ -57,16 +57,14 @@ struct DriveEvidence {
   bool discharge;         // the battery is discharging above DRIVE_DISCHARGE_KW
   bool charge_latched;    // the charge latch (recently_charging) is set
 };
-enum DriveRefusal { DRIVE_GNSS_OK, DRIVE_REFUSE_MOTION, DRIVE_REFUSE_CAR_OFF, DRIVE_REFUSE_CHARGING };
-
-inline DriveRefusal driveGnssVerdict(const DriveEvidence& e) {
-  if (e.charge_latched) return DRIVE_REFUSE_CHARGING;
-  if (!e.car_on) return DRIVE_REFUSE_CAR_OFF;
-  if (!e.motion_recent) return DRIVE_REFUSE_MOTION;
-  return DRIVE_GNSS_OK;
-}
-inline const char* driveRefusalName(DriveRefusal r) {
-  return r == DRIVE_REFUSE_CHARGING ? "charging" : r == DRIVE_REFUSE_CAR_OFF ? "car-off" : "motion";
+// Why a fresh moving GNSS fix may not start a drive, or nullptr when it may. A drive already under way just
+// continues on it: no new gate.
+inline const char* driveGnssRefusal(const DriveRegion& r, const DriveEvidence& e) {
+  if (r.state == DRIVE_DRIVING) return nullptr;
+  if (e.charge_latched) return "charging";
+  if (!e.car_on) return "car-off";
+  if (!e.motion_recent) return "motion";
+  return nullptr;
 }
 
 inline DriveRegion driveOnMoving(DriveRegion r, unsigned long now_ms) {
@@ -74,18 +72,14 @@ inline DriveRegion driveOnMoving(DriveRegion r, unsigned long now_ms) {
   r.last_hold_ms = now_ms;
   return r;
 }
-// A fresh moving GNSS fix starts a drive only with the evidence; one already under way just refreshes.
-inline bool driveGnssStarts(const DriveRegion& r, const DriveEvidence& e) {
-  return r.state == DRIVE_DRIVING || driveGnssVerdict(e) == DRIVE_GNSS_OK;
-}
 inline DriveRegion driveOnAccel(DriveRegion r, const DriveEvidence& e, unsigned long now_ms) {
   if (r.state == DRIVE_UNCONFIRMED && e.charge_latched) {
     r.state = DRIVE_PARKED;
     return r;
   }
   if (e.charge_latched || !e.car_on || !e.motion_sustained) return r;
-  if (e.discharge) return driveOnMoving(r, now_ms);  // also DRIVING: a drive with no speed or fix is held by this
-  if (r.state == DRIVE_DRIVING) return r;
+  // A drive under way is held by the motion alone (cruising draws well under the start limit); starting one needs the discharge.
+  if (r.state == DRIVE_DRIVING || e.discharge) return driveOnMoving(r, now_ms);
   if (r.state == DRIVE_PARKED) {
     r.state = DRIVE_UNCONFIRMED;
     r.last_hold_ms = now_ms;
@@ -153,8 +147,7 @@ inline DriveSample driveSample(const OBDVector* frame) {
   s.evidence.car_on = g_last_io36 >= RAIL_AWAKE_VOLTS || s.obd_recent;
   s.evidence.motion_recent = g_last_motion_ms && now - g_last_motion_ms <= (unsigned long)DRIVE_MOTION_RECENT_MS;
 #if ENABLE_MEMS
-  s.evidence.motion_sustained = motionSustained(g_drive_motion, now, DRIVE_SUSTAINED_WINDOW_MS,
-                                                DRIVE_SUSTAINED_MIN_SAMPLED_MS, DRIVE_SUSTAINED_ACT_PCT, &s.act_pct);
+  s.evidence.motion_sustained = motionSustained(g_drive_motion, now, &s.act_pct);
 #endif
   s.evidence.charge_latched = recently_charging;
   double amps = 0, volts = 0;
@@ -185,17 +178,15 @@ inline void driveSpeed(double kmh) {
 
 // gpsMovingFresh() this poll; kmh is the GNSS speed, for the log lines only. Starting a drive needs the evidence.
 inline void driveGnss(double kmh) {
-  const DriveEvidence evidence = driveSample(nullptr).evidence;
-  if (!driveGnssStarts(driveRegion(), evidence)) {
+  if (const char* refused = driveGnssRefusal(driveRegion(), driveSample(nullptr).evidence)) {
     if (!g_drive_gnss_refused) {
       g_drive_gnss_refused = true;
 #if ENABLE_LOGGING
-      logEvent("LEASH gnss=%.1fkm/h refused reason=%s", kmh, driveRefusalName(driveGnssVerdict(evidence)));
+      logEvent("LEASH gnss=%.1fkm/h refused reason=%s", kmh, refused);
 #endif
     }
     return;
   }
-  g_drive_gnss_refused = false;
   if (is_currently_parked) {
     Serial.printf("LEASH: GNSS %.1f km/h -> driving (unlatch parked, hold awake)\n", kmh);
 #if ENABLE_LOGGING
@@ -209,27 +200,22 @@ inline void driveGnss(double kmh) {
 // Every poll, after the speed and GNSS checks: sustained accelerometer motion on a car that is on.
 inline void driveAccel(const OBDVector& frame) {
   const DriveSample s = driveSample(&frame);
-  const DriveRegion region = driveRegion();
-  const DriveState to = driveOnAccel(region, s.evidence, millis()).state;
-  if (to == region.state) {
-    if (to == DRIVE_DRIVING && s.evidence.car_on && s.evidence.motion_sustained && s.evidence.discharge &&
-        !s.evidence.charge_latched) {
-      last_active = millis();
-      driveStore(driveOnAccel(region, s.evidence, millis()));
-    }
+  const DriveRegion region = driveRegion(), next = driveOnAccel(region, s.evidence, millis());
+  if (next.state != region.state) {
+#if ENABLE_LOGGING
+    if (next.state == DRIVE_DRIVING)
+      logEvent("LEASH driving accel act=%u%% power=%.1fkW -> unlatch parked", s.act_pct, s.kw);
+    else if (next.state == DRIVE_UNCONFIRMED)
+      logEvent("LEASH unconfirmed accel act=%u%% rail=%.2f obd=%d -> live location, no drivingState", s.act_pct,
+        g_last_io36, s.obd_recent ? 1 : 0);
+    else
+      logEvent("LEASH unconfirmed charging -> parked");
+#endif
+  } else if (next.last_hold_ms == region.last_hold_ms) {
     return;
   }
-#if ENABLE_LOGGING
-  if (to == DRIVE_DRIVING)
-    logEvent("LEASH driving accel act=%u%% power=%.1fkW -> unlatch parked", s.act_pct, s.kw);
-  else if (to == DRIVE_UNCONFIRMED)
-    logEvent("LEASH unconfirmed accel act=%u%% rail=%.2f obd=%d -> live location, no drivingState", s.act_pct,
-      g_last_io36, s.obd_recent ? 1 : 0);
-  else
-    logEvent("LEASH unconfirmed charging -> parked");
-#endif
-  if (to == DRIVE_DRIVING) last_active = millis();
-  driveStore(driveOnAccel(region, s.evidence, millis()));
+  if (next.state == DRIVE_DRIVING) last_active = millis();
+  driveStore(next);
 }
 
 // After the speed, GNSS and accelerometer checks of every poll: the time-based re-latch.

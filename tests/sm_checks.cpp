@@ -589,21 +589,34 @@ void rules() {
   playCur(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, true, 10.0), t);
   check(!is_currently_parked && !drive_unconfirmed && park_marker_owed, "UNCONFIRMED + discharge + sustained motion is DRIVING", t);
 
-  // A drive confirmed by accel + discharge alone (no speed PID, no fix) is held by each such poll, not re-latched.
+  // A drive confirmed by accel + discharge alone (no speed PID, no fix) is held by sustained motion while it
+  // lasts, whatever the power: cruising at 2.5 kW must not re-latch it.
   begin();
+  playCur(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, true, 12.5), t);
   for (int i = 0; i < 11; ++i) {
-    playCur(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, true, 12.5), t);
     playCur(Advance(60000), t);
+    playCur(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, true, 2.5), t);
   }
   check(!is_currently_parked && sm_freezes == 0 && countLog("LEASH no speed") == 0 && countLog("LEASH driving") == 1,
-        "sustained motion with discharge holds DRIVING past ACTIVE_TIMER: no flap, no freeze, one LEASH line", t);
-  playCur(Advance(AT - 60000), t);
+        "sustained motion holds DRIVING past ACTIVE_TIMER at 2.5 kW: no flap, no freeze, one LEASH line", t);
+  playCur(Advance(AT), t);
   playCur(Rules(quiet, SM_CAR_RAIL, SM_MOVE_KEEP, false), t);
-  check(!is_currently_parked, "the hold ends ACTIVE_TIMER after the last accel + discharge poll", t);
+  check(!is_currently_parked, "the hold ends ACTIVE_TIMER after the last sustained-motion poll", t);
   playCur(Advance(1), t);
   playCur(Rules(quiet, SM_CAR_RAIL, SM_MOVE_KEEP, false), t);
   check(is_currently_parked && sm_freezes == 1 && countLog("LEASH no speed for 300s") == 1,
         "then the normal re-latch fires, with one freeze", t);
+
+  // A speed-less drive confirmed by GNSS + motion keeps going on fresh moving fixes alone: no new gate on continuation.
+  begin();
+  playCur(Rules(fix(40.0), SM_CAR_RAIL, SM_MOVE_NOW, false), t);
+  check(!is_currently_parked, "GNSS with motion starts the drive", t);
+  for (int i = 0; i < 11; ++i) {
+    playCur(Advance(60000), t);
+    playCur(Rules(fix(40.0), SM_CAR_RAIL, SM_MOVE_NONE, false), t);
+  }
+  check(!is_currently_parked && sm_freezes == 0 && countLog("LEASH gnss=") == 0 && countLog("LEASH no speed") == 0,
+        "fresh moving fixes without motion keep a drive going past ACTIVE_TIMER, never refused", t);
 
   // 4. Charge block: the charge latch keeps sustained motion and GNSS out, and drops UNCONFIRMED to PARKED.
   begin();
@@ -619,7 +632,7 @@ void rules() {
 
   // 5. UNCONFIRMED exit: ACTIVE_TIMER without motion, each motion refreshing it; the idle stage; never a freeze.
   enterUnconfirmed();
-  playCur(Advance(AT), t);
+  playCur(Advance(AT + 1), t);
   playCur(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, false), t);
   check(drive_unconfirmed, "a motion hit near the end of the timer keeps UNCONFIRMED", t);
   playCur(Advance(AT), t);
@@ -632,7 +645,8 @@ void rules() {
         "one ms past ACTIVE_TIMER without motion: PARKED, no PARK marker, no refreeze", t);
   enterUnconfirmed();
   playCur(Ladder(SmTo::CHARGING), t);
-  check(is_currently_parked && !drive_unconfirmed && sm_freezes == 0 && !park_marker_owed,
+  check(is_currently_parked && !drive_unconfirmed && sm_freezes == 0 && !park_marker_owed &&
+        logged("LEASH unconfirmed idle -> parked"),
         "the idle stage drops UNCONFIRMED to PARKED without a freeze", t);
   playCur(Advance(AT), t);
   playCur(Sleep(), t);

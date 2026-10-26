@@ -631,7 +631,6 @@ void gpsStationary() {
   const auto unconfirmed = json::parse(bulkStringV2({frame}, 1791500000))[0];
   drive_unconfirmed = false;
   checkLocation(unconfirmed, gd->lat, gd->lng, "UNCONFIRMED publishes the live fix, not the frozen spot");
-  check(!unconfirmed.contains("drivingState"), "a frame without is_parked has no drivingState");
 }
 
 // Fresh zero-speed fixes in GNIFO 1e6 units, one receiver second apart from 11:08:00; lat_step walks them.

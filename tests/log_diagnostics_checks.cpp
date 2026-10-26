@@ -12,7 +12,6 @@
 #include <fstream>
 #include <map>
 #include "ble_write_summary.h"
-#include "motion_stats.h"
 #include <memory>
 #include <set>
 #include <sstream>
@@ -141,6 +140,7 @@ File File::openNextFile() {
 #define FW_BUILD_TAG "v1.4.0-rc.2+12.gabc1234.dirty"
 #define OTA_FW_VERSION 1004000
 #include "../baseLogger/config.h"
+#include "motion_stats.h"
 
 #define RTC_DATA_ATTR
 using json = nlohmann::json;
@@ -547,8 +547,7 @@ void motionChecks() {
     DriveMotion dm;
     unsigned long at = 100000;
     for (int i = 0; i < windows; ++i, at += window_ms) motionAccumulate(dm, true, i < active_windows, window_ms, at);
-    return motionSustained(dm, at - window_ms + later, DRIVE_SUSTAINED_WINDOW_MS, DRIVE_SUSTAINED_MIN_SAMPLED_MS,
-                                DRIVE_SUSTAINED_ACT_PCT, act);
+    return motionSustained(dm, at - window_ms + later, act);
   };
   unsigned act = 0;
   check(sustained(100, 30, 200, 0, &act) && act == 30, "30 % of 20 s sampled is sustained: act=" + std::to_string(act));
@@ -558,8 +557,7 @@ void motionChecks() {
   check(!sustained(20, 20, 1000, 40000), "windows older than the rolling window do not count");
   DriveMotion bypassed;
   for (int i = 0; i < 40; ++i) motionAccumulate(bypassed, false, true, 1000, 100000 + 1000 * i);
-  check(!motionSustained(bypassed, 140000, DRIVE_SUSTAINED_WINDOW_MS, DRIVE_SUSTAINED_MIN_SAMPLED_MS,
-                              DRIVE_SUSTAINED_ACT_PCT), "bypassed windows are not sampled time");
+  check(!motionSustained(bypassed, 140000), "bypassed windows are not sampled time");
 }
 
 

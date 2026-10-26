@@ -298,6 +298,14 @@ if calls != extracted:
     sys.exit(f"FAIL: {calls} drive_state.h calls in the firmware but {extracted} in the extracted blocks; "
              "a call outside them is not compared against SM_PIN - extract its block")
 
+# Two wires the adapter bypasses (it sets the inputs directly): the sampled motion windows must reach the
+# accumulator, and an OBD answer must stamp the car-on evidence.
+if not re.search(r"motion_sampled = !g_ota_active && !g_logdump_active && current_state != UNINITIALIZED;\s*"
+                 r"noteDriveMotionWindow\(motion_sampled, active\);", cur_src["machine"]):
+    sys.exit("FAIL: state_machine.h must feed every sampled detectMovement window to noteDriveMotionWindow()")
+if not re.search(r"if \(obd_count > 0\) \{[^}]*g_last_obd_answer_ms = millis\(\);", cur_src["logger"]):
+    sys.exit("FAIL: logger.ino must stamp g_last_obd_answer_ms = millis() when obd_count > 0")
+
 energy = tree("tests/energy_checks.cpp")
 field = "".join(block(energy, f"const std::vector<Sample> {n} = ", "tests/energy_checks.cpp").rstrip() + ";\n" for n in ("DRIVE_0930", "DRIVE_1012"))
 
