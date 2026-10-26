@@ -16,10 +16,17 @@
 #include <regex>
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <stdexcept>
 
 
-std::vector<Token> Parser::tokenize(const std::string& expression, const std::vector<int>& variables) {
+static std::string lower(std::string s) {
+  for (auto& c : s) c = tolower((unsigned char)c);
+  return s;
+}
+
+std::vector<Token> Parser::tokenize(const std::string& expression, const std::vector<int>& variables,
+                                    const ParserValues* values) {
   std::vector<Token> tokens;
   std::string currentToken;
   std::cmatch match;
@@ -76,8 +83,28 @@ std::vector<Token> Parser::tokenize(const std::string& expression, const std::ve
       // else: fall through; the operator branch below emits a binary '-'
     }
 
-    if (str13 == "ifGreaterThan") {
-      tokens.emplace_back(str13, Token::FUNC);
+    // VAL{name}: another key's value from this poll, as the app's virtual keys use. The app's grammar takes the
+    // name's characters from [a-zA-z0-9], a range that includes '_' and so the profiles' _-prefixed keys.
+    if (lower(str4) == "val{") {
+      const size_t close = expression.find('}', i + 4);
+      if (close == std::string::npos) throw std::runtime_error("Unclosed VAL{");
+      const std::string name = expression.substr(i + 4, close - i - 4);
+      const std::pair<std::string, double>* found = nullptr;
+      if (values)
+        for (const auto& v : *values) if (v.first == name) found = &v;
+      if (!found) throw std::runtime_error("val not available: " + name);
+      if (!currentToken.empty() && currentToken != "-") throw std::runtime_error("Number before VAL{");
+      char number[32];
+      snprintf(number, sizeof(number), "%.17g", currentToken == "-" ? -found->second : found->second);
+      tokens.emplace_back(number, Token::NUM);
+      currentToken.clear();
+      i = close;
+      continue;
+    }
+
+    // Function names in any case, as the app's grammar takes them (MEB writes ifgreaterthan).
+    if (lower(str13) == "ifgreaterthan") {
+      tokens.emplace_back("ifGreaterThan", Token::FUNC);
       // skip 13 characters
       i += 12;
       continue;
@@ -94,13 +121,8 @@ std::vector<Token> Parser::tokenize(const std::string& expression, const std::ve
       }
     }
 
-    if (str5 == "int32" || str5 == "INT32" ||
-      str5 == "int24" || str5 == "INT24" ||
-      str5 == "int16" || str5 == "INT16") {
-      for (auto& c : str5) {
-        c = tolower(c);
-      }
-      tokens.emplace_back(str5, Token::FUNC);
+    if (lower(str5) == "int32" || lower(str5) == "int24" || lower(str5) == "int16") {
+      tokens.emplace_back(lower(str5), Token::FUNC);
 
       // skip 5 characters
       i += 4;
@@ -165,11 +187,14 @@ std::vector<Token> Parser::tokenize(const std::string& expression, const std::ve
       // against a 1-byte buffer), and variables[index] read out of bounds -> junk results (-2.9e8) and, on an
       // empty response, heap-corrupting UB that abort()ed the chip (the PANIC reboots). The old multi-letter
       // check also underflowed on an empty vector (`index > variables.size()-1` with unsigned size()==0).
-      // The throw is caught upstream by readPIDs' catch(...) -> graceful "failed to parse evaluation".
+      // A byte the reply does not have is NaN, as the app's undefined is: ifgreaterthan(C+1, 0, ...) then takes its
+      // else branch, which is how MEB's _soe_safe falls back when only the shorter of its two replies came. Any
+      // other use stays NaN, and readPIDs drops a non-finite result.
       if (index < 0 || (size_t)index >= variables.size()) {
-        throw std::runtime_error("Variable out of range: " + variable);
+        str = "nan";
+      } else {
+        str = std::to_string(variables[index]);
       }
-      str = std::to_string(variables[index]);
 
       if (currentToken.length() == 0) {
         tokens.emplace_back(str, Token::NUM);
@@ -186,7 +211,10 @@ std::vector<Token> Parser::tokenize(const std::string& expression, const std::ve
         tokens.emplace_back(currentToken, Token::NUM);
         currentToken.clear();
       }
-      tokens.emplace_back(str2, Token::OP, 5);
+      // The app has no !=; refusing it drops the key there and here alike.
+      if (str2 == "!=") throw std::runtime_error("Unsupported operator: !=");
+      // == binds as * does in the app's grammar.
+      tokens.emplace_back(str2, Token::OP, str2 == "==" ? 3 : 5);
       //An extra increment for 2-char tokens
       ++i;
     } else {
@@ -415,6 +443,8 @@ NodePtr Parser::buildTree(const std::vector<Token>& unstacked) {
             operationNode = std::make_shared<AndNode>(var2, var1);
           } else if (token.expr == "||") {
             operationNode = std::make_shared<OrNode>(var2, var1);
+          } else if (token.expr == "==") {
+            operationNode = std::make_shared<EqualNode>(var2, var1);
           }
         } else if (token.type == Token::FUNC) {
           if (token.expr == "bit") {
@@ -436,6 +466,9 @@ NodePtr Parser::buildTree(const std::vector<Token>& unstacked) {
           }
         }
       }
+      // A token with no node (an operator this parser does not build) would leave a null tree, and readPIDs
+      // calls evaluate() on it: refuse the equation instead.
+      if (!operationNode) throw std::runtime_error("Unsupported token: " + token.expr);
       nodeStack.push_back(operationNode);
     }
   }
@@ -452,6 +485,10 @@ NodePtr Parser::parse(const std::string& expression) {
 }
 
 NodePtr Parser::parse(const std::string& expression, const std::vector<int>& variables) {
-  std::vector<Token> tokens = tokenize(expression, variables);
+  return parse(expression, variables, nullptr);
+}
+
+NodePtr Parser::parse(const std::string& expression, const std::vector<int>& variables, const ParserValues* values) {
+  std::vector<Token> tokens = tokenize(expression, variables, values);
   return buildTree(tokens);
 }

@@ -32,10 +32,14 @@ double SubtractionNode::evaluate() const {
   return left - right;
 }
 
+// A missing reply byte is NaN (parser.cpp), and casting NaN to int is undefined: every integer operation passes it on.
+
 // BitcompareNode implementation
 double BitcompareNode::evaluate() const {
-  auto integer = static_cast<int>(left_->evaluate());
-  auto bit = static_cast<int>(right_->evaluate());
+  const double l = left_->evaluate(), r = right_->evaluate();
+  if (std::isnan(l) || std::isnan(r)) return NAN;
+  auto integer = static_cast<int>(l);
+  auto bit = static_cast<int>(r);
   auto comp = integer >> (bit);
   // std::cout << "Evaluating BIT: " << integer << " : " << bit << " : " << comp << std::endl;
 
@@ -67,20 +71,40 @@ double PowerNode::evaluate() const {
   return std::pow(left_->evaluate(), right_->evaluate());
 }
 
+// Shifts as JavaScript's (the app's grammar): operands wrapped to 32 bits, the count taken mod 32. In C++ a shift
+// by 32 or more, a negative left operand or an out-of-range cast is undefined; eny1 shifts by 252.
+static int32_t toInt32(double v) {
+  if (!std::isfinite(v)) return 0;
+  return (int32_t)(uint32_t)(uint64_t)(int64_t)std::fmod(std::trunc(v), 4294967296.0);
+}
+
 double BitShiftLeftNode::evaluate() const {
-  return static_cast<int>( left_->evaluate() ) << static_cast<int>( right_->evaluate() );
+  const double l = left_->evaluate(), r = right_->evaluate();
+  if (std::isnan(l) || std::isnan(r)) return NAN;
+  return (int32_t)((uint32_t)toInt32(l) << ((uint32_t)toInt32(r) & 31));
 }
 
 double BitShiftRightNode::evaluate() const {
-  return static_cast<int>( left_->evaluate() ) >> static_cast<int>( right_->evaluate() );
+  const double l = left_->evaluate(), r = right_->evaluate();
+  if (std::isnan(l) || std::isnan(r)) return NAN;
+  return toInt32(l) >> ((uint32_t)toInt32(r) & 31);
 }
 
+// && and || as JavaScript's, where the app's run: the deciding operand itself, with NaN falsy.
 double AndNode::evaluate() const {
-  return left_->evaluate() && right_->evaluate();
+  const double l = left_->evaluate();
+  if (std::isnan(l) || l == 0) return l;
+  return right_->evaluate();
 }
 
 double OrNode::evaluate() const {
-  return left_->evaluate() || right_->evaluate();
+  const double l = left_->evaluate();
+  if (!std::isnan(l) && l != 0) return l;
+  return right_->evaluate();
+}
+
+double EqualNode::evaluate() const {
+  return left_->evaluate() == right_->evaluate() ? 1 : 0;
 }
 
 double SinNode::evaluate() const {
@@ -158,11 +182,14 @@ double CschNode::evaluate() const {
 }
 
 double SignedNode::evaluate() const {
-  return static_cast<int8_t>(static_cast<int>(operand_->evaluate()));
+  const double v = operand_->evaluate();
+  if (std::isnan(v)) return NAN;
+  return static_cast<int8_t>(static_cast<int>(v));
 }
 
 double NotNode::evaluate() const {
-  return !operand_->evaluate();
+  const double v = operand_->evaluate();
+  return std::isnan(v) ? NAN : !v;
 }
 
 ByteConverter16Node::ByteConverter16Node(const NodePtr& var2, const NodePtr& var1) : var2_{ var2 }, var1_{ var1 } { };
