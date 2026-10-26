@@ -819,11 +819,19 @@ session.
   included (#50: a battery that sags out on every modem start loops like a crash); a deep-sleep wake or any
   other reset ends it. `retained=0` means the count did not survive the reset and restarted at 1; on a
   `BROWNOUT` line it answers whether RTC memory survives a brownout on this board. `owed=1`: this boot owes
-  the trip-end `is_parked:1` marker, restored from the same store (#49). At `streak=2` the boot logs
-  `WDT streak=2 -> skip init, sleep <m>min` and sleeps with `reason=wdt-streak`: 30 min, or 3 min when the
-  rail says the car is awake. A crash boot zeroes the clock, so these lines and the sleep after them usually
-  carry no UTC; read them in order against the next `WAKE`. Nothing is reachable over BLE during that
-  sleep; re-plugging the dongle is a power-on, which never escalates. The same store remembers whether
+  the trip-end `is_parked:1` marker, restored from the same store (#49). At `streak=2` the existing late
+  setup escalation logs `WDT streak=2 -> skip init, sleep <m>min` and sleeps with `reason=wdt-streak`: 30 min,
+  or 3 min when the rail says the car is awake. If normal recovery does not complete and the crash streak reaches
+  3—including a crash inside the threshold-2 `enterDeepSleep()`—an early setup exception starts a timer-only
+  parked sleep before clock acquisition, filesystem/NVS storage, co-processor or gate/MEMS initialisation. It
+  prints one serial line, not a flash log or `SLEEP enter`; zeros RTC system time locally without acquiring time,
+  disables all wake sources and arms the parked timer regardless of rail, without WOM or peripheral shutdown.
+  Already-powered peripherals and the modem/marker flags are unchanged for this sleep; marker debt survives the
+  clean timer wake, and its deep-sleep reset clears the streak so initialization retries. This exception does not
+  guarantee that every battery-drain mode is solved. In the normal recovery path a crash boot zeroes the clock,
+  so its ordinary log lines and sleep usually carry no UTC; read them in order against the next `WAKE`. Nothing
+  is reachable over BLE during that sleep; re-plugging the dongle is a power-on, which never escalates. The same
+  store remembers whether
   the modem may still be powered (set by every modem init, cleared only by an acknowledged `AT+CPOWD`),
   and a sleep that did not power it this wake sends it an `AT` while that is set: an answer gets `AT+CPOWD`
   (so `SLEEP enter -> modem+GPS off` can follow a skip wake after a crash), silence counts as off.
