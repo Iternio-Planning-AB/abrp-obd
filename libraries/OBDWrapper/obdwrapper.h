@@ -91,9 +91,11 @@ public:
   unsigned skipped_prefix_lines{ 0 };
   /* Commands this poll that got no usable answer (#85), in poll order, at most 8: the command's index in get_pids(),
      why (no_data, no_connect, nrc, no_link, at_reply, a refusal reason as in UnexpectedPidResponse, eval or range)
-     and the reply's first 120 bytes as received. Co-processor text, safe to log. */
+     and the reply's first 120 bytes, with readBuffer's \r already turned into \n. Co-processor text, safe to log.
+     Commands whose bit is set in fail_known (the caller's already-logged set) are not kept, so the 8 go to new ones. */
   struct CommandFailure { size_t index; std::string pid, reason, reply; };
   std::vector<CommandFailure> failures;
+  uint64_t fail_known{ 0 };
   /* FNV-1a over get_pids(), set by setVehicleCommands(): which profile the indices above belong to. */
   uint32_t pids_hash{ 0 };
 

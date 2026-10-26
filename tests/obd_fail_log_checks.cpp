@@ -15,6 +15,7 @@ struct { std::vector<CommandFailure> failures; uint32_t pids_hash = 0; } obd;
 uint64_t obd_fail_logged = 0;
 uint32_t obd_fail_profile = 0;
 std::vector<std::string> lines;
+int obd_count = 3;   // the car answered something this poll
 
 void logEvent(const char* fmt, ...) {
   char text[512];
@@ -35,6 +36,10 @@ void poll() {
 int main() {
   for (size_t i = 0; i < 6; ++i) obd.failures.push_back({ i * 2, "22" + std::to_string(1000 + i), "no_data", "NO DATA\n\n>" });
   obd.pids_hash = 7;
+  obd_count = 0;   // asleep: every command NO DATA, none logged and none spent
+  poll();
+  CHECK(lines.empty() && obd_fail_logged == 0);
+  obd_count = 3;
   poll();
   CHECK(lines.size() == 8);   // 4 commands, each a line and its reply
   CHECK(lines[0] == "OBDFAIL 221000 reason=no_data len=10" && lines[1] == "OBDRAW fail 10");

@@ -255,6 +255,35 @@ static void checkFailures() {
   CHECK(same.pids_hash == hash && hash != 0);
   setUp(same, other_link, PROFILE);
   CHECK(same.pids_hash != hash);
+  // Commands already logged (fail_known) are not kept, so the 8 slots go to the ones not seen yet: 10 silent commands,
+  // the first 8 known, leave the last two.
+  {
+    std::string many = R"P({ "obd_protocol": "7", "init_commands": { "command": ["ATZ"] }, "data_commands": { "command": [)P";
+    std::string keys;
+    for (int i = 0; i < 10; ++i) {
+      const std::string cmd = "2201" + std::to_string(10 + i);
+      many += (i ? ", \"" : "\"") + cmd + "\"";
+      keys += ", \"k" + std::to_string(i) + "\": { \"command\": \"" + cmd + "\", \"equation\": \"A\" }";
+    }
+    many += "] }" + keys + " }";
+    OBDWrapper obd;
+    ScriptedLink link;
+    setUp(obd, link, many.c_str());
+    poll(obd, link, {});
+    CHECK(obd.failures.size() == 8 && obd.failures[0].index == 0);
+    obd.fail_known = 0xFF;
+    poll(obd, link, {});
+    CHECK(obd.failures.size() == 2 && obd.failures[0].index == 8 && obd.failures[1].index == 9);
+  }
+  // An AT command that answers with text, not OK, worked: only the co-processor's ? is a refusal.
+  {
+    OBDWrapper obd;
+    ScriptedLink link;
+    setUp(obd, link, R"P({ "obd_protocol": "7", "init_commands": { "command": ["ATZ"] },
+      "data_commands": { "command": ["ATI", "ATRV", "ATSH7E4"] } })P");
+    poll(obd, link, { "ELM327 v1.5" + PROMPT, "12.4V" + PROMPT, "OK" + PROMPT });
+    CHECK(obd.failures.empty());
+  }
   // A refused reply keeps its refusal reason; the reply kept is the last one, the retry's.
   OBDWrapper uds;
   ScriptedLink uds_link;

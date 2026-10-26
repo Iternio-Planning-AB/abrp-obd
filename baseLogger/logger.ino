@@ -1482,10 +1482,16 @@ void loop() {
         logEvent("ALARMGATE deferred OBD init ran (first permitted cycle)");
 #endif
       }
+#if ENABLE_LOGGING
+      obd.fail_known = obd.pids_hash == obd_fail_profile ? obd_fail_logged : 0;  // #85: only new failures kept
+#endif
       current_frame = obd.readPIDs(PRINT);
       obd_read_attempted = true;
     }
 #else
+#if ENABLE_LOGGING
+    obd.fail_known = obd.pids_hash == obd_fail_profile ? obd_fail_logged : 0;  // #85: only new failures kept
+#endif
     auto current_frame = obd.readPIDs(PRINT); // pass PRINT so raw SENDING/RECEIVING CAN buffers are shown while debugging
     bool obd_read_attempted = true;
 #endif
@@ -1547,13 +1553,15 @@ void loop() {
         obd_retry_logs++;
       }
       // #85: an ECU that never answers, or a filter command the co-processor refuses, shows once per command with
-      // its reply. At most 4 a poll; the rest follow on later polls.
+      // its reply. At most 4 a poll; the rest follow on later polls. Only on a poll the car answered: asleep, every
+      // command is NO DATA, and those would spend each command's one line before the poll that matters.
       if (obd.pids_hash != obd_fail_profile) {
         obd_fail_profile = obd.pids_hash;
         obd_fail_logged = 0;
       }
       unsigned fail_lines = 0;
       for (const auto& f : obd.failures) {
+        if (obd_count == 0) break;
         if (f.index >= 64 || (obd_fail_logged >> f.index & 1ULL) || fail_lines >= 4) continue;
         obd_fail_logged |= 1ULL << f.index;
         fail_lines++;

@@ -471,6 +471,7 @@ OBDVector OBDWrapper::readPIDs(bool print) {
     };
     // A command that got no usable answer is kept for the log (#85), with the reply as it came.
     auto failed = [&](const char* reason) {
+      if (n < 64 && (fail_known >> n & 1ULL)) return;
       if (failures.size() < 8) failures.push_back({ n, pid_string, reason, std::string(buffer, strnlen(buffer, 120)) });
     };
     if (!send()) {
@@ -480,7 +481,8 @@ OBDVector OBDWrapper::readPIDs(bool print) {
     }
     if (fields.empty()) {
       // A filter or header command the co-processor did not take ("?") leaves every command after it unanswered.
-      if (pid_string.compare(0, 2, "AT") == 0 && !strstr(buffer, "OK")) failed("at_reply");
+      // Its refusal, not a missing OK: ATZ, ATI and ATRV answer with text.
+      if (strchr(buffer, '?')) failed("at_reply");
       continue;
     }
 
