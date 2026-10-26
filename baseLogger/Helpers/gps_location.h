@@ -308,7 +308,7 @@ void addGpsData(OBDVector& vec) {
   // Parked: reuse the FROZEN fix - a GNSS that just powered up on a parked wake can't re-stabilize in the few
   // seconds we're awake, so its fresh reading is worse than the averaged one we captured while stopped (and on
   // a stationary sample wake we don't even power the GNSS).
-  if (is_currently_parked) {
+  if (is_currently_parked && !drive_unconfirmed) {  // UNCONFIRMED (#6) publishes the live fix like DRIVING
     // ...EXCEPT when the GNSS itself says we are moving. is_currently_parked stays latched until a poll returns
     // vehicle speed > 0, so on a motion wake - or any drive where the car's speed PID is unavailable - this
     // branch would keep publishing the LAST PARKING SPOT while the car is actually under way, teleporting the

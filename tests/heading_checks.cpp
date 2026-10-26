@@ -92,6 +92,10 @@ struct FakeLink : CLink {
 FreematicsESP32 sys;
 GPS_DATA* gd = &gpsData;
 bool g_gps_powered = false, is_currently_parked = false, frozen_valid = false;
+// The drive rules' inputs (drive_state.h): a car that is on, with motion at every fix, unless a check says otherwise.
+bool drive_unconfirmed = false, g_drive_gnss_refused = false, recently_charging = false;
+float g_last_io36 = 13.5f;
+unsigned long g_last_motion_ms = 0, g_last_obd_answer_ms = 0;
 double frozen_lat = 0, frozen_lon = 0;
 enum ClockSource { CLK_GPS, CLK_HTTP };
 #include "utc_converter.inc"
@@ -103,8 +107,11 @@ time_t parseHttpDate(const char*) { return 0; }
 void esp_task_wdt_reset() {}
 #include "telemetry_format.h"
 #include "gps_location.h"
+#include "motion_stats.h"
+DriveMotion g_drive_motion;
 #include "drive_state.h"
 void gpsUnlatch() {
+  g_last_motion_ms = fake_ms;
 #include "gps_unlatch.inc"
 }
 
@@ -616,6 +623,14 @@ void gpsStationary() {
         "fresh stationary receiver record is accepted and ages independently of published frozen location");
   check(!first.contains("heading") && !fresh.contains("heading") && !gpsMovingFresh(GPS_MOVING_MAX_AGE_MS) &&
         last_active == 0 && g_last_speed_ms == 0, "stationary fixes neither emit heading nor unlatch parked");
+
+  // UNCONFIRMED (#6): still parked for every guard, but the live fix is published and the frame says nothing of PARK/DRIVE.
+  drive_unconfirmed = true;
+  OBDVector frame{{"utc", 1791500000}, {"soc", 50}};
+  addGpsData(frame);
+  const auto unconfirmed = json::parse(bulkStringV2({frame}, 1791500000))[0];
+  drive_unconfirmed = false;
+  checkLocation(unconfirmed, gd->lat, gd->lng, "UNCONFIRMED publishes the live fix, not the frozen spot");
 }
 
 // Fresh zero-speed fixes in GNIFO 1e6 units, one receiver second apart from 11:08:00; lat_step walks them.

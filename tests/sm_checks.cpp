@@ -25,6 +25,8 @@ enum class SmKind { POLL, ADVANCE, LADDER, HOLD, SLEEP, WAKE, MAINT, CRASH };
 enum class SmTo { ACTIVE, BLE, CHARGING, STANDBY };
 enum { SM_NONE, SM_SPEED, SM_VRS, SM_BOTH };  // which speed keys the poll carries (BOTH: speed, then vrs)
 enum { SM_TIMER, SM_MOTION, SM_COLD };   // wake cause
+enum { SM_CAR_RAIL, SM_CAR_OBD, SM_CAR_OFF };  // why the car counts as on: the 12 V rail, or an OBD answer
+enum { SM_MOVE_NOW, SM_MOVE_NONE, SM_MOVE_KEEP };  // the last detectMovement hit: this poll, never, as it was
 
 struct SmEvent {
   SmKind k;
@@ -48,6 +50,13 @@ struct SmEvent {
   bool charge_latched = false;
   bool dump = false;  // HOLD: the log dump rather than an OTA update
   bool on = false;    // MAINT: the console's maintenance_mode
+  // POLL inputs to the driving rules (#6). The defaults make CUR agree with OLD: car on, motion this poll, no
+  // sustained motion, no power, no charge latch.
+  int car = SM_CAR_RAIL;
+  int motion = SM_MOVE_NOW;
+  bool sustained = false;  // the accumulator holds 20 s of motion
+  bool charge_block = false;
+  double power = NAN, current = NAN, voltage = NAN;
 };
 
 SmEvent Poll(int key, double speed, bool gnss = false, double kmh = 0, bool has_data = true, double speed2 = 0) {
@@ -61,6 +70,16 @@ SmEvent Poll(int key, double speed, bool gnss = false, double kmh = 0, bool has_
   name << ")";
   e.name = name.str();
   e.key = key, e.speed = speed, e.speed2 = speed2, e.gnss = gnss, e.gnss_kmh = kmh, e.has_data = has_data;
+  return e;
+}
+// A poll with the driving rules' inputs set; the name lists what differs from the defaults.
+SmEvent Rules(SmEvent e, int car, int motion, bool sustained, double power = NAN, bool charge_block = false) {
+  e.car = car, e.motion = motion, e.sustained = sustained, e.power = power, e.charge_block = charge_block;
+  static const char* cars[] = {"", ",obd-only", ",car-off"};
+  static const char* moves[] = {"", ",no-motion", ",motion-kept"};
+  e.name.pop_back();
+  e.name += std::string(cars[car]) + moves[motion] + (sustained ? ",sustained" : "") +
+            (std::isnan(power) ? "" : ",power=" + std::to_string(power)) + (charge_block ? ",charging" : "") + ")";
   return e;
 }
 SmEvent Advance(unsigned long ms) {
@@ -481,6 +500,159 @@ void crashes(int depth) {
   }
 }
 
+
+// ---- the driving rules (#6), on CUR only ----
+// OLD has no UNCONFIRMED and gates GNSS on nothing, so these cannot be a differential: the named cases of the
+// issue, each asserting the state, what a frame publishes, the marker debt, the freezes and the LEASH lines.
+int parkKey(const OBDVector& frame) {
+  for (const auto& res : frame) if (res.first == "is_parked") return (int)res.second;
+  return -1;
+}
+bool logged(const std::string& text) {
+  for (const auto& line : sm_cur::sm_log) if (line == text) return true;
+  return false;
+}
+
+void rules() {
+  std::vector<SmEvent> t;
+  using namespace sm_cur;
+  auto begin = [&] { startCur(t); playCur(Advance(60000), t); };
+  const SmEvent quiet = Poll(SM_NONE, 0);
+  auto fix = [](double kmh = 6.0) { return Poll(SM_NONE, 0, true, kmh); };
+  auto enterUnconfirmed = [&] {
+    begin();
+    playCur(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, true), t);
+    check(is_currently_parked && drive_unconfirmed, "sustained motion on a car that is on is UNCONFIRMED", t);
+  };
+
+  // 1. Desk drift: fresh moving fixes with no accelerometer motion stay PARKED, car on or off.
+  begin();
+  for (int i = 0; i < 3; ++i) {
+    playCur(Rules(fix(), SM_CAR_RAIL, SM_MOVE_NONE, false), t);
+    playCur(Advance(5000), t);
+  }
+  check(is_currently_parked && !drive_unconfirmed && parkKey(obd_result_vector.back()) == 1 &&
+        countLog("LEASH driving") == 0 && !park_marker_owed, "drift without motion stays PARKED and says PARK", t);
+  check(countLog("LEASH gnss=") == 1 && logged("LEASH gnss=6.0km/h refused reason=motion"),
+        "one refusal line for the whole streak", t);
+  begin();
+  playCur(Rules(fix(), SM_CAR_OFF, SM_MOVE_NOW, false), t);
+  check(is_currently_parked && countLog("LEASH driving") == 0 && logged("LEASH gnss=6.0km/h refused reason=car-off"),
+        "a moving fix on a car that is off is refused", t);
+
+  // 2. Late-fix drive: sustained motion, no speed, no power -> UNCONFIRMED; a moving fix confirms DRIVING.
+  enterUnconfirmed();
+  check(parkKey(obd_result_vector.back()) == -1 && obd_result_vector.size() == 1 && !park_marker_owed && sm_published == -1,
+        "UNCONFIRMED frames carry no is_parked and owe no marker", t);
+  check(logged("LEASH unconfirmed accel act=100% rail=13.50 obd=0 -> live location, no drivingState"),
+        "the UNCONFIRMED line", t);
+  playCur(Advance(MAX_AWAKE_MS), t);
+  playCur(Ladder(SmTo::ACTIVE), t);
+  check(sm_asleep && sm_sleep_reason == "backstop", "the max-awake backstop still applies to UNCONFIRMED", t);
+  enterUnconfirmed();
+  playCur(Advance(5000), t);
+  playCur(Rules(fix(40.0), SM_CAR_RAIL, SM_MOVE_NOW, false), t);
+  check(!is_currently_parked && !drive_unconfirmed && parkKey(obd_result_vector.back()) == 0 && park_marker_owed &&
+        logged("LEASH driving gnss=40.0km/h -> unlatch parked (no OBD speed needed)"),
+        "a moving fix with motion confirms DRIVING from UNCONFIRMED: frames say DRIVE, the marker is owed", t);
+  begin();
+  playCur(Rules(quiet, SM_CAR_OBD, SM_MOVE_NOW, true), t);
+  check(drive_unconfirmed && logged("LEASH unconfirmed accel act=100% rail=12.00 obd=1 -> live location, no drivingState"),
+        "an OBD answer within ACTIVE_TIMER counts as the car being on", t);
+  begin();
+  playCur(Rules(quiet, SM_CAR_OFF, SM_MOVE_NOW, true, 12.5), t);
+  check(is_currently_parked && !drive_unconfirmed && countLog("LEASH") == 0, "sustained motion on a car that is off does nothing", t);
+
+  // 3. Discharge confirms DRIVING without a fix: the power key, else current x voltage; neither cannot confirm.
+  begin();
+  playCur(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, true, 12.5), t);
+  check(!is_currently_parked && !drive_unconfirmed && parkKey(obd_result_vector.back()) == 0 && park_marker_owed &&
+        logged("LEASH driving accel act=100% power=12.5kW -> unlatch parked"), "power > 4 kW is DRIVING", t);
+  begin();
+  playCur(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, true, 4.0), t);
+  check(drive_unconfirmed, "exactly 4.0 kW is not above the limit", t);
+  begin();
+  playCur(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, true, -20.0), t);
+  check(drive_unconfirmed, "charging power is not a discharge", t);
+  begin();
+  SmEvent iv = Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, true);
+  iv.current = 30, iv.voltage = 400;
+  playCur(iv, t);
+  check(!is_currently_parked && logged("LEASH driving accel act=100% power=12.0kW -> unlatch parked"),
+        "current x voltage over 4 kW is DRIVING when the frame has no power key", t);
+  begin();
+  iv.current = 30, iv.voltage = NAN;
+  playCur(iv, t);
+  check(drive_unconfirmed, "a current with no voltage cannot confirm", t);
+  enterUnconfirmed();
+  playCur(Advance(5000), t);
+  playCur(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, true, 10.0), t);
+  check(!is_currently_parked && !drive_unconfirmed && park_marker_owed, "UNCONFIRMED + discharge + sustained motion is DRIVING", t);
+
+  // A drive confirmed by accel + discharge alone (no speed PID, no fix) is held by sustained motion while it
+  // lasts, whatever the power: cruising at 2.5 kW must not re-latch it.
+  begin();
+  playCur(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, true, 12.5), t);
+  for (int i = 0; i < 11; ++i) {
+    playCur(Advance(60000), t);
+    playCur(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, true, 2.5), t);
+  }
+  check(!is_currently_parked && sm_freezes == 0 && countLog("LEASH no speed") == 0 && countLog("LEASH driving") == 1,
+        "sustained motion holds DRIVING past ACTIVE_TIMER at 2.5 kW: no flap, no freeze, one LEASH line", t);
+  playCur(Advance(AT), t);
+  playCur(Rules(quiet, SM_CAR_RAIL, SM_MOVE_KEEP, false), t);
+  check(!is_currently_parked, "the hold ends ACTIVE_TIMER after the last sustained-motion poll", t);
+  playCur(Advance(1), t);
+  playCur(Rules(quiet, SM_CAR_RAIL, SM_MOVE_KEEP, false), t);
+  check(is_currently_parked && sm_freezes == 1 && countLog("LEASH no speed for 300s") == 1,
+        "then the normal re-latch fires, with one freeze", t);
+
+  // A speed-less drive confirmed by GNSS + motion keeps going on fresh moving fixes alone: no new gate on continuation.
+  begin();
+  playCur(Rules(fix(40.0), SM_CAR_RAIL, SM_MOVE_NOW, false), t);
+  check(!is_currently_parked, "GNSS with motion starts the drive", t);
+  for (int i = 0; i < 11; ++i) {
+    playCur(Advance(60000), t);
+    playCur(Rules(fix(40.0), SM_CAR_RAIL, SM_MOVE_NONE, false), t);
+  }
+  check(!is_currently_parked && sm_freezes == 0 && countLog("LEASH gnss=") == 0 && countLog("LEASH no speed") == 0,
+        "fresh moving fixes without motion keep a drive going past ACTIVE_TIMER, never refused", t);
+
+  // 4. Charge block: the charge latch keeps sustained motion and GNSS out, and drops UNCONFIRMED to PARKED.
+  begin();
+  playCur(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, true, 12.5, true), t);
+  check(is_currently_parked && !drive_unconfirmed && countLog("LEASH") == 0, "sustained motion while charging stays PARKED", t);
+  playCur(Rules(fix(), SM_CAR_RAIL, SM_MOVE_NOW, false, NAN, true), t);
+  check(is_currently_parked && logged("LEASH gnss=6.0km/h refused reason=charging"), "a moving fix while charging is refused", t);
+  enterUnconfirmed();
+  playCur(Advance(5000), t);
+  playCur(Rules(quiet, SM_CAR_RAIL, SM_MOVE_KEEP, false, NAN, true), t);
+  check(is_currently_parked && !drive_unconfirmed && sm_freezes == 0 && !park_marker_owed &&
+        logged("LEASH unconfirmed charging -> parked"), "the charge latch drops UNCONFIRMED to PARKED, no freeze", t);
+
+  // 5. UNCONFIRMED exit: ACTIVE_TIMER without motion, each motion refreshing it; the idle stage; never a freeze.
+  enterUnconfirmed();
+  playCur(Advance(AT + 1), t);
+  playCur(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, false), t);
+  check(drive_unconfirmed, "a motion hit near the end of the timer keeps UNCONFIRMED", t);
+  playCur(Advance(AT), t);
+  playCur(Rules(quiet, SM_CAR_RAIL, SM_MOVE_KEEP, false), t);
+  check(drive_unconfirmed, "ACTIVE_TIMER after the last motion is still UNCONFIRMED", t);
+  playCur(Advance(1), t);
+  playCur(Rules(quiet, SM_CAR_RAIL, SM_MOVE_KEEP, false), t);
+  check(is_currently_parked && !drive_unconfirmed && sm_freezes == 0 && !park_marker_owed &&
+        logged("LEASH unconfirmed no motion for 300s -> parked") && parkKey(obd_result_vector.back()) == 1,
+        "one ms past ACTIVE_TIMER without motion: PARKED, no PARK marker, no refreeze", t);
+  enterUnconfirmed();
+  playCur(Ladder(SmTo::CHARGING), t);
+  check(is_currently_parked && !drive_unconfirmed && sm_freezes == 0 && !park_marker_owed &&
+        logged("LEASH unconfirmed idle -> parked"),
+        "the idle stage drops UNCONFIRMED to PARKED without a freeze", t);
+  playCur(Advance(AT), t);
+  playCur(Sleep(), t);
+  check(obd_result_vector.size() == 1, "a parked heartbeat after UNCONFIRMED queues no marker", t);
+}
+
 int main(int argc, char** argv) {
   std::string group = "all";
   int depth = 5;  // caught every harness mutant that depth 6 did, in ~3 s; --depth 6 runs the 11 M sequences
@@ -489,8 +661,9 @@ int main(int argc, char** argv) {
     if (arg == "--depth" && i + 1 < argc) depth = std::atoi(argv[++i]);
     else group = arg;
   }
-  if (group != "all" && group != "enumerate" && group != "random" && group != "scenarios" && group != "crash") {
-    std::cerr << "unknown group " << group << " (all, enumerate, random, scenarios, crash)\n";
+  if (group != "all" && group != "enumerate" && group != "random" && group != "scenarios" && group != "crash" &&
+      group != "rules") {
+    std::cerr << "unknown group " << group << " (all, enumerate, random, scenarios, crash, rules)\n";
     return 2;
   }
   using clock = std::chrono::steady_clock;
@@ -515,6 +688,10 @@ int main(int argc, char** argv) {
     crashes(depth);
     std::cout << "PASS: crash (CUR only: scenarios, depth " << depth << " over " << crashAlphabet().size() << " symbols, "
               << crash_leaves << " sequences, 5 seeds x 1000 x 30)\n";
+  }
+  if (group == "all" || group == "rules") {
+    rules();
+    std::cout << "PASS: rules (CUR only: the #6 driving-rule scenarios)\n";
   }
   std::cout << "events compared: " << events << '\n';
 }

@@ -89,6 +89,14 @@ bool logging_message_printed = false; // print message once
 // motion has stopped (see changeState). This is the IMU "smart cheat" - there is no real gear PID.
 // Written only by the drive region (Helpers/drive_state.h), as are g_last_speed_ms and park_marker_owed.
 bool is_currently_parked = true;
+// UNCONFIRMED (#6): the car looks like it is driving (sustained accelerometer motion, car on) but nothing has
+// confirmed it - no speed, no discharge, no fresh GNSS fix with motion. is_currently_parked stays true so every
+// parked-gated guard (the max-awake backstop, is_charging, the pre-sleep marker) keeps treating it as parked;
+// this flag only withholds the is_parked frame key (so no drivingState), publishes the live location instead
+// of the frozen spot and owes no PARK marker. Written only by the drive region (Helpers/drive_state.h).
+bool drive_unconfirmed = false;
+// A GNSS-moving fix was refused this streak and logged once (drive_state.h); cleared when the state changes.
+bool g_drive_gnss_refused = false;
 // Set when a DRIVE frame enters the upload buffer or is relayed over BLE, cleared when the pre-sleep PARK marker is queued: the
 // server has been told DRIVE and not yet PARK. RTC so a trip end that straddles a deep sleep (the mid-drive
 // modem-recovery sleep) is still closed on the next wake, while a parked heartbeat wake owes nothing and opens
@@ -263,6 +271,8 @@ uint8_t g_dc_inferred_polls = 0;  // consecutive inferred-DC polls; one garbage 
 unsigned long g_dc_silent_since_ms = 0;  // millis() a held charge went silent; 0 = answering
 // millis() of the last detectMovement() motion. Not last_active: the console and an unlatch stamp that too.
 unsigned long g_last_motion_ms = 0;
+// millis() of the last poll in which the car answered with any PID (obd_count > 0); 0 = none this wake.
+unsigned long g_last_obd_answer_ms = 0;
 // Anti-runaway latch: set once the cap is hit, forcing the LONG cadence even while the charge signals persist
 // (a stuck rail+current can't keep fast-waking us). Cleared only when the car is genuinely not charging, so
 // the cap actually holds slow instead of resetting and bouncing back to fast every interval.
@@ -1528,7 +1538,7 @@ void loop() {
 
     // Heartbeat back-off bookkeeping: any successful read means the car is responsive -> reset. A heartbeat
     // poke that still finds nothing -> lengthen the interval (see heartbeat_asleep_streak / the gate).
-    if (obd_count > 0) heartbeat_asleep_streak = 0;
+    if (obd_count > 0) { heartbeat_asleep_streak = 0; g_last_obd_answer_ms = millis(); }
     else if (g_sample_poke && heartbeat_asleep_streak < 16) heartbeat_asleep_streak++;
 #if ENABLE_LOGGING
     if (obd_read_attempted) {
@@ -1697,6 +1707,8 @@ void loop() {
     // latch restored, a forgotten connected phone is genuinely bounded by MAX_AWAKE_MINUTES, and plugging in
     // at a charger with the phone connected still detects is_charging.
     // The 0->1 transition freezes the stabilized last-driving fix, as changeState does.
+    // THIRD source (#6): sustained accelerometer motion on a car that is on is UNCONFIRMED, or DRIVING with a discharge.
+    driveAccel(current_frame);
     drivePollEnd();
     // Before is_parked is appended: a frame whose only v2 field would be drivingState is not worth a POST.
     // utc is always present, so this asks the serializer. A location or heading already accepted, or already
@@ -1709,7 +1721,8 @@ void loop() {
 #else
     bool frame_has_data = !current_frame.empty();
 #endif
-    current_frame.emplace_back("is_parked", is_currently_parked ? 1.0 : 0.0);
+    // UNCONFIRMED says nothing: no is_parked key, so v2 has no drivingState and the CSV cell is empty.
+    if (!drive_unconfirmed) current_frame.emplace_back("is_parked", is_currently_parked ? 1.0 : 0.0);
 
     // Feature A - is_charging from the current PID's sign. Charging pushes current INTO the battery (negative,
     // ~-51A); discharge/idle is >= 0. Gate on parked so a drive's regen braking isn't mislabeled. Per-frame.

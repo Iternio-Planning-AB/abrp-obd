@@ -59,3 +59,49 @@ void motionStatsLine(char* buf, size_t len, const MotionStats& m, bool parked, b
     m.total_ms ? (unsigned)((m.active_ms * 100ULL + m.total_ms / 2) / m.total_ms) : 0U, (unsigned)m.n, (m.last_ms - m.start_ms) / 1000UL,
     m.peak, m.n ? m.sum / m.n : 0.0f, m.axmax, m.obd ? 1 : 0, parked ? 1 : 0, chg ? 1 : 0);
 }
+
+// Rolling accumulator behind the drive rules' "sustained motion" (#6): a ring of 5 s buckets of sampled and
+// active time, fed by every sampled detectMovement window (the same dt rule as MotionStats), judged over the
+// last window_ms. Independent of ENABLE_LOGGING; a bucket from an earlier lap is skipped by its id.
+static const unsigned long DRIVE_MOTION_BUCKET_MS = 5000UL;
+// The +1: the current bucket is partly filled, so the window still has a full DRIVE_SUSTAINED_WINDOW_MS behind it.
+static const unsigned DRIVE_MOTION_BUCKETS = DRIVE_SUSTAINED_WINDOW_MS / DRIVE_MOTION_BUCKET_MS + 1;
+static_assert(DRIVE_SUSTAINED_WINDOW_MS % DRIVE_MOTION_BUCKET_MS == 0, "the window is a whole number of buckets");
+
+struct DriveMotion {
+  uint32_t id[DRIVE_MOTION_BUCKETS] = {};  // now / DRIVE_MOTION_BUCKET_MS of the bucket's contents
+  uint32_t total_ms[DRIVE_MOTION_BUCKETS] = {};
+  uint32_t active_ms[DRIVE_MOTION_BUCKETS] = {};
+  unsigned long last_ms = 0;
+  bool seen = false;
+};
+
+void motionAccumulate(DriveMotion& m, bool sampled, bool active, uint32_t window_ms, unsigned long now) {
+  if (!sampled) return;
+  uint32_t dt = window_ms ? window_ms : 1;
+  if (m.seen) dt = now - m.last_ms < MOTION_GAP_CAP_MS ? now - m.last_ms : MOTION_GAP_CAP_MS;
+  m.seen = true;
+  m.last_ms = now;
+  const uint32_t id = (uint32_t)(now / DRIVE_MOTION_BUCKET_MS);
+  const unsigned slot = id % DRIVE_MOTION_BUCKETS;
+  if (m.id[slot] != id) {
+    m.id[slot] = id;
+    m.total_ms[slot] = m.active_ms[slot] = 0;
+  }
+  m.total_ms[slot] += dt;
+  if (active) m.active_ms[slot] += dt;
+}
+
+// Sustained: at least DRIVE_SUSTAINED_MIN_SAMPLED_MS sampled over the window, DRIVE_SUSTAINED_ACT_PCT of it active.
+// act_out gets the active share, rounded, for the log line.
+bool motionSustained(const DriveMotion& m, unsigned long now, unsigned* act_out = nullptr) {
+  const uint32_t id = (uint32_t)(now / DRIVE_MOTION_BUCKET_MS);
+  uint64_t sampled = 0, active = 0;
+  for (unsigned slot = 0; slot < DRIVE_MOTION_BUCKETS; ++slot) {
+    if (id - m.id[slot] >= DRIVE_MOTION_BUCKETS) continue;
+    sampled += m.total_ms[slot];
+    active += m.active_ms[slot];
+  }
+  if (act_out) *act_out = sampled ? (unsigned)((active * 100 + sampled / 2) / sampled) : 0U;
+  return sampled >= DRIVE_SUSTAINED_MIN_SAMPLED_MS && active * 100 >= (uint64_t)DRIVE_SUSTAINED_ACT_PCT * sampled;
+}

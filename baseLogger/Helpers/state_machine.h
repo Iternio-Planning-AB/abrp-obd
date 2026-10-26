@@ -225,8 +225,12 @@ void handleActivityState() {
   } else {
     active = detectMovement(500);
   }
-#if ENABLE_MEMS && ENABLE_LOGGING
-  noteMotionWindow(!g_ota_active && !g_logdump_active && current_state != UNINITIALIZED, active);
+#if ENABLE_MEMS
+  const bool motion_sampled = !g_ota_active && !g_logdump_active && current_state != UNINITIALIZED;
+  noteDriveMotionWindow(motion_sampled, active);
+#if ENABLE_LOGGING
+  noteMotionWindow(motion_sampled, active);
+#endif
 #endif
   auto now = millis();
 
