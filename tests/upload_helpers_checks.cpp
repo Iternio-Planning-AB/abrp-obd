@@ -163,7 +163,8 @@ void reset() {
     last_clock_sync_epoch = rtc.epoch;
     clock_after_gzip = 0; sync_after_gzip = -1;
     LittleFS.files.clear(); LittleFS.fail_open = false;
-    LittleFS.other_used = 0; LittleFS.enforce_capacity = false; LittleFS.write_lines = SIZE_MAX;
+    LittleFS.other_used = 0; LittleFS.enforce_capacity = false;
+    LittleFS.write_lines = LittleFS.keep_lines = SIZE_MAX;
     LittleFS.read_observer = nullptr;
     network.response_epochs.clear();
     network.sent.clear(); network.headers.clear(); network.codes.clear(); network.uart = CFreematics{};
@@ -586,6 +587,23 @@ void bleHandover() {
     check(saveUploadBacklog() && park_marker_owed && events("BACKLOG write failed at 2 of 5").size() == 1,
           "a write that fails stops the save and re-arms a marker it lost");
     LittleFS.write_lines = SIZE_MAX;
+
+    // A buffered File reports success for lines a failed flush loses: the size check after close finds them.
+    reset();
+    for (unsigned i = 0; i < 4; ++i) obd_result_vector.push_back(frame(i));
+    obd_result_vector.push_back(parkMarker());
+    LittleFS.keep_lines = 3;
+    check(saveUploadBacklog() && park_marker_owed && events("BACKLOG write failed at 3 of 5").size() == 1 &&
+          events("BACKLOG saved 3 unsent").size() == 1, "lines lost without an error are found after close");
+    LittleFS.keep_lines = SIZE_MAX;
+
+    // A relay spill is all or nothing: past the budget the queue stays in PSRAM.
+    reset();
+    for (unsigned i = 0; i < 10; ++i) obd_result_vector.push_back(frame(i));
+    LittleFS.other_used = LittleFS.capacity - BACKLOG_FS_RESERVE - lineBytes(frame(9));
+    spillUploadBacklog();
+    check(obd_result_vector.size() == 10 && upload_spilled == 0 && !LittleFS.exists("/upload_backlog.jsonl") &&
+          events("reason=fs").empty(), "a spill that does not fit leaves the queue in RAM");
 
     reset();
     g_upload_held = {frame(10)};

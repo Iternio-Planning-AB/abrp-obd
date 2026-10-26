@@ -459,8 +459,10 @@ PSRAM ballasted to ~80 KB above the reserve, 300 frames settle at ~50 kept, the 
 
 The backlog file shares LittleFS with the flash log, whose rotation keeps ~384 KB free. `saveUploadBacklog` writes
 at most what is free above `BACKLOG_FS_RESERVE`; past that the oldest frames are left out (`UPLOAD discarded n=…
-reason=fs`), so the trip-end marker, queued last, is kept, and a write that still fails ends the save (`BACKLOG write
-failed at`), re-arming the marker debt if the marker was lost. A full queue's file is ~260 KB: ~5.7 s to write at
+reason=fs`), so the trip-end marker, queued last, is kept. A write that still fails ends the save (`BACKLOG write
+failed at`), and since `File` buffers, the file's size is checked after close to catch a failed final flush; lost
+frames re-arm the marker debt if the marker was among them. A relay spill writes all of the queue or none of it, so
+a queue that does not fit stays in PSRAM. A full queue's file is ~260 KB: ~5.7 s to write at
 sleep and ~7.3 s to read at the next polling wake, which a parked offline car pays on every polling wake.
 
 **A frame older than 6 days is dropped from the queue** (#67). Parked history that old is worth little next to the

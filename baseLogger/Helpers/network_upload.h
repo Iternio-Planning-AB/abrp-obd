@@ -513,10 +513,12 @@ void logUploadCapped() {
 // Called from enterDeepSleep AFTER the flush attempt, before an OTA reboot, and to spill. Overwrite semantics
 // are correct: the RAM buffer already contains any previously-loaded backlog (the file is deleted at load).
 // Only a spill from this wake can still be in the file, and it is older than RAM, so RAM goes behind it.
-// The file takes at most what LittleFS has free above BACKLOG_FS_RESERVE. Past that the oldest frames are not saved
-// (reason=fs), so the newest, the trip-end marker among them, are the ones kept; a write that still fails ends the
-// save there. Lost frames re-arm the marker debt if the marker is among them.
-bool saveUploadBacklog() {
+// The file takes at most what LittleFS has free above BACKLOG_FS_RESERVE (a file being overwritten still counts as
+// used: littlefs keeps its blocks until the new one is synced). Past that the oldest frames are not saved
+// (reason=fs), so the newest, the trip-end marker among them, are the ones kept; `whole` saves nothing then and
+// leaves RAM as it is. A write that fails ends the save, and the file's size is checked after close, since File
+// buffers and a failed final flush is not reported. Lost frames re-arm the marker debt if the marker is among them.
+static bool writeUploadBacklog(bool whole) {
   logUploadCapped();
   const size_t held_count = g_upload_held.size();
   const size_t frame_count = held_count + obd_result_vector.size();
@@ -524,50 +526,57 @@ bool saveUploadBacklog() {
   auto frameAt = [&](size_t i) -> const OBDVector& {
     return i < held_count ? g_upload_held[i] : obd_result_vector[i - held_count];
   };
-  size_t replaced = 0; // an older file this save overwrites: its bytes count as free
-  if (!upload_spilled && LittleFS.exists(UPLOAD_BACKLOG_PATH)) {
-    File old = LittleFS.open(UPLOAD_BACKLOG_PATH, "r");
-    if (old) { replaced = old.size(); old.close(); }
-  }
+  auto lineBytes = [&](size_t i) { return encodeUploadFrame(frameAt(i)).dump().size() + 2; }; // println's CR LF
   const size_t total = LittleFS.totalBytes(), used = LittleFS.usedBytes();
-  const size_t free_bytes = (total > used ? total - used : 0) + replaced;
+  const size_t free_bytes = total > used ? total - used : 0;
   const size_t budget = free_bytes > BACKLOG_FS_RESERVE ? free_bytes - BACKLOG_FS_RESERVE : 0;
   size_t first = frame_count, bytes = 0;
   while (first) {
-    const size_t line = encodeUploadFrame(frameAt(first - 1)).dump().size() + 2; // println's CR LF
+    const size_t line = lineBytes(first - 1);
     if (bytes + line > budget) break;
     bytes += line;
     --first;
   }
+  if (first && whole) return false;
   auto lost = [&](size_t from, size_t to) {
-    for (size_t i = from; i < to; ++i)
-      uploadFrameLost(frameAt(i));
+    for (size_t i = from; i < to; ++i) uploadFrameLost(frameAt(i));
   };
   if (first) {
     lost(0, first);
     logEvent("UPLOAD discarded n=%u reason=fs free=%u", (unsigned)first, (unsigned)free_bytes);
   }
   if (first == frame_count) return true;
+  size_t before = 0; // an appended file's bytes already there
+  if (upload_spilled && LittleFS.exists(UPLOAD_BACKLOG_PATH)) {
+    File old = LittleFS.open(UPLOAD_BACKLOG_PATH, "r");
+    if (old) { before = old.size(); old.close(); }
+  }
   File f = LittleFS.open(UPLOAD_BACKLOG_PATH, upload_spilled ? "a" : "w");
   if (!f) { Serial.printf("Backlog: open for write failed\n"); return false; }
   size_t written = first;
   for (; written < frame_count; ++written)
     if (!f.println(encodeUploadFrame(frameAt(written)).dump().c_str())) break;
   f.close();
-  if (written < frame_count) {
-    lost(written, frame_count);
-    logEvent("BACKLOG write failed at %u of %u", (unsigned)(written - first), (unsigned)(frame_count - first));
+  size_t on_flash = 0;
+  if (File check = LittleFS.open(UPLOAD_BACKLOG_PATH, "r")) { on_flash = check.size(); check.close(); }
+  size_t kept = first;
+  for (size_t at = before; kept < written && at + lineBytes(kept) <= on_flash; ++kept) at += lineBytes(kept);
+  if (kept < frame_count) {
+    lost(kept, frame_count);
+    logEvent("BACKLOG write failed at %u of %u", (unsigned)(kept - first), (unsigned)(frame_count - first));
   }
-  Serial.printf("Backlog: %d unsent frame(s) persisted to flash\n", (int)(written - first));
-  logEvent("BACKLOG saved %d unsent frame(s)", (int)(written - first));
+  Serial.printf("Backlog: %d unsent frame(s) persisted to flash\n", (int)(kept - first));
+  logEvent("BACKLOG saved %d unsent frame(s)", (int)(kept - first));
   return true;
 }
 
-// Parks the queue in the backlog file while a phone relays (pairing, profile push, OTA, log dump). Frames are in PSRAM
-// (obd_vector.h), so this frees no internal heap; a full queue costs ~6 s of flash writes.
+bool saveUploadBacklog() { return writeUploadBacklog(false); }
+
+// Parks the queue in the backlog file while a phone relays (pairing, profile push, OTA, log dump), only if all of it
+// fits. Frames are in PSRAM (obd_vector.h), so this frees no internal heap; a full queue costs ~6 s of flash writes.
 void spillUploadBacklog() {
   const size_t n = obd_result_vector.size() + g_upload_held.size();
-  if (!n || !saveUploadBacklog()) return;
+  if (!n || !writeUploadBacklog(true)) return;
   obd_result_vector.clear();
   g_upload_held.clear();
   upload_spilled += n;

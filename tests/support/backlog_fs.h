@@ -30,12 +30,15 @@ struct File {
   }
   size_t* room = nullptr; // bytes the filesystem can still take, when the test sets a capacity
   size_t* lines_left = nullptr; // writes that still succeed, when the test makes them fail
-  size_t println(const char* value) {
-    const size_t n = std::strlen(value) + 1;
+  size_t* kept_left = nullptr;  // writes that still reach flash; past them println reports success, as a buffered File
+  size_t println(const char* value) { // CR LF, as Arduino's Print
+    const size_t n = std::strlen(value) + 2;
     if (room && *room < n) return 0;
     if (lines_left && !(*lines_left)--) return 0;
+    if (kept_left && !*kept_left) return n;
+    if (kept_left) --*kept_left;
     if (room) *room -= n;
-    *data += std::string(value) + '\n';
+    *data += std::string(value) + "\r\n";
     return n;
   }
   size_t print(const char* value) { *data += value; return std::strlen(value); }
@@ -52,6 +55,7 @@ struct FakeLittleFS {
   size_t room = 0;
   bool enforce_capacity = false; // writes past the capacity fail, as on a full filesystem
   size_t write_lines = SIZE_MAX;  // println succeeds this many times per open, then fails
+  size_t keep_lines = SIZE_MAX;   // println reaches flash this many times per open, then is lost unreported
   size_t usedBytes() const {
     size_t n = other_used;
     for (const auto& file : files) n += file.second->size();
@@ -65,6 +69,7 @@ struct FakeLittleFS {
     if (!exists(path)) return File{};
     File file{files.at(path), 0, read_observer};
     if (write_lines != SIZE_MAX) file.lines_left = &write_lines;
+    if (keep_lines != SIZE_MAX) file.kept_left = &keep_lines;
     if (enforce_capacity) {
       room = capacity > usedBytes() ? capacity - usedBytes() : 0;
       file.room = &room;
