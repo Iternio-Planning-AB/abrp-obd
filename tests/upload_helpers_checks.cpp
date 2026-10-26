@@ -413,10 +413,15 @@ void queue() {
 
     reset();
     heap_fixture_enabled = true;
-    heap_fixture_free = 33100;
-    heap_fixture_maxblock = 40000;
     obd_result_vector = {{{"utc", 1791112000}, {"is_parked", 1}}};
-    const bool marker_admitted = queueUploadFrame(obd_result_vector, frame(1));
+    const OBDVector incoming = frame(1);
+    size_t copy_bytes = incoming.size() * sizeof(OBDVector::value_type) + 16;
+    for (const auto& value : incoming) copy_bytes += value.first.size() + 1 + 16;
+    const size_t outer_bytes = obd_result_vector.capacity() * sizeof(OBDVector) + 16;
+    // Budget the conservative ABI-sized copy to fit exactly after the old marker is evicted.
+    heap_fixture_free = UPLOAD_MIN_FREE_HEAP + outer_bytes + copy_bytes;
+    heap_fixture_maxblock = 40000;
+    const bool marker_admitted = queueUploadFrame(obd_result_vector, incoming);
     check(marker_admitted && park_marker_owed && obd_result_vector.size() == 1 &&
           upload_heap_dropped == 1,
           "heap marker eviction: admitted=" + std::to_string(marker_admitted) +
