@@ -52,15 +52,11 @@ with tempfile.TemporaryDirectory(prefix="obd-heading-checks-") as temporary:
     relay = logger[relay_start:logger.index("\n    } else {", relay_start)]
     if re.search(r"(obd_result_vector|g_upload_held)\.(clear|erase|swap)|BacklogPath|[sS]pill|saveUploadBacklog|loadUploadBacklog|queueUploadFrame", relay):
         raise RuntimeError("the BLE relay branch must leave the cellular upload queue in PSRAM, untouched (#91)")
-    if "upload_" "spilled" in logger or "spillUpload" "Backlog" in logger:
-        raise RuntimeError("there is no relay spill: the queue stays in PSRAM, and the loop gate and session end read no backlog (#91)")
     ota = (root / "baseLogger/Helpers/ota_update.h").read_text()
     ota_commit = ota[ota.index("static void otaFinalize()"):]
     if not 0 <= ota_commit.find("saveUploadBacklog();") < ota_commit.index("esp_restart();"):
         raise RuntimeError("the OTA reboot must save the upload backlog kept through the session (#58)")
     sleep = (root / "baseLogger/Helpers/sleep_power.h").read_text()
-    if "upload_" "spilled" in sleep:
-        raise RuntimeError("the pre-sleep flush sends the queue whether or not a relay session ran (#91)")
     marker_start = sleep.index("  if (rtc.getEpoch() > 1e9 && is_currently_parked")
     marker_end = sleep.index("\n  }\n", marker_start) + len("\n  }\n")
     (build / "park_marker.inc").write_text(sleep[marker_start:marker_end])

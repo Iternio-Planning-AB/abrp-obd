@@ -237,7 +237,7 @@ int main() {
     applyPending();
     obd_result_vector = {{{"utc", 1}, {"soc", 50}}};
     LittleFS.files["/upload_backlog.jsonl"] = std::make_shared<std::string>("{}\n");
-      frozen_valid = true;
+    frozen_valid = true;
     push(profile, "token-k", 23); // waiting for the loop
     datalogger.result = *stuck ? 3 : -1;
     LittleFS.fail_remove = stuck;

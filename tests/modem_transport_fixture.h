@@ -146,12 +146,13 @@ protected:
     CELL_TYPE m_type = CELL_SIM7600;
 };
 
+inline bool g_fixture_session_opens = false; // a test sets it for the connect() that must succeed
 class HTTPClientSIM : public CellSIMCOM {
 public:
     bool setup(const char* apn, unsigned int timeout = 30000);
     void end() override;
     HTTP_STATES state() const { return HTTP_DISCONNECTED; }
-    bool open(const char*, unsigned) { return false; }
+    bool open(const char*, unsigned) { return g_fixture_session_opens; }
     bool close() { return true; }
     bool setHeaders(const HeaderVector&) { return false; }
     void setCaBundle(const uint8_t*, size_t) {}

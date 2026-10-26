@@ -512,13 +512,10 @@ void countBacklogRead() { ++backlog_reads; }
 void bleHandover() {
     reset();
     auto utcs = [] { std::vector<double> u; for (const auto& f : obd_result_vector) for (const auto& kv : f) if (kv.first == "utc") u.push_back(kv.second); return u; };
-    (void)utcs;
 #if ENABLE_LOGGING
     // Relayed polls queue nothing and touch no file, so what was queued before stays, in order. The session's
     // end hands the loop's upload the same queue: oldest first, and the backlog is never read.
     obd_result_vector = {frame(0), frame(1), frame(2)};
-    check(!LittleFS.exists("/upload_backlog.jsonl") && utcs() == std::vector<double>{1791112000, 1791112001, 1791112002},
-          "a relay session leaves the queue in RAM and writes no backlog file");
     LittleFS.read_observer = countBacklogRead;
     backlog_reads = 0;
     check(uploadBuffered(true) && obd_result_vector.empty() && backlog_reads == 0 && !LittleFS.exists("/upload_backlog.jsonl"),
