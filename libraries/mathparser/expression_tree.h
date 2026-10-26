@@ -285,6 +285,13 @@ private:
   NodePtr var1_;
 };
 
+class EqualNode : public BinaryOperationNode
+{
+public:
+  using BinaryOperationNode::BinaryOperationNode;
+  double evaluate() const override;
+};
+
 class IfGreaterThanNode : public Node
 {
 public:

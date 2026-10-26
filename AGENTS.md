@@ -378,8 +378,13 @@ a failed retry until the command decodes, the 220105 capture keeping the first r
 that threw part-way through being applied. `failures` covers what `readPIDs()` keeps for the `OBDFAIL` log (#85): a
 refused AT filter, no data, a refusal, an out-of-range value and a reply too short for its equation, each with the
 command's index and reply, cleared each poll. It also covers `loop()`'s logging block, compiled from `logger.ino`:
-once per command, 4 a poll, again after a new profile. Fixtures are
-scrubbed co-processor replies; the co-processor itself is not exercised.
+once per command, 4 a poll, only on a poll the car answered, the 8 slots kept for commands not yet logged, again
+after a new profile. `profile` runs the app's MEB SoC cases (`MEBsw6.test.ts`, 11 replies
+including the missing-reply fallbacks) through the real `readPIDs()` and expects the app's numbers: virtual `VAL{}`
+keys in any order with min/max clamping, multi-command keys, missing bytes as NaN, the multi-frame index digit,
+`==` and refused `!=`, and the parser refusing a function it has no node for. Fixtures are
+scrubbed co-processor replies (the MEB ones are the app's, with their line breaks put back); the co-processor
+itself is not exercised.
 
 ## Profile push checks
 

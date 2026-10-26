@@ -259,11 +259,21 @@ std::vector<int> genericProtocol(std::string data, std::string protocol, const s
 
   std::vector<int> obdVariables{};
   data.erase(remove_if(data.begin(), data.end(), isspace), data.end());
-  data.erase(std::remove(data.begin(), data.end(), ':'), data.end());
   auto npos = std::string::npos;
   auto updatedCommandLen = 6;
 
   if (protocol != "6") {
+    // A multi-frame reply with headers off comes auto-formatted: "00B" (the length), then "0:622AB8000007",
+    // "1:5200000000AAAA" and so on. Drop the length and each frame's index digit with its colon, as the app does;
+    // removing only the colons left each index digit in the payload and shifted every byte after frame 0 by a nibble.
+    const size_t first = data.find(':');
+    if (first != npos) {
+      std::string joined;
+      size_t from = first + 1;
+      for (size_t colon; (colon = data.find(':', from)) != npos; from = colon + 1)
+        joined += data.substr(from, colon > from ? colon - from - 1 : 0);
+      data = joined + data.substr(from);
+    }
 
     auto commandIndex = -1;
     auto commandIndex62 = data.find("62");
@@ -285,6 +295,7 @@ std::vector<int> genericProtocol(std::string data, std::string protocol, const s
   }
 
   else {
+    data.erase(std::remove(data.begin(), data.end(), ':'), data.end());
     auto identifier = data.substr(0, 3);
     auto len = stoi(data.substr(3, 2), 0, 16);
     std::string payload{};
@@ -397,6 +408,31 @@ void OBDWrapper::testPIDLoop() {
   delay(5000);
 }
 
+// A key's command is one command or a comma-separated list ("22028C,222AB8"): the key is evaluated on the reply to
+// each, as the app does.
+static bool commandListed(const json& command, const std::string& pid) {
+  if (!command.is_string()) return false;
+  const std::string& list = command.get_ref<const std::string&>();
+  size_t start = 0;
+  while (start <= list.size()) {
+    size_t end = list.find(',', start);
+    if (end == std::string::npos) end = list.size();
+    size_t a = start, b = end;
+    while (a < b && list[a] == ' ') ++a;
+    while (b > a && list[b - 1] == ' ') --b;
+    if (list.compare(a, b - a, pid) == 0 && b - a == pid.size()) return true;
+    start = end + 1;
+  }
+  return false;
+}
+
+// A later reply's value replaces an earlier one for the same key, as the app merges a poll's replies.
+static void putResult(OBDVector& results, const std::string& key, double value) {
+  for (auto& r : results)
+    if (r.first == key) { r.second = value; return; }
+  results.emplace_back(key, value);
+}
+
 // Read a JSON field that may be a number (Scenic profile) or a quoted string (older profiles) as a double.
 static double jsonToDouble(const json& j) {
   if (j.is_number()) return j.get<double>();
@@ -442,7 +478,7 @@ OBDVector OBDWrapper::readPIDs(bool print) {
     for (const auto& j : vehicle_commands.items()) {
       const auto& value = j.value();
       if (!value.is_object() || !value.contains("command") || !value.contains("equation")) continue;
-      if (value["command"] != pid_string) continue;
+      if (!commandListed(value["command"], pid_string)) continue;
       // A profile error, not a reading. get<std::string>() on a non-string would throw, and an
       // exception out of readPIDs reboots the dongle on every wake with the profile persisted.
       // Length-capped too: the parser recurses per term, so a huge equation overflows the loop stack.
@@ -586,7 +622,7 @@ OBDVector OBDWrapper::readPIDs(bool print) {
       if (vc.contains("maxValue") && res > jsonToDouble(vc["maxValue"])) in_range = false;
       if (in_range) {
         decoded++;
-        results.push_back(std::make_pair(key, res));
+        putResult(results, key, res);
         if (key == "soc") { have_soc = true; low_soc = res == 0.5; }
         else if (key == "soh") have_soh = true;
       } else {
@@ -609,8 +645,76 @@ OBDVector OBDWrapper::readPIDs(bool print) {
   }
 
   pollStandardFallback(results, protocol);
+  evaluateVirtualKeys(results);
 
   return results;
+}
+
+// The VAL{name} inputs an equation names.
+static std::vector<std::string> valInputs(const std::string& equation) {
+  std::vector<std::string> names;
+  for (size_t i = 0; i + 4 <= equation.size(); ++i) {
+    if (tolower((unsigned char)equation[i]) != 'v' || tolower((unsigned char)equation[i + 1]) != 'a' ||
+        tolower((unsigned char)equation[i + 2]) != 'l' || equation[i + 3] != '{') continue;
+    const size_t close = equation.find('}', i + 4);
+    if (close == std::string::npos) break;
+    names.push_back(equation.substr(i + 4, close - i - 4));
+    i = close;
+  }
+  return names;
+}
+
+// Virtual keys (isVirtual, an equation over other keys' VAL{name}, no reply of their own; MEB's soc is one). The
+// app evaluates them over a poll's merged values after the poll (postProcessTlm), and so does this, so a profile
+// reads the same through either. A key whose inputs did not all arrive is skipped, as the app's throw skips it.
+// The result is clamped to the key's min/max, as the app clamps, and a non-finite one is dropped. One virtual key
+// may read another, in any order: each pass evaluates those whose inputs are all there.
+void OBDWrapper::evaluateVirtualKeys(OBDVector& results) {
+  if (results.empty()) return;  // the car did not answer: nothing to compute from, as the app returns early too
+  struct Virtual { std::string key, equation; const json* spec; };
+  std::vector<Virtual> pending;
+  for (const auto& j : vehicle_commands.items()) {
+    const auto& value = j.value();
+    if (!value.is_object() || !value.contains("isVirtual") || value["isVirtual"] != true) continue;
+    if (!value.contains("equation") || !value["equation"].is_string() ||
+        value["equation"].get<std::string>().empty() || value["equation"].get<std::string>().size() > 512) {
+      drop_eval++;  // a profile error, as in readPIDs
+      continue;
+    }
+    pending.push_back({ j.key(), value["equation"].get<std::string>(), &value });
+  }
+  auto present = [&](const std::string& name) {
+    for (const auto& r : results) if (r.first == name) return true;
+    return false;
+  };
+  for (bool progress = true; progress && !pending.empty();) {
+    progress = false;
+    for (size_t i = 0; i < pending.size();) {
+      const Virtual& v = pending[i];
+      bool ready = true;
+      for (const auto& name : valInputs(v.equation)) ready = ready && present(name);
+      if (!ready) { ++i; continue; }
+      double res{};
+      bool ok = true;
+      try {
+        res = parser.parse(v.equation, std::vector<int>{}, &results)->evaluate();
+      }
+      catch (...) {
+        ok = false;
+      }
+      if (!ok || !std::isfinite(res)) {
+        Serial.printf("Dropped virtual %s\n", v.key.c_str());
+        drop_eval++;
+      } else {
+        const json& spec = *v.spec;
+        if (spec.contains("min") && res < jsonToDouble(spec["min"])) res = jsonToDouble(spec["min"]);
+        if (spec.contains("max") && res > jsonToDouble(spec["max"])) res = jsonToDouble(spec["max"]);
+        putResult(results, v.key, res);
+      }
+      pending.erase(pending.begin() + i);
+      progress = true;
+    }
+  }
 }
 
 // ======================================================================

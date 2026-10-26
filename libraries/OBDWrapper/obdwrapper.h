@@ -122,6 +122,7 @@ private:
   /* Fill missing universal speed/ext_temp via standard Mode 01 PIDs on the
      functional broadcast address, then restore the profile's ELM state */
   void pollStandardFallback(OBDVector& results, const std::string& protocol);
+  void evaluateVirtualKeys(OBDVector& results);
 };
 
 #endif

@@ -12,7 +12,11 @@
 #define PARSER_H
 
 #include "expression_tree.h"
+#include <utility>
 #include <vector>
+
+// Named values VAL{name} reads: a poll's results so far, the newest last.
+using ParserValues = std::vector<std::pair<std::string, double>>;
 
 struct Token {
   enum TYPE {
@@ -52,9 +56,13 @@ public:
   // Parses the expression and returns an expression tree
   NodePtr parse(const std::string& expression, const std::vector<int>& variables);
 
+  // As above, with VAL{name} taken from values (the last entry of that name). A name it lacks throws.
+  NodePtr parse(const std::string& expression, const std::vector<int>& variables, const ParserValues* values);
+
 private:
   // Splits the expression into tokens
-  std::vector<Token> tokenize(const std::string& expression, const std::vector<int>& variables);
+  std::vector<Token> tokenize(const std::string& expression, const std::vector<int>& variables,
+                              const ParserValues* values);
 
   //Creates outputStack in RPN according to shunting yard algorithm
   std::vector<Token> buildStack(const std::vector<Token>& tokens);

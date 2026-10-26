@@ -1497,6 +1497,10 @@ void loop() {
 #endif
 #endif
     int obd_count = (int)current_frame.size(); // PIDs returned this reading (0 = car asleep / no answer)
+    // is_parked is the drive latch's, appended below; a profile's own (MEB B==8) would put a second, disagreeing one
+    // in the frame. Counted above: it is still the car answering.
+    current_frame.erase(std::remove_if(current_frame.begin(), current_frame.end(),
+      [](const std::pair<std::string, double>& r) { return r.first == "is_parked"; }), current_frame.end());
 #if ENABLE_MEMS && ENABLE_LOGGING
     if (obd_count > 0) motion_stats.obd = true;
 #endif
