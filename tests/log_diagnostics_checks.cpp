@@ -90,6 +90,7 @@ struct Filesystem {
   std::set<std::string> failed_reads, failed_appends;
   std::map<std::string, int> opens; // file opens per path, so a check can prove a segment was never read
   bool mount_ok = true;
+  bool fail_dir = false; // the root listing will not open
   size_t capacity = 8 * 1024 * 1024;
   bool begin(bool) { return mount_ok; }
   size_t totalBytes() const { return capacity; }
@@ -99,9 +100,15 @@ struct Filesystem {
     return size;
   }
   bool exists(const char* path) const { return files.count(path) != 0; }
-  bool remove(const char* path) { return files.erase(path) != 0; }
+  std::vector<std::string> removed;
+  std::set<std::string> failed_removes;
+  bool remove(const char* path) {
+    removed.push_back(path);
+    return !failed_removes.count(path) && files.erase(path) != 0;
+  }
   File open(const char* path, const char* mode = "r") {
     if (std::strcmp(path, "/") == 0) {
+      if (fail_dir) return {};
       File directory;
       directory.handle = std::make_shared<File::Handle>();
       directory.handle->directory = true;
@@ -406,8 +413,27 @@ void fwBuildChecks() {
   check(datalogger.writeLine("z") && LittleFS.files.size() == 3 && LittleFS.files.at("/log0002.csv") == head + line + "z\n",
         "the next row rotates, and the build line is not undercounted");
 
-  datalogger.clearAll();
+  LittleFS.removed.clear();
+  check(datalogger.clearAll() == 3, "CLEAR counts the segments it removed");
+  check(LittleFS.removed == std::vector<std::string>{"/log0002.csv", "/log0001.csv", "/log0000.csv"},
+        "newest first, so a power cut part-way drops the recent history first");
   check(LittleFS.files.size() == 1 && LittleFS.files.at("/log0000.csv") == head + line, "CLEAR restarts with the build line");
+  datalogger.writeLine("x");
+  LittleFS.failed_removes = {"/log0000.csv"};
+  check(datalogger.clearAll() == -1, "a segment that cannot be removed fails the clear, so a key reset can keep its key");
+  LittleFS.failed_removes.clear();
+  datalogger.clearAll();
+  LittleFS.files["/log0001.csv"] = head + line;
+  LittleFS.files["/log0002.csv"] = head + line;
+  LittleFS.failed_removes = {"/log0002.csv"};
+  check(datalogger.clearAll() == -1 && datalogger.writeLine("w") && LittleFS.files.at("/log0002.csv") == head + line + "w\n",
+        "after a failed clear the log goes on in the segment that stayed, so it stays in order");
+  LittleFS.failed_removes.clear();
+  datalogger.clearAll();
+  LittleFS.fail_dir = true;
+  check(datalogger.clearAll() == -1 && LittleFS.files.count("/log0000.csv"), "a root that cannot be listed is not an erased log");
+  LittleFS.fail_dir = false;
+  datalogger.clearAll();
 
   host_running_partition = nullptr;
   logFwBuild();
@@ -649,6 +675,7 @@ void dumpSinceChecks() {
     Stream none;
     unmounted.dumpSince(none, 0);
     check(none.bytes == "[log] not mounted\n", "an unmounted log says so, as DUMP does");
+    check(unmounted.clearAll() == -1, "an unmounted log is not an erased one: a key reset keeps its key");
   }
 
   int newest = -1;

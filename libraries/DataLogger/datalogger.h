@@ -40,7 +40,7 @@ public:
   // dumpSince in datalogger.cpp). Segments that end before `since` are not read.
   struct SinceStats { int start = -1; int cut = -1; size_t sent = 0; }; // segment indexes; -1 = none
   SinceStats dumpSince(Stream& out, uint32_t since);
-  void clearAll();         // delete all segments and start fresh
+  int clearAll();          // delete all segments (newest first) and start fresh; how many went, -1 if any stayed
   void printStats(Stream& out);
 
   // Random-access read view over the same oldest->newest byte stream dump() produces, for the BLE log

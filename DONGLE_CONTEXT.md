@@ -166,7 +166,17 @@ profile write.
   keep, and every other holder is locked out. (It must always mint fresh — re-pushing known secrets
   destroys revocation.) It and the in-app key reset also forget the vehicle: profile file, stored hash,
   push token and upload queue (`PROFILE forgotten`), so polling and upload wait for the next owner's push.
-  AUTHCLEAR also ends the grant of a session already open. Neither wipes the diagnostic flash log.
+  AUTHCLEAR also ends the grant of a session already open. Both erase the flash log too (newest segment first,
+  before the key goes, so a power cut part-way leaves a reset that can be repeated) and end a log dump or update the
+  revoked session had running (`err:ended`, OTA `ABORTED`/`NOAUTH`); serial AUTHCLEAR is refused during either, like
+  CLEAR. The fresh log opens with `PROFILE forgotten (authreset|authclear) - log erased (N segments) …` after the
+  header and `FW build=` line. If a segment, the profile file or the backlog file cannot be removed (or the log is not
+  mounted or cannot be listed) the reset fails (`{"auth":"error"}`, or `AUTHCLEAR FAILED` on serial) with the key and
+  token kept, so it can be repeated. An in-app reset on a dongle with no key, such as a repeat after a reply lost on a
+  slow erase, still answers `reset`. The files are deleted,
+  not scrubbed: a raw read of the flash chip can still recover them, and a reset does not touch the coredump
+  partition, BLE bonds (`BONDCLEAR`), the OBD-alarm flag or the clock and OTA NVS. The in-app reset needs only the
+  power-on window, not a grant, so anyone in range then can erase the log.
 - **Greet on the CCCD rising edge.** The dongle speaks first, when the app's subscription is armed,
   which removes the subscribe-vs-write race entirely — no retries, no timeouts.
 - **Two flags, deliberately:** `setup_unlocked` (the ABD2 state-machine latch) vs `authenticated`

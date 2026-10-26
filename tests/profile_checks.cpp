@@ -1,3 +1,6 @@
+#include <algorithm>
+#include <cstdarg>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
@@ -10,6 +13,8 @@
 #define ENABLE_BLE 1
 #define ENABLE_LOGGING 1
 #define ENABLE_NETWORK 1
+#define ENABLE_OTA 1
+#define ENABLE_MEMS 1
 #include "backlog_fs.h"
 
 using json = nlohmann::json;
@@ -30,7 +35,24 @@ void check(bool condition, const std::string& message) {
 struct SerialStub {
   template<typename... Args> void printf(const char*, Args...) {}
 } Serial;
-template<typename... Args> void logEvent(const char*, Args...) {}
+// Everything the forget does to the log, in order: event lines, and markers for the calls around them.
+std::vector<std::string> events;
+void logEvent(const char* format, ...) {
+  char line[256];
+  va_list args;
+  va_start(args, format);
+  std::vsnprintf(line, sizeof(line), format, args);
+  va_end(args);
+  events.push_back(line);
+}
+struct FakeLogger {
+  int result = 3; // segments removed, -1 if any stayed
+  int clearAll() { events.push_back("<erase>"); return result; }
+} datalogger;
+struct FakeQueue {} fake_queue;
+FakeQueue* bleLogQueue = &fake_queue;
+void xQueueReset(FakeQueue*) { events.push_back("<drop ble events>"); }
+void flushMotionStats() { events.push_back("<motion flush>"); }
 
 struct FakeObd {
   json commands;
@@ -48,7 +70,7 @@ struct FakeBle {
   bool forgotten = false;
   void invalidateHash() { nvs_hash = 0; }
   void commitHash(unsigned long hash, bool persist) { if (persist) nvs_hash = hash; }
-  void forgetStoredPush() { nvs_hash = 0; forgotten = true; }
+  void forgetStoredPush() { nvs_hash = 0; forgotten = true; events.push_back("<forget push>"); }
 } ble;
 
 // RAM the extracted code shares with the sketch. reboot() resets it, except the block's function-static
@@ -60,6 +82,26 @@ std::vector<OBDVector> obd_result_vector, g_upload_held;
 unsigned long upload_spilled = 0;
 void alarmGrantSetupPermit() {}
 bool alarmEnforced() { return false; }
+bool frozen_valid = false;
+double frozen_lat = 0, frozen_lon = 0;
+unsigned long upload_capped = 0;
+struct GeoMarks { double lat = 0; } g_geo_queued;
+uint64_t obd_fail_logged = 0;
+char last_good_220105_reply[513] = {};
+void resetGeoAccepted(bool deep_sleep) { if (!deep_sleep) events.push_back("<geo marks reset>"); }
+void resetFrozenGpsProvenance(bool deep_sleep) { if (!deep_sleep) events.push_back("<frozen fix reset>"); }
+#include "ota_codes.inc"
+void logDumpEnd(const char* why) { g_logdump_active = false; events.push_back(std::string("<dump end ") + why + ">"); }
+void otaReset(uint8_t phase, uint16_t reason) {
+  check(phase == OTA_PH_ABORTED && reason == OTA_ERR_NOAUTH, "a forget aborts the update as not authorized");
+  g_ota_active = false;
+  events.push_back("<ota abort>");
+}
+size_t indexOf(const std::string& prefix) {
+  for (size_t i = 0; i < events.size(); ++i) if (events[i].rfind(prefix, 0) == 0) return i;
+  check(false, "missing " + prefix);
+  return 0;
+}
 
 #include "backlog_path.inc"
 #include "config_callback.inc"
@@ -144,7 +186,9 @@ int main() {
   LittleFS.files["/upload_backlog.jsonl"] = std::make_shared<std::string>("{}\n");
   upload_spilled = 1;
   push(profile, "token-g", 19);
-  forgetProfile("authclear");
+  events.clear();
+  check(forgetProfile("authclear"), "a forget that erases the log succeeds");
+  check(std::find(events.begin(), events.end(), "<ota abort>") == events.end(), "with no update running it aborts nothing");
   check(!LittleFS.exists("/vehicle_profile.json") && ble.forgotten && ble.nvs_hash == 0, "a key reset forgets the stored push");
   check(tlm_push_token.empty() && g_no_profile && obd_result_vector.empty() && g_upload_held.empty(),
         "and stops uploading and polling, held frames included");
@@ -152,5 +196,69 @@ int main() {
   check(!g_config_pending && g_pending_config_str.empty(), "and drops a push still waiting for the loop");
   reboot();
   check(tlm_push_token.empty(), "and the next boot restores nothing");
+
+  // A key reset while the revoked session is downloading the log and updating the firmware.
+  push(profile, "token-h", 20);
+  applyPending();
+  obd_result_vector = {{{"utc", 1}, {"soc", 50}}};
+  g_upload_held = obd_result_vector;
+  upload_spilled = 1;
+  g_logdump_active = g_ota_active = frozen_valid = true;
+  frozen_lat = 1;
+  g_geo_queued.lat = 1;
+  upload_capped = 2;
+  obd_fail_logged = 1;
+  last_good_220105_reply[0] = '6';
+  events.clear();
+  check(forgetProfile("authreset"), "the reset succeeds");
+  const size_t erase = indexOf("<erase>");
+  check(indexOf("<dump end") < erase && indexOf("<ota abort>") < erase, "the transfers end before the log is erased");
+  check(indexOf("<drop ble events>") < erase && indexOf("<motion flush>") < erase, "and nothing queued from before lands after it");
+  check(erase < indexOf("<forget push>"), "the log goes first, so a power cut part-way leaves a reset that can be repeated");
+  size_t first = erase + 1;
+  while (first < events.size() && events[first][0] == '<') ++first; // call markers, not log lines
+  check(first < events.size() && events[first] ==
+        "PROFILE forgotten (authreset) - log erased (3 segments), profile and push token cleared, ended dump, ended ota",
+        "the reset reason is the first line of the fresh log");
+  check(indexOf("UPLOAD discarded n=3 reason=forget") > erase && upload_capped == 0,
+        "every queued frame is dropped and counted: in RAM, held for gzip and parked in the backlog");
+  check(obd_fail_logged == 0 && !last_good_220105_reply[0], "the fresh log names OBD failures again, without the old reply");
+  check(!frozen_valid && frozen_lat == 0, "the frozen parked fix is dropped too");
+  indexOf("<frozen fix reset>");
+  indexOf("<geo marks reset>");
+  check(g_geo_queued.lat == 0, "and the send-once geo marks start again");
+
+  // An erase that had no segment to remove still succeeds.
+  push(profile, "token-i", 21);
+  applyPending();
+  datalogger.result = 0;
+  check(forgetProfile("authclear"), "an empty log erases");
+
+  // A log that cannot all be erased, or a file that stays: the caller keeps the key and can repeat the reset.
+  for (const char* stuck : {"", "/vehicle_profile.json", "/upload_backlog.jsonl"}) {
+    push(profile, "token-j", 22);
+    applyPending();
+    obd_result_vector = {{{"utc", 1}, {"soc", 50}}};
+    LittleFS.files["/upload_backlog.jsonl"] = std::make_shared<std::string>("{}\n");
+    upload_spilled = 1;
+    frozen_valid = true;
+    push(profile, "token-k", 23); // waiting for the loop
+    datalogger.result = *stuck ? 3 : -1;
+    LittleFS.fail_remove = stuck;
+    events.clear();
+    check(!forgetProfile("authreset"), "a forget that leaves the log, the profile or the backlog on flash fails");
+    LittleFS.fail_remove.clear();
+    datalogger.result = 3;
+    check(std::find(events.begin(), events.end(), *stuck ? "PROFILE forget FAILED (authreset) - profile or backlog file not removed"
+                                                         : "PROFILE forget FAILED (authreset) - log not erased, nothing cleared") != events.end(),
+          "and says why");
+    check(tlm_push_token == "token-j" && !obd_result_vector.empty() && upload_spilled == 1 && frozen_valid,
+          "and keeps the token, the queue and the frozen fix");
+    if (!*stuck)
+      check(LittleFS.exists("/vehicle_profile.json") && LittleFS.exists("/upload_backlog.jsonl") && ble.nvs_hash == 22 &&
+            g_config_pending && std::find(events.begin(), events.end(), "<forget push>") == events.end(),
+            "and a log that would not erase touches nothing else");
+    applyPending();
+  }
   std::puts("profile checks passed");
 }

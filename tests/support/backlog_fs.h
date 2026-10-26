@@ -50,6 +50,7 @@ struct File {
 struct FakeLittleFS {
   std::map<std::string, std::shared_ptr<std::string>> files;
   bool fail_open = false;
+  std::string fail_remove; // a path remove() leaves in place
   void (*read_observer)() = nullptr;
   size_t capacity = 3538944, other_used = 0; // the ONE+ partition; other_used stands in for the flash log
   size_t room = 0;
@@ -76,7 +77,7 @@ struct FakeLittleFS {
     }
     return file;
   }
-  void remove(const char* path) { files.erase(path); }
+  void remove(const char* path) { if (fail_remove != path) files.erase(path); }
   void seed(const std::string& value) { files["/upload_backlog.jsonl"] = std::make_shared<std::string>(value); }
   std::string contents() const { return *files.at("/upload_backlog.jsonl"); }
 } LittleFS;
