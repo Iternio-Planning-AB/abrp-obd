@@ -1,5 +1,6 @@
-// Differential checks for the park/drive decision; built and run by run_sm_checks.py, which writes the
-// old_side.inc / cur_side.inc / field.inc files from the pinned commit and the working tree.
+// Differential checks for the park/drive decision and the poll-side energy block; built and run by
+// run_sm_checks.py, which writes the old_side.inc / cur_side.inc / field.inc files from the pinned commit and the
+// working tree.
 #include <cmath>
 #include <cstdarg>
 #include <cstdint>
@@ -25,7 +26,7 @@ enum class SmKind { POLL, ADVANCE, LADDER, HOLD, SLEEP, WAKE, MAINT, CRASH };
 enum class SmTo { ACTIVE, BLE, CHARGING, STANDBY };
 enum { SM_NONE, SM_SPEED, SM_VRS, SM_BOTH };  // which speed keys the poll carries (BOTH: speed, then vrs)
 enum { SM_TIMER, SM_MOTION, SM_COLD };   // wake cause
-enum { SM_CAR_RAIL, SM_CAR_OBD, SM_CAR_OFF };  // why the car counts as on: the 12 V rail, or an OBD answer
+enum { SM_CAR_RAIL, SM_CAR_OBD, SM_CAR_OFF, SM_CAR_KEEP };  // car on by the 12 V rail or an OBD answer; KEEP: as read
 enum { SM_MOVE_NOW, SM_MOVE_NONE, SM_MOVE_KEEP };  // the last detectMovement hit: this poll, never, as it was
 
 struct SmEvent {
@@ -51,12 +52,16 @@ struct SmEvent {
   bool dump = false;  // HOLD: the log dump rather than an OTA update
   bool on = false;    // MAINT: the console's maintenance_mode
   // POLL inputs to the driving rules (#6). The defaults make CUR agree with OLD: car on, motion this poll, no
-  // sustained motion, no power, no charge latch.
+  // sustained motion, no power, no charge latch. Charge and Silent polls keep the wake's rail and motion instead.
   int car = SM_CAR_RAIL;
   int motion = SM_MOVE_NOW;
   bool sustained = false;  // the accumulator holds 20 s of motion
   bool charge_block = false;
-  double power = NAN, current = NAN, voltage = NAN;
+  // POLL, the car's side (carFrame): silent answers nothing; NaN leaves a PID out. Counter steps add to the last value.
+  bool silent = false;
+  double soc_step = 0, kwh_step = NAN, soe_step = NAN;
+  double power = NAN, current = NAN, voltage = NAN, dcfc = NAN;
+  double poll_rail = NAN;  // the rail this cycle read; NaN keeps the last
 };
 
 SmEvent Poll(int key, double speed, bool gnss = false, double kmh = 0, bool has_data = true, double speed2 = 0) {
@@ -75,11 +80,37 @@ SmEvent Poll(int key, double speed, bool gnss = false, double kmh = 0, bool has_
 // A poll with the driving rules' inputs set; the name lists what differs from the defaults.
 SmEvent Rules(SmEvent e, int car, int motion, bool sustained, double power = NAN, bool charge_block = false) {
   e.car = car, e.motion = motion, e.sustained = sustained, e.power = power, e.charge_block = charge_block;
+  if (car == SM_CAR_OFF) e.silent = true, e.has_data = false;
   static const char* cars[] = {"", ",obd-only", ",car-off"};
   static const char* moves[] = {"", ",no-motion", ",motion-kept"};
   e.name.pop_back();
   e.name += std::string(cars[car]) + moves[motion] + (sustained ? ",sustained" : "") +
             (std::isnan(power) ? "" : ",power=" + std::to_string(power)) + (charge_block ? ",charging" : "") + ")";
+  return e;
+}
+// A parked poll the car answers with charging PIDs (carFrame): current, and optionally voltage, the soc, kwh_charged
+// and soe steps, the car's own is_dcfc and the rail this cycle read. NaN leaves a PID out.
+SmEvent Charge(double amps, double volts = NAN, double soc_step = 0, double rail = NAN, double kwh_step = NAN,
+               double dcfc = NAN, double soe_step = NAN) {
+  std::ostringstream name;
+  name << "CHARGE(a=" << amps;
+  if (!std::isnan(volts)) name << ",v=" << volts;
+  if (std::isnan(soc_step)) name << ",nosoc";
+  else if (soc_step) name << ",soc+" << soc_step;
+  if (!std::isnan(kwh_step)) name << ",kwh+" << kwh_step;
+  if (!std::isnan(soe_step)) name << ",soe+" << soe_step;
+  if (!std::isnan(dcfc)) name << ",dcfc=" << dcfc;
+  if (!std::isnan(rail)) name << ",rail=" << rail;
+  name << ")";
+  SmEvent e{SmKind::POLL, name.str()};
+  e.current = amps, e.voltage = volts, e.soc_step = soc_step, e.poll_rail = rail, e.kwh_step = kwh_step, e.dcfc = dcfc;
+  e.soe_step = soe_step, e.car = SM_CAR_KEEP, e.motion = SM_MOVE_KEEP;
+  return e;
+}
+// A poll the car does not answer.
+SmEvent Silent(double rail = NAN) {
+  SmEvent e{SmKind::POLL, std::isnan(rail) ? std::string("SILENT") : "SILENT(rail=" + std::to_string(rail) + ")"};
+  e.silent = true, e.poll_rail = rail, e.has_data = false, e.car = SM_CAR_KEEP, e.motion = SM_MOVE_KEEP;
   return e;
 }
 SmEvent Advance(unsigned long ms) {
@@ -140,14 +171,18 @@ void check(bool condition, const std::string& message, const std::vector<SmEvent
   if (!condition) fail(message, trace);
 }
 
+// A NaN PID (#87) is the same NaN on both sides; strings compare by text, never by pointer.
 template <class A, class B> bool same(const A& a, const B& b) {
   if constexpr (std::is_enum<A>::value) return (int)a == (int)b;
+  else if constexpr (std::is_floating_point<A>::value) return a == b || (std::isnan(a) && std::isnan(b));
+  else if constexpr (std::is_same<A, const char*>::value) return a == b || (a && b && !strcmp(a, b));
   else return a == b;
 }
 template <class T> std::string text(const T& v) {
   if constexpr (std::is_enum<T>::value) return std::to_string((int)v);
   else if constexpr (std::is_same<T, std::string>::value) return '"' + v + '"';
-  else { std::ostringstream s; s.precision(17); s << v; return s.str(); }
+  else if constexpr (std::is_same<T, const char*>::value) return v ? '"' + std::string(v) + '"' : "(null)";
+  else { std::ostringstream s; s.precision(17); s << +v; return s.str(); }  // + prints a uint8_t as a number
 }
 std::string firstLineDiff(const char* what, const std::vector<std::string>& a, const std::vector<std::string>& b) {
   for (size_t i = 0; i < std::max(a.size(), b.size()); ++i) {
@@ -163,12 +198,11 @@ std::string difference(const sm_old::Snap& a, const sm_cur::Snap& b) {
   SM_RAM(SM_CMP) SM_RTC(SM_CMP) SM_STUB(SM_CMP)
 #undef SM_CMP
   if (a.gps_speed != b.gps_speed) return "gps speed";
-  auto value = [](double x, double y) { return x == y || (std::isnan(x) && std::isnan(y)); };
   bool frames = a.frames.size() == b.frames.size();
   for (size_t i = 0; frames && i < a.frames.size(); ++i) {
     frames = a.frames[i].size() == b.frames[i].size();
     for (size_t j = 0; frames && j < a.frames[i].size(); ++j)
-      frames = a.frames[i][j].first == b.frames[i][j].first && value(a.frames[i][j].second, b.frames[i][j].second);
+      frames = a.frames[i][j].first == b.frames[i][j].first && same(a.frames[i][j].second, b.frames[i][j].second);
   }
   if (!frames) return "buffered frames: OLD " + std::to_string(a.frames.size()) + " | CUR " +
                                    std::to_string(b.frames.size());
@@ -212,16 +246,26 @@ const std::vector<SmEvent> ALPHABET = {
   Ladder(SmTo::CHARGING), Ladder(SmTo::STANDBY), Hold(), Sleep(), Wake(SM_MOTION, 12.6f), Wake(SM_COLD, 9.5f),
 };
 
+const unsigned long CONFIRM_MS = (unsigned long)CHARGE_STREAM_CONFIRM_SECONDS * 1000UL;
+// The energy alphabet (#81): charge, release, silence and wake symbols (a taper-band wake among them), including
+// soc-less kwh and soe profiles.
+const std::vector<SmEvent> ENERGY_ALPHABET = {
+  Charge(-50, 380, 0.5), Charge(-150, 400, 1), Charge(-30, NAN, 0, NAN, NAN, 1), Charge(1, NAN, NAN, NAN, 0.01),
+  Charge(-50, NAN, NAN, NAN, NAN, NAN, 250), Charge(-50), Charge(0.479), Charge(30), Silent(), Silent(12.6),
+  Advance(CONFIRM_MS), Wake(SM_TIMER, 13.6f), Wake(SM_TIMER, 13.1f), Wake(SM_TIMER, 12.6f), Wake(SM_MOTION, 13.6f),
+  Sleep(),
+};
+
 unsigned long leaves = 0;
-void enumerate(int depth, std::vector<SmEvent>& trace) {
+void enumerate(int depth, std::vector<SmEvent>& trace, const std::vector<SmEvent>& alphabet) {
   if (depth == 0) { leaves++; return; }
   const sm_old::Snap old_node = sm_old::save();
   const sm_cur::Snap cur_node = sm_cur::save();
-  for (const auto& e : ALPHABET) {
+  for (const auto& e : alphabet) {
     sm_old::restore(old_node);
     sm_cur::restore(cur_node);
     play(e, trace, old_node, cur_node);
-    enumerate(depth - 1, trace);
+    enumerate(depth - 1, trace, alphabet);
     trace.pop_back();
   }
 }
@@ -230,7 +274,13 @@ SmEvent randomEvent(std::mt19937& rng) {
   auto pick = [&](std::initializer_list<double> values) {
     return *(values.begin() + std::uniform_int_distribution<size_t>(0, values.size() - 1)(rng));
   };
-  switch (std::uniform_int_distribution<int>(0, 9)(rng)) {
+  switch (std::uniform_int_distribution<int>(0, 11)(rng)) {
+  case 10: case 11: {
+    if (pick({0, 0, 0, 1}) != 0) return Silent(pick({NAN, 12.6, 13.6}));
+    return Charge(pick({-150, -50, -30, -2.5, -2, -1.5, 0, 0.479, 2, 2.5, 30, -3e8, NAN}), pick({NAN, 300, 380, 400}),
+                  pick({0, 0.1, 0.2, 0.25, 1, -1, NAN}), pick({NAN, NAN, 12.6, 13.0, 13.29, 13.3, 14.4}),
+                  pick({NAN, 0, 0.004, 0.005, 0.01}), pick({NAN, NAN, NAN, 0, 1}), pick({NAN, NAN, 0, 199, 200, 250}));
+  }
   case 0: case 1: case 2: {
     const int key = (int)pick({SM_NONE, SM_SPEED, SM_SPEED, SM_VRS, SM_BOTH});
     const double speeds[] = {0, 0.05, 0.15, 0.25, 0.95, 12.35, 129.95, -1, 1e-9, NAN};
@@ -240,7 +290,7 @@ SmEvent randomEvent(std::mt19937& rng) {
     return Poll(key, first, gnss, pick({5.0, 7.25, 88.85}), pick({0, 1, 1, 1}) != 0, second);
   }
   case 3: case 4:
-    return Advance((unsigned long)pick({1, 4999, 5000, (double)(AT - 1), (double)AT, (double)(AT + 1),
+    return Advance((unsigned long)pick({1, 4999, 5000, (double)(AT - 1), (double)AT, (double)(AT + 1), (double)CONFIRM_MS,
                                         (double)GPS_MOVING_MAX_AGE_MS, (double)MAX_AWAKE_MS,
                                         (double)std::uniform_int_distribution<unsigned long>(0, 400000)(rng)}));
   case 5: return Ladder((SmTo)std::uniform_int_distribution<int>(0, 3)(rng));
@@ -403,12 +453,168 @@ void scenarios() {
       check(is_currently_parked == (sample.ms < drive.second), "the field drive latches only on fresh GNSS", t);
     }
   }
+
+  // ---- energy (#81): the poll block's verdicts, each asserted on CUR while OLD and CUR stay equal ----
+  auto poke = [&](const SmEvent& poll) {  // one charge-sample poke: sleep, a high-rail timer wake, one poll
+    play(Sleep(), t);
+    play(Wake(SM_TIMER, 13.6f), t);
+    check(g_sample_poke, "a high-rail timer wake is a sample poke", t);
+    play(poll, t);
+  };
+  auto until = [&](auto done, auto next, const char* what) {  // a loop that fails, rather than spins, if never done
+    for (int i = 0; !done(); ++i) {
+      if (i == 1000) fail(std::string("never reached: ") + what, t);
+      next();
+    }
+  };
+  auto bufferedHas = [&](const char* key, double value) {
+    for (const auto& kv : obd_result_vector.back()) if (kv.first == key) return kv.second == value;
+    return false;
+  };
+
+  // AC at sample pokes: the charging cadence; the field's one positive sample holds the latch for
+  // CHARGE_RELEASE_POLLS, then the release arms the follow-up.
+  start(t);
+  poke(Charge(-50, 380, 0.5));
+  check(recently_charging && g_next_wake_minutes == WAKE_CHARGING_MINUTES && bufferedHas("is_charging", 1) &&
+        bufferedHas("is_dcfc", 0) && countLog("CHARGE 19.0kW (380.0V x -50.0A) -> AC") == 1, "an AC charge", t);
+  poke(Charge(0.479));
+  check(recently_charging && charge_release_polls == 1 && g_next_wake_minutes == WAKE_CHARGING_MINUTES,
+        "one positive sample only starts the release", t);
+  poke(Charge(0.479));
+  check(!recently_charging && g_next_wake_minutes == WAKE_PARKED_MINUTES && charge_followup == 1 &&
+        countLog("FOLLOWUP armed (latch released)") == 1, "the second releases and arms the follow-up", t);
+
+  // DC by power: two inferred polls latch the session, which holds DC through a taper below DC_CHARGING_MIN_KW;
+  // the car's own is_dcfc=0 ends it.
+  start(t);
+  poke(Charge(-150, 400, 1));
+  check(g_dc_confirmed && !dc_session && g_dc_inferred_polls == 1 && g_next_wake_minutes == WAKE_DC_CHARGING_MINUTES,
+        "one inferred DC poll: the DC cadence, no session yet", t);
+  play(Charge(-150, 400, 1), t);
+  check(dc_session && countLog("CHARGE 60.0kW") == 1, "the second latches the session, logged once", t);
+  play(Charge(-50, 380, 0.5), t);
+  check(dc_session && g_dc_confirmed && g_next_wake_minutes == WAKE_DC_CHARGING_MINUTES &&
+        countLog("CHARGE 19.0kW (380.0V x -50.0A) -> AC") == 1, "the taper stays DC", t);
+  play(Charge(-30, NAN, 0.5, NAN, NAN, 0), t);
+  check(!dc_session && !g_dc_confirmed && g_next_wake_minutes == WAKE_CHARGING_MINUTES, "the car's is_dcfc=0 ends it", t);
+  // On a streaming wake, a DC charge that falls silent with the rail down releases once the hold is spent, and the
+  // release drops the session with the rest of the charge's state.
+  start(t);
+  play(Advance(CONFIRM_MS), t);
+  play(Charge(-150, 400, 1), t);
+  play(Charge(-150, 400, 1), t);
+  check(dc_session && !g_sample_poke, "a DC session on a streaming wake", t);
+  until([&] { return !recently_charging; }, [&] { play(Silent(12.6), t); }, "the silent DC release");
+  check(!dc_session && charge_uncorroborated_s == 0 && charge_corr_soc_hw < 0, "its release drops the session", t);
+
+  // Silence: CHARGE_SILENT_HOLD_POLLS silent pokes hold the latch; past that, a high rail waits at the parked
+  // cadence still latched (parked-held) and never releases.
+  start(t);
+  poke(Charge(-50, 380, 0.5));
+  for (int i = 0; i < CHARGE_SILENT_HOLD_POLLS; ++i) {
+    poke(Silent());
+    check(recently_charging && g_next_wake_minutes == WAKE_CHARGING_MINUTES, "a silent poll holds the charge", t);
+  }
+  poke(Silent());
+  check(recently_charging && g_next_wake_minutes == WAKE_PARKED_MINUTES && g_cadence_reason &&
+        std::string(g_cadence_reason) == "parked-held" && charge_release_polls == 0, "past the hold: parked-held", t);
+  // A pause keeps the charge's budget, cap and soc mark until its last evidence is CHARGE_STALE_RESET_MINUTES old.
+  const uint64_t STALE_US = (uint64_t)CHARGE_STALE_RESET_MINUTES * 60000000ULL;
+  auto stale = [&] { return esp_rtc_get_time_us() - charge_last_evidence_us >= STALE_US; };
+  const uint32_t held_fast = charging_fast_minutes;
+  const double held_soc = prev_charge_soc, held_hw = charge_corr_soc_hw;
+  check(held_fast > 0 && held_soc > 0 && held_hw >= 0, "the held charge has a budget and a soc mark", t);
+  until(stale, [&] {
+    check(charging_fast_minutes == held_fast && prev_charge_soc == held_soc && charge_corr_soc_hw == held_hw,
+          "parked-held keeps the budget and the soc mark until stale", t);
+    poke(Silent());
+  }, "a stale parked-held charge");
+  check(recently_charging && charging_fast_minutes == 0 && prev_charge_soc == 0.0 && charge_corr_soc_hw < 0,
+        "the first parked-held poll once stale resets them", t);
+  // The same pause ending in a skip wake: the release at a poke keeps the budget, the skip resets it once stale.
+  start(t);
+  for (int i = 0; i < 3; ++i) poke(Charge(-50, 380, 0.5));
+  poke(Charge(0.479));
+  poke(Charge(0.479));
+  const uint32_t released_fast = charging_fast_minutes;
+  const double released_hw = charge_corr_soc_hw;
+  check(!recently_charging && released_fast > 0 && released_hw >= 0, "a release at a poke keeps the budget", t);
+  play(Sleep(), t);
+  until(stale, [&] {
+    check(charging_fast_minutes == released_fast && charge_corr_soc_hw == released_hw,
+          "a skip wake keeps the budget until stale", t);
+    play(Wake(SM_TIMER, 12.6f), t);
+    check(sm_asleep && !sm_gate_open, "a low-rail parked wake is a skip", t);
+  }, "a stale skip");
+  check(charging_fast_minutes == 0 && charge_corr_soc_hw < 0, "the first skip once stale resets the budget", t);
+
+  // The post-drive window: a streaming wake ending at a high rail comes back on the charging cadence; each silent
+  // high-rail poke inside the window is one more pdw poll, until the window expires.
+  start(t);
+  play(Sleep(), t);
+  play(Wake(SM_MOTION, 13.6f), t);
+  play(Sleep(), t);
+  check(pdw_open && g_next_wake_minutes == WAKE_CHARGING_MINUTES && countLog("POSTDRIVE window opened") == 1,
+        "the ladder end opens the window", t);
+  const uint64_t WINDOW_US = (uint64_t)POST_DRIVE_WINDOW_MINUTES * 60000000ULL;
+  unsigned pdw_expected = 0;
+  until([&] { return !pdw_open; }, [&] {
+    poke(Silent());
+    if (esp_rtc_get_time_us() - pdw_open_us < WINDOW_US)
+      check(pdw_open && pdw_polls == ++pdw_expected && g_next_wake_minutes == WAKE_CHARGING_MINUTES &&
+            std::string(g_cadence_reason) == "pdw", "a silent high-rail poke inside the window", t);
+  }, "the window's end");
+  check(pdw_expected >= 2 && g_next_wake_minutes == WAKE_PARKED_MINUTES &&
+        countLog("POSTDRIVE window closed reason=expired") == 1, "the window expires, logged once", t);
+
+  // A streaming wake trusts a charging sample only CHARGE_STREAM_CONFIRM_SECONDS after the last discharge one.
+  start(t);
+  play(Charge(-50), t);
+  check(!recently_charging && !bufferedHas("is_charging", 1), "no verdict before the confirm delay", t);
+  play(Advance(CONFIRM_MS), t);
+  play(Charge(-50), t);
+  check(recently_charging && bufferedHas("is_charging", 1), "a charge once it is trusted", t);
+  play(Charge(30), t);
+  play(Advance(CONFIRM_MS - 1), t);
+  play(Charge(-50), t);
+  check(!bufferedHas("is_charging", 1), "a discharge sample restarts the delay", t);
+
+  // The fast budget: WAKE_CHARGING_MAX_MINUTES of charging cadence latches the cap, and it holds.
+  start(t);
+  until([&] { return charging_cap_latched; }, [&] { poke(Charge(-50, 380, 0.5)); }, "the cap");
+  check(charging_fast_minutes >= (uint32_t)WAKE_CHARGING_MAX_MINUTES && g_next_wake_minutes == WAKE_PARKED_MINUTES &&
+        std::string(g_cadence_reason) == "parked-cap", "the cap latches at the budget", t);
+  poke(Charge(-50, 380, 0.5));
+  check(charging_cap_latched && g_next_wake_minutes == WAKE_PARKED_MINUTES, "and stays latched while charging", t);
+  // Answered pokes after the charge keep the cap until its last evidence is stale, then drop it.
+  poke(Charge(30));
+  poke(Charge(30));
+  check(!recently_charging && charging_cap_latched, "a release at a poke keeps the cap", t);
+  until([&] { return !charging_cap_latched; }, [&] {
+    check(!stale(), "the cap holds until stale", t);
+    poke(Charge(30));
+  }, "a stale cap");
+  check(charging_fast_minutes == 0, "the first answered poke once stale drops the cap and the budget", t);
+
+  // Corroboration: a charging current with a flat soc for CHARGE_CORROBORATE_MINUTES goes slow; a rise restores it.
+  start(t);
+  until([&] { return charge_uncorroborated_s >= (uint32_t)CHARGE_CORROBORATE_MINUTES * 60; },
+        [&] { poke(Charge(-50)); }, "uncorroborated");
+  check(countLog("CHARGE uncorroborated") == 1 && g_next_wake_minutes == WAKE_CHARGING_MINUTES,
+        "the poll that crosses CHARGE_CORROBORATE_MINUTES logs it, at the charging cadence still", t);
+  poke(Charge(-50));
+  check(countLog("CHARGE uncorroborated") == 1 && g_next_wake_minutes == WAKE_PARKED_MINUTES &&
+        std::string(g_cadence_reason) == "parked-uncorroborated", "the next one is slow, with no second line", t);
+  poke(Charge(-50, NAN, 0.5));
+  check(g_next_wake_minutes == WAKE_CHARGING_MINUTES && charge_uncorroborated_s == 0 &&
+        countLog("CHARGE corroborated") == 1, "a soc rise restores it", t);
 }
 
 
 // ---- the marker debt across a crash (#49), on CUR only ----
-// The setup() restore is a drive writer SM_PIN does not have, so a crash that owes the marker is meant to differ
-// from OLD: these run CUR alone, with its properties (a crash never loses the debt or an unsent marker).
+// These run CUR alone: what they check is absolute, not relative to SM_PIN (a crash never loses the debt or an
+// unsent marker).
 void playCur(const SmEvent& e, std::vector<SmEvent>& trace) {
   const sm_cur::Snap pre = sm_cur::save();
   trace.push_back(e);
@@ -460,7 +666,7 @@ void crashes(int depth) {
   check(!park_marker_owed && obd_result_vector.size() == 1 && obd_result_vector[0].size() == 2 && sm_store_marker,
         "one marker queued; its crash copy stays until it is sent", t);
   // In the backlog, then a panic after the next wake loaded it: the marker is lost, the debt is not.
-  playCur(Wake(SM_TIMER, 13.6f), t);
+  playCur(Wake(SM_MOTION, 13.6f), t);  // a streaming wake: a sample poke would sleep after its poll
   playCur(Poll(SM_NONE, 0, false, 0, false), t);
   playCur(Crash(), t);
   check(park_marker_owed && obd_result_vector.empty(), "a crash after the backlog load keeps the debt", t);
@@ -502,8 +708,8 @@ void crashes(int depth) {
 
 
 // ---- the driving rules (#6), on CUR only ----
-// OLD has no UNCONFIRMED and gates GNSS on nothing, so these cannot be a differential: the named cases of the
-// issue, each asserting the state, what a frame publishes, the marker debt, the freezes and the LEASH lines.
+// The differential only proves CUR equals SM_PIN; these are the absolute checks: the named cases of the issue,
+// each asserting the state, what a frame publishes, the marker debt, the freezes and the LEASH lines.
 int parkKey(const OBDVector& frame) {
   for (const auto& res : frame) if (res.first == "is_parked") return (int)res.second;
   return -1;
@@ -544,7 +750,7 @@ void rules() {
   enterUnconfirmed();
   check(parkKey(obd_result_vector.back()) == -1 && obd_result_vector.size() == 1 && !park_marker_owed && sm_published == -1,
         "UNCONFIRMED frames carry no is_parked and owe no marker", t);
-  check(logged("LEASH unconfirmed accel act=100% rail=13.50 obd=0 -> live location, no drivingState"),
+  check(logged("LEASH unconfirmed accel act=100% rail=13.50 obd=1 -> live location, no drivingState"),
         "the UNCONFIRMED line", t);
   playCur(Advance(MAX_AWAKE_MS), t);
   playCur(Ladder(SmTo::ACTIVE), t);
@@ -555,6 +761,12 @@ void rules() {
   check(!is_currently_parked && !drive_unconfirmed && parkKey(obd_result_vector.back()) == 0 && park_marker_owed &&
         logged("LEASH driving gnss=40.0km/h -> unlatch parked (no OBD speed needed)"),
         "a moving fix with motion confirms DRIVING from UNCONFIRMED: frames say DRIVE, the marker is owed", t);
+  begin();
+  SmEvent rail_only = Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, true);
+  rail_only.silent = true;
+  playCur(rail_only, t);
+  check(drive_unconfirmed && logged("LEASH unconfirmed accel act=100% rail=13.50 obd=0 -> live location, no drivingState"),
+        "the rail alone counts as the car being on", t);
   begin();
   playCur(Rules(quiet, SM_CAR_OBD, SM_MOVE_NOW, true), t);
   check(drive_unconfirmed && logged("LEASH unconfirmed accel act=100% rail=12.00 obd=1 -> live location, no drivingState"),
@@ -679,9 +891,13 @@ int main(int argc, char** argv) {
     const auto t0 = clock::now();
     std::vector<SmEvent> trace;
     start(trace);
-    enumerate(depth, trace);
+    enumerate(depth, trace, ALPHABET);
+    const unsigned long drive_leaves = leaves;
+    start(trace);
+    enumerate(depth, trace, ENERGY_ALPHABET);
     const double s = std::chrono::duration<double>(clock::now() - t0).count();
-    std::cout << "PASS: enumerate depth " << depth << " over " << ALPHABET.size() << " symbols, " << leaves
+    std::cout << "PASS: enumerate depth " << depth << " over " << ALPHABET.size() << " drive and "
+              << ENERGY_ALPHABET.size() << " energy symbols, " << drive_leaves << " + " << leaves - drive_leaves
               << " sequences in " << s << "s\n";
   }
   if (group == "all" || group == "crash") {

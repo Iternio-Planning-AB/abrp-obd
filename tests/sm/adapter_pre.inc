@@ -9,8 +9,6 @@
   X(bool, is_currently_parked, true) \
   X(bool, drive_unconfirmed, false) \
   X(bool, g_drive_gnss_refused, false) \
-  X(float, g_last_io36, 0.0f) \
-  X(unsigned long, g_last_motion_ms, 0) \
   X(unsigned long, g_last_obd_answer_ms, 0) \
   X(unsigned long, g_last_speed_ms, 0) \
   X(unsigned long, last_active, 0) \
@@ -22,12 +20,46 @@
   X(bool, maintenance_mode, false) \
   X(bool, g_taper_confirm, false) \
   X(unsigned long, polling_delay, 5000) \
-  X(unsigned long, transmission_delay, 25000)
+  X(unsigned long, transmission_delay, 25000) \
+  X(const char*, g_wake_reason, "POWERON") \
+  X(bool, g_sample_poke, false) \
+  X(float, g_rail_before_poke, 0.0f) \
+  X(float, g_last_io36, 0.0f) \
+  X(unsigned long, g_last_discharge_ms, 0) \
+  X(int, g_next_wake_minutes, WAKE_PARKED_MINUTES) \
+  X(unsigned long, g_fast_anchor_ms, 0) \
+  X(bool, g_dc_confirmed, false) \
+  X(uint8_t, g_dc_inferred_polls, 0) \
+  X(unsigned long, g_dc_silent_since_ms, 0) \
+  X(bool, g_pdw_ladder_done, false) \
+  X(const char*, g_cadence_reason, nullptr) \
+  X(bool, g_dc_logged, false) \
+  X(bool, g_dc_refused_logged, false) \
+  X(unsigned long, g_last_motion_ms, 0)
 #define SM_RTC(X) \
   X(bool, park_marker_owed, false) \
   X(bool, recently_charging, false) \
   X(uint32_t, taper_confirm_wakes, 0) \
-  X(bool, charge_end_polled, false)
+  X(bool, charge_end_polled, false) \
+  X(uint32_t, charging_fast_minutes, 0) \
+  X(bool, dc_session, false) \
+  X(bool, charging_cap_latched, false) \
+  X(uint32_t, charge_uncorroborated_s, 0) \
+  X(uint64_t, charge_corr_last_us, 0) \
+  X(double, charge_corr_soc_hw, -1.0) \
+  X(double, charge_corr_kwh_hw, -1.0) \
+  X(double, charge_corr_soe_hw, -1.0) \
+  X(double, prev_charge_soc, 0.0) \
+  X(double, prev_parked_soc, -1.0) \
+  X(double, prev_parked_kwh, -1.0) \
+  X(double, prev_parked_soe, -1.0) \
+  X(uint8_t, charge_release_polls, 0) \
+  X(uint8_t, charge_silent_polls, 0) \
+  X(uint8_t, charge_followup, 0) \
+  X(uint8_t, pdw_open, 0) \
+  X(uint64_t, pdw_open_us, 0) \
+  X(uint8_t, pdw_polls, 0) \
+  X(uint64_t, charge_last_evidence_us, 0)
 // Harness-only state: the trace's inputs and what the stubs recorded. Not firmware globals, so not checked.
 // sm_store_marker is the RTC_NOINIT debt copy (wdt_streak.h; its own semantics are the energy wdt-streak
 // group's). The buffer stands for RAM and the upload backlog together, except on a gate skip, which sleeps
@@ -39,7 +71,6 @@ enum SmReset { ESP_RST_POWERON = 1, ESP_RST_PANIC = 4, ESP_RST_TASK_WDT = 6, ESP
   X(bool, sm_backlog_file, false) \
   X(bool, sm_flush_ok, false) \
   X(unsigned long, sm_now, 0) \
-  X(uint8_t, charge_followup, 0) \
   X(bool, g_ota_active, false) \
   X(bool, g_logdump_active, false) \
   X(bool, sm_gnss_fresh, false) \
@@ -48,7 +79,11 @@ enum SmReset { ESP_RST_POWERON = 1, ESP_RST_PANIC = 4, ESP_RST_TASK_WDT = 6, ESP
   X(unsigned, sm_alarm_calls, 0) \
   X(double, sm_alarm_last, 0) \
   X(unsigned, sm_freezes, 0) \
-  X(unsigned, sm_corr_resets, 0) \
+  X(unsigned long, sm_rtc_ms, 0) \
+  X(int, sm_armed_minutes, WAKE_PARKED_MINUTES) \
+  X(double, sm_soc, 50) \
+  X(double, sm_kwh, 10) \
+  X(double, sm_soe, 40000) \
   X(unsigned, sm_polls, 0) \
   X(bool, sm_asleep, false) \
   X(bool, sm_gate_open, true) \
@@ -75,6 +110,14 @@ struct SmHeap {
   unsigned long getPsramSize() const { return 4194304; }
   unsigned long getFreePsram() const { return 4000000; }
 } ESP;
+
+// Function-local statics in the extracted blocks, hoisted by run_sm_checks.py so that each boot resets them, as
+// a deep-sleep wake does.
+#define SM_LOCAL(X) \
+  X(int, logged_dcfc, -1)
+#define SM_DEFINE(T, name, value) T name = value;
+SM_LOCAL(SM_DEFINE)
+#undef SM_DEFINE
 
 unsigned long millis() { return sm_now; }
 // Logging and the freeze take real time on the device (UART, flash), so each moves the clock: a reordering of
@@ -114,12 +157,15 @@ void freezeParkedLocation() {
   logEvent("PARKED_LOC (harness)");
 }
 void alarmNoteSpeed(double kmh) { sm_alarm_calls++; sm_alarm_last = kmh; }
-void resetChargeCorroboration() { sm_corr_resets++; }
-// The wake gate and the awake ladder reach the post-charge follow-up and the post-drive window; the harness
-// models neither (no stale charge evidence, no window), so both sides see the same inert stubs.
-uint64_t esp_rtc_get_time_us() { return (uint64_t)sm_now * 1000ULL; }
-bool chargeStateStale(uint64_t) { return false; }
-void pdwArmAtLadderEnd() {}
+// No alarm-flagged car here: the gate's ALARMGATE branch and pdwOpenWindow's veto stay shut on both sides.
+int g_alarm_flag = -1;
+bool alarmEnforced() { return false; }
+// The RTC microsecond clock runs on through deep sleep and every reset but a power loss: the time of earlier
+// wakes and sleeps (sm_rtc_ms) plus this wake's millis().
+uint64_t esp_rtc_get_time_us() { return (uint64_t)(sm_rtc_ms + sm_now) * 1000ULL; }
+float readIO36Rail() { return g_last_io36; }
+// The motion window's peaks only fill log lines; the motion stamp itself is a poll input.
+float motion_window_peak = 0, motion_window_axmax = 0;
 SmReset esp_reset_reason() { return sm_reset; }
 void wdtStreakMarker(bool owed) { sm_store_marker = owed; }
 bool wdtStreakMarkerOwed() { return sm_store_marker; }
