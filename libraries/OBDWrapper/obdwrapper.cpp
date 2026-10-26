@@ -71,6 +71,10 @@ void OBDWrapper::setVehicleCommands(const json& newData) {
   }
   reply_headers = expectedReplyHeaders(init_commands, pids);
   retry_held.assign(pids.size(), false);
+  pids_hash = 2166136261u;
+  for (const auto& p : pids) {
+    for (char c : p + '\n') { pids_hash ^= (uint8_t)c; pids_hash *= 16777619u; }
+  }
 }
 
 json OBDWrapper::getVehicleCommands() const {
@@ -447,6 +451,7 @@ OBDVector OBDWrapper::readPIDs(bool print) {
   raw_220105_reply.clear();
   skipped_prefix_pid.clear();
   skipped_prefix_lines = 0;
+  failures.clear();
   // A profile without a string obd_protocol can't be polled; throwing here would reboot the dongle.
   if (!vehicle_commands.contains("obd_protocol") || !vehicle_commands["obd_protocol"].is_string()) return results;
   std::string protocol = vehicle_commands["obd_protocol"].get<std::string>();
@@ -500,7 +505,22 @@ OBDVector OBDWrapper::readPIDs(bool print) {
       snprintf(buffer, sizeof(buffer), "%04s\r", pid_string.c_str());
       return readBuffer(pid_string, buffer, sizeof(buffer), print);
     };
-    if (!send() || fields.empty()) continue;
+    // A command that got no usable answer is kept for the log (#85), with the reply as it came.
+    auto failed = [&](const char* reason) {
+      if (n < 64 && (fail_known >> n & 1ULL)) return;
+      if (failures.size() < 8) failures.push_back({ n, pid_string, reason, std::string(buffer, strnlen(buffer, 120)) });
+    };
+    if (!send()) {
+      failed(strstr(buffer, "NO DATA") ? "no_data" : strstr(buffer, "UNABLE TO CONNECT") ? "no_connect"
+             : strstr(buffer, "7EC 03 7F 22 12") ? "nrc" : "no_link");
+      continue;
+    }
+    if (fields.empty()) {
+      // A filter or header command the co-processor did not take ("?") leaves every command after it unanswered.
+      // Its refusal, not a missing OK: ATZ, ATI and ATRV answer with text.
+      if (strchr(buffer, '?')) failed("at_reply");
+      continue;
+    }
 
     // Decode once for all fields. genericProtocol throws on replies readBuffer lets through ("?",
     // "STOPPED", "CAN ERROR", short frames); uncaught, that is a reboot.
@@ -549,6 +569,7 @@ OBDVector OBDWrapper::readPIDs(bool print) {
       retry_held[n] = false;
     }
     if (!refused.empty()) {
+      failed(refused.c_str());
       Serial.printf("failed to decode reply to %s\n", pid_string.c_str());
       drop_eval += fields.size();
       if (stop) break;
@@ -567,6 +588,7 @@ OBDVector OBDWrapper::readPIDs(bool print) {
 #endif
 
     bool low_soc = false, soh_bad = false, have_soc = false, have_soh = false;
+    size_t decoded = 0, out_of_range = 0;   // this command's fields, for the OBDFAIL reason
     for (const auto& f : fields) {
       const std::string& key = f.first;
       const std::string& equation = f.second;
@@ -599,6 +621,7 @@ OBDVector OBDWrapper::readPIDs(bool print) {
       if (vc.contains("minValue") && res < jsonToDouble(vc["minValue"])) in_range = false;
       if (vc.contains("maxValue") && res > jsonToDouble(vc["maxValue"])) in_range = false;
       if (in_range) {
+        decoded++;
         putResult(results, key, res);
         if (key == "soc") { have_soc = true; low_soc = res == 0.5; }
         else if (key == "soh") have_soh = true;
@@ -606,8 +629,10 @@ OBDVector OBDWrapper::readPIDs(bool print) {
         Serial.printf("Dropped out-of-range %s = %f\n", key.c_str(), res);
         if (key == "soh") soh_bad = true;
         drop_range++;
+        out_of_range++;
       }
     }
+    if (!decoded) failed(out_of_range ? "range" : "eval");
     if (pid_string == "220105") {
       if (low_soc && soh_bad) {
         anomalous_220105_reason = "soc0.5_soh_drop";

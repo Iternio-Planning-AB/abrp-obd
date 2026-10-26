@@ -323,6 +323,10 @@ RTC_DATA_ATTR uint64_t obd_skip_last_us = 0;
 // A refused reply sent again (#45): same cap and spacing, own budget.
 RTC_DATA_ATTR uint8_t obd_retry_logs = 0;
 RTC_DATA_ATTR uint64_t obd_retry_last_us = 0;
+// Commands that got no usable answer (#85): each is logged the first time, with its reply, until a reset other than a
+// deep-sleep wake or a new profile (obd_fail_profile, the profile's pids_hash) clears the bits.
+RTC_DATA_ATTR uint64_t obd_fail_logged = 0;
+RTC_DATA_ATTR uint32_t obd_fail_profile = 0;
 // Consecutive polls with no charge evidence while the charge latch was still set (CHARGE_RELEASE_POLLS).
 RTC_DATA_ATTR uint8_t charge_release_polls = 0;
 // Consecutive latched polls the car did not answer, held off the release up to CHARGE_SILENT_HOLD_POLLS.
@@ -1478,10 +1482,16 @@ void loop() {
         logEvent("ALARMGATE deferred OBD init ran (first permitted cycle)");
 #endif
       }
+#if ENABLE_LOGGING
+      obd.fail_known = obd.pids_hash == obd_fail_profile ? obd_fail_logged : 0;  // #85: only new failures kept
+#endif
       current_frame = obd.readPIDs(PRINT);
       obd_read_attempted = true;
     }
 #else
+#if ENABLE_LOGGING
+    obd.fail_known = obd.pids_hash == obd_fail_profile ? obd_fail_logged : 0;  // #85: only new failures kept
+#endif
     auto current_frame = obd.readPIDs(PRINT); // pass PRINT so raw SENDING/RECEIVING CAN buffers are shown while debugging
     bool obd_read_attempted = true;
 #endif
@@ -1506,6 +1516,17 @@ void loop() {
 #if ENABLE_LOGGING
     if (obd_read_attempted) {
       const uint64_t now_us = esp_rtc_get_time_us();
+      auto logRaw = [&](const char* kind, const char* data, size_t size) {
+        for (size_t off = 0; off < size; off += 40) {
+          size_t n = size - off;
+          if (n > 40) n = 40;
+          char hex[81];
+          for (size_t i = 0; i < n; ++i)
+            snprintf(hex + 2 * i, 3, "%02X", (unsigned char)data[off + i]);
+          logEvent("OBDRAW %s %u/%u %s", kind, (unsigned)(off / 40 + 1),
+            (unsigned)((size + 39) / 40), hex);
+        }
+      };
       if (!obd.anomalous_220105_reason.empty() && obd_anomaly_logs < 3 &&
           (!obd_anomaly_last_us || now_us < obd_anomaly_last_us ||
            now_us - obd_anomaly_last_us >= 15ULL * 60ULL * 1000000ULL)) {
@@ -1513,17 +1534,6 @@ void loop() {
         logEvent("OBD220105 reason=%s hdr=%s retry=%s raw=%u prev=%u", obd.anomalous_220105_reason.c_str(),
           obd.anomalous_220105_header.empty() ? "-" : obd.anomalous_220105_header.c_str(),
           obd.anomalous_220105_retry.c_str(), (unsigned)obd.anomalous_220105_reply.size(), (unsigned)prev_len);
-        auto logRaw = [&](const char* kind, const char* data, size_t size) {
-          for (size_t off = 0; off < size; off += 40) {
-            size_t n = size - off;
-            if (n > 40) n = 40;
-            char hex[81];
-            for (size_t i = 0; i < n; ++i)
-              snprintf(hex + 2 * i, 3, "%02X", (unsigned char)data[off + i]);
-            logEvent("OBDRAW %s %u/%u %s", kind, (unsigned)(off / 40 + 1),
-              (unsigned)((size + 39) / 40), hex);
-          }
-        };
         logRaw("prev", last_good_220105_reply, prev_len);
         logRaw("bad", obd.anomalous_220105_reply.data(), obd.anomalous_220105_reply.size());
         obd_anomaly_last_us = now_us;
@@ -1545,6 +1555,22 @@ void loop() {
           obd.first_retry.header.empty() ? "-" : obd.first_retry.header.c_str(), obd.first_retry.ok ? 1 : 0);
         obd_retry_last_us = now_us;
         obd_retry_logs++;
+      }
+      // #85: an ECU that never answers, or a filter command the co-processor refuses, shows once per command with
+      // its reply. At most 4 a poll; the rest follow on later polls. Only on a poll the car answered: asleep, every
+      // command is NO DATA, and those would spend each command's one line before the poll that matters.
+      if (obd.pids_hash != obd_fail_profile) {
+        obd_fail_profile = obd.pids_hash;
+        obd_fail_logged = 0;
+      }
+      unsigned fail_lines = 0;
+      for (const auto& f : obd.failures) {
+        if (obd_count == 0) break;
+        if (f.index >= 64 || (obd_fail_logged >> f.index & 1ULL) || fail_lines >= 4) continue;
+        obd_fail_logged |= 1ULL << f.index;
+        fail_lines++;
+        logEvent("OBDFAIL %s reason=%s len=%u", f.pid.c_str(), f.reason.c_str(), (unsigned)f.reply.size());
+        logRaw("fail", f.reply.data(), f.reply.size());
       }
       if (!obd.good_220105_reply.empty()) {
         size_t n = obd.good_220105_reply.size();

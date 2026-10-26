@@ -214,6 +214,88 @@ static void checkPartialProfile() {
   CHECK(hasSoc(p));
 }
 
+// ---- commands with no usable answer (#85): what readPIDs keeps for the log ----
+
+static void checkFailures() {
+  // MEB's second ECU, the shape #85 needs: a filter the co-processor refuses, then silence, a value out of range and
+  // a reply too short for its equation.
+  static const char* ECU = R"P({
+    "obd_protocol": "7",
+    "init_commands": { "command": ["ATZ"] },
+    "data_commands": { "command": ["ATCRA17FE0076", "22295A", "222609", "22210E"] },
+    "odometer": { "command": "22295A", "equation": "INT24(A:B:C)" },
+    "ext_temp": { "command": "222609", "equation": "A/2-50", "minValue": -40, "maxValue": 80 },
+    "gear": { "command": "22210E", "equation": "D" }
+  })P";
+  OBDWrapper obd;
+  ScriptedLink link;
+  setUp(obd, link, ECU);
+  // ATCRA becomes ATCM7FF + ATCF<id>: five commands.
+  Poll p = poll(obd, link, { "OK" + PROMPT, "?" + PROMPT, "NO DATA" + PROMPT, "62260900" + PROMPT, "62210E01" + PROMPT });
+  CHECK(p.results.empty());
+  const std::vector<std::pair<std::string, std::string>> want = {
+    { "ATCF17FE0076", "at_reply" }, { "22295A", "no_data" }, { "222609", "range" }, { "22210E", "eval" } };
+  CHECK(obd.failures.size() == want.size());
+  for (size_t i = 0; i < want.size() && i < obd.failures.size(); ++i) {
+    const auto& f = obd.failures[i];
+    CHECK(f.pid == want[i].first && f.reason == want[i].second);
+    CHECK(f.index < obd.get_pids().size() && obd.get_pids()[f.index] == f.pid);
+  }
+  if (obd.failures.size() == want.size()) {
+    CHECK(obd.failures[1].reply.find("NO DATA") != std::string::npos);
+    CHECK(obd.failures[3].reply.find("62210E01") != std::string::npos);
+  }
+  // Answered next time: nothing kept, and the list is per poll.
+  Poll ok = poll(obd, link, { "OK" + PROMPT, "OK" + PROMPT, "62295A001234" + PROMPT, "62260964" + PROMPT, "62210E01020304" + PROMPT });
+  CHECK(ok.results.size() == 3 && obd.failures.empty());
+  // The hash names the command list: the same list hashes the same, another one differently.
+  const uint32_t hash = obd.pids_hash;
+  OBDWrapper same;
+  ScriptedLink other_link;
+  setUp(same, other_link, ECU);
+  CHECK(same.pids_hash == hash && hash != 0);
+  setUp(same, other_link, PROFILE);
+  CHECK(same.pids_hash != hash);
+  // Commands already logged (fail_known) are not kept, so the 8 slots go to the ones not seen yet: 10 silent commands,
+  // the first 8 known, leave the last two.
+  {
+    std::string many = R"P({ "obd_protocol": "7", "init_commands": { "command": ["ATZ"] }, "data_commands": { "command": [)P";
+    std::string keys;
+    for (int i = 0; i < 10; ++i) {
+      const std::string cmd = "2201" + std::to_string(10 + i);
+      many += (i ? ", \"" : "\"") + cmd + "\"";
+      keys += ", \"k" + std::to_string(i) + "\": { \"command\": \"" + cmd + "\", \"equation\": \"A\" }";
+    }
+    many += "] }" + keys + " }";
+    OBDWrapper obd;
+    ScriptedLink link;
+    setUp(obd, link, many.c_str());
+    poll(obd, link, {});
+    CHECK(obd.failures.size() == 8 && obd.failures[0].index == 0);
+    obd.fail_known = 0xFF;
+    poll(obd, link, {});
+    CHECK(obd.failures.size() == 2 && obd.failures[0].index == 8 && obd.failures[1].index == 9);
+  }
+  // An AT command that answers with text, not OK, worked: only the co-processor's ? is a refusal.
+  {
+    OBDWrapper obd;
+    ScriptedLink link;
+    setUp(obd, link, R"P({ "obd_protocol": "7", "init_commands": { "command": ["ATZ"] },
+      "data_commands": { "command": ["ATI", "ATRV", "ATSH7E4"] } })P");
+    poll(obd, link, { "ELM327 v1.5" + PROMPT, "12.4V" + PROMPT, "OK" + PROMPT });
+    CHECK(obd.failures.empty());
+  }
+  // A refused reply keeps its refusal reason; the reply kept is the last one, the retry's.
+  OBDWrapper uds;
+  ScriptedLink uds_link;
+  setUp(uds, uds_link);
+  std::string other = GOOD;
+  other.replace(other.find("620105"), 6, "620101");
+  poll(uds, uds_link, { SPLICE, other });
+  CHECK(uds.failures.size() == 1 && uds.failures[0].pid == "220105" && uds.failures[0].reason == "wrong_did");
+  CHECK(uds.failures.size() == 1 && uds.failures[0].reply.size() == 120);
+}
+
 // ---- profile evaluation as the app does it (#84): virtual keys, multi-command keys, the MEB soc ----
 
 // The MEB profile's soc and its inputs (obd/MEB.json), on one bus for the scripted link.
@@ -405,6 +487,11 @@ int main(int argc, char** argv) {
     checkTwo();
     checkPartialProfile();
     std::printf("%s retry\n", failures == before ? "ok  " : "FAIL");
+  }
+  if (group == "all" || group == "failures") {
+    const int before = failures;
+    checkFailures();
+    std::printf("%s failures\n", failures == before ? "ok  " : "FAIL");
   }
   if (group == "all" || group == "profile") {
     const int before = failures;
