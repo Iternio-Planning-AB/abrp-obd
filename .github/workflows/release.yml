@@ -112,8 +112,15 @@ jobs:
       - name: Release notes
         env:
           NAME: ${{ steps.version.outputs.name }}
+          PRERELEASE: ${{ inputs.prerelease }}
         run: |
           mkdir -p out
+          # A candidate's notes start at the previous tag of either kind; cliff.toml's tag_pattern (stable only)
+          # is for a final, whose notes cover the whole cycle.
+          if [ "$PRERELEASE" = "true" ]; then
+            pattern="$(python3 baseLogger/tools/fw_version.py notes-pattern)"
+            if [ -n "$pattern" ]; then export GIT_CLIFF_TAG_PATTERN="$pattern"; fi
+          fi
           git cliff --unreleased --tag "v$NAME" --strip all > out/notes.md
           cat out/notes.md >> "$GITHUB_STEP_SUMMARY"
           cp baseLogger/.pio/build/esp32dev/{firmware.bin,firmware.elf,factory.bin} out/
