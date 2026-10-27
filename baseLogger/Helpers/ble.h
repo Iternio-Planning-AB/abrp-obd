@@ -99,6 +99,15 @@ bool bleAuthenticated() {
 #endif
 }
 
+// Which session grant authenticated() belongs to (BLEWrapper::auth_grant): the relay acks are per session.
+uint32_t bleAuthGrant() {
+#if ENABLE_BLE
+  return ble.auth_grant();
+#else
+  return 0;
+#endif
+}
+
 // The phone is the transport: authenticated, and either an app that never announced relay acks (today's
 // apps, trusted as before) or one whose acks are still moving forward (Helpers/ble_relay.h). This, not
 // bleAuthenticated(), is what the cellular gates key on: an authenticated app that stopped posting (backgrounded,

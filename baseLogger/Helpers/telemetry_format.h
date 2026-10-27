@@ -26,7 +26,7 @@ bool isGeoMetaKey(const std::string& key) { return key.compare(0, 6, "__geo_") =
 bool isGeoValueKey(const std::string& key) { return key == "lat" || key == "lon" || key == "heading"; }
 
 // The ABD1 seq a queued frame was relayed under, so the app's ack can take it off the queue (Helpers/ble_relay.h,
-// #90). Seqs restart every wake, so it is never written to the backlog, and it is never uploaded.
+// #90). Seqs restart every wake, so it is never written to the backlog, and the v2 body never carries it.
 static const char* const RELAY_SEQ_KEY = "__relay_seq";
 bool isRelaySeqKey(const std::string& key) { return key == RELAY_SEQ_KEY; }
 
@@ -58,7 +58,7 @@ std::string logString(OBDVector vec) {
   std::stringstream ss;
 
   for (auto res : vec) {
-    if (!isGeoMetaKey(res.first) && !isGeoValueKey(res.first) && !isRelaySeqKey(res.first)) tlm[res.first] = res.second;
+    if (!isGeoMetaKey(res.first) && !isGeoValueKey(res.first)) tlm[res.first] = res.second;
   }
   ss << "{\"tlm\":" << tlm.dump() << "}";
   return ss.str();
@@ -127,8 +127,7 @@ BleTlmFrame bleTlmFrame(const OBDVector& vec, size_t budget, uint32_t seq = 0) {
   if (seq) fields.push_back({ "", "\"seq\":" + std::to_string(seq) });
   for (const auto& res : vec) {
     const std::string& k = res.first;
-    if (isGeoMetaKey(k) || isGeoValueKey(k) || isRelaySeqKey(k) || k == "utc" || !bleTlmKey(k) ||
-        (seq && k == "seq")) continue;
+    if (isGeoMetaKey(k) || isGeoValueKey(k) || k == "utc" || !bleTlmKey(k) || (seq && k == "seq")) continue;
     char num[32];
     if (k == "is_charging" || k == "is_parked" || k == "is_dcfc") strcpy(num, res.second != 0.0 ? "true" : "false");
     else if (!bleTlmNumber(res.second, num, sizeof(num))) continue;
@@ -191,7 +190,7 @@ std::string bulkString(const std::vector<OBDVector>& frames, const std::string& 
   for (const auto& frame : frames) {
     json tlm = json::object();
     for (const auto& res : frame) {
-      if (!isGeoMetaKey(res.first) && !isGeoValueKey(res.first) && !isRelaySeqKey(res.first)) tlm[res.first] = res.second;
+      if (!isGeoMetaKey(res.first) && !isGeoValueKey(res.first)) tlm[res.first] = res.second;
     }
     tlm_list.push_back(tlm);
   }

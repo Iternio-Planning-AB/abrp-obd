@@ -112,7 +112,10 @@ public:
   bool authenticate(std::string auth_token);
   void clearAuthentication() { auth_token = "false"; set_authenticated(false); setup_unlocked = false; }
   bool get_authenticated() { return authenticated; }
-  void set_authenticated(bool auth) { authenticated = auth; };
+  void set_authenticated(bool auth) { if (auth && !authenticated) ++auth_grants; authenticated = auth; };
+  /* Counts session grants: a new one on every false -> true. The relay acks (Helpers/ble_relay.h) are per session, and
+     a disconnect, reconnect and AUTH can all land between two loop iterations, where authenticated alone looks unchanged. */
+  uint32_t auth_grant() const { return auth_grants; }
   bool get_setup_unlocked() { return setup_unlocked; }
   /* Phase B lockdown, passed in from config.h PROFILE_REQUIRE_SIGNATURE the same way - see there for
      what it refuses and the single lockout scenario. */
@@ -295,6 +298,7 @@ private:
   */
   std::string auth_token{ "false" };
   bool authenticated = false;   // the SESSION GRANT - see the authenticate() block above
+  volatile uint32_t auth_grants = 0; // see auth_grant()
   bool setup_unlocked = false;  // the ABD2 state-machine latch - see the same block
   bool profile_require_signature{ false }; // set from config.h PROFILE_REQUIRE_SIGNATURE, before init
 

@@ -141,18 +141,22 @@ ABD1 is notify-only, so the app has to say what it posted (`Helpers/ble_relay.h`
 - **Announce:** after AUTH OK the app writes `{"relay_ack":0}` on ABD2. From then on every ABD1 frame
   carries `"seq":n`, counting from 1 every wake. It leads the frame and is the last field trimmed; at an
   unnegotiated MTU 23 it may not fit the notify, and the readable value always carries it.
-- **Ack:** after each successful `APP_OBD` post, `{"relay_ack":n}`, the highest seq up to which every
-  frame was posted (cumulative). ABD2 answers `ACK`, as for every one-key write.
+- **Ack:** after each successful `APP_OBD` post, `{"relay_ack":n}` with the seq of the frame it posted.
+  It is cumulative: the app posts only the latest frame at each tick, and an ack covers every frame up to
+  n. Neither message gets a reply on ABD2 (no `ACK`): one arrives per post, mid-push too.
 - Once announced, each relayed frame is also queued for cellular under its seq, and an ack takes it off.
-  The phone stays the transport (`bleRelaying()`) while acks move forward; `RELAY_ACK_TIMEOUT_MS` (120 s)
-  after the announce or the last ack that did, cellular takes over with every frame still queued, and the
-  next ack that moves forward hands the transport back. An ack beyond the last seq sent is ignored.
-  An update or a log dump pauses polling, so the clock waits while either runs.
+  The phone stays the transport (`bleRelaying()`) while acks move forward: once frames have waited
+  `RELAY_ACK_TIMEOUT_MS` (120 s) with none moving forward, cellular takes over with every frame still
+  queued, and the next ack that moves forward hands the transport back. Nothing outstanding is never
+  late, and an update or a log dump (which pause polling) holds the clock. An ack beyond the last seq
+  sent is ignored, and a session's unacked frames lose their seq when it ends (sessions are counted by
+  AUTH grant, so a reconnect between two loop iterations still ends one), so the next session's acks
+  cannot drop them.
 - **An app that never announces is trusted as before**, frames byte-identical, so current apps keep
   #90 until they ship the ack. Presence (the awake leash, the alarm gate) keys on `bleAuthenticated()`,
   which a lapse does not change.
-- Log lines: `BLE relay acks on`, `BLE relay lapsed … -> cellular`, `BLE relay resumed`, `BLE relay ack
-  ignored`, `BLE relay end acked= sent= unacked=`. Acks themselves are not logged.
+- Log lines: `BLE relay acks on`, `BLE relay lapsed … -> cellular`, `BLE relay resumed`, `BLE relay held`,
+  `BLE relay ack ignored`, `BLE relay end acked= sent= unacked=`. Valid acks themselves are not logged.
 
 ---
 

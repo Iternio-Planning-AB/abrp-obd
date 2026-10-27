@@ -43,9 +43,12 @@ handler = code(wrapper[handler_start:find(wrapper, "void ServerCallbacks::onConn
 branch = find(handler, 'else if (message_key == "relay_ack") {', what="ABD2 handler")
 if not find(handler, "if (!wrapper->get_authenticated()) {", what="ABD2 handler") < branch:
     fail("the relay_ack branch must sit behind the ABD2 authorization gate")
-relay_branch = handler[branch:find(handler, "return;", branch, "ABD2 handler") + len("return;")]
-if "dispatchRelayAck(" not in relay_branch or "logEvt" in relay_branch or "logError" in relay_branch:
-    fail("the relay_ack branch must return, and log nothing on the Bluedroid task")
+relay_branch = block(handler[branch:], 'else if (message_key == "relay_ack") {', "ABD2 handler")
+if "dispatchRelayAck(" not in relay_branch or not re.search(r"\n      return;\n    }\n$", relay_branch) or \
+        re.search(r"logEvt|logError|notify", relay_branch):
+    fail("the relay_ack branch must end in an unconditional return, and log and answer nothing on the Bluedroid task")
+if 'message_key != "HASH" && message_key != "relay_ack"' not in handler:
+    fail("a relay_ack must not get the generic ACK on ABD2")
 if not branch < find(handler, "wrapper->profile_signature_required()", what="ABD2 handler") < \
         find(handler, "wrapper->setJsonValue(message_key", what="ABD2 handler"):
     fail("the relay_ack branch must return before the Phase B lockdown and setJsonValue")
@@ -53,6 +56,10 @@ if "bleRelayAckWrite(input)" not in handler[:find(handler, "ABD2 rx:", what="ABD
     fail("the ABD2 rx log must leave relay acks out")
 if "ble.set_relay_ack_hook(relayAckHook);" not in block(ble, "void bleInitForWake() {", "ble.h"):
     fail("bleInitForWake must wire the relay-ack hook")
+
+relay = (helpers / "ble_relay.h").read_text()
+if re.search(r"logEvent|Serial", block(relay, "void relayAckHook(", "ble_relay.h")):
+    fail("relayAckHook runs on the Bluedroid task: stash only")
 
 # The cellular block runs whenever the phone is not the transport, relayed frame or not.
 relay_start = find(logger, "    if (ble_relayed) {", what="logger.ino")
@@ -89,6 +96,7 @@ print(subprocess.check_output([*compiler, "--version"], text=True).splitlines()[
 with tempfile.TemporaryDirectory(prefix="obd-relay-checks-") as temporary:
     build = Path(temporary)
     (build / "ble_predicates.inc").write_text(block(ble, "bool bleAuthenticated() {", "ble.h")
+                                              + block(ble, "uint32_t bleAuthGrant() {", "ble.h")
                                               + block(ble, "bool bleRelaying() {", "ble.h"))
     send_start = find(logger, "    const uint16_t ble_mtu = ble.mtu();", what="logger.ino")
     (build / "ble_send.inc").write_text(logger[send_start:find(logger, "#else\n    const bool ble_relayed = false;",

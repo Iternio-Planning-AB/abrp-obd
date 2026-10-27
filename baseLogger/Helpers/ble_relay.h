@@ -15,21 +15,25 @@
     {"relay_ack":n}  every frame up to seq n was posted (cumulative).
   An app that never announces is trusted as before, so today's apps keep today's behaviour, frames included.
   Once announced, a relayed frame is ALSO queued for cellular under its seq (RELAY_SEQ_KEY), and an ack takes it
-  off. The phone stays the transport while acks move forward; RELAY_ACK_TIMEOUT_MS after the announce or the last
-  ack that did, cellular takes over with every frame still queued, and the next ack that moves forward hands the
-  transport back. An ack beyond the last seq sent is ignored, so a peer cannot drop frames it was never sent.
+  off. The phone stays the transport while acks move forward: once a frame has waited RELAY_ACK_TIMEOUT_MS with no
+  ack moving forward, cellular takes over with every frame still queued, and the next ack that moves forward hands
+  the transport back. An ack beyond the last seq sent is ignored, so a peer cannot drop frames it was never sent, and
+  a session's unacked frames lose their seq when it ends, so the next session's acks cannot drop them either.
 
   This file is #included by logger.ino into the single sketch translation unit - it is NOT a standalone
   compilation unit - so it shares logger.ino's globals and the config.h feature flags.
 */
 
-// Mailbox from the Bluedroid task. Written under the lock by relayAckHook, emptied by relayAckService.
+// Mailbox from the Bluedroid task. Written under the lock by relayAckHook, emptied by relayAckService. Values carry the
+// session grant they arrived under, so one written just before a reconnect is never applied to the next session.
 portMUX_TYPE g_relay_mux = portMUX_INITIALIZER_UNLOCKED;
 bool g_relay_announce_pending = false;
-uint32_t g_relay_ack_pending = 0; // highest ack waiting; 0 = none
+uint32_t g_relay_ack_pending = 0;   // highest ack waiting; 0 = none
+uint32_t g_relay_pending_grant = 0; // the session grant the waiting values arrived under
 
 // Loop-task state. The seq counts every wake from 1 and never resets within it, so a seq names one frame.
 uint32_t g_relay_seq = 0;          // the last seq notified this wake
+uint32_t g_relay_grant = 0;        // the session grant the state below belongs to
 bool g_relay_announced = false;    // this session's app acks
 uint32_t g_relay_acked = 0;        // highest seq acked (or sent before the announce) this session
 unsigned long g_relay_live_ms = 0; // the announce, or the last ack that moved forward
@@ -38,7 +42,13 @@ bool g_relay_ignored = false;      // logged an ack beyond the last seq this ses
 
 // Bluedroid task: stash only.
 void relayAckHook(uint32_t v) {
+  const uint32_t grant = bleAuthGrant();
   portENTER_CRITICAL(&g_relay_mux);
+  if (grant != g_relay_pending_grant) {
+    g_relay_announce_pending = false;
+    g_relay_ack_pending = 0;
+    g_relay_pending_grant = grant;
+  }
   if (v == 0) g_relay_announce_pending = true;
   else if (v > g_relay_ack_pending) g_relay_ack_pending = v;
   portEXIT_CRITICAL(&g_relay_mux);
@@ -54,43 +64,68 @@ uint32_t relayNextSeq() {
 }
 
 #if ENABLE_NETWORK
+// A frame's relay seq; 0 when it was not relayed to an app that acks.
+static uint32_t relaySeqOf(const OBDVector& frame) {
+  for (const auto& value : frame)
+    if (isRelaySeqKey(value.first)) return (uint32_t)value.second;
+  return 0;
+}
+
 // Take the frames up to seq off the cellular queue.
 static void relayDropAcked(std::vector<OBDVector>& frames, uint32_t seq) {
   frames.erase(std::remove_if(frames.begin(), frames.end(), [&](const OBDVector& frame) {
-    for (const auto& value : frame)
-      if (isRelaySeqKey(value.first)) return value.second <= seq;
-    return false;
+    const uint32_t frame_seq = relaySeqOf(frame);
+    return frame_seq && frame_seq <= seq;
   }), frames.end());
+}
+
+// At a session's end its unacked frames become plain cellular frames: the next session's acks name its own seqs only.
+static size_t relayUntag() {
+  size_t n = 0;
+  for (auto* frames : { &obd_result_vector, &g_upload_held })
+    for (auto& frame : *frames) {
+      const size_t before = frame.size();
+      frame.erase(std::remove_if(frame.begin(), frame.end(), [](const OBDPair& value) { return isRelaySeqKey(value.first); }),
+        frame.end());
+      n += before - frame.size();
+    }
+  return n;
 }
 
 static size_t relayQueued() {
   size_t n = 0;
   for (const auto* frames : { &obd_result_vector, &g_upload_held })
-    for (const auto& frame : *frames)
-      for (const auto& value : frame)
-        if (isRelaySeqKey(value.first)) { ++n; break; }
+    for (const auto& frame : *frames) n += relaySeqOf(frame) != 0;
   return n;
 }
 #endif
 
 void relayAckService() {
+  const bool authenticated = bleAuthenticated();
+  const uint32_t grant = bleAuthGrant();
   portENTER_CRITICAL(&g_relay_mux);
-  const bool announce = g_relay_announce_pending;
-  const uint32_t ack = g_relay_ack_pending;
+  const bool current = authenticated && g_relay_pending_grant == grant;
+  const bool announce = current && g_relay_announce_pending;
+  const uint32_t ack = current ? g_relay_ack_pending : 0;
   g_relay_announce_pending = false;
   g_relay_ack_pending = 0;
   portEXIT_CRITICAL(&g_relay_mux);
 
-  if (!bleAuthenticated()) {
-    // The session is over: its frames still queued go up over cellular, and what is in the mailbox was its.
+  if (!authenticated || grant != g_relay_grant) {
+    // The session is over, even when a new one was granted since the last iteration: its unacked frames go up over
+    // cellular as plain frames.
     if (g_relay_announced) {
 #if ENABLE_NETWORK
+      const size_t unacked = relayUntag();
       logEvent("BLE relay end acked=%lu sent=%lu unacked=%u", (unsigned long)g_relay_acked,
-        (unsigned long)g_relay_seq, (unsigned)relayQueued());
+        (unsigned long)g_relay_seq, (unsigned)unacked);
+#else
+      logEvent("BLE relay end acked=%lu sent=%lu", (unsigned long)g_relay_acked, (unsigned long)g_relay_seq);
 #endif
     }
     g_relay_announced = g_relay_lapsed = g_relay_ignored = false;
-    return;
+    g_relay_grant = grant;
+    if (!authenticated) return;
   }
   const unsigned long now = millis();
   if (announce && !g_relay_announced) {
@@ -104,24 +139,22 @@ void relayAckService() {
   if (ack > g_relay_seq) {
     if (!g_relay_ignored) logEvent("BLE relay ack ignored ack=%lu sent=%lu", (unsigned long)ack, (unsigned long)g_relay_seq);
     g_relay_ignored = true;
-  } else if (ack && (ack > g_relay_acked || g_relay_acked == g_relay_seq)) {
-    // Moving forward, or nothing outstanding: the app is posting. A repeat of an old ack with frames still
-    // unacked proves nothing and does not hold cellular off.
+  } else if (ack > g_relay_acked) {
+    // Moving forward: the app is posting. A repeat of an old ack proves nothing and does not hold cellular off.
 #if ENABLE_NETWORK
-    if (ack > g_relay_acked) {
-      relayDropAcked(obd_result_vector, ack);
-      relayDropAcked(g_upload_held, ack);
-    }
+    relayDropAcked(obd_result_vector, ack);
+    relayDropAcked(g_upload_held, ack);
 #endif
-    if (ack > g_relay_acked) g_relay_acked = ack;
+    g_relay_acked = ack;
     if (g_relay_lapsed)
       logEvent("BLE relay resumed ack=%lu after %lus", (unsigned long)ack, (unsigned long)((now - g_relay_live_ms) / 1000));
     g_relay_live_ms = now;
     g_relay_lapsed = false;
   }
-  if (g_ota_active || g_logdump_active) {
-    // An update or a log dump pauses polling, so there is nothing to ack, and either is a phone busy on this link:
-    // the clock waits for it, and cellular stays off so a reconnect cannot block the loop under the transfer.
+  if (g_ota_active || g_logdump_active || (!g_relay_lapsed && g_relay_acked == g_relay_seq)) {
+    // Nothing outstanding is nothing to be late with. And an update or a log dump pauses polling and is a phone busy on
+    // this link: the clock waits for it, and cellular stays off so a reconnect cannot block the loop under the transfer.
+    if (g_relay_lapsed) logEvent("BLE relay held for an update or log dump");
     g_relay_live_ms = now;
     g_relay_lapsed = false;
   }

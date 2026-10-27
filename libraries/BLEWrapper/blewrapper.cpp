@@ -650,7 +650,8 @@ void StartupCallbacks::onWrite(BLECharacteristic* pStartupCharacteristic) {
       }
       // ACK is per bulk-push packet (contract §4c). Do NOT ACK the HASH write - it gets HASH OK / HASH NOT OK,
       // and an extra ACK before that puts an unexpected response on the channel the app is strictly matching.
-      if (message_key != "HASH") {
+      // Nor a relay_ack (#90): one arrives per app post, mid-push too, and an extra ACK there would answer a push packet.
+      if (message_key != "HASH" && message_key != "relay_ack") {
         pStartupCharacteristic->setValue(std::string("ACK"));
         pStartupCharacteristic->notify();
       }
@@ -715,8 +716,8 @@ void StartupCallbacks::onWrite(BLECharacteristic* pStartupCharacteristic) {
       // profile content: it must RETURN before the lockdown and setJsonValue below, or every ack would fold into
       // configJson and perturb the profile HASH. Bluedroid task: stash only, and no log line - one arrives per
       // app post, and Helpers/ble_relay.h logs the transitions on the loop task.
-      const json& v = j.at(message_key);
-      if (v.is_number_unsigned() && v.get<uint64_t>() <= UINT32_MAX) wrapper->dispatchRelayAck(v.get<uint32_t>());
+      uint32_t v;
+      if (bleRelayAckValue(j.at(message_key), v)) wrapper->dispatchRelayAck(v);
       return;
     }
     // PHASE B LOCKDOWN. Everything reaching this line is a profile VALUE - the protocol packages

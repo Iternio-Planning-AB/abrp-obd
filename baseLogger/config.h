@@ -265,8 +265,8 @@
 #define BLE_UPLOAD_GRACE_MS 10000
 #endif
 
-// How long a phone that announced relay acks (ABD2 {"relay_ack":0}) stays the transport without an ack that
-// moves forward (Helpers/ble_relay.h, #90). A connected, authenticated phone used to count as relaying for as
+// How long frames relayed to a phone that announced relay acks (ABD2 {"relay_ack":0}) may wait with no ack moving
+// forward before cellular takes over (Helpers/ble_relay.h, #90). A connected, authenticated phone used to count as relaying for as
 // long as it stayed connected: an ID.5 drove 65 minutes in the BLE state with the app posting nothing, and the
 // frames it was handed were never queued for cellular. At 120 s, over two of the dongle's own 50 s cellular
 // cycles, an app that batches or posts slowly keeps the transport, and a stalled one costs about 2 minutes

@@ -97,6 +97,8 @@ unsigned long g_ble_disconnect_ms = 0, last_broadcast = 0;
 
 struct FakeBle {
   bool linked = false, authenticated = false;
+  uint32_t grants = 0;
+  uint32_t auth_grant() const { return grants; }
   uint16_t negotiated = 185;
   std::vector<std::string> notifies, values;
   bool connected() { return linked; }
@@ -177,6 +179,7 @@ void reset() {
 }
 
 void connect() {
+  if (!ble.authenticated) ++ble.grants; // BLEWrapper::set_authenticated(true)
   ble.linked = ble.authenticated = true;
 }
 
@@ -324,6 +327,65 @@ void presence() {
   check(!bleRelaying() && bleAuthenticated(), "during a lapse the phone still counts as present for the leash and alarm gate");
 }
 
+std::vector<unsigned> queuedPolls() {
+  std::vector<unsigned> out;
+  for (const auto& frame : obd_result_vector)
+    for (const auto& value : frame) if (value.first == "soc") out.push_back((unsigned)(value.second + 0.5) - 10);
+  return out;
+}
+
+// A session's acks name its own frames only, however quickly the next session follows.
+void sessions() {
+  reset();
+  connect();
+  announce();
+  poll();
+  poll();
+  relayAckHook(1);
+  poll();
+  ble.linked = ble.authenticated = false;
+  g_ble_disconnect_ms = fake_ms;
+  poll();
+  connect();
+  announce();
+  relayAckHook(g_relay_seq);
+  poll();
+  check(queuedPolls() == std::vector<unsigned>({2, 3, 4, 5, 7}),
+        "a reconnect inside the grace: the new session's ack leaves the old session's unacked frames queued");
+  check(queuedSeqs() == std::vector<unsigned>({g_relay_seq}), "and they lost their seq with their session");
+
+  reset();
+  connect();
+  announce();
+  poll();
+  ble.authenticated = false;
+  connect(); // dropped and granted again between two loop iterations, to an app that never announces
+  poll();
+  check(ble.notifies.back() == historical::bleTlmFrame(pollFrame(polls), bleNotifyBudget(ble.negotiated)).notify,
+        "a session granted between two iterations starts unannounced");
+  check(queuedPolls() == std::vector<unsigned>({1, 2}) && queuedSeqs().empty(),
+        "and its relayed frames are not queued, while the last session's go up as plain frames");
+
+  reset();
+  connect();
+  announce();
+  relayAckHook(g_relay_seq);
+  poll();
+  relayAckHook(g_relay_seq);
+  for (int i = 0; i < 3; ++i) {
+    fake_ms += RELAY_ACK_TIMEOUT_MS;
+    relayAckService();
+  }
+  check(bleRelaying(), "with nothing outstanding there is nothing to be late with");
+
+  uint32_t v = 7;
+  check(bleRelayAckValue(json::parse("0"), v) && v == 0 && bleRelayAckValue(json::parse("4294967295"), v) &&
+        v == 4294967295u && bleRelayAckWrite("{\"relay_ack\":12}"), "relay_ack takes any uint32 the app writes");
+  for (const char* bad : {"-1", "1.5", "\"3\"", "4294967296", "null"})
+    check(!bleRelayAckValue(json::parse(bad), v) && !bleRelayAckWrite(std::string("{\"relay_ack\":") + bad + "}"),
+          std::string("relay_ack refuses ") + bad + ", and the rx log keeps it");
+}
+
 // A log dump or an update pauses polling, so an announced app has nothing to ack meanwhile.
 void hold() {
   reset();
@@ -354,7 +416,7 @@ void persistence() {
 int main(int argc, char** argv) {
   const std::vector<std::pair<std::string, void (*)()>> groups{
     {"old-app", oldApp}, {"acking", acking}, {"stall", stall}, {"never-ack", neverAck},
-    {"resume", resume}, {"disconnect", disconnect}, {"presence", presence}, {"hold", hold}, {"persistence", persistence},
+    {"resume", resume}, {"disconnect", disconnect}, {"presence", presence}, {"hold", hold}, {"sessions", sessions}, {"persistence", persistence},
   };
   for (const auto& group : groups) {
     if (argc > 1 && group.first != argv[1]) continue;
