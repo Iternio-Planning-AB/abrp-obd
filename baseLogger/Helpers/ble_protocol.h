@@ -36,27 +36,26 @@ struct BleProtocol {
   uint32_t (*nextSeq)();                                  // the seq the next ABD1 frame carries; 0: none
   void (*frameNotified)(uint32_t seq);                    // a frame went out on ABD1 under seq
   bool (*phoneIsTransport)();                             // may cellular stand down for this authenticated phone?
-  bool (*sessionMessage)(const char* key, const json& value); // an ABD9 message; false: not in this version
+  bool (*sessionApply)(uint32_t ack, RelayVerb verb);     // ABD9's relay ack (0: none) and verb; false: not this version
   bool setupAllowed;                                      // false: no-protocol session (no ABD1 relay, ABD2 PROTO)
-  bool relayNeedsSeq;                                     // a frame counts as relayed only if it carries a seq
 };
 
 static uint32_t bleNoSeq() { return 0; }
 static void bleNoFrame(uint32_t) {}
 static bool bleAlways() { return true; }
 static bool bleNever() { return false; }
-static bool bleNoMessages(const char*, const json&) { return false; }
+static bool bleNoSession(uint32_t, RelayVerb) { return false; }
 
 static const uint8_t BLE_PROTO_NONE = 0xFF; // the version of a session with no protocol
 
-constexpr BleProtocol kProtoNone = { BLE_PROTO_NONE, bleNoSeq, bleNoFrame, bleNever, bleNoMessages, false, false };
+constexpr BleProtocol kProtoNone = { BLE_PROTO_NONE, bleNoSeq, bleNoFrame, bleNever, bleNoSession, false };
 // v0 is today's protocol: an authenticated phone is the transport while it stays connected, its frames carry no seq
 // and are not queued, and ABD9 carries nothing.
-constexpr BleProtocol kProtoV0 = { 0, bleNoSeq, bleNoFrame, bleAlways, bleNoMessages, true, false };
+constexpr BleProtocol kProtoV0 = { 0, bleNoSeq, bleNoFrame, bleAlways, bleNoSession, true };
 // v1 (#90, Helpers/ble_relay.h): v0, plus the frames of a subscribed app carry "seq" beside "tlm" and stay queued until
 // it acks them on ABD9, the app can hand the transport back (relay stop/resume), and it stops being the transport when
 // its acks stall.
-constexpr BleProtocol kProtoV1 = { 1, relayNextSeq, relayFrameNotified, relayTransportLive, relayMessage, true, true };
+constexpr BleProtocol kProtoV1 = { 1, relayNextSeq, relayFrameNotified, relayTransportLive, relaySessionApply, true };
 
 constexpr const BleProtocol* kProtocols[] = { &kProtoV0, &kProtoV1 };
 static const uint8_t BLE_PROTO_MAX = sizeof(kProtocols) / sizeof(kProtocols[0]) - 1;
@@ -81,9 +80,15 @@ bool bleProtoPhoneIsTransport() {
   return bleProto()->phoneIsTransport();
 }
 
+// Whether a protocol tags frames for the app to ack: then a frame counts as relayed only if it carries a seq, and a new
+// grant starts the relay session. One field decides it, nextSeq, never a version number.
+bool bleProtoTagsFrames(const BleProtocol* proto) {
+  return proto->nextSeq != bleNoSeq;
+}
+
 // Through a forward declaration in ble_relay.h: a new grant starts the relay session when its protocol acks frames.
 bool bleProtoRelayAcks() {
-  return bleProto()->relayNeedsSeq;
+  return bleProtoTagsFrames(bleProto());
 }
 
 // Loop task, every pass, after relayAckService(): apply what ABD9 stashed (Helpers/ble_relay.h) through the session's
@@ -99,13 +104,14 @@ void sessionChannelService() {
       logEvent("BLE session stale grant");
     } else {
       const BleProtocol* proto = bleProto();
-      auto apply = [&](const char* key, const json& value) {
-        if (!proto->sessionMessage(key, value) && relayFirstIgnore(key))
-          logEvent("BLE session proto=%u ignored key=%s", (unsigned)proto->version, key);
+      auto ignore = [&](const char* key) {
+        if (relayFirstIgnore(key)) logEvent("BLE session proto=%u ignored key=%s", (unsigned)proto->version, key);
       };
-      if (ack) apply("relay_ack", json(ack));
-      if (verb != RELAY_VERB_NONE) apply("relay", json(verb == RELAY_VERB_STOP ? "stop" : "resume"));
-      if (bad[0]) apply(bad, json());
+      if ((ack || verb != RELAY_VERB_NONE) && !proto->sessionApply(ack, verb)) {
+        if (ack) ignore("relay_ack");
+        if (verb != RELAY_VERB_NONE) ignore("relay");
+      }
+      if (bad[0]) ignore(bad); // no version takes it: an unknown key, or a value the hook could not use
     }
   }
   relayStateRefresh();

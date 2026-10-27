@@ -161,6 +161,11 @@ if "bleProtoRangeField(" not in block(auth, "static void authSendNonce() {", "au
 if not re.search(r"static_assert\([^;]*< 93,", auth):
     fail("auth_gate.h must hold the worst-case nonce frame under the 93-byte notify at compile time")
 protocol = code((helpers / "ble_protocol.h").read_text())
+table = block(protocol, "struct BleProtocol {", "ble_protocol.h")
+if "bool (*sessionApply)(uint32_t ack, RelayVerb verb);" not in table or re.search(r"sessionMessage|relayNeedsSeq|json", table):
+    fail("the protocol table takes ABD9's typed values (sessionApply), and whether it tags frames is nextSeq's alone")
+if "relayStateRefresh()" in code(block((helpers / "ble_relay.h").read_text(), "void relayAckService() {", "ble_relay.h")):
+    fail("relayAckService must leave ABD9's state to sessionChannelService, which refreshes it every pass")
 accept = block(protocol, "void bleProtoAccept(", "ble_protocol.h")
 if not find(accept, "ble.set_setup_allowed(", what="bleProtoAccept") < find(accept, "ble.set_authenticated(true)", what="bleProtoAccept"):
     fail("bleProtoAccept must allow or refuse setup before it sets the grant")

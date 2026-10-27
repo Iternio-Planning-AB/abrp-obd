@@ -3,7 +3,7 @@
   The relay session (#90) - whether a connected, authenticated phone is actually carrying the telemetry - and the ABD9
   session channel it is driven over.
   Contains: the session state machine (relayAckService), v1's protocol entries (relayNextSeq, relayFrameNotified,
-  relayTransportLive, relayMessage), the Bluedroid-task ABD9 hooks (relaySessionWrite, relaySessionRead) and the
+  relayTransportLive, relaySessionApply), the Bluedroid-task ABD9 hooks (relaySessionWrite, relaySessionRead) and the
   loop-task service that applies what they stash (sessionChannelService).
 
   A connected, authenticated phone used to count as the transport for as long as it stayed connected, and a
@@ -222,23 +222,14 @@ static void relayAck(uint32_t ack) {
   else if (g_relay_state == RELAY_LIVE) g_relay_live_ms = now;
 }
 
-// v1's sessionMessage. False: not a message of this version (or not one it takes), which the caller logs.
-bool relayMessage(const char* key, const json& value) {
+// v1's sessionApply: an ABD9 burst, the ack first (0: none), then the verb. False outside a relay session.
+bool relaySessionApply(uint32_t ack, RelayVerb verb) {
   if (!relaySession()) return false;
-  uint32_t ack;
-  if (!strcmp(key, "relay_ack") && relayAckValue(value, ack)) {
-    relayAck(ack);
-    return true;
-  }
-  if (!strcmp(key, "relay") && value == "stop") {
-    if (!(g_relay_state == RELAY_LAPSED && g_relay_why == RELAY_WHY_STOP)) relayLapse(RELAY_WHY_STOP, millis());
-    return true;
-  }
-  if (!strcmp(key, "relay") && value == "resume") {
-    if (g_relay_state == RELAY_LAPSED) relayLive(millis(), 0);
-    return true;
-  }
-  return false;
+  if (ack) relayAck(ack);
+  if (verb == RELAY_VERB_STOP && !(g_relay_state == RELAY_LAPSED && g_relay_why == RELAY_WHY_STOP))
+    relayLapse(RELAY_WHY_STOP, millis());
+  if (verb == RELAY_VERB_RESUME && g_relay_state == RELAY_LAPSED) relayLive(millis(), 0);
+  return true;
 }
 
 // The session ended: its unacked frames go up over cellular as plain frames.
@@ -277,15 +268,9 @@ void relayAckService() {
   const unsigned long now = millis();
   if (!authenticated || grant != g_relay_grant) {
     // The session is over, even when a new one was granted since the last pass.
-    if (g_relay_state != RELAY_NO_SESSION) {
-      relayEnd();
-      relayStateRefresh();
-    }
+    if (g_relay_state != RELAY_NO_SESSION) relayEnd();
     g_relay_grant = grant;
-    if (authenticated) {
-      relayStart(now);
-      relayStateRefresh();
-    }
+    if (authenticated) relayStart(now); // ABD9's state follows in sessionChannelService, later this pass
   }
   // Read once per pass, before the ABD1 send, so the state machine and the send agree.
   g_relay_subscribed = relaySession() && bleTelemetrySubscribed();

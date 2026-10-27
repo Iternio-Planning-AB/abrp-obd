@@ -986,7 +986,7 @@ void modelPoll() {
   const bool subscribed = ble.telemetry_subscribed;
   const uint32_t grant = currentGrant();
   const size_t before = ble.values.size(), uploaded = network.received.size();
-  const bool v0 = grant && !bleProto()->relayNeedsSeq && bleProto()->setupAllowed;
+  const bool v0 = grant && !bleProtoTagsFrames(bleProto()) && bleProto()->setupAllowed;
   poll();
   const unsigned p = polls;
   const uint32_t s = ble.values.size() > before ? frameSeq(ble.values.back()) : 0;
@@ -1018,7 +1018,7 @@ void modelAck(bool then_reconnect) {
   }
   services();
   if (!then_reconnect && grant) {
-    if (bleProto()->relayNeedsSeq) model.acked_by[grant] = std::max(model.acked_by[grant], seq);
+    if (bleProtoTagsFrames(bleProto())) model.acked_by[grant] = std::max(model.acked_by[grant], seq);
   }
 }
 
@@ -1038,7 +1038,7 @@ void modelCheck(bool was_stopped, uint32_t grant_before, bool resumed) {
   for (const auto& frame : obd_result_vector) {
     bool tagged = false;
     for (const auto& value : frame) tagged |= value.first == RELAY_SEQ_KEY;
-    check(!tagged || (grant && bleProto()->relayNeedsSeq), "invariant: no tagged frame from an ended session");
+    check(!tagged || (grant && bleProtoTagsFrames(bleProto())), "invariant: no tagged frame from an ended session");
   }
   if (grant) {
     if (model.version_grant != (int)grant) {
@@ -1047,7 +1047,7 @@ void modelCheck(bool was_stopped, uint32_t grant_before, bool resumed) {
     }
     check(bleProto()->version == model.version, "invariant: the version is fixed for the grant");
   }
-  if (grant && grant != grant_before && bleProto()->relayNeedsSeq)
+  if (grant && grant != grant_before && bleProtoTagsFrames(bleProto()))
     check(bleRelaying() && sessionState()["relay"] == "live", "invariant: a new v1 session starts live");
   if (was_stopped && grant == grant_before && !resumed)
     check(!bleRelaying() && sessionState().value("why", "") == "stop", "invariant: only a resume ends a stop");
@@ -1103,7 +1103,7 @@ void enumerate(int depth) {
       start(which);
       modelCheck(false, currentGrant(), false);
       for (int e : events) {
-        const bool stopped = bleAuthenticated() && bleProto()->relayNeedsSeq && sessionState().value("why", "") == "stop";
+        const bool stopped = bleAuthenticated() && bleProtoTagsFrames(bleProto()) && sessionState().value("why", "") == "stop";
         const uint32_t grant_before = currentGrant();
         apply(e);
         modelCheck(stopped, grant_before, e == RESUME);

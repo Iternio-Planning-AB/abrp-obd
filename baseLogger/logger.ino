@@ -2089,7 +2089,7 @@ void loop() {
     // protocol is handed nothing, and a version that needs a seq counts a frame without one as not relayed: either
     // way the frame stays queued for cellular.
     const bool ble_relayed = proto->setupAllowed && ble.logData(ble_frame.notify, ble_frame.full) &&
-                             (relay_seq || !proto->relayNeedsSeq);
+                             (relay_seq || !bleProtoTagsFrames(proto));
     if (ble_relayed && relay_seq) proto->frameNotified(relay_seq);
 #else
     const bool ble_relayed = false;
