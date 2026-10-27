@@ -204,6 +204,8 @@ with tempfile.TemporaryDirectory(prefix="obd-relay-checks-") as temporary:
     handoff = find(logger, "      bool ble_handoff_fire = ", grace, "logger.ino")
     (build / "upload_grace.inc").write_text(logger[grace:find(logger, "\n", grace) + 1]
                                             + logger[handoff:find(logger, "\n", handoff) + 1])
+    reconnect = find(logger, "  if (!g_weak_rail_cold_boot && !bleRelaying() && !g_ota_active", what="logger.ino")
+    (build / "reconnect_gate.inc").write_text(logger[reconnect + len("  if ("):find(logger, ") {\n", reconnect, "logger.ino")])
     gate = find(logger, "      if (!bleRelaying() && !g_ota_active && !ble_upload_grace", what="logger.ino")
     (build / "upload_gate.inc").write_text(logger[gate + len("      if ("):find(logger, ") {\n", gate, "logger.ino")])
     historical = subprocess.check_output(

@@ -1373,7 +1373,10 @@ void loop() {
   // the instant the phone drops - which is exactly the OTA resume window - and a modem reconnect/POST there
   // would block the loop for seconds (starving sector ACKs) or, via the http=0 recovery ladder, deep-sleep
   // the device mid-transfer.
-  if (!g_weak_rail_cold_boot && !bleRelaying() && !g_ota_active && !network.connected() && (millis() - last_reconnect_try) > WIFI_RETRY_MS) {
+  // !g_logdump_active too, for the same reason (a window reply stalled behind a modem reconnect): the dump used to
+  // rely on the relay hold for it, which kept the transport on the phone while it ran. A v1 relay session (#90) may
+  // now lapse or stop during a dump without reopening cellular under it.
+  if (!g_weak_rail_cold_boot && !bleRelaying() && !g_ota_active && !g_logdump_active && !network.connected() && (millis() - last_reconnect_try) > WIFI_RETRY_MS) {
     Serial.printf("Network offline - retrying\n");
     network.reconnect();
     last_reconnect_try = millis();
@@ -1443,7 +1446,7 @@ void loop() {
       // upload, so an unpaired camping phone that also blocked clock recovery would starve cellular of
       // usable frames on top of blocking the POSTs.
       static unsigned long last_clock_retry = 0;
-      if (!t && !bleRelaying() && !g_ota_active && (millis() - last_clock_retry) > 30000UL) {
+      if (!t && !bleRelaying() && !g_ota_active && !g_logdump_active && (millis() - last_clock_retry) > 30000UL) {
         last_clock_retry = millis();
         if (!clockResync("loop")) clockNtpNoClock();  // before the poll, so its frame gets a utc
       }
@@ -2203,7 +2206,7 @@ void loop() {
       // No token, no upload. Belt-and-braces since an unpaired dongle also never polls, so the buffer
       // should be empty anyway - but the alternative is powering the modem for a POST the API can only
       // answer 401, and this is the one condition where that is knowable in advance.
-      if (!bleRelaying() && !g_ota_active && !ble_upload_grace && !obd_result_vector.empty() &&
+      if (!bleRelaying() && !g_ota_active && !ble_upload_grace && !g_logdump_active && !obd_result_vector.empty() &&
           !tlm_push_token.empty() &&
           (ble_handoff_fire || dc_first_upload || ( millis() - last_broadcast ) > upload_delay)) {
         // Awake-aware backoff. The fail cap exists to stop the modem thrashing a SLEEPING car's 12V when

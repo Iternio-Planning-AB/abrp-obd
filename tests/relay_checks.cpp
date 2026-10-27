@@ -88,6 +88,7 @@ struct FakeNetwork {
   int responseCode = 200;
   bool set_headers(const HeaderVector&) { return true; }
   std::string getDateHeader() { return {}; }
+  bool connected() { return false; } // offline: only the reconnect gate stands between the loop and the modem
   HttpResponse sendBulk(const std::string& payload) {
     check(payload.find("relay_seq") == std::string::npos, "a relay seq never reaches an upload body");
     if (responseCode == 200) for (const auto& point : json::parse(payload)) received.push_back(point);
@@ -193,6 +194,25 @@ void services() {
   sessionChannelService();
 }
 
+// logger.ino's cellular gates: the modem reconnect (outside the poll block, so it runs during a log dump) and the
+// upload's condition with the grace and handoff it reads; the cadence term is zero.
+bool g_weak_rail_cold_boot = false;
+const unsigned long WIFI_RETRY_MS = 20000;
+unsigned long last_reconnect_try = 0;
+bool reconnectGate() {
+  return
+#include "reconnect_gate.inc"
+  ;
+}
+bool uploadGate() {
+#include "upload_grace.inc"
+  const unsigned long upload_delay = 0;
+  const bool dc_first_upload = false;
+  return
+#include "upload_gate.inc"
+  ;
+}
+
 // One loop iteration from the session services to the cellular upload gate, all production code but the fakes.
 const double T = 1791500000;
 unsigned polls = 0, posts = 0;
@@ -209,12 +229,7 @@ void poll() {
   GeoMarks poll_geo{};
 #include "ble_send.inc"
 #include "upload_buffer.inc"
-#include "upload_grace.inc"
-  const unsigned long upload_delay = 0;
-  const bool dc_first_upload = false;
-  if (
-#include "upload_gate.inc"
-  ) {
+  if (uploadGate()) {
     ++posts;
     check(uploadBuffered(true), "the cellular upload succeeds");
     g_ble_handoff_pending = false;
@@ -766,6 +781,24 @@ void seqFrame() {
         "at the 93-byte notify of MTU 96 the trim drops telemetry fields only, never the seq: " + trimmed);
 }
 
+// A log dump pauses polling and keeps the phone busy on the link: it changes no relay state, but no cellular gate may
+// open under it, the modem reconnect included (it runs outside the poll block and can block the loop for seconds).
+void dumpCellular() {
+  reset();
+  negotiate();
+  poll();
+  g_logdump_active = true;
+  stop();
+  services();
+  check(!bleRelaying() && sessionState()["why"] == "stop", "a stop during a log dump is applied at once");
+  fake_ms += WIFI_RETRY_MS + 1;
+  check(!reconnectGate() && !uploadGate(), "but cellular stays off while the dump runs: no modem reconnect, no upload");
+  g_logdump_active = false;
+  check(reconnectGate() && uploadGate(), "and takes over the moment it ends");
+  g_ota_active = true;
+  check(!reconnectGate() && !uploadGate(), "as for an update");
+}
+
 // Every sequence of `depth` events from three starting points, with the session invariants (design §5.4) checked
 // after each event. The model tracks what each poll's frame may legitimately become.
 struct Model {
@@ -1047,7 +1080,7 @@ int main(int argc, char** argv) {
     {"sessions", sessions}, {"persistence", persistence},
     {"negotiation", negotiation}, {"grant", grant}, {"nonce", nonce},
     {"stop-resume", stopResume}, {"mailbox", mailbox}, {"state", state}, {"subscribed-seq", subscribedSeq},
-    {"seq-frame", seqFrame},
+    {"seq-frame", seqFrame}, {"dump-cellular", dumpCellular},
     {"enumerate", enumerateGroup},
   };
 #else
