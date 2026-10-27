@@ -57,9 +57,9 @@ if "bleRelayAckWrite(input)" not in handler[:find(handler, "ABD2 rx:", what="ABD
 if "ble.set_relay_ack_hook(relayAckHook);" not in block(ble, "void bleInitForWake() {", "ble.h"):
     fail("bleInitForWake must wire the relay-ack hook")
 
-if "void set_authenticated(bool auth) { if (auth && !authenticated) ++auth_grants; authenticated = auth; };" not in \
-        (root / "libraries/BLEWrapper/blewrapper.h").read_text():
-    fail("BLEWrapper must count a session grant on every false -> true, and only then")
+if "void set_authenticated(bool auth) { if (auth && !authenticated) ++auth_grants; if (!auth) setup_allowed = false; " \
+        "authenticated = auth; };" not in (root / "libraries/BLEWrapper/blewrapper.h").read_text():
+    fail("BLEWrapper must count a session grant on every false -> true, and only then, and end setup with the grant")
 relay = (helpers / "ble_relay.h").read_text()
 if re.search(r"logEvent|Serial", block(relay, "void relayAckHook(", "ble_relay.h")):
     fail("relayAckHook runs on the Bluedroid task: stash only")
@@ -94,10 +94,53 @@ worst = worst.replace('"build":"resume_wait"', '"build":"' + "v" * 48 + '"', 1)
 if len(worst) + 1 > size:
     fail(f"the ABD5 info JSON can reach {len(worst) + 1} bytes, over its {size}-byte buffer")
 
+# Negotiation (Helpers/ble_protocol.h). auth_gate.h does not compile on a host, so what it does around bleProtoAccept is
+# pinned here: the version is chosen only after the HMAC check, and nothing else in it grants a session.
+auth = code((helpers / "auth_gate.h").read_text())
+proof_branch = block(auth, 'if (j.contains("proof") && j["proof"].is_string()) {', "auth_gate.h")
+diff_at = find(proof_branch, "if (diff != 0) {", what="the proof branch")
+if find(proof_branch, "bleProtoAccept(", what="the proof branch") < diff_at + len(block(proof_branch[diff_at:], "if (diff != 0) {")):
+    fail("the protocol must be selected after the HMAC check, never before it")
+if "set_authenticated(true)" in auth:
+    fail("auth_gate.h must grant a session only through bleProtoAccept, which allows setup before the grant")
+if "bleProtoRangeField(" not in block(auth, "static void authSendNonce() {", "auth_gate.h"):
+    fail("authSendNonce must send the range in every nonce frame")
+if not re.search(r"static_assert\([^;]*< 93,", auth):
+    fail("auth_gate.h must hold the worst-case nonce frame under the 93-byte notify at compile time")
+protocol = code((helpers / "ble_protocol.h").read_text())
+accept = block(protocol, "void bleProtoAccept(", "ble_protocol.h")
+if not find(accept, "ble.set_setup_allowed(", what="bleProtoAccept") < find(accept, "ble.set_authenticated(true)", what="bleProtoAccept"):
+    fail("bleProtoAccept must allow or refuse setup before it sets the grant")
+for path in [*sorted(helpers.glob("*.h")), root / "baseLogger/logger.ino"]:
+    if path.name != "ble_protocol.h" and re.search(r"->version\b|\bkProtoV\d", code(path.read_text())):
+        fail(f"{path.name} tests a protocol version: versions live in ble_protocol.h and its selection only")
+if "return bleAuthenticated() && bleProtoPhoneIsTransport();" not in block(ble, "bool bleRelaying() {", "ble.h"):
+    fail("bleRelaying() must ask the session's protocol table whether the phone is the transport")
+gate_start = find(handler, "if (!wrapper->get_authenticated()) {", what="ABD2 handler")
+gate_end = gate_start + len(block(handler[gate_start:], "if (!wrapper->get_authenticated()) {"))
+proto_gate = find(handler, "if (!wrapper->get_setup_allowed()) {", what="ABD2 handler")
+if not gate_end <= proto_gate < find(handler, "bool is_auth_write", what="ABD2 handler") or \
+        '"PROTO"' not in block(handler[proto_gate:], "if (!wrapper->get_setup_allowed()) {"):
+    fail("ABD2 must answer PROTO to every write in a no-protocol session, right after the NOAUTH gate")
+for name in ("ota_update.h", "log_dump.h", "auth_gate.h"):
+    if "setup_allowed" in code((helpers / name).read_text()):
+        fail(f"{name} must not look at setup_allowed: OTA, the log dump and ABD8 work in a no-protocol session")
+
 compiler = shlex.split(os.environ.get("CXX", "clang++"))
 print(subprocess.check_output([*compiler, "--version"], text=True).splitlines()[0], flush=True)
 with tempfile.TemporaryDirectory(prefix="obd-relay-checks-") as temporary:
     build = Path(temporary)
+    auth_source = (helpers / "auth_gate.h").read_text()
+    constants = find(auth_source, "static const uint32_t AUTH_NONCE_TTL_MS", what="auth_gate.h")
+    nonce_state = find(auth_source, "static uint8_t g_auth_nonce[AUTH_NONCE_LEN];", what="auth_gate.h")
+    (build / "auth_nonce.inc").write_text(
+        auth_source[constants:find(auth_source, "\n", find(auth_source, "static const size_t   AUTH_NONCE_LEN", what="auth_gate.h")) + 1]
+        + auth_source[nonce_state:find(auth_source, "static bool g_auth_nonce_valid = false;", what="auth_gate.h")]
+        + "static bool g_auth_nonce_valid = false;\n"
+        + block(auth_source, "static void authNotifyJson(", "auth_gate.h")
+        + block(auth_source, "static const char* authDongleId() {", "auth_gate.h")
+        + block(auth_source, "static bool authResetWindowOpen() {", "auth_gate.h")
+        + block(auth_source, "static void authSendNonce() {", "auth_gate.h"))
     (build / "ble_predicates.inc").write_text(block(ble, "bool bleAuthenticated() {", "ble.h")
                                               + block(ble, "uint32_t bleAuthGrant() {", "ble.h")
                                               + block(ble, "bool bleRelaying() {", "ble.h"))
@@ -126,14 +169,19 @@ with tempfile.TemporaryDirectory(prefix="obd-relay-checks-") as temporary:
     upload = (helpers / "network_upload.h").read_text()
     backlog = find(upload, "static const char* UPLOAD_BACKLOG_PATH", what="network_upload.h")
     (build / "backlog.inc").write_text(upload[backlog:find(upload, "\n#endif", backlog)])
-    executable = build / "relay_checks"
-    subprocess.run([
-        *compiler, "-std=c++17", "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
-        "-Wall", "-Wextra", "-Wno-unused-parameter", "-Wno-unused-variable", "-Wno-unused-function",
-        "-I", str(root / "tests/support"), "-I", str(root / "libraries/nlohmann"),
-        "-I", str(root / "libraries/BLEWrapper"), "-I", str(helpers), "-I", str(build),
-        str(root / "tests/relay_checks.cpp"), "-o", str(executable),
-    ], check=True)
+    # Two builds: the production BLE_PROTO_MIN, and a raised minimum for the no-protocol session (design §3.4).
     environment = dict(os.environ)
     environment["UBSAN_OPTIONS"] = environment.get("UBSAN_OPTIONS", "") + ":halt_on_error=1"
-    sys.exit(subprocess.run([str(executable), *sys.argv[1:]], env=environment).returncode)
+    for name, defines in (("relay_checks", []), ("relay_checks_min1", ["-DBLE_PROTO_MIN=1"])):
+        executable = build / name
+        subprocess.run([
+            *compiler, "-std=c++17", "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
+            "-Wall", "-Wextra", "-Wno-unused-parameter", "-Wno-unused-variable", "-Wno-unused-function",
+            *defines,
+            "-I", str(root / "tests/support"), "-I", str(root / "libraries/nlohmann"),
+            "-I", str(root / "libraries/BLEWrapper"), "-I", str(helpers), "-I", str(build),
+            str(root / "tests/relay_checks.cpp"), "-o", str(executable),
+        ], check=True)
+        result = subprocess.run([str(executable), *sys.argv[1:]], env=environment).returncode
+        if result:
+            sys.exit(result)

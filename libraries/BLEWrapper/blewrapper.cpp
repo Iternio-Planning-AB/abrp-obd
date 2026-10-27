@@ -549,6 +549,18 @@ void StartupCallbacks::onWrite(BLECharacteristic* pStartupCharacteristic) {
       pStartupCharacteristic->notify();
       return;
     }
+    // NO-PROTOCOL SESSION (Helpers/ble_protocol.h): the proof was accepted at a version below this firmware's
+    // BLE_PROTO_MIN, from an app that predates negotiation or is too old. The grant stands, so OTA (ABD5/ABD6) and
+    // the log dump (ABD7) still work and an old dongle firmware can still be fixed, but setup is versioned and this
+    // app does not speak a version we do: refuse every write, AUTH and profile packets included, with a reply
+    // distinct from NOAUTH. The bit is set on the loop task before the grant, so it is settled by the time a write
+    // gets past the gate above.
+    if (!wrapper->get_setup_allowed()) {
+      wrapper->logEvt("ABD2 refused: no protocol (app below BLE_PROTO_MIN)");
+      pStartupCharacteristic->setValue("PROTO");
+      pStartupCharacteristic->notify();
+      return;
+    }
     /*
       Dispatch AUTH on its CONTENT, not on the latch.
 

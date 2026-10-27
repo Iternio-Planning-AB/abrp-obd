@@ -63,6 +63,11 @@ uint32_t relayNextSeq() {
   return g_relay_announced ? g_relay_seq + 1 : 0;
 }
 
+// The frame relayNextSeq() named went out on ABD1.
+void relayFrameNotified(uint32_t seq) {
+  g_relay_seq = seq;
+}
+
 #if ENABLE_NETWORK
 // A frame's relay seq; 0 when it was not relayed to an app that acks.
 static uint32_t relaySeqOf(const OBDVector& frame) {

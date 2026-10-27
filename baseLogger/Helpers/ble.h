@@ -22,7 +22,7 @@ extern bool g_obd_needs_init;
 extern bool g_no_profile;
 void dropUnsavedPush(const char* why); // defined with the persisted profile below
 bool forgetProfile(const char* why);   // Helpers/auth_gate.h (after network_upload.h); AUTHCLEAR calls it too
-bool relayTransportLive();             // Helpers/ble_relay.h (after network_upload.h)
+bool bleProtoPhoneIsTransport();       // Helpers/ble_protocol.h (after ble_relay.h)
 void relayAckHook(uint32_t v);         // Helpers/ble_relay.h: the ABD2 "relay_ack" stash
 
 /*
@@ -108,12 +108,12 @@ uint32_t bleAuthGrant() {
 #endif
 }
 
-// The phone is the transport: authenticated, and either an app that never announced relay acks (today's
-// apps, trusted as before) or one whose acks are still moving forward (Helpers/ble_relay.h). This, not
-// bleAuthenticated(), is what the cellular gates key on: an authenticated app that stopped posting (backgrounded,
-// logged out, offline) kept cellular off for a 65-minute drive (#90).
+// The phone is the transport: authenticated, and its session's protocol says so (Helpers/ble_protocol.h): always in
+// v0 (today's apps, trusted as before), in v1 only while its acks keep moving forward (Helpers/ble_relay.h), never in a
+// session with no protocol. This, not bleAuthenticated(), is what the cellular gates key on: an authenticated app that
+// stopped posting (backgrounded, logged out, offline) kept cellular off for a 65-minute drive (#90).
 bool bleRelaying() {
-  return bleAuthenticated() && relayTransportLive();
+  return bleAuthenticated() && bleProtoPhoneIsTransport();
 }
 
 #if ENABLE_BLE

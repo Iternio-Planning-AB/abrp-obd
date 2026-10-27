@@ -473,7 +473,8 @@ void changeState(ActivityState new_state);     // Helpers/state_machine.h
 #include "Helpers/gzip_body.h"
 #include "Helpers/tlm_signature.h" // pure builder used by network_upload.h
 #include "Helpers/network_upload.h"
-#include "Helpers/ble_relay.h"     // relay acks (#90): uses obd_result_vector, g_upload_held, logEvent; bleRelaying() calls it
+#include "Helpers/ble_relay.h"     // relay acks (#90): uses obd_result_vector, g_upload_held, logEvent; v1's table names it
+#include "Helpers/ble_protocol.h"  // BLE protocol versions: the per-session table bleRelaying() asks; before auth_gate.h
 #include "Helpers/gps_location.h"
 #include "Helpers/state_machine.h"
 #include "Helpers/misc.h"
@@ -2074,12 +2075,16 @@ void loop() {
 
 #if ENABLE_BLE
     const uint16_t ble_mtu = ble.mtu();
-    // 0 unless this session's app announced relay acks (#90); then the frame carries it for the app to ack.
-    const uint32_t relay_seq = relayNextSeq();
+    const BleProtocol* proto = bleProto(); // the session's protocol version (Helpers/ble_protocol.h)
+    // 0 unless the session's version tags frames for the app to ack (#90): then the frame carries it beside tlm.
+    const uint32_t relay_seq = proto->nextSeq();
     const BleTlmFrame ble_frame = bleTlmFrame(current_frame, bleNotifyBudget(ble_mtu), relay_seq);
-    // Sent before buffering: one answer decides whether the phone or cellular carries this frame.
-    const bool ble_relayed = ble.logData(ble_frame.notify, ble_frame.full);
-    if (ble_relayed && relay_seq) g_relay_seq = relay_seq;
+    // Sent before buffering: one answer decides whether the phone or cellular carries this frame. A session with no
+    // protocol is handed nothing, and a version that needs a seq counts a frame without one as not relayed: either
+    // way the frame stays queued for cellular.
+    const bool ble_relayed = proto->setupAllowed && ble.logData(ble_frame.notify, ble_frame.full) &&
+                             (relay_seq || !proto->relayNeedsSeq);
+    if (ble_relayed && relay_seq) proto->frameNotified(relay_seq);
 #else
     const bool ble_relayed = false;
     const uint32_t relay_seq = 0;

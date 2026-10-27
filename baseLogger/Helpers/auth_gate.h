@@ -28,12 +28,18 @@
                                       A nonce frame carries "reset":1 while that window is open, so
                                       an app holding no key can offer this instead of dead-ending.
                                       See authResetWindowOpen() for why uptime alone is not enough.
-    app → {"challenge":1}             → {"nonce":"<b64 16B>","id":"<dongle id>"} (single-use, TTL)
+    app → {"challenge":1}             → {"nonce":"<b64 16B>","id":"<dongle id>","proto":[MIN,MAX]}
+                                      (single-use, TTL; "proto" is the BLE protocol range, see
+                                       Helpers/ble_protocol.h)
                                       (an unprovisioned dongle answers
                                        {"auth":"unprovisioned","id":"..."} - the app's TOFU cue)
   Every greet carries "id", the STABLE dongle identity the app keys its keyring by - see
   authDongleId() for why neither the BLE device id nor the vehicle id can serve that role.
-    app → {"proof":"<b64 32B>"}       HMAC-SHA256(secret, nonce) → {"auth":"ok"} / {"auth":"fail"}
+    app → {"proof":"<b64 32B>","proto":v}
+                                      HMAC-SHA256(secret, nonce) → {"auth":"ok","proto":v} / {"auth":"fail"}
+                                      "proto" in the proof is the version the app chose, sent only if the
+                                      nonce frame offered a range; the ok reply names the session's version
+                                      only if the proof carried one.
 
   ENFORCEMENT IS UNCONDITIONAL. A valid proof is the ONLY thing that grants a session; the legacy
   AUTH write on ABD2 unlocks the profile push and nothing else. There was an audit mode that let the
@@ -180,11 +186,22 @@ static void authSendNonce() {
   // "reset":1 says the power-on window is open, so an app that cannot answer this nonce can offer
   // the user a key reset instead of a dead end. Sent only while it is TRUE, so its absence is a
   // definite "not available" rather than "old firmware" - the app must not offer what would be
-  // refused. Frame grows to ~68 B, still far inside the MTU-3 the greet gate guarantees.
-  snprintf(msg, sizeof(msg), "{\"nonce\":\"%.*s\",\"id\":\"%s\"%s}",
-    (int)olen, (const char*)b64, authDongleId(), authResetWindowOpen() ? ",\"reset\":1" : "");
+  // refused.
+  // "proto":[MIN,MAX] is the range of BLE protocol versions this firmware speaks (Helpers/ble_protocol.h), in every
+  // nonce frame, so every proof answers a frame that offered it. It is the ONE thing negotiation adds here, ever: this
+  // frame goes out before either side knows the other's version, so it must stay JSON every app parses, and its
+  // headroom is small. Anything a version needs beyond the range is exchanged after the grant.
+  // Sizes: the id is 12 characters and the nonce 24, so the frame is 56 B, 66 B with "reset":1, and the range makes it
+  // 70 B / 80 B; at worst ([255,255]) 84 B, held under the 93 B notify of the MTU 96 floor below. The greet waits for
+  // that MTU; the {"challenge":1} reply relies on the app's own MTU >= 96 check, as it always has.
+  char range[24];
+  bleProtoRangeField(range, sizeof(range));
+  snprintf(msg, sizeof(msg), "{\"nonce\":\"%.*s\",\"id\":\"%s\"%s%s}",
+    (int)olen, (const char*)b64, authDongleId(), authResetWindowOpen() ? ",\"reset\":1" : "", range);
   authNotifyJson(msg);
 }
+static_assert(sizeof("{\"nonce\":\"\",\"id\":\"\",\"reset\":1,\"proto\":[255,255]}") - 1 + (AUTH_NONCE_LEN + 2) / 3 * 4 + 12 < 93,
+  "the worst-case nonce frame must fit one notify at the MTU 96 floor");
 
 /* Loop-task service: consume one command per call. Cheap flag test when idle. */
 // AUTHCLEAR and the in-app key reset: the dongle forgets the vehicle it was paired to, so a re-paired dongle cannot
@@ -460,11 +477,13 @@ void authGateService() {
       authNotifyJson("{\"auth\":\"fail\"}");
       return;
     }
-    // The proof IS the session grant: the legacy AUTH write only unlocks the ABD2 profile push, so
-    // telemetry/OTA/log-dump are withheld until this line.
-    ble.set_authenticated(true);
-    logEvent("AUTH2 ok - session granted");
-    authNotifyJson("{\"auth\":\"ok\"}");
+    // The proof IS the session grant, and the grant carries its protocol version: bleProtoAccept chooses it (or keeps
+    // it, for a proof on a live grant), allows or refuses setup, sets the grant and logs it (Helpers/ble_protocol.h).
+    // The reply names the version only when the proof offered one, so an app that does not negotiate reads
+    // {"auth":"ok"} as it always has; it is at most 23 B, inside any MTU.
+    char reply[48];
+    bleProtoAccept(j, reply, sizeof(reply));
+    authNotifyJson(reply);
     return;
   }
 }

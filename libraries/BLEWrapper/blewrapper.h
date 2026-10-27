@@ -112,7 +112,14 @@ public:
   bool authenticate(std::string auth_token);
   void clearAuthentication() { auth_token = "false"; set_authenticated(false); setup_unlocked = false; }
   bool get_authenticated() { return authenticated; }
-  void set_authenticated(bool auth) { if (auth && !authenticated) ++auth_grants; authenticated = auth; };
+  void set_authenticated(bool auth) { if (auth && !authenticated) ++auth_grants; if (!auth) setup_allowed = false; authenticated = auth; };
+  /* Whether this grant's protocol version allows the ABD2 setup channel (Helpers/ble_protocol.h). False in a session
+     with no protocol - a proof below the firmware's BLE_PROTO_MIN - where the grant is kept so OTA and the log dump
+     still work, and every ABD2 write is answered PROTO. The loop task sets it BEFORE set_authenticated(true), because
+     StartupCallbacks::onWrite decides on the Bluedroid task and cannot see the loop task's protocol; ending the grant
+     clears it. */
+  void set_setup_allowed(bool allowed) { setup_allowed = allowed; }
+  bool get_setup_allowed() { return setup_allowed; }
   /* Counts session grants: a new one on every false -> true. The relay acks (Helpers/ble_relay.h) are per session, and
      a disconnect, reconnect and AUTH can all land between two loop iterations, where authenticated alone looks unchanged. */
   uint32_t auth_grant() const { return auth_grants; }
@@ -299,6 +306,7 @@ private:
   std::string auth_token{ "false" };
   bool authenticated = false;   // the SESSION GRANT - see the authenticate() block above
   volatile uint32_t auth_grants = 0; // see auth_grant()
+  volatile bool setup_allowed = false; // see set_setup_allowed()
   bool setup_unlocked = false;  // the ABD2 state-machine latch - see the same block
   bool profile_require_signature{ false }; // set from config.h PROFILE_REQUIRE_SIGNATURE, before init
 

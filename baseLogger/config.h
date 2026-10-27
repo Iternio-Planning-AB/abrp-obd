@@ -275,6 +275,17 @@
 #define RELAY_ACK_TIMEOUT_MS 120000UL
 #endif
 
+// The oldest BLE protocol version this firmware still speaks (Helpers/ble_protocol.h): every nonce frame offers
+// "proto":[BLE_PROTO_MIN, BLE_PROTO_MAX], and a proof below it gets a session with no protocol (OTA and the log dump
+// only; ABD2 answers PROTO). The newest version, BLE_PROTO_MAX, is not a tunable: it is however many versions the
+// firmware has tables for. 0 is today's protocol, which every released app speaks, including the ones that predate
+// negotiation and cannot be told why their setup is refused. So raising this is a policy decision, taken once apps
+// that negotiate dominate, judged from the app=M field of the "AUTH2 ok - session granted" log line, never guessed.
+// Overridable for a bench image and the host checks (-DBLE_PROTO_MIN=1).
+#ifndef BLE_PROTO_MIN
+#define BLE_PROTO_MIN 0
+#endif
+
 #ifndef ENABLE_MEMS
 #define ENABLE_MEMS 1
 #endif
