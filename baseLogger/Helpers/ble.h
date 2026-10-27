@@ -100,7 +100,8 @@ bool bleAuthenticated() {
 #endif
 }
 
-// Which session grant authenticated() belongs to (BLEWrapper::auth_grant): the relay acks are per session.
+// Which session grant authenticated() belongs to (BLEWrapper::auth_grant): the protocol version (Helpers/ble_protocol.h)
+// and the relay session (Helpers/ble_relay.h) belong to one grant each.
 uint32_t bleAuthGrant() {
 #if ENABLE_BLE
   return ble.auth_grant();
