@@ -30,7 +30,7 @@ side that does not negotiate (firmware: no `proto` in its nonce frame; app: no `
 | `v1/fw-0-2_app-0-1.json` | `[0,2]` | `[0,1]` | v1 | app |
 | `v1/fw-0-1_app-0-2.json` | `[0,1]` | `[0,2]` | v1 | firmware, app |
 | `v1/fw-0-1_app-proof-7.json` | `[0,1]` | a proof asking for 7 | v1 (above the maximum: runs at it, echoes 1) | firmware |
-| `v1/fw-1-1_app-none.json` | `[1,1]` (`-DBLE_PROTO_MIN=1`) | no negotiation | no protocol | firmware |
+| `v1/fw-1-1_app-none.json` | `[1,1]` (`-DBLE_PROTO_MIN=1`) | no negotiation | no protocol | firmware (its ABD2 `PROTO` step: sketch-side gate only, handler pinned structurally) |
 | `v1/fw-1-2_app-0-0.json` | `[1,2]` | `[0,0]` | app too old | app |
 | `v1/fw-none_app-1-2.json` | no negotiation | `[1,2]` | dongle too old | app (nonce frame checked by the firmware) |
 
@@ -93,7 +93,7 @@ Every file is one JSON object:
 | `{"from":"app","char":"ABD9","op":"read","json":{…}}` | The app reads ABD9; `json` is the value the dongle returns. |
 | `{"from":"dongle","char":"ABD9","op":"notify","json":{…}}` | A session-channel event. |
 | `{"from":"app","char":"ABD2","op":"write","text":"…"}` | A setup-channel write (raw text, as written). |
-| `{"from":"dongle","char":"ABD2","op":"notify","text":"…"}` | A setup-channel reply (plain text such as `PROTO`, compared exactly). |
+| `{"from":"dongle","char":"ABD2","op":"notify","text":"…"}` | A setup-channel reply (plain text such as `PROTO`, compared exactly). The firmware replay checks only the sketch-side gate replies (`NOAUTH`, `PROTO`); the ABD2 handler itself is pinned structurally. |
 | `{"wait":120000}` | Nothing happens for this many milliseconds. |
 | `{"check":{"transport":"phone","queued":[3],"uploaded":[1,2]}}` | Dongle-internal state at this point (below). |
 

@@ -276,7 +276,8 @@ profile write.
 - **Greet on the CCCD rising edge.** The dongle speaks first, when the app's subscription is armed,
   which removes the subscribe-vs-write race entirely — no retries, no timeouts.
 - **Two flags, deliberately:** `setup_unlocked` (the ABD2 state-machine latch) vs `authenticated`
-  (the session grant). Conflating them made enforcement impossible.
+  (the session grant). Conflating them made enforcement impossible. Both are cleared on disconnect and again on
+  connect, so a grant is always the current link's own (the protocol version and the relay session are keyed on it).
 - Why it exists: the old handshake sent the vehicle's **cloud push token in plaintext on every
   connect**. Sniff it once and you could push fabricated telemetry for that vehicle forever.
 

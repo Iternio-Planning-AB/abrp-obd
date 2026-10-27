@@ -30,6 +30,9 @@ sys.path.insert(0, str(root / "tests/support"))
 from extract import block, find  # noqa: E402
 
 PIN = "c61c081139f8021018458f882e4a73b7024316d0"  # main before #90: today's ABD1 frame and GATT table
+MIN1_GROUPS = {"no-protocol", "fixtures"}  # groups the -DBLE_PROTO_MIN=1 build runs (relay_checks.cpp main())
+MIN1_ONLY_GROUPS = {"no-protocol"}
+NO_SUCH_GROUP = 3                          # relay_checks.cpp's exit code when the requested group is not in its build
 
 def code(text):
     return re.sub(r"/\*.*?\*/|//[^\n]*", "", text, flags=re.S)
@@ -104,6 +107,11 @@ cccds = new_init.count("new BLE2902()")
 if cccds != old_init.count("new BLE2902()") + 2 or 1 + 2 * len(new_chars) + cccds != 30 or \
         "pService = pServer->createService(BLEUUID(SERVICE_UUID), 32);" not in new_init:
     fail("the table is 1 + 10 x 2 + 9 CCCDs = 30 handles of the 32 the service reserves")
+connect = code(block(wrapper, "void ServerCallbacks::onConnect(", "blewrapper.cpp"))
+if not find(connect, "wrapper->clearAuthentication();", what="onConnect") < find(connect, "wrapper->set_device_connected(true);", what="onConnect") \
+        or not re.search(r"volatile bool authenticated\b", wrapper_h) or not re.search(r"volatile bool setup_allowed\b", wrapper_h):
+    fail("a connection must start with no grant (onConnect clears it before marking the link up), and authenticated and "
+         "setup_allowed are read across tasks (volatile)")
 disconnect = code(block(wrapper, "void ServerCallbacks::onDisconnect(", "blewrapper.cpp"))
 if "wrapper->clearAuthSubscription();" not in disconnect or "wrapper->clearRelaySubscriptions();" not in disconnect:
     fail("a disconnect must clear the ABD8, ABD1 and ABD9 CCCDs: each is per-connection state")
@@ -154,6 +162,8 @@ proof_branch = block(auth, 'if (j.contains("proof") && j["proof"].is_string()) {
 diff_at = find(proof_branch, "if (diff != 0) {", what="the proof branch")
 if find(proof_branch, "bleProtoAccept(", what="the proof branch") < diff_at + len(block(proof_branch[diff_at:], "if (diff != 0) {")):
     fail("the protocol must be selected after the HMAC check, never before it")
+if not re.search(r"bleProtoAccept\(j, reply, sizeof\(reply\)\);\s*authNotifyJson\(reply\);", proof_branch):
+    fail("auth_gate.h must notify bleProtoAccept's reply straight after it: the echo the app adopts is that reply")
 if "set_authenticated(true)" in auth:
     fail("auth_gate.h must grant a session only through bleProtoAccept, which allows setup before the grant")
 if "bleProtoRangeField(" not in block(auth, "static void authSendNonce() {", "auth_gate.h"):
@@ -188,28 +198,19 @@ compiler = shlex.split(os.environ.get("CXX", "clang++"))
 print(subprocess.check_output([*compiler, "--version"], text=True).splitlines()[0], flush=True)
 with tempfile.TemporaryDirectory(prefix="obd-relay-checks-") as temporary:
     build = Path(temporary)
-    auth_source = (helpers / "auth_gate.h").read_text()
-    constants = find(auth_source, "static const uint32_t AUTH_NONCE_TTL_MS", what="auth_gate.h")
-    nonce_state = find(auth_source, "static uint8_t g_auth_nonce[AUTH_NONCE_LEN];", what="auth_gate.h")
-    (build / "auth_nonce.inc").write_text(
-        auth_source[constants:find(auth_source, "\n", find(auth_source, "static const size_t   AUTH_NONCE_LEN", what="auth_gate.h")) + 1]
-        + auth_source[nonce_state:find(auth_source, "static bool g_auth_nonce_valid = false;", what="auth_gate.h")]
-        + "static bool g_auth_nonce_valid = false;\n"
-        + block(auth_source, "static void authNotifyJson(", "auth_gate.h")
-        + block(auth_source, "static const char* authDongleId() {", "auth_gate.h")
-        + block(auth_source, "static bool authResetWindowOpen() {", "auth_gate.h")
-        + block(auth_source, "static void authSendNonce() {", "auth_gate.h"))
-    main_auth = subprocess.check_output(["git", "show", f"{PIN}:baseLogger/Helpers/auth_gate.h"], cwd=root, text=True)
-    main_constants = find(main_auth, "static const uint32_t AUTH_NONCE_TTL_MS", what="PIN auth_gate.h")
-    main_state = find(main_auth, "static uint8_t g_auth_nonce[AUTH_NONCE_LEN];", what="PIN auth_gate.h")
-    (build / "main_auth_nonce.inc").write_text(
-        main_auth[main_constants:find(main_auth, "\n", find(main_auth, "static const size_t   AUTH_NONCE_LEN", what="PIN auth_gate.h")) + 1]
-        + main_auth[main_state:find(main_auth, "static bool g_auth_nonce_valid = false;", what="PIN auth_gate.h")]
-        + "static bool g_auth_nonce_valid = false;\n"
-        + block(main_auth, "static void authNotifyJson(", "PIN auth_gate.h")
-        + block(main_auth, "static const char* authDongleId() {", "PIN auth_gate.h")
-        + block(main_auth, "static bool authResetWindowOpen() {", "PIN auth_gate.h")
-        + block(main_auth, "static void authSendNonce() {", "PIN auth_gate.h"))
+    # authSendNonce and what it needs, from this tree and from PIN (main before negotiation: the fw-none fixtures).
+    def nonce_pieces(source, what):
+        constants = find(source, "static const uint32_t AUTH_NONCE_TTL_MS", what=what)
+        state = find(source, "static uint8_t g_auth_nonce[AUTH_NONCE_LEN];", what=what)
+        return (source[constants:find(source, "\n", find(source, "static const size_t   AUTH_NONCE_LEN", what=what)) + 1]
+                + source[state:find(source, "static bool g_auth_nonce_valid = false;", what=what)]
+                + "static bool g_auth_nonce_valid = false;\n"
+                + "".join(block(source, opener, what) for opener in (
+                    "static void authNotifyJson(", "static const char* authDongleId() {",
+                    "static bool authResetWindowOpen() {", "static void authSendNonce() {")))
+    (build / "auth_nonce.inc").write_text(nonce_pieces((helpers / "auth_gate.h").read_text(), "auth_gate.h"))
+    (build / "main_auth_nonce.inc").write_text(nonce_pieces(subprocess.check_output(
+        ["git", "show", f"{PIN}:baseLogger/Helpers/auth_gate.h"], cwd=root, text=True), "PIN auth_gate.h"))
     (build / "ble_predicates.inc").write_text(block(ble, "bool bleAuthenticated() {", "ble.h")
                                               + block(ble, "uint32_t bleAuthGrant() {", "ble.h")
                                               + block(ble, "bool bleTelemetrySubscribed() {", "ble.h")
@@ -245,7 +246,17 @@ with tempfile.TemporaryDirectory(prefix="obd-relay-checks-") as temporary:
     # Two builds: the production BLE_PROTO_MIN, and a raised minimum for the no-protocol session (design §3.4).
     environment = dict(os.environ)
     environment["UBSAN_OPTIONS"] = environment.get("UBSAN_OPTIONS", "") + ":halt_on_error=1"
-    for name, defines in (("relay_checks", []), ("relay_checks_min1", ["-DBLE_PROTO_MIN=1"])):
+    # A group name runs that group in whichever build has it, and fails when neither does (exit 3 from a build means
+    # "no such group here"). The BLE_PROTO_MIN=1 build is compiled only when it has something to run.
+    args = sys.argv[1:]
+    group = next((arg for i, arg in enumerate(args) if not arg.startswith("--") and (i == 0 or args[i - 1] != "--depth")), None)
+    builds = []
+    if group is None or group not in MIN1_ONLY_GROUPS:
+        builds.append(("relay_checks", []))
+    if group is None or group in MIN1_GROUPS:
+        builds.append(("relay_checks_min1", ["-DBLE_PROTO_MIN=1"]))
+    found = False
+    for name, defines in builds:
         executable = build / name
         subprocess.run([
             *compiler, "-std=c++17", "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
@@ -255,6 +266,11 @@ with tempfile.TemporaryDirectory(prefix="obd-relay-checks-") as temporary:
             "-I", str(root / "libraries/BLEWrapper"), "-I", str(helpers), "-I", str(build),
             str(root / "tests/relay_checks.cpp"), "-o", str(executable),
         ], check=True)
-        result = subprocess.run([str(executable), *sys.argv[1:]], env=environment).returncode
+        result = subprocess.run([str(executable), *args], env=environment).returncode
+        if result == NO_SUCH_GROUP:
+            continue
         if result:
             sys.exit(result)
+        found = True
+    if not found:
+        fail(f"no group named {group!r}")

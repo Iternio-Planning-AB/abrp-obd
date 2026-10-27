@@ -400,7 +400,7 @@ void acking() {
   ble.negotiated = 23;
   poll();
   const uint32_t notify = frameSeq(ble.notifies.back()), value = frameSeq(ble.values.back());
-  check(value == g_relay_seq && (notify == 0 || notify == g_relay_seq),
+  check(value == g_relay_seq && notify == g_relay_seq,
         "the readable value always carries the seq, and a notify that carries one carries the same");
   const uint32_t sent = g_relay_seq;
   const size_t queued = obd_result_vector.size();
@@ -1357,9 +1357,12 @@ int main(int argc, char** argv) {
 #else
   const std::vector<std::pair<std::string, void (*)()>> groups{{"no-protocol", noProtocol}, {"fixtures", fixtures}};
 #endif
+  bool matched = false;
   for (const auto& group : groups) {
     if (!only.empty() && group.first != only) continue;
+    matched = true;
     group.second();
     std::cout << "ok " << group.first << '\n';
   }
+  return matched ? 0 : 3; // 3: no such group in this build (run_relay_checks.py NO_SUCH_GROUP)
 }

@@ -432,7 +432,8 @@ for the protocol version a session negotiates and whether a connected phone is t
 per-version tables), auth_gate.h's `authSendNonce`, ble.h's predicates, the ABD1 frame builder, the upload queue, v2
 body and backlog encoder, and from `loop()` the ABD1 send, the queue block, the modem reconnect gate and the upload
 gate with its grace and handoff; BLE, HTTP, the clock and `esp_random` are fakes. A second build with
-`-DBLE_PROTO_MIN=1` runs `no-protocol` and its fixture row. Covered: the negotiation matrix (absent, 0, 1, 7, the
+`-DBLE_PROTO_MIN=1` runs `no-protocol` and its fixture row; it is compiled only when no group or one of those two is
+named, and a group name that neither build has fails the run. Covered: the negotiation matrix (absent, 0, 1, 7, the
 malformed values, MTU < 96), the version bound to the grant (a repeat proof keeps it, a reconnect between two loop
 passes selects the new grant's), the nonce frame (70 B, 80 B with `"reset":1`), the no-protocol session (setup refused
 before the grant, nothing relayed, everything uploaded). The eight #90 acceptance scenarios run as negotiated v1
@@ -453,9 +454,9 @@ v1 session holds cellular off with untagged frames queued past `RELAY_UNSUBSCRIB
 long). `fixtures`
 replays every file under `protocol/fixtures/` the firmware owns (see its README) and checks the main-firmware nonce
 frames against `authSendNonce` from the pinned main commit. Checked by position: the ABD2 handler (its `PROTO` gate
-right after `NOAUTH`, no `relay_ack` case left), the GATT table (ABD1-ABD8 as on the pinned main commit, ABD9/ABDA
+right after `NOAUTH`, no `relay_ack` case left), a connection starting with no grant (`onConnect` clears it), the GATT table (ABD1-ABD8 as on the pinned main commit, ABD9/ABDA
 with notify and an encrypted CCCD, 30 of 32 handles, the ABD1/ABD8/ABD9 CCCDs cleared on disconnect, the boot handle
-log), auth_gate.h around `bleProtoAccept` (after the HMAC check, the only grant), version numbers outside
+log), auth_gate.h around `bleProtoAccept` (after the HMAC check, the only grant, its reply notified straight after), version numbers outside
 `ble_protocol.h`, which gates key on `bleAuthenticated()`, and the ABD5 info JSON's worst-case length. A phone, the
 app, the GATT stack and the modem are not exercised: the bench procedure is a local document next to the design.
 

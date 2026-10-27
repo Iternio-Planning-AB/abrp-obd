@@ -328,7 +328,7 @@ private:
     Authentication, no new device connected without correct token
   */
   std::string auth_token{ "false" };
-  bool authenticated = false;   // the SESSION GRANT - see the authenticate() block above
+  volatile bool authenticated = false; // the SESSION GRANT - see the authenticate() block above; read on both tasks
   volatile uint32_t auth_grants = 0; // see auth_grant()
   volatile bool setup_allowed = false; // see set_setup_allowed()
   bool setup_unlocked = false;  // the ABD2 state-machine latch - see the same block
