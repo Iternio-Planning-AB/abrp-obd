@@ -754,6 +754,20 @@ void state() {
   services();
   check(sessionRead() == "{}", "and once the session ends it is empty again");
 
+  // A read answers only the grant the state was built for: what ABD9 means is unknown until the handshake has chosen
+  // a version, and a new link must never see the last phone's session, even before the next loop pass.
+  reset();
+  negotiate();
+  services();
+  unlink();
+  check(sessionRead() == "{}", "a dropped link's session is not readable before the next pass: " + sessionRead());
+  link();
+  check(sessionRead() == "{}", "nor by the next link before its handshake: " + sessionRead());
+  prove(proofWith("1"));
+  check(sessionRead() == "{}", "nor under its new grant before the state is rebuilt for it: " + sessionRead());
+  services();
+  check(sessionState()["relay"] == "live", "the new grant's own state, once built: " + sessionRead());
+
   // "oldest": the lowest relay seq still in the cellular queue (tagged frames, held ones included), 0 for none.
   reset();
   negotiate();

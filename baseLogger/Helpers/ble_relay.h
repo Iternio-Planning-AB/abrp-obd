@@ -70,6 +70,7 @@ uint32_t g_session_ack_pending = 0;   // highest relay_ack waiting; 0 = none
 RelayVerb g_session_verb_pending = RELAY_VERB_NONE;
 char g_session_bad_pending[25] = "";  // the first key in the burst that no version could take ("?" if unloggable)
 char g_session_state[96] = "{}";      // ABD9's readable value, served by relaySessionRead
+uint32_t g_session_state_grant = 0;   // the session grant it was built for
 static_assert(sizeof("{\"relay\":\"lapsed\",\"why\":\"unsubscribed\",\"sent\":4294967295,\"oldest\":4294967295}") - 1 <= 93,
   "the ABD9 state must be one read at the MTU 96 floor, never a long read");
 static_assert(sizeof(g_session_state) > 93, "room for the worst-case state");
@@ -180,6 +181,7 @@ static void relayStateRefresh() {
       (unsigned long)g_relay_seq, (unsigned long)relayOldest());
   portENTER_CRITICAL(&g_relay_mux);
   memcpy(g_session_state, text, sizeof(text));
+  g_session_state_grant = g_relay_grant;
   portEXIT_CRITICAL(&g_relay_mux);
 }
 
@@ -383,13 +385,19 @@ void relaySessionWrite(const uint8_t* data, size_t len) {
   portEXIT_CRITICAL(&g_relay_mux);
 }
 
-// Bluedroid task (BLEWrapper's ABD9 onRead, just before the library builds the read response): the current state.
+// Bluedroid task (BLEWrapper's ABD9 onRead, just before the library builds the read response): the current state, and
+// only to the grant it was built for. Before the handshake there is no version to give ABD9 a meaning, and a link that
+// dropped, the next link, or a new grant before the loop pass rebuilds the state must not read the last session's: {}.
 size_t relaySessionRead(uint8_t* out, size_t size) {
-  if (!out || !size) return 0;
+  if (!out || size < 2) return 0;
+  const bool authenticated = bleAuthenticated();
+  const uint32_t grant = bleAuthGrant();
   portENTER_CRITICAL(&g_relay_mux);
-  size_t n = strnlen(g_session_state, sizeof(g_session_state));
+  const bool own = authenticated && g_session_state_grant == grant;
+  const char* state = own ? g_session_state : "{}";
+  size_t n = own ? strnlen(g_session_state, sizeof(g_session_state)) : 2;
   if (n > size) n = size;
-  memcpy(out, g_session_state, n);
+  memcpy(out, state, n);
   portEXIT_CRITICAL(&g_relay_mux);
   return n;
 }
