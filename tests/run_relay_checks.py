@@ -57,6 +57,9 @@ if "bleRelayAckWrite(input)" not in handler[:find(handler, "ABD2 rx:", what="ABD
 if "ble.set_relay_ack_hook(relayAckHook);" not in block(ble, "void bleInitForWake() {", "ble.h"):
     fail("bleInitForWake must wire the relay-ack hook")
 
+if "void set_authenticated(bool auth) { if (auth && !authenticated) ++auth_grants; authenticated = auth; };" not in \
+        (root / "libraries/BLEWrapper/blewrapper.h").read_text():
+    fail("BLEWrapper must count a session grant on every false -> true, and only then")
 relay = (helpers / "ble_relay.h").read_text()
 if re.search(r"logEvent|Serial", block(relay, "void relayAckHook(", "ble_relay.h")):
     fail("relayAckHook runs on the Bluedroid task: stash only")

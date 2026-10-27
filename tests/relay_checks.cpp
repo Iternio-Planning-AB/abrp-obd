@@ -378,6 +378,16 @@ void sessions() {
   }
   check(bleRelaying(), "with nothing outstanding there is nothing to be late with");
 
+  reset();
+  connect();
+  poll();
+  relayAckHook(0); // stashed under this grant, serviced only after the next one, granted to an app that never announces
+  ble.authenticated = false;
+  connect();
+  poll();
+  check(json::parse(ble.notifies.back())["tlm"].count("seq") == 0 && obd_result_vector.empty(),
+        "an announce stashed in one session is never applied to the next");
+
   uint32_t v = 7;
   check(bleRelayAckValue(json::parse("0"), v) && v == 0 && bleRelayAckValue(json::parse("4294967295"), v) &&
         v == 4294967295u && bleRelayAckWrite("{\"relay_ack\":12}"), "relay_ack takes any uint32 the app writes");

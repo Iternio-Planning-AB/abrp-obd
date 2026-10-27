@@ -151,7 +151,8 @@ ABD1 is notify-only, so the app has to say what it posted (`Helpers/ble_relay.h`
   late, and an update or a log dump (which pause polling) holds the clock. An ack beyond the last seq
   sent is ignored, and a session's unacked frames lose their seq when it ends (sessions are counted by
   AUTH grant, so a reconnect between two loop iterations still ends one), so the next session's acks
-  cannot drop them.
+  cannot drop them. An ack still on its way when a session ends is lost with it, so frames the app did
+  post can go up over cellular too: a duplicate point, never a lost one.
 - **An app that never announces is trusted as before**, frames byte-identical, so current apps keep
   #90 until they ship the ack. Presence (the awake leash, the alarm gate) keys on `bleAuthenticated()`,
   which a lapse does not change.
