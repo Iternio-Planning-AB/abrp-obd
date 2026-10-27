@@ -25,6 +25,11 @@ bool isGeoMetaKey(const std::string& key) { return key.compare(0, 6, "__geo_") =
 
 bool isGeoValueKey(const std::string& key) { return key == "lat" || key == "lon" || key == "heading"; }
 
+// The ABD1 seq a queued frame was relayed under, so the app's ack can take it off the queue (Helpers/ble_relay.h,
+// #90). Seqs restart every wake, so it is never written to the backlog, and it is never uploaded.
+static const char* const RELAY_SEQ_KEY = "__relay_seq";
+bool isRelaySeqKey(const std::string& key) { return key == RELAY_SEQ_KEY; }
+
 void scrubGeoMetadata(OBDVector& frame) {
   for (auto it = frame.begin(); it != frame.end();) {
     if (isGeoMetaKey(it->first)) it = frame.erase(it);
@@ -53,7 +58,7 @@ std::string logString(OBDVector vec) {
   std::stringstream ss;
 
   for (auto res : vec) {
-    if (!isGeoMetaKey(res.first) && !isGeoValueKey(res.first)) tlm[res.first] = res.second;
+    if (!isGeoMetaKey(res.first) && !isGeoValueKey(res.first) && !isRelaySeqKey(res.first)) tlm[res.first] = res.second;
   }
   ss << "{\"tlm\":" << tlm.dump() << "}";
   return ss.str();
@@ -114,12 +119,16 @@ static int bleTlmRank(const std::string& key) {
   return unlisted;
 }
 
-BleTlmFrame bleTlmFrame(const OBDVector& vec, size_t budget) {
+// seq > 0 (a session whose app announced relay acks, #90) leads the frame as "seq":n and is the last field trimmed:
+// an ack names it. With seq 0 the frame is exactly what apps without acks have always read.
+BleTlmFrame bleTlmFrame(const OBDVector& vec, size_t budget, uint32_t seq = 0) {
   struct Field { std::string key, text; };
   std::vector<Field> fields;
+  if (seq) fields.push_back({ "", "\"seq\":" + std::to_string(seq) });
   for (const auto& res : vec) {
     const std::string& k = res.first;
-    if (isGeoMetaKey(k) || isGeoValueKey(k) || k == "utc" || !bleTlmKey(k)) continue;
+    if (isGeoMetaKey(k) || isGeoValueKey(k) || isRelaySeqKey(k) || k == "utc" || !bleTlmKey(k) ||
+        (seq && k == "seq")) continue;
     char num[32];
     if (k == "is_charging" || k == "is_parked" || k == "is_dcfc") strcpy(num, res.second != 0.0 ? "true" : "false");
     else if (!bleTlmNumber(res.second, num, sizeof(num))) continue;
@@ -148,11 +157,12 @@ BleTlmFrame bleTlmFrame(const OBDVector& vec, size_t budget) {
   }
 
   // Greedy by priority: a field that does not fit is skipped and a smaller, lower one may still go.
-  // The empty envelope (10 B) always fits: the budget is at least 20.
+  // The empty envelope (10 B) always fits: the budget is at least 20. The seq (empty key) goes first; only an
+  // unnegotiated MTU 23 can be too small for it, and the readable value, which an app at 23 reads, carries it.
   std::vector<size_t> by_rank(fields.size());
   for (size_t i = 0; i < by_rank.size(); ++i) by_rank[i] = i;
-  std::stable_sort(by_rank.begin(), by_rank.end(),
-    [&](size_t a, size_t b) { return bleTlmRank(fields[a].key) < bleTlmRank(fields[b].key); });
+  auto rank = [&](size_t i) { return fields[i].key.empty() ? -1 : bleTlmRank(fields[i].key); };
+  std::stable_sort(by_rank.begin(), by_rank.end(), [&](size_t a, size_t b) { return rank(a) < rank(b); });
   std::fill(keep.begin(), keep.end(), false);
   size_t used = 10, kept = 0;
   for (size_t i : by_rank) {
@@ -181,7 +191,7 @@ std::string bulkString(const std::vector<OBDVector>& frames, const std::string& 
   for (const auto& frame : frames) {
     json tlm = json::object();
     for (const auto& res : frame) {
-      if (!isGeoMetaKey(res.first) && !isGeoValueKey(res.first)) tlm[res.first] = res.second;
+      if (!isGeoMetaKey(res.first) && !isGeoValueKey(res.first) && !isRelaySeqKey(res.first)) tlm[res.first] = res.second;
     }
     tlm_list.push_back(tlm);
   }
@@ -217,8 +227,8 @@ static const char* const V2_PROVIDER = "ABRP_OTA";
 
 // Per-point keys that are metadata or are consumed by a state field below, so they never map 1:1.
 static bool isV2MetaKey(const std::string& k) {
-  return isGeoMetaKey(k) || k == "utc" || k == "is_parked" || k == "is_charging" || k == "is_dcfc" ||
-         k == "lat" || k == "lon";
+  return isGeoMetaKey(k) || isRelaySeqKey(k) || k == "utc" || k == "is_parked" || k == "is_charging" ||
+         k == "is_dcfc" || k == "lat" || k == "lon";
 }
 
 // RFC 3339 in UTC, which is what WithTime.time wants. One per VALUE in v2, where v1 had one integer utc

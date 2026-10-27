@@ -147,7 +147,8 @@ order and share its globals. See [`AGENTS.md`](../AGENTS.md) before adding one.
 | `network_upload.h` | Cellular upload, bulk POST, the offline backlog. |
 | `gzip_body.h` | gzip for the POST body: vendored zlib, state in PSRAM, each sent body verified by inflating it again. |
 | `geo_backlog.h` | Keeps location provenance in the backlog so stale positions are never uploaded as fresh. |
-| `ble.h` | The BLEWrapper instance, per-wake BLE bring-up/teardown, the persisted-profile loader, `bleRelaying()`. |
+| `ble.h` | The BLEWrapper instance, per-wake BLE bring-up/teardown, the persisted-profile loader, `bleAuthenticated()` and `bleRelaying()`. |
+| `ble_relay.h` | Relay acks: whether a connected app is actually posting the telemetry, and the frames it has not acked yet. |
 | `log_dump.h` | BLE log-retrieval protocol (ABD7). |
 | `ota_update.h` | BLE firmware-update engine (ABD5/ABD6): staging, ECDSA verify, rollback, the ABD5 info JSON. |
 | `ota_pubkey.h` | Embedded ECDSA public key for OTA image verification. |

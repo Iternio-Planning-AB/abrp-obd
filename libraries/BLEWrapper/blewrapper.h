@@ -213,6 +213,11 @@ public:
      NVS on the loop task. Reaches here only past ABD2's authorization gate. */
   void set_alarm_flag_hook(void (*h)(int v)) { alarm_flag_cb = h; }
   void dispatchAlarmFlag(int v) { if (alarm_flag_cb) alarm_flag_cb(v); }
+  /* Relay-ack plumbing (ABD2 key "relay_ack", #90): 0 announces that the app acks, n > 0 acks every ABD1 frame
+     up to seq n. Same forward-only pattern: the hook stashes on the Bluedroid task; Helpers/ble_relay.h acts on
+     the loop task. Reaches here only past ABD2's authorization gate. */
+  void set_relay_ack_hook(void (*h)(uint32_t v)) { relay_ack_cb = h; }
+  void dispatchRelayAck(uint32_t v) { if (relay_ack_cb) relay_ack_cb(v); }
   bool notifyAuth(const uint8_t* frame, size_t len);
   /* TRUE when the central has armed ABD8's CCCD. The auth gate GREETS on this flag's rising edge -
      the dongle speaks first, so the app's first frame arrives exactly when its subscription is
@@ -331,6 +336,8 @@ private:
   void (*auth_cb)(const uint8_t*, size_t) = nullptr;
   /* OBD-alarm flag hook (see set_alarm_flag_hook) */
   void (*alarm_flag_cb)(int) = nullptr;
+  /* Relay-ack hook (see set_relay_ack_hook) */
+  void (*relay_ack_cb)(uint32_t) = nullptr;
 
   /* Profile-signature chunk hook (see set_profile_sig_hook) - null until the sketch wires it */
   bool (*profile_sig_cb)(int, int, const char*, size_t) = nullptr;

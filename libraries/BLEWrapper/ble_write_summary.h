@@ -19,6 +19,13 @@ inline bool bleLoggableKey(const std::string& key) {
 
 inline const char* bleKeyForLog(const std::string& key) { return bleLoggableKey(key) ? key.c_str() : "?"; }
 
+// The app's relay ack, {"relay_ack":n} (#90): one arrives per app post, so the rx log leaves it out and the loop
+// task logs its transitions instead (Helpers/ble_relay.h).
+inline bool bleRelayAckWrite(const std::string& input) {
+  const auto j = nlohmann::json::parse(input, nullptr, false);
+  return !j.is_discarded() && j.is_object() && j.size() == 1 && j.contains("relay_ack");
+}
+
 inline std::string bleWriteSummary(const std::string& input) {
   const auto j = nlohmann::json::parse(input, nullptr, false);
   std::string out = "len=" + std::to_string(input.size());

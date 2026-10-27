@@ -276,11 +276,12 @@ void handleActivityState() {
     // charge-watching isn't cut mid-session (field log: the motion leash slept the device under an
     // actively-streaming session at ~3min; the phone saw reason=0x16).
     //
-    // RELAYING, not merely connected. With the whole GATT table encryption- and authorization-gated, a
+    // AUTHENTICATED, not merely connected. With the whole GATT table encryption- and authorization-gated, a
     // peer that never authorizes can read and write nothing - so letting it refresh this leash only
     // lets a stranger (or a phone whose user declined the pairing dialog) hold the car awake for the
-    // full MAX_AWAKE_MINUTES backstop for no benefit. Keying on bleRelaying() drops that to
-    // ACTIVE_TIMER + CHARGING_TIMER (~10 min) and then sleeps normally.
+    // full MAX_AWAKE_MINUTES backstop for no benefit. Keying on bleAuthenticated() drops that to
+    // ACTIVE_TIMER + CHARGING_TIMER (~10 min) and then sleeps normally. Not bleRelaying(): an app whose
+    // relay acks lapsed (#90) is still a person at the car, and only the transport moves to cellular.
     //
     // Deliberately NOT the vestibule idea of dropping such a connection: the dongle cannot tell a
     // camper from a user mid-pairing-decision, and dropping the link makes the app's poller reconnect
@@ -291,7 +292,7 @@ void handleActivityState() {
     // to complete its handshake - without that, a phone connecting when the leash was nearly expired
     // could fall out of this state mid-handshake, and CHARGING deliberately never revives on a
     // connection alone.
-    if (bleRelaying()) {
+    if (bleAuthenticated()) {
       last_active = now;
     }
 #endif

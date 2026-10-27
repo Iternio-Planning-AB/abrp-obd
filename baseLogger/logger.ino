@@ -473,6 +473,7 @@ void changeState(ActivityState new_state);     // Helpers/state_machine.h
 #include "Helpers/gzip_body.h"
 #include "Helpers/tlm_signature.h" // pure builder used by network_upload.h
 #include "Helpers/network_upload.h"
+#include "Helpers/ble_relay.h"     // relay acks (#90): uses obd_result_vector, g_upload_held, logEvent; bleRelaying() calls it
 #include "Helpers/gps_location.h"
 #include "Helpers/state_machine.h"
 #include "Helpers/misc.h"
@@ -1236,6 +1237,10 @@ void loop() {
   // Persist a pending OBD-alarm flag write (ABD2 "obd_alarm") - NVS on the loop task, never the
   // Bluedroid one - and republish the ABD5 info JSON. A cheap flag test when idle (alarm_gate.h).
   alarmGateService();
+
+  // Apply the app's relay announce and acks (ABD2 "relay_ack", #90): take acked frames off the cellular queue,
+  // log a lapse or a resume, and forget the session once the phone is gone. A cheap flag test when idle.
+  relayAckService();
 
 #if ENABLE_BLE
   // A phone utc push set the clock without clockNoteRealSync(): the sleep and steps counted so far no longer
@@ -2069,19 +2074,29 @@ void loop() {
 
 #if ENABLE_BLE
     const uint16_t ble_mtu = ble.mtu();
-    const BleTlmFrame ble_frame = bleTlmFrame(current_frame, bleNotifyBudget(ble_mtu));
+    // 0 unless this session's app announced relay acks (#90); then the frame carries it for the app to ack.
+    const uint32_t relay_seq = relayNextSeq();
+    const BleTlmFrame ble_frame = bleTlmFrame(current_frame, bleNotifyBudget(ble_mtu), relay_seq);
     // Sent before buffering: one answer decides whether the phone or cellular carries this frame.
     const bool ble_relayed = ble.logData(ble_frame.notify, ble_frame.full);
+    if (ble_relayed && relay_seq) g_relay_seq = relay_seq;
 #else
     const bool ble_relayed = false;
+    const uint32_t relay_seq = 0;
 #endif
 
     if (frame_has_data) { // skip frames that would carry only drivingState so we never POST a meaningless tlm
       driveFrameBuffered();
-      // A relayed frame is not queued too (no second post as ABRP_OTA); the frames already queued stay and
-      // drain over cellular once the session ends.
-      if (!ble_relayed) {
-        const bool queued = queueUploadFrame(obd_result_vector, current_frame);
+      // A frame relayed to an app without acks is not queued too (no second post as ABRP_OTA); the frames already
+      // queued stay and drain over cellular once the session ends. One relayed to an app that acks (#90) is
+      // queued under its seq until the ack takes it off, so a stalled app loses nothing.
+      if (!ble_relayed || relay_seq) {
+        OBDVector tagged;
+        if (ble_relayed && relay_seq) {
+          tagged = current_frame;
+          tagged.emplace_back(RELAY_SEQ_KEY, relay_seq);
+        }
+        const bool queued = queueUploadFrame(obd_result_vector, tagged.empty() ? current_frame : tagged);
 #if ENABLE_NETWORK
         if (queued) g_geo_queued = poll_geo;
 #endif
@@ -2126,8 +2141,11 @@ void loop() {
 #if PRINT
       Serial.printf("Successfully logged BLE\n");
 #endif
-    } else { // if logging data over BLE failed / no phone connected -> fall through to the cellular block
-      if (logging_message_printed) {
+    }
+    // No phone, or one that is not carrying the data: an app whose relay acks lapsed is still notified above,
+    // and cellular carries the frames it never acked (#90).
+    if (!bleRelaying()) {
+      if (!ble_relayed && logging_message_printed) {
         logging_message_printed = false;
         Serial.println(); // Newline to end line of single dots
       }

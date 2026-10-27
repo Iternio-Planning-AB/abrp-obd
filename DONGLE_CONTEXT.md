@@ -90,11 +90,11 @@ handles silently breaks already-paired iPhones.
 | UUID | Purpose |
 |---|---|
 | `ABD0` | The service |
-| `ABD1` | Telemetry (notify + read) — the live frame |
-| `ABD2` | Setup/config: token handshake, profile push, `obd_alarm` flag |
+| `ABD1` | Telemetry (notify + read) — the live frame; `seq` once the app announced relay acks |
+| `ABD2` | Setup/config: token handshake, profile push, `obd_alarm` flag, `relay_ack` |
 | `ABD3` | Developer |
 | `ABD4` | Error |
-| `ABD5` | OTA control + the readable info JSON (installed fw, state, `alarm`) |
+| `ABD5` | OTA control + the readable info JSON (installed fw, state, `alarm`, `relay_ack`) |
 | `ABD6` | OTA data (write-only firmware payload) |
 | `ABD7` | Log dump |
 | `ABD8` | Auth handshake (nonce + HMAC) |
@@ -128,6 +128,31 @@ handles silently breaks already-paired iPhones.
 - **Clearing a bond on one side only looks like a hardware fault.** The phone keeps its half of the
   key, offers it, and the link drops before pairing runs — a connect flap with no error anywhere.
   `BONDCLEAR` prints the "forget the device on the phone too" reminder for this reason.
+
+### Relay acks: is the phone actually carrying the data? (#90)
+
+A connected, authenticated phone used to count as the transport for as long as it stayed connected, and
+a frame notified on ABD1 was never queued for cellular. An app that stopped posting (backgrounded, logged
+out, offline) silenced the car: an ID.5 drove 65 minutes in the `BLE` state with nothing reaching ABRP.
+ABD1 is notify-only, so the app has to say what it posted (`Helpers/ble_relay.h`):
+
+- ABD5's info JSON carries `"relay_ack":1`. The app writes the two messages below **only** when it sees
+  it: older firmware folds an unknown ABD2 key into the profile, or refuses it under Phase B.
+- **Announce:** after AUTH OK the app writes `{"relay_ack":0}` on ABD2. From then on every ABD1 frame
+  carries `"seq":n`, counting from 1 every wake. It leads the frame and is the last field trimmed; at an
+  unnegotiated MTU 23 it may not fit the notify, and the readable value always carries it.
+- **Ack:** after each successful `APP_OBD` post, `{"relay_ack":n}`, the highest seq up to which every
+  frame was posted (cumulative). ABD2 answers `ACK`, as for every one-key write.
+- Once announced, each relayed frame is also queued for cellular under its seq, and an ack takes it off.
+  The phone stays the transport (`bleRelaying()`) while acks move forward; `RELAY_ACK_TIMEOUT_MS` (120 s)
+  after the announce or the last ack that did, cellular takes over with every frame still queued, and the
+  next ack that moves forward hands the transport back. An ack beyond the last seq sent is ignored.
+  An update or a log dump pauses polling, so the clock waits while either runs.
+- **An app that never announces is trusted as before**, frames byte-identical, so current apps keep
+  #90 until they ship the ack. Presence (the awake leash, the alarm gate) keys on `bleAuthenticated()`,
+  which a lapse does not change.
+- Log lines: `BLE relay acks on`, `BLE relay lapsed … -> cellular`, `BLE relay resumed`, `BLE relay ack
+  ignored`, `BLE relay end acked= sent= unacked=`. Acks themselves are not logged.
 
 ---
 

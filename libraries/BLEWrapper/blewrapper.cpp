@@ -535,7 +535,7 @@ void StartupCallbacks::onWrite(BLECharacteristic* pStartupCharacteristic) {
     // Log every app write to ABD2 (keys only, never values). The push packets are expected; what we're hunting
     // for is ANY write that arrives AFTER SETUP OK (a keep-alive, nonce/challenge, or signed-auth message the
     // app expects us to answer). If one shows up and we don't respond correctly, that's why the app drops us (0x13).
-    wrapper->logEvt("ABD2 rx: %s", bleWriteSummary(input).c_str());
+    if (!bleRelayAckWrite(input)) wrapper->logEvt("ABD2 rx: %s", bleWriteSummary(input).c_str());
     // AUTHORIZATION GATE on the profile push. ABD2 is the highest-value write in the protocol: it
     // carries the vehicle profile (the PID list) and the tlm push token, so an unauthorized peer that
     // could write here could inject arbitrary PIDs at the CAN bus. Pairing alone does NOT earn that -
@@ -709,6 +709,14 @@ void StartupCallbacks::onWrite(BLECharacteristic* pStartupCharacteristic) {
       int v = j.at(message_key).get<int>() ? 1 : 0;
       wrapper->dispatchAlarmFlag(v);
       wrapper->logEvt("ABD2 obd_alarm=%d received (persisted by loop task)", v);
+      return;
+    } else if (message_key == "relay_ack") {
+      // The app's relay announce (0) and acks (highest ABD1 seq it posted), #90. Transport bookkeeping, not
+      // profile content: it must RETURN before the lockdown and setJsonValue below, or every ack would fold into
+      // configJson and perturb the profile HASH. Bluedroid task: stash only, and no log line - one arrives per
+      // app post, and Helpers/ble_relay.h logs the transitions on the loop task.
+      const json& v = j.at(message_key);
+      if (v.is_number_unsigned() && v.get<uint64_t>() <= UINT32_MAX) wrapper->dispatchRelayAck(v.get<uint32_t>());
       return;
     }
     // PHASE B LOCKDOWN. Everything reaching this line is a profile VALUE - the protocol packages

@@ -22,6 +22,8 @@ extern bool g_obd_needs_init;
 extern bool g_no_profile;
 void dropUnsavedPush(const char* why); // defined with the persisted profile below
 bool forgetProfile(const char* why);   // Helpers/auth_gate.h (after network_upload.h); AUTHCLEAR calls it too
+bool relayTransportLive();             // Helpers/ble_relay.h (after network_upload.h)
+void relayAckHook(uint32_t v);         // Helpers/ble_relay.h: the ABD2 "relay_ack" stash
 
 /*
   Callbackfunction for BLEWrapper. To be called when config has been completely transferred over BLE
@@ -83,19 +85,26 @@ bool bleConnected() {
 #endif
 }
 
-// TRUE only when a connected phone has ALSO completed the AUTH handshake on ABD2 - i.e. the app is
-// actually taking the telemetry and relaying it to the cloud. This, not bleConnected(), is what the
-// cellular gates must key on: with the GATT table encryption-gated, a phone that DECLINED the pairing
-// dialog (or any stranger) stays connected but can read nothing - and keying cellular off mere presence
-// made the dongle buffer silently while such a phone camped (data flowed NOWHERE live; field-found).
-// authenticated is session-scoped: set by AUTH OK, cleared on disconnect/deinit - and AUTH can only
-// arrive over a paired link, so this is exactly "the phone is a working transport".
-bool bleRelaying() {
+// TRUE only when a connected phone has ALSO completed the AUTH handshake on ABD2. With the GATT table
+// encryption-gated, a phone that DECLINED the pairing dialog (or any stranger) stays connected but can read
+// nothing - and keying cellular off mere presence made the dongle buffer silently while such a phone camped
+// (data flowed NOWHERE live; field-found). authenticated is session-scoped: set by AUTH OK, cleared on
+// disconnect/deinit - and AUTH can only arrive over a paired link. This says a person with the app is at the
+// car: the awake leash and the alarm gate's "human is here" key on it.
+bool bleAuthenticated() {
 #if ENABLE_BLE
   return ble.connected() && ble.get_authenticated();
 #else
   return false;
 #endif
+}
+
+// The phone is the transport: authenticated, and either an app that never announced relay acks (today's
+// apps, trusted as before) or one whose acks are still moving forward (Helpers/ble_relay.h). This, not
+// bleAuthenticated(), is what the cellular gates key on: an authenticated app that stopped posting (backgrounded,
+// logged out, offline) kept cellular off for a 65-minute drive (#90).
+bool bleRelaying() {
+  return bleAuthenticated() && relayTransportLive();
 }
 
 #if ENABLE_BLE
@@ -131,6 +140,8 @@ void bleInitForWake() {
   // OBD-alarm flag writes (ABD2 "obd_alarm" - the save-screen toggle). The hook only stashes; the
   // NVS persist runs on the loop task (alarmGateService). See the forward declaration at the top.
   ble.set_alarm_flag_hook(alarmFlagHook);
+  // Relay acks (ABD2 "relay_ack", #90): stash only; relayAckService applies them on the loop task.
+  ble.set_relay_ack_hook(relayAckHook);
   ble.init();
   ble.set_force_repush(BLE_FORCE_REPUSH); // DIAGNOSTIC: force full profile re-push on connect (see config.h)
   g_ble_up = true;

@@ -898,8 +898,10 @@ void otaPublishInfo() {
   // "alarm" = the RAW stored OBD-alarm flag (-1 never written / 0 / 1), so the app's save-screen
   // toggle initialises from the dongle's stored value instead of silently flipping a deliberate
   // "No" back to the protective default (IGNITION_SENSE_ARCHITECTURE.md §10.3/§10.4).
+  // "relay_ack":1 = this firmware takes the app's relay announce and acks on ABD2 (#90). The app writes them only
+  // when it sees this: older firmware would fold an unknown ABD2 key into the profile, or refuse it under Phase B.
   snprintf(buf, sizeof(buf),
-    "{\"fw\":%lu,\"floor\":%lu,\"build\":\"%s\",\"signed\":%d,\"state\":\"%s\",\"rolled_back\":%d,\"sector\":%u,\"sectors\":%u,\"alarm\":%d}",
+    "{\"fw\":%lu,\"floor\":%lu,\"build\":\"%s\",\"signed\":%d,\"state\":\"%s\",\"rolled_back\":%d,\"sector\":%u,\"sectors\":%u,\"alarm\":%d,\"relay_ack\":1}",
     (unsigned long)OTA_FW_VERSION, (unsigned long)otaCurrentVersion(), FW_BUILD_TAG,
     OTA_REQUIRE_SIGNATURE ? 1 : 0,
     ota_state == OTA_S_IDLE ? "idle" : ota_state == OTA_S_RECEIVING ? "receiving" : "resume_wait",

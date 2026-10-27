@@ -417,6 +417,20 @@ older token. The runner also checks that `otaFinalize` and `bleDeinitForSleep` d
 pending, after the boot-partition commit and after `ble.deinit()`, by position only. The BLE task, NVS and the reset
 itself are not exercised.
 
+## Relay-ack checks (#90)
+
+Run `python3 tests/run_relay_checks.py` (groups `old-app`, `acking`, `stall`, `never-ack`, `resume`, `disconnect`,
+`presence`, `hold`, `persistence`) for whether a connected phone is the transport. It compiles the real `Helpers/ble_relay.h`,
+`bleAuthenticated()`/`bleRelaying()`, the ABD1 frame builder, the upload queue, v2 body and backlog encoder, and from
+`loop()` the ABD1 send, the queue block and the cellular gate's condition with its grace and handoff; BLE, HTTP and the
+clock are fakes. An app that never announces reads frames byte-identical to the pinned pre-#90 builder and keeps the
+transport however long it stays; once announced, frames carry `seq`, relayed frames are queued until acked, the transport
+lapses exactly `RELAY_ACK_TIMEOUT_MS` after the announce or the last ack that moved forward, and cellular then sends every
+unacked frame once, in order; an ack that moves forward hands it back, one beyond the last seq is ignored, an update or log dump holds the clock, and a seq never
+reaches a body or the backlog. The ABD2 handler (behind the authorization gate, out before the Phase B lockdown, no log
+line), the cellular block running for a relayed-but-lapsed frame, which gates moved to `bleAuthenticated()` and the
+ABD5 info JSON's worst-case length are checked by position. A phone, the app and the modem are not exercised.
+
 ## Config macro checks
 
 Run `python3 tests/run_config_checks.py`: preprocesses `config.h` for the default build and every flag set `tools/check_variants.sh` builds,
