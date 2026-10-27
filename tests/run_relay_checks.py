@@ -191,6 +191,17 @@ with tempfile.TemporaryDirectory(prefix="obd-relay-checks-") as temporary:
         + block(auth_source, "static const char* authDongleId() {", "auth_gate.h")
         + block(auth_source, "static bool authResetWindowOpen() {", "auth_gate.h")
         + block(auth_source, "static void authSendNonce() {", "auth_gate.h"))
+    main_auth = subprocess.check_output(["git", "show", f"{PIN}:baseLogger/Helpers/auth_gate.h"], cwd=root, text=True)
+    main_constants = find(main_auth, "static const uint32_t AUTH_NONCE_TTL_MS", what="PIN auth_gate.h")
+    main_state = find(main_auth, "static uint8_t g_auth_nonce[AUTH_NONCE_LEN];", what="PIN auth_gate.h")
+    (build / "main_auth_nonce.inc").write_text(
+        main_auth[main_constants:find(main_auth, "\n", find(main_auth, "static const size_t   AUTH_NONCE_LEN", what="PIN auth_gate.h")) + 1]
+        + main_auth[main_state:find(main_auth, "static bool g_auth_nonce_valid = false;", what="PIN auth_gate.h")]
+        + "static bool g_auth_nonce_valid = false;\n"
+        + block(main_auth, "static void authNotifyJson(", "PIN auth_gate.h")
+        + block(main_auth, "static const char* authDongleId() {", "PIN auth_gate.h")
+        + block(main_auth, "static bool authResetWindowOpen() {", "PIN auth_gate.h")
+        + block(main_auth, "static void authSendNonce() {", "PIN auth_gate.h"))
     (build / "ble_predicates.inc").write_text(block(ble, "bool bleAuthenticated() {", "ble.h")
                                               + block(ble, "uint32_t bleAuthGrant() {", "ble.h")
                                               + block(ble, "bool bleTelemetrySubscribed() {", "ble.h")
@@ -231,7 +242,7 @@ with tempfile.TemporaryDirectory(prefix="obd-relay-checks-") as temporary:
         subprocess.run([
             *compiler, "-std=c++17", "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
             "-Wall", "-Wextra", "-Wno-unused-parameter", "-Wno-unused-variable", "-Wno-unused-function",
-            *defines,
+            *defines, f'-DFIXTURE_DIR="{root / "protocol/fixtures"}"',
             "-I", str(root / "tests/support"), "-I", str(root / "libraries/nlohmann"),
             "-I", str(root / "libraries/BLEWrapper"), "-I", str(helpers), "-I", str(build),
             str(root / "tests/relay_checks.cpp"), "-o", str(executable),

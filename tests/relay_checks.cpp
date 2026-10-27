@@ -4,6 +4,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <ctime>
 #include <iostream>
 #include <map>
@@ -183,6 +185,9 @@ bool bleProtoRelayAcks();
 #include "ble_protocol.h"
 #include <mbedtls/base64.h>
 #include "auth_nonce.inc"
+namespace main_fw { // authSendNonce as PIN (main before negotiation) has it: the fw-none fixtures' nonce frame
+#include "main_auth_nonce.inc"
+}
 
 namespace historical {
 #include "historical_ble_frame.inc"
@@ -222,9 +227,11 @@ OBDVector pollFrame(unsigned i) {
   frame.insert(frame.end(), g_extra_values.begin(), g_extra_values.end());
   return frame;
 }
+const OBDVector* g_poll_values = nullptr; // a fixture's poll values instead of pollFrame's
 void poll() {
   services();
-  OBDVector current_frame = pollFrame(++polls);
+  ++polls;
+  OBDVector current_frame = g_poll_values ? *g_poll_values : pollFrame(polls);
   const bool frame_has_data = true;
   GeoMarks poll_geo{};
 #include "ble_send.inc"
@@ -799,6 +806,150 @@ void dumpCellular() {
   check(!reconnectGate() && !uploadGate(), "as for an update");
 }
 
+// ---- protocol/fixtures (see its README.md): the firmware side of the wire contract with the app.
+
+std::string g_fixture; // the file being replayed, for failure messages
+void fixtureCheck(bool condition, size_t step, const std::string& message) {
+  check(condition, g_fixture + " step " + std::to_string(step) + ": " + message);
+}
+// Parsed and re-serialised: key order does not matter, an integer token stays one (1 and 1.0 differ).
+bool sameJson(const std::string& text, const json& expected) {
+  const json parsed = json::parse(text, nullptr, false);
+  return !parsed.is_discarded() && parsed.dump() == expected.dump();
+}
+
+void replayFixture(const json& doc) {
+  const json& inputs = doc["inputs"];
+  reset();
+  const std::string nonce_hex = inputs["nonce_hex"];
+  for (size_t i = 0; i < sizeof(fake_nonce); ++i) fake_nonce[i] = (uint8_t)std::stoul(nonce_hex.substr(2 * i, 2), nullptr, 16);
+  ESP.efuse_mac = std::stoull(inputs["dongle_id"].get<std::string>(), nullptr, 16);
+  fake_reset_reason = inputs["reset_window"].get<bool>() ? ESP_RST_POWERON : ESP_RST_DEEPSLEEP;
+  link(inputs["mtu"].get<uint16_t>());
+  const bool main_firmware = doc["firmware"]["range"].is_null();
+  std::map<unsigned, unsigned> poll_of_soc; // a poll's frame is told apart by its soc
+  for (const auto& step : doc["steps"])
+    if (step.contains("poll")) poll_of_soc[(unsigned)std::lround(step["values"]["soc"].get<double>())] = step["poll"];
+  auto polls_of = [&](const std::vector<unsigned>& socs_minus_10) {
+    std::vector<unsigned> out;
+    for (unsigned s : socs_minus_10) out.push_back(poll_of_soc.count(s + 10) ? poll_of_soc[s + 10] : 0);
+    return out;
+  };
+  size_t auth_seen = 0, session_seen = 0;
+  std::string abd2_reply;
+  OBDVector values;
+  for (size_t i = 0; i < doc["steps"].size(); ++i) {
+    const json& step = doc["steps"][i];
+    // Main's firmware is not this one: only its nonce frame is checked, against PIN's authSendNonce.
+    if (main_firmware && !(step.value("char", "") == "ABD8" && step.value("from", "") == "dongle" &&
+                           step["json"].contains("nonce")))
+      continue;
+    if (step.contains("wait")) {
+      fake_ms += step["wait"].get<unsigned long>();
+      services();
+      continue;
+    }
+    if (step.contains("check")) {
+      const json& c = step["check"];
+      if (c.contains("transport"))
+        fixtureCheck(bleRelaying() == (c["transport"] == "phone"), i, "the transport is " + c["transport"].get<std::string>());
+      if (c.contains("queued"))
+        fixtureCheck(polls_of(queuedPolls()) == c["queued"].get<std::vector<unsigned>>(), i, "the queued polls are " + c["queued"].dump());
+      if (c.contains("uploaded"))
+        fixtureCheck(polls_of(uploadedPolls()) == c["uploaded"].get<std::vector<unsigned>>(), i, "the uploaded polls are " + c["uploaded"].dump());
+      continue;
+    }
+    const std::string from = step["from"], ch = step["char"], op = step["op"];
+    // A notify is listed right after the step that caused it: anything else first means one the file does not list.
+    if (!(from == "dongle" && (ch == "ABD8" || ch == "ABD9")))
+      fixtureCheck(auth_seen == ble.auth_notifies.size() && session_seen == ble.session_notifies.size(), i,
+                   "no ABD8 or ABD9 notify the file does not list");
+    if (from == "dongle" && ch == "ABD8") {
+      if (step["json"].contains("nonce")) {
+        fake_random_at = 0;
+        main_firmware ? main_fw::authSendNonce() : authSendNonce();
+      }
+      fixtureCheck(auth_seen < ble.auth_notifies.size(), i, "the dongle notifies on ABD8");
+      const std::string& frame = ble.auth_notifies[auth_seen++];
+      fixtureCheck(sameJson(frame, step["json"]), i, "ABD8 notifies " + step["json"].dump() + ", not " + frame);
+      if (step.contains("length"))
+        fixtureCheck(frame.size() == step["length"].get<size_t>(), i, "the nonce frame is " + step["length"].dump() + " B, not " + std::to_string(frame.size()));
+    } else if (from == "dongle" && ch == "ABD1") {
+      values.clear();
+      for (auto it = step["values"].begin(); it != step["values"].end(); ++it) values.emplace_back(it.key(), it.value().get<double>());
+      const size_t before = ble.values.size();
+      g_poll_values = &values;
+      poll();
+      g_poll_values = nullptr;
+      if (op == "none") {
+        fixtureCheck(ble.values.size() == before, i, "nothing is written to ABD1");
+      } else {
+        fixtureCheck(ble.values.size() == before + 1 && sameJson(ble.values.back(), step["json"]), i,
+                     "ABD1's value is " + step["json"].dump() + (ble.values.size() > before ? ", not " + ble.values.back() : ""));
+        fixtureCheck(ble.telemetry_subscribed == (op == "notify") && (op != "notify" || sameJson(ble.notifies.back(), step["json"])), i,
+                     "the frame is notified exactly when the app is subscribed, and the notify is the frame");
+      }
+    } else if (from == "dongle" && ch == "ABD9") {
+      fixtureCheck(session_seen < ble.session_notifies.size(), i, "the dongle notifies on ABD9");
+      fixtureCheck(sameJson(ble.session_notifies[session_seen], step["json"]), i,
+                   "ABD9 notifies " + step["json"].dump() + ", not " + ble.session_notifies[session_seen]);
+      ++session_seen;
+    } else if (from == "dongle" && ch == "ABD2") {
+      fixtureCheck(abd2_reply == step["text"].get<std::string>(), i, "ABD2 answers " + step["text"].get<std::string>() + ", not " + abd2_reply);
+    } else if (from == "app" && ch == "ABD8") {
+      ble.auth_notifies.push_back(prove(step.contains("text") ? step["text"].get<std::string>() : step["json"].dump())); // authNotifyJson
+      services();
+    } else if (from == "app" && (op == "subscribe" || op == "unsubscribe")) {
+      (ch == "ABD1" ? ble.telemetry_subscribed : ble.session_subscribed) = op == "subscribe";
+      services();
+    } else if (from == "app" && ch == "ABD9" && op == "write") {
+      sessionWrite(step["json"].dump());
+      services();
+    } else if (from == "app" && ch == "ABD9" && op == "read") {
+      fixtureCheck(sameJson(sessionRead(), step["json"]), i, "ABD9 reads " + step["json"].dump() + ", not " + sessionRead());
+    } else if (from == "app" && ch == "ABD2") {
+      // The ABD2 handler runs on the Bluedroid task (blewrapper.cpp, pinned by the runner); the sketch decides only its
+      // two gates: NOAUTH before a grant, PROTO in a session with no protocol.
+      abd2_reply = !ble.get_authenticated() ? "NOAUTH" : !ble.get_setup_allowed() ? "PROTO" : "";
+      services();
+    } else {
+      fixtureCheck(false, i, "a step this replay does not know");
+    }
+  }
+  fixtureCheck(auth_seen == ble.auth_notifies.size() && session_seen == ble.session_notifies.size(), doc["steps"].size(),
+               "no ABD8 or ABD9 notify the file does not list");
+  if (main_firmware) return;
+  const json& session = doc["expect"]["session"];
+  fixtureCheck(session == "none" ? bleProto()->version == BLE_PROTO_NONE : bleProto()->version == session.get<unsigned>(),
+               doc["steps"].size(), "the session runs " + session.dump());
+}
+
+void fixtures() {
+  const std::string build = BLE_PROTO_MIN == 0 ? "" : "-DBLE_PROTO_MIN=" + std::to_string(BLE_PROTO_MIN);
+  std::vector<std::filesystem::path> files;
+  for (const char* version : {"v0", "v1"})
+    for (const auto& entry : std::filesystem::directory_iterator(std::filesystem::path(FIXTURE_DIR) / version))
+      if (entry.path().extension() == ".json") files.push_back(entry.path());
+  std::sort(files.begin(), files.end());
+  unsigned replayed = 0, nonces = 0;
+  for (const auto& path : files) {
+    std::ifstream in(path);
+    const json doc = json::parse(in);
+    const auto& replay = doc["replay"];
+    const bool firmware = std::find(replay.begin(), replay.end(), "firmware") != replay.end();
+    const bool main_nonce = doc["firmware"]["range"].is_null() && !doc["firmware"].contains("nonce_proto") &&
+                            !doc["steps"].empty() && doc["steps"][0].value("char", "") == "ABD8";
+    if (doc["firmware"].value("build", "") != build || (!firmware && !main_nonce)) continue;
+    g_fixture = path.parent_path().filename().string() + "/" + path.filename().string();
+    replayFixture(doc);
+    (firmware ? replayed : nonces) += 1;
+  }
+  check(replayed >= (BLE_PROTO_MIN == 0 ? 9u : 1u) && (BLE_PROTO_MIN != 0 || nonces == 3),
+        "every fixture for this build was found (" + std::to_string(replayed) + " replayed, " + std::to_string(nonces) +
+        " main nonce frames)");
+  std::cout << "  " << replayed << " fixtures replayed, " << nonces << " main-firmware nonce frames checked\n";
+}
+
 // Every sequence of `depth` events from three starting points, with the session invariants (design §5.4) checked
 // after each event. The model tracks what each poll's frame may legitimately become.
 struct Model {
@@ -1080,11 +1231,11 @@ int main(int argc, char** argv) {
     {"sessions", sessions}, {"persistence", persistence},
     {"negotiation", negotiation}, {"grant", grant}, {"nonce", nonce},
     {"stop-resume", stopResume}, {"mailbox", mailbox}, {"state", state}, {"subscribed-seq", subscribedSeq},
-    {"seq-frame", seqFrame}, {"dump-cellular", dumpCellular},
+    {"seq-frame", seqFrame}, {"dump-cellular", dumpCellular}, {"fixtures", fixtures},
     {"enumerate", enumerateGroup},
   };
 #else
-  const std::vector<std::pair<std::string, void (*)()>> groups{{"no-protocol", noProtocol}};
+  const std::vector<std::pair<std::string, void (*)()>> groups{{"no-protocol", noProtocol}, {"fixtures", fixtures}};
 #endif
   for (const auto& group : groups) {
     if (!only.empty() && group.first != only) continue;

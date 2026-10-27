@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "title": "firmware [1,2] x an early negotiating app [0,0]: no overlap, the app is too old and writes no proof",
+  "firmware": {"range": [1, 2]},
+  "app": {"range": [0, 0]},
+  "replay": ["app"],
+  "inputs": {"secret_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", "nonce_hex": "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf", "dongle_id": "A1B2C3D4E5F6", "mtu": 185, "reset_window": false},
+  "steps": [
+    {"from": "dongle", "char": "ABD8", "op": "notify", "json": {"nonce": "oKGio6SlpqeoqaqrrK2urw==", "id": "A1B2C3D4E5F6", "proto": [1, 2]}, "length": 70}
+  ],
+  "expect": {"session": "app_too_old", "app_writes_abd9": false}
+}

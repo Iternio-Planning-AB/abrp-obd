@@ -34,11 +34,11 @@ def compact(value):
     return json.dumps(value, separators=(",", ":"))
 
 
-def nonce(range_):
+def nonce(range_, raw=None):
     # The frame authSendNonce builds: nonce, id, then the range when this firmware negotiates. Its exact text decides
-    # the length: keys in this order, no spaces.
-    text = '{"nonce":"%s","id":"%s"%s}' % (
-        NONCE_B64, DONGLE_ID, "" if range_ is None else ',"proto":[%d,%d]' % tuple(range_))
+    # the length: keys in this order, no spaces. raw: a malformed "proto" as written (the app-side rows).
+    proto = "" if range_ is None and raw is None else ',"proto":%s' % (raw if raw is not None else "[%d,%d]" % tuple(range_))
+    text = '{"nonce":"%s","id":"%s"%s}' % (NONCE_B64, DONGLE_ID, proto)
     frame = json.loads(text)
     return {"from": "dongle", "char": "ABD8", "op": "notify", "json": frame, "length": len(text.encode())}
 
@@ -176,6 +176,73 @@ def render(content):
         else:
             lines.append("  " + json.dumps(key) + ": " + json.dumps(value, separators=(", ", ": ")))
     return "{\n" + ",\n".join(lines) + "\n}\n"
+
+
+def abd2(text, reply):
+    return [{"from": "app", "char": "ABD2", "op": "write", "text": text},
+            {"from": "dongle", "char": "ABD2", "op": "notify", "text": reply}]
+
+
+def v0_session(nonce_step, proof_step, note=None):
+    # A v0 session: frames byte-identical to today's (no seq), relayed and not queued, nothing written to ABD9.
+    steps = [nonce_step, proof_step, ok(), subscribe("ABD1"), poll(1), poll(2), poll(3),
+             check(transport="phone", queued=[], uploaded=[])]
+    if note:
+        steps[1] = dict(steps[1], note=note)
+    return steps
+
+
+FIXTURES["v0/fw-none_app-none.json"] = fixture(
+    "main firmware (no negotiation) x app without negotiation: today's exchange", None, None, [],
+    v0_session(nonce(None), proof()), 0, False)
+FIXTURES["v0/fw-none_app-0-1.json"] = fixture(
+    "main firmware (no negotiation) x negotiating app [0,1]: no range offered, so no proto in the proof",
+    None, [0, 1], ["app"], v0_session(nonce(None), proof()), 0, False)
+FIXTURES["v0/fw-0-1_app-none.json"] = fixture(
+    "v1 firmware [0,1] x app without negotiation: a v0 session, frames byte-identical to today's",
+    [0, 1], None, ["firmware"], v0_session(nonce([0, 1]), proof()), 0, False)
+for name, raw in (("string", '"1"'), ("negative", "-1"), ("fraction", "1.5"), ("float", "1.0"),
+                  ("huge", "1099511627776")):
+    FIXTURES[f"v0/fw-0-1_app-malformed-{name}.json"] = fixture(
+        f"v1 firmware [0,1] x a proof whose proto is {raw}: malformed means absent, a v0 session, no echo",
+        [0, 1], None, ["firmware"], v0_session(nonce([0, 1]), proof(raw=raw)), 0, False,
+        app_extra={"proof_proto": raw})
+for name, raw in (("number", "1"), ("one-element", "[1]"), ("reversed", "[1,0]"), ("string-element", '["0",1]'),
+                  ("out-of-range", "[0,256]")):
+    FIXTURES[f"v0/fw-malformed-{name}_app-0-1.json"] = fixture(
+        f"a nonce frame whose proto is {raw} x negotiating app [0,1]: malformed means absent, so no proto in the proof",
+        None, [0, 1], ["app"], v0_session(nonce(None, raw=raw), proof()), 0, False,
+        firmware_extra={"nonce_proto": raw})
+
+FIXTURES["v1/fw-0-2_app-0-1.json"] = fixture(
+    "firmware [0,2] x negotiating app [0,1]: the app chooses 1", [0, 2], [0, 1], ["app"], [
+        nonce([0, 2]), proof(1), ok(1), subscribe("ABD9"), subscribe("ABD1"), state("live", 0, 0, 0),
+        poll(1, 1), abd9_write({"relay_ack": 1}), state("live", 1, 1, 0),
+    ], 1, True)
+FIXTURES["v1/fw-0-1_app-0-2.json"] = fixture(
+    "v1 firmware [0,1] x negotiating app [0,2]: the app chooses 1", [0, 1], [0, 2], ["firmware", "app"], [
+        nonce([0, 1]), proof(1), ok(1), subscribe("ABD9"), subscribe("ABD1"), state("live", 0, 0, 0),
+        poll(1, 1), abd9_write({"relay_ack": 1}), state("live", 1, 1, 0), check(transport="phone", queued=[]),
+    ], 1, True)
+FIXTURES["v1/fw-0-1_app-proof-7.json"] = fixture(
+    "v1 firmware [0,1] x a proof asking for 7: above the maximum runs at it, and the echo says 1",
+    [0, 1], None, ["firmware"], [
+        nonce([0, 1]), proof(7), ok(1), subscribe("ABD1"), poll(1, 1), check(transport="phone", queued=[1]),
+    ], 1, False, app_extra={"proof_proto": "7"})
+FIXTURES["v1/fw-1-1_app-none.json"] = fixture(
+    "firmware [1,1] (BLE_PROTO_MIN 1) x app without negotiation: a session with no protocol", [1, 1], None,
+    ["firmware"], [
+        nonce([1, 1]), proof(), ok(), subscribe("ABD1"),
+        *abd2('{"obd_alarm":1}', "PROTO"),
+        poll(1, op="none"), check(transport="cellular"),
+        poll(2, op="none"), check(transport="cellular", queued=[], uploaded=[1, 2]),
+    ], "none", False, firmware_extra={"build": "-DBLE_PROTO_MIN=1"})
+FIXTURES["v1/fw-1-2_app-0-0.json"] = fixture(
+    "firmware [1,2] x an early negotiating app [0,0]: no overlap, the app is too old and writes no proof",
+    [1, 2], [0, 0], ["app"], [nonce([1, 2])], "app_too_old", False)
+FIXTURES["v1/fw-none_app-1-2.json"] = fixture(
+    "main firmware (no negotiation) x app [1,2]: no overlap, the dongle is too old and the app writes no proof",
+    None, [1, 2], ["app"], [nonce(None)], "dongle_too_old", False)
 
 
 def main():

@@ -21,17 +21,18 @@ side that does not negotiate (firmware: no `proto` in its nonce frame; app: no `
 
 | File | Firmware | App | Session | Replayed by |
 |---|---|---|---|---|
-| `v0/fw-none_app-none.json` | no negotiation (main) | no negotiation | v0 | neither (documents today's exchange) |
-| `v0/fw-none_app-0-1.json` | no negotiation (main) | `[0,1]` | v0 | app |
+| `v0/fw-none_app-none.json` | no negotiation (main) | no negotiation | v0 | neither (documents today's exchange; nonce frame checked) |
+| `v0/fw-none_app-0-1.json` | no negotiation (main) | `[0,1]` | v0 | app (nonce frame checked by the firmware) |
 | `v0/fw-0-1_app-none.json` | `[0,1]` | no negotiation | v0 | firmware |
-| `v0/fw-0-1_app-malformed-*.json` | `[0,1]` | proof with a malformed `proto` | v0 | firmware |
-| `v0/fw-malformed-*_app-0-1.json` | nonce with a malformed range | `[0,1]` | v0 | app |
+| `v0/fw-0-1_app-malformed-*.json` | `[0,1]` | proof with a malformed `proto` (`"1"`, `-1`, `1.5`, `1.0`, 2^40) | v0 | firmware |
+| `v0/fw-malformed-*_app-0-1.json` | nonce with a malformed range (`1`, `[1]`, `[1,0]`, `["0",1]`, `[0,256]`) | `[0,1]` | v0 | app |
 | `v1/fw-0-1_app-0-1.json` | `[0,1]` | `[0,1]` | v1 | firmware, app |
 | `v1/fw-0-2_app-0-1.json` | `[0,2]` | `[0,1]` | v1 | app |
-| `v1/fw-0-1_app-0-2.json` | `[0,1]` | `[0,2]` | v1 (clamped) | firmware |
+| `v1/fw-0-1_app-0-2.json` | `[0,1]` | `[0,2]` | v1 | firmware, app |
+| `v1/fw-0-1_app-proof-7.json` | `[0,1]` | a proof asking for 7 | v1 (above the maximum: runs at it, echoes 1) | firmware |
 | `v1/fw-1-1_app-none.json` | `[1,1]` (`-DBLE_PROTO_MIN=1`) | no negotiation | no protocol | firmware |
 | `v1/fw-1-2_app-0-0.json` | `[1,2]` | `[0,0]` | app too old | app |
-| `v1/fw-none_app-1-2.json` | no negotiation | `[1,2]` | dongle too old | app |
+| `v1/fw-none_app-1-2.json` | no negotiation | `[1,2]` | dongle too old | app (nonce frame checked by the firmware) |
 
 The design's `[1,2]` × no-negotiation row is `v1/fw-1-1_app-none.json`: this firmware's maximum is 1, so the
 `BLE_PROTO_MIN` override build speaks `[1,1]`, and the dongle side of that row (a no-protocol session) is the same.
@@ -61,9 +62,10 @@ Every file is one JSON object:
 
 - `firmware.range`: the `proto` range the dongle sends in its nonce frame, or `null` for firmware that does not
   negotiate. `firmware.build` (optional) names a test build, e.g. `"-DBLE_PROTO_MIN=1"`.
-- `app.range`: the range the app supports, `[min,max]`, or `null` for an app that does not negotiate.
-  `app.proof_proto` (optional) is the raw JSON the proof carries as `proto` when it is not what the range implies
-  (the malformed rows).
+- `app.range`: the range the app supports, `[min,max]`, or `null` for an app that does not negotiate (or for a
+  synthetic peer). `app.proof_proto` (optional) is the raw JSON the proof carries as `proto` when no conforming app
+  would send it (the malformed rows, a proof asking for 7). `firmware.nonce_proto` (optional) is likewise the raw
+  malformed range a nonce frame carries in the app-side rows; no firmware sends one.
 - `replay`: which sides replay the file. A side not listed must not fail on it; it may still parse it.
 - `inputs`: everything that makes the exchange deterministic. The secret is the dongle's provisioned key; the nonce is
   what the firmware's `esp_random()` yields (the firmware replay fakes it, four little-endian 32-bit words in byte
@@ -100,6 +102,9 @@ Any step may carry a `"note"` string for people; it has no meaning.
 Timing: every poll step takes one second (the clock advances 1000 ms after it); every other step except `wait` takes
 no time.
 
+Within a file every poll's `values.soc` is distinct: the firmware replay tells a poll's frame apart by it, in the
+queue and in what was uploaded.
+
 `check` fields, each optional: `transport` is `"phone"` while the phone counts as the transport (cellular stands down)
 and `"cellular"` otherwise; `queued` lists, in order, the polls (by `poll` number) waiting in the dongle's cellular
 queue; `uploaded` lists, in order, every poll the dongle has uploaded over cellular so far. The app may use
@@ -114,6 +119,9 @@ queue; `uploaded` lists, in order, every poll the dongle has uploaded over cellu
 - ABD2 `text` is compared byte for byte.
 - `proof` values are `base64(HMAC-SHA256(secret, nonce))` over the raw bytes from `inputs`; the fixture checker
   recomputes every one.
+- `1.0` is a malformed version for the firmware (nlohmann parses it as a float), but `JSON.parse` in the app cannot
+  tell `1.0` from `1`. So it appears only in a firmware-replayed proof (`v0/fw-0-1_app-malformed-float.json`, where
+  `text` holds the exact write), never in a nonce frame the app must reject.
 - Dongle notifies on ABD8 and ABD9 are complete: the firmware replay fails if it sent one the file does not list, in
   that place. ABD1 frames appear exactly where the polls are.
 
@@ -126,7 +134,8 @@ queue; `uploaded` lists, in order, every poll the dongle has uploaded over cellu
   session hooks. After each `app` step and each `wait` the replay runs one loop pass without a poll. ABD2 replies are
   checked only for the gate replies the sketch decides (`NOAUTH`, `PROTO`); the ABD2 handler itself runs on the
   Bluedroid task and is pinned structurally. The `fw-none_*` nonce frames are checked byte for byte against
-  `authSendNonce` from the runner's pinned main commit, so the main-firmware shape is the real one, not a copy.
+  `authSendNonce` from the runner's pinned main commit, so the main-firmware shape is the real one, not a copy; nothing
+  else in those files is the firmware's to replay. The `-DBLE_PROTO_MIN=1` row runs in the runner's second build.
 - **App**: every file whose `replay` lists `app`. Dongle steps are what the app receives; app steps are what it must
   write (and nothing else may be written: in particular, no ABD9 write where the file has none). `check` steps are
   optional for the app.

@@ -72,7 +72,7 @@ for name in sorted(present):
     if not (is_version(session) or session in SESSIONS) or type(doc["expect"]["app_writes_abd9"]) is not bool:
         fail(f"{where}: expect.session and expect.app_writes_abd9 are malformed")
     abd9_writes = proofs = 0
-    polls = []
+    polls, socs = [], []
     for index, step in enumerate(doc["steps"]):
         at = f"{where} step {index}"
         extra = set(step) - {"from", "char", "op", "json", "text", "length", "poll", "values", "note", "wait", "check"}
@@ -110,12 +110,15 @@ for name in sorted(present):
                     not isinstance(step.get("values"), dict) or ("json" in step) == (step["op"] == "none"):
                 fail(f"{at}: an ABD1 poll has op notify/value/none, a poll number, values, and json unless none")
             polls.append(step["poll"])
+            socs.append(step["values"].get("soc"))
         if step["char"] == "ABD9" and step["from"] == "app" and step["op"] == "write":
             abd9_writes += 1
         if step["char"] == "ABD2" and not isinstance(step.get("text"), str):
             fail(f"{at}: ABD2 steps carry text")
     if polls != list(range(1, len(polls) + 1)):
         fail(f"{where}: polls are numbered 1, 2, ... in order")
+    if None in socs or len(set(socs)) != len(socs):
+        fail(f"{where}: every poll reads a distinct soc (the firmware replay tells frames apart by it)")
     if doc["expect"]["app_writes_abd9"] != (abd9_writes > 0):
         fail(f"{where}: expect.app_writes_abd9 must say whether the steps have the app write ABD9")
     if session in ("app_too_old", "dongle_too_old") and proofs:
