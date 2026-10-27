@@ -119,15 +119,18 @@ static int bleTlmRank(const std::string& key) {
   return unlisted;
 }
 
-// seq > 0 (a session whose app announced relay acks, #90) leads the frame as "seq":n and is the last field trimmed:
-// an ack names it. With seq 0 the frame is exactly what apps without acks have always read.
+// seq > 0 (a protocol v1 session whose app is subscribed, #90) goes BESIDE tlm, {"tlm":{...},"seq":n}: frame
+// metadata, which released apps ignore (they read JSON.parse(value).tlm), so it can never collide with a profile key
+// or be forwarded to ABRP as telemetry. Its bytes are reserved from the budget before any field, so the trim drops
+// telemetry only: an ack names it. A negotiating session always has MTU >= 96 (the dongle picks v0 below it), so the
+// envelope and seq always fit. With seq 0 the frame is exactly what apps without acks have always read.
 BleTlmFrame bleTlmFrame(const OBDVector& vec, size_t budget, uint32_t seq = 0) {
   struct Field { std::string key, text; };
   std::vector<Field> fields;
-  if (seq) fields.push_back({ "", "\"seq\":" + std::to_string(seq) });
+  const std::string meta = seq ? ",\"seq\":" + std::to_string(seq) : std::string();
   for (const auto& res : vec) {
     const std::string& k = res.first;
-    if (isGeoMetaKey(k) || isGeoValueKey(k) || k == "utc" || !bleTlmKey(k) || (seq && k == "seq")) continue;
+    if (isGeoMetaKey(k) || isGeoValueKey(k) || k == "utc" || !bleTlmKey(k)) continue;
     char num[32];
     if (k == "is_charging" || k == "is_parked" || k == "is_dcfc") strcpy(num, res.second != 0.0 ? "true" : "false");
     else if (!bleTlmNumber(res.second, num, sizeof(num))) continue;
@@ -143,7 +146,7 @@ BleTlmFrame bleTlmFrame(const OBDVector& vec, size_t budget, uint32_t seq = 0) {
       first = false;
       out += fields[i].text;
     }
-    return out + "}}";
+    return out + "}" + meta + "}";
   };
 
   BleTlmFrame frame;
@@ -156,14 +159,13 @@ BleTlmFrame bleTlmFrame(const OBDVector& vec, size_t budget, uint32_t seq = 0) {
   }
 
   // Greedy by priority: a field that does not fit is skipped and a smaller, lower one may still go.
-  // The empty envelope (10 B) always fits: the budget is at least 20. The seq (empty key) goes first; only an
-  // unnegotiated MTU 23 can be too small for it, and the readable value, which an app at 23 reads, carries it.
+  // The empty envelope (10 B) always fits: the budget is at least 20.
   std::vector<size_t> by_rank(fields.size());
   for (size_t i = 0; i < by_rank.size(); ++i) by_rank[i] = i;
-  auto rank = [&](size_t i) { return fields[i].key.empty() ? -1 : bleTlmRank(fields[i].key); };
-  std::stable_sort(by_rank.begin(), by_rank.end(), [&](size_t a, size_t b) { return rank(a) < rank(b); });
+  std::stable_sort(by_rank.begin(), by_rank.end(),
+    [&](size_t a, size_t b) { return bleTlmRank(fields[a].key) < bleTlmRank(fields[b].key); });
   std::fill(keep.begin(), keep.end(), false);
-  size_t used = 10, kept = 0;
+  size_t used = 10 + meta.size(), kept = 0;
   for (size_t i : by_rank) {
     const size_t cost = fields[i].text.size() + (kept ? 1 : 0);
     if (used + cost > budget) continue;

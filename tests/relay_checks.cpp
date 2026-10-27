@@ -196,7 +196,12 @@ void services() {
 // One loop iteration from the session services to the cellular upload gate, all production code but the fakes.
 const double T = 1791500000;
 unsigned polls = 0, posts = 0;
-OBDVector pollFrame(unsigned i) { return {{"utc", T + i}, {"soc", 10.0 + i}, {"voltage", 350}, {"current", -20}}; }
+OBDVector g_extra_values; // more values every poll reads, for the frame-shape checks
+OBDVector pollFrame(unsigned i) {
+  OBDVector frame{{"utc", T + i}, {"soc", 10.0 + i}, {"voltage", 350}, {"current", -20}};
+  frame.insert(frame.end(), g_extra_values.begin(), g_extra_values.end());
+  return frame;
+}
 void poll() {
   services();
   OBDVector current_frame = pollFrame(++polls);
@@ -236,9 +241,9 @@ std::vector<unsigned> queuedPolls() {
     for (const auto& value : frame) if (value.first == "soc") out.push_back((unsigned)(value.second + 0.5) - 10);
   return out;
 }
-// The seq an ABD1 frame carries, 0 for none.
+// The seq an ABD1 frame carries beside tlm, 0 for none.
 uint32_t frameSeq(const std::string& text) {
-  const auto frame = json::parse(text)["tlm"];
+  const auto frame = json::parse(text);
   return frame.contains("seq") ? frame["seq"].get<uint32_t>() : 0;
 }
 uint32_t notifiedSeq(size_t i) { return frameSeq(ble.notifies.at(i)); }
@@ -303,6 +308,7 @@ void reset() {
   services();
   g_relay_seq = 0;
   g_log.clear();
+  g_extra_values.clear();
 }
 
 // A session of an app that does not negotiate: its proof carries no proto.
@@ -736,6 +742,30 @@ void subscribedSeq() {
   check(!bleRelaying(), "an app that unsubscribes with frames unacked still lapses");
 }
 
+// v1's seq goes beside tlm, never inside it: frame metadata released apps ignore (they read JSON.parse(value).tlm),
+// which cannot collide with a profile key, and which the trim never drops.
+void seqFrame() {
+  reset();
+  negotiate();
+  const json notify = json::parse(ble.notifies.back()), value = json::parse(ble.values.back());
+  check(notify.size() == 2 && notify["seq"] == 1 && !notify["tlm"].contains("seq") && value == notify,
+        "a v1 frame is {\"tlm\":{...},\"seq\":n}: " + ble.notifies.back());
+  check(ble.notifies.back() == "{\"tlm\":{\"soc\":11,\"voltage\":350,\"current\":-20},\"seq\":1}",
+        "with the seq after tlm, as the fixtures have it: " + ble.notifies.back());
+  g_extra_values = {{"seq", 42}};
+  poll();
+  const json keyed = json::parse(ble.notifies.back());
+  check(keyed["seq"] == 2 && keyed["tlm"]["seq"] == 42, "a profile key named seq stays inside tlm, untouched");
+  g_extra_values.clear();
+  for (int i = 0; i < 24; ++i) g_extra_values.push_back({"_profile_value_" + std::to_string(i), 1234.56 + i});
+  ble.negotiated = 96;
+  poll();
+  const std::string trimmed = ble.notifies.back();
+  check(trimmed.size() <= bleNotifyBudget(96) && json::parse(trimmed)["seq"] == g_relay_seq &&
+        json::parse(trimmed)["tlm"]["soc"] == 10 + polls && json::parse(ble.values.back())["tlm"].size() == 3 + 24,
+        "at the 93-byte notify of MTU 96 the trim drops telemetry fields only, never the seq: " + trimmed);
+}
+
 // Every sequence of `depth` events from three starting points, with the session invariants (design §5.4) checked
 // after each event. The model tracks what each poll's frame may legitimately become.
 struct Model {
@@ -1017,6 +1047,7 @@ int main(int argc, char** argv) {
     {"sessions", sessions}, {"persistence", persistence},
     {"negotiation", negotiation}, {"grant", grant}, {"nonce", nonce},
     {"stop-resume", stopResume}, {"mailbox", mailbox}, {"state", state}, {"subscribed-seq", subscribedSeq},
+    {"seq-frame", seqFrame},
     {"enumerate", enumerateGroup},
   };
 #else
