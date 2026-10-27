@@ -193,7 +193,8 @@ ABD1 is notify-only, so the app has to say what it posted (`Helpers/ble_relay.h`
 - **ABD9** answers with events (`{"relay":"lapsed","why":"timeout"|"stop"}`, `{"relay":"live"}`, as
   notifies that never replace the value) and a readable state, `{"relay":"live"|"lapsed","why":…,
   "acked":n,"sent":m,"queued":k}` (`{}` outside a v1 session; at most 93 B, checked at compile time),
-  served from `onRead` under the relay lock. Writes are dropped unless the link holds a grant; the
+  served from `onRead` under the relay lock. Writes are dropped unless the link holds a grant, and one over 64 B is
+  not parsed (logged as key `?`); the
   Bluedroid callback keeps one grant-stamped mailbox (highest ack, last verb), applied on the loop task
   by `sessionChannelService()` — ack first, then the verb — and an entry from an ended grant is
   discarded (`BLE session stale grant`).
@@ -208,7 +209,8 @@ ABD1 is notify-only, so the app has to say what it posted (`Helpers/ble_relay.h`
   `bleAuthenticated()`, which a lapse does not change.
 - Log lines: `BLE relay acks on`, `BLE relay lapsed … -> cellular`, `BLE relay stop by app`,
   `BLE relay resume by app`, `BLE relay resumed ack=`, `BLE relay ack ignored`,
-  `BLE relay end acked= sent= unacked=`, `BLE session proto=N ignored key=K`, `BLE session stale grant`.
+  `BLE relay end acked= sent= unacked=`, `BLE session proto=N ignored key=K` (at most 8 keys a session, then
+  `BLE session further ignored keys not logged`), `BLE session stale grant`.
   Valid acks themselves are not logged.
 
 ---

@@ -80,7 +80,10 @@ or software reset reloads it too (`DONGLE_CONTEXT.md` §11).
 
 **BLE callbacks run on the Bluedroid task and must only copy bytes and set a flag.** All NVS, crypto
 and OBD work happens on the loop task, in the matching `*Service()` function. This is stated as
-load-bearing in `auth_gate.h` and holds equally for OTA, the log dump and the profile push.
+load-bearing in `auth_gate.h` and holds equally for OTA, the log dump and the profile push. Two handlers parse small
+JSON there: ABD2's (`StartupCallbacks::onWrite`) and ABD9's (`relaySessionWrite`, at most 64 B, into a mailbox under a
+lock); neither does NVS, crypto or OBD work, and ABD9's also never logs or calls `ble` (pinned by
+`run_relay_checks.py`).
 
 **Tunables live in `config.h`**, each with the reasoning above it. Change the constant, and update the
 comment when the reasoning changes — several of them encode a measured field result, not a preference.

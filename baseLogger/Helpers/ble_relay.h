@@ -35,6 +35,10 @@
     any -> NO_SESSION when the session ends: disconnect, authreset, AUTHCLEAR or a new grant
   Being subscribed to ABD1 is a condition, not a state: it decides whether a frame gets a seq, in LIVE and LAPSED.
 
+  Task discipline: relaySessionWrite and relaySessionRead run on the Bluedroid task. The write hook parses one small
+  JSON message (at most 64 B, like the ABD2 handler parses its writes) into the mailbox under the lock, and the read hook
+  copies the state out under it; neither touches NVS, crypto, the log or ble. Everything else runs on the loop task.
+
   This file is #included by logger.ino into the single sketch translation unit - it is NOT a standalone
   compilation unit - so it shares logger.ino's globals and the config.h feature flags.
 */
@@ -291,13 +295,19 @@ void relayAckService() {
   else if (relayLate(now)) relayLapse(RELAY_WHY_TIMEOUT, now);
 }
 
+// The longest session message is {"relay_ack":4294967295} (24 B); nothing longer is parsed on the Bluedroid task.
+static const size_t RELAY_SESSION_WRITE_MAX = 64;
+
 // Bluedroid task (BLEWrapper's ABD9 onWrite): stash only. Dropped unless the link holds a session grant; parsed here, so
-// the mailbox holds only what can collapse, but applied on the loop task. Never logs, never touches ble.
+// the mailbox holds only what can collapse, but applied on the loop task. It parses one small JSON message (at most
+// RELAY_SESSION_WRITE_MAX bytes, as the ABD2 handler parses its writes) and does nothing else: no NVS, no crypto, no
+// logging, no ble calls.
 void relaySessionWrite(const uint8_t* data, size_t len) {
   if (!bleAuthenticated() || !data || !len) return;
   const uint32_t grant = bleAuthGrant();
   // Through std::string, as every other parse in the sketch: a pointer range would instantiate a second parser (~20 KB).
-  const json message = json::parse(std::string((const char*)data, len), nullptr, false);
+  const json message = len > RELAY_SESSION_WRITE_MAX ? json(json::value_t::discarded)
+                                                     : json::parse(std::string((const char*)data, len), nullptr, false);
   uint32_t ack = 0;
   RelayVerb verb = RELAY_VERB_NONE;
   char bad[sizeof(g_session_bad_pending)] = "";
@@ -353,10 +363,19 @@ static bool relayTakeMailbox(uint32_t& grant, uint32_t& ack, RelayVerb& verb, ch
   return pending;
 }
 
-// A message the session's version does not take is logged once per key and session, by key only, and ignored.
+// A message the session's version does not take is logged once per key and session, by key only, and ignored. At most
+// RELAY_IGNORED_KEYS_LOGGED keys per session, then one line: a peer cycling through keys must not fill the flash log.
+static const size_t RELAY_IGNORED_KEYS_LOGGED = 8;
 static bool relayFirstIgnore(const char* key) {
   for (const auto& logged : g_session_logged)
     if (logged == key) return false;
-  if (g_session_logged.size() < 8) g_session_logged.push_back(key);
-  return true;
+  if (g_session_logged.size() < RELAY_IGNORED_KEYS_LOGGED) {
+    g_session_logged.push_back(key);
+    return true;
+  }
+  if (g_session_logged.size() == RELAY_IGNORED_KEYS_LOGGED) {
+    g_session_logged.push_back(""); // the marker: the line below is written once per session
+    logEvent("BLE session further ignored keys not logged");
+  }
+  return false;
 }

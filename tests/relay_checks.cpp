@@ -696,6 +696,26 @@ void mailbox() {
         loggedLine("BLE session proto=1 ignored key=relay_ack") == 1 && loggedLine("BLE session proto=1 ignored key=relay") == 1,
         "a key the version does not know, or a value it does not take, is logged once per session by key");
   check(bleRelaying(), "and changes nothing");
+  // A peer cycling through keys must not turn the flash log into its outlet: a few keys per session, then one line.
+  for (int round = 0; round < 3; ++round)
+    for (int k = 0; k < 12; ++k) {
+      sessionWrite("{\"k" + std::to_string(k) + "\":1}");
+      services();
+    }
+  size_t ignored = 0;
+  for (const auto& line : g_log) ignored += line.rfind("BLE session proto=1 ignored key=", 0) == 0;
+  check(ignored == 8 && loggedLine("BLE session further ignored keys not logged") == 1,
+        "at most 8 ignored keys are logged per session, then one line says the rest are not: " + std::to_string(ignored));
+  // The Bluedroid task parses nothing longer than a session message can be.
+  const std::string padded = "{\"relay_ack\":" + std::to_string(g_relay_seq) + std::string(64, ' ') + "}";
+  unlink();
+  negotiate();
+  poll();
+  g_log.clear();
+  sessionWrite(padded);
+  services();
+  check(queuedSeqs().size() == 2 && loggedLine("BLE session proto=1 ignored key=?") == 1,
+        "a write over 64 bytes is not parsed: logged as an unknown key, its ack not applied");
 }
 
 void state() {

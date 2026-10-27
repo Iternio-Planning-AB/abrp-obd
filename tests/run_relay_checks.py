@@ -60,8 +60,11 @@ if "void set_authenticated(bool auth) { if (auth && !authenticated) ++auth_grant
     fail("BLEWrapper must count a session grant on every false -> true, and only then, and end setup with the grant")
 relay = (helpers / "ble_relay.h").read_text()
 for hook in ("void relaySessionWrite(", "size_t relaySessionRead("):
-    if re.search(r"logEvent|Serial|ble\.", block(relay, hook, "ble_relay.h")):
-        fail(f"{hook[:-1]} runs on the Bluedroid task: copy bytes under the lock, nothing else")
+    if re.search(r"logEvent|logEvt|Serial|\bble\.|Preferences|nvs_|mbedtls|LittleFS|datalogger|delay\(", code(block(relay, hook, "ble_relay.h"))):
+        fail(f"{hook[:-1]} runs on the Bluedroid task: no NVS, crypto, flash, logging or ble calls, only bytes under the lock")
+session_write = code(block(relay, "void relaySessionWrite(", "ble_relay.h"))
+if not find(session_write, "len > RELAY_SESSION_WRITE_MAX", what="relaySessionWrite") < find(session_write, "json::parse(", what="relaySessionWrite"):
+    fail("relaySessionWrite must refuse an oversized write before it parses anything on the Bluedroid task")
 if not re.search(r"static_assert\(sizeof\(\"\{\\\"relay\\\":\\\"lapsed\\\"[^;]*<= 93,", relay):
     fail("ble_relay.h must hold the worst-case ABD9 state under the 93-byte read at compile time")
 
