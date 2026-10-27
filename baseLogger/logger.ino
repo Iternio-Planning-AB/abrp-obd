@@ -2082,15 +2082,17 @@ void loop() {
 #if ENABLE_BLE
     const uint16_t ble_mtu = ble.mtu();
     const BleProtocol* proto = bleProto(); // the session's protocol version (Helpers/ble_protocol.h)
-    // 0 unless the session's version tags frames for the app to ack (#90): then the frame carries it beside tlm.
-    const uint32_t relay_seq = proto->nextSeq();
+    // 0 unless the session's version tags frames for the app to ack (#90): then the frame carries it beside tlm. Only a
+    // frame the buffer block below will queue takes one: an empty frame with a seq would start the ack clock for a
+    // frame cellular never had.
+    const uint32_t relay_seq = frame_has_data ? proto->nextSeq() : 0;
     const BleTlmFrame ble_frame = bleTlmFrame(current_frame, bleNotifyBudget(ble_mtu), relay_seq);
     // Sent before buffering: one answer decides whether the phone or cellular carries this frame. A session with no
     // protocol is handed nothing, and a version that needs a seq counts a frame without one as not relayed: either
     // way the frame stays queued for cellular.
     const bool ble_relayed = proto->setupAllowed && ble.logData(ble_frame.notify, ble_frame.full) &&
                              (relay_seq || !bleProtoTagsFrames(proto));
-    if (ble_relayed && relay_seq) proto->frameNotified(relay_seq);
+    if (frame_has_data) proto->frameQueued(ble_relayed ? relay_seq : 0); // the buffer block below queues it either way
 #else
     const bool ble_relayed = false;
     const uint32_t relay_seq = 0;

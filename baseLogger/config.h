@@ -277,6 +277,17 @@
 #define RELAY_ACK_TIMEOUT_MS 120000UL
 #endif
 
+// The second bound on a protocol v1 session (Helpers/ble_relay.h, #90): how long it may hold cellular off while the
+// app is not subscribed to ABD1 and frames have been queued untagged since it lost (or never had) the subscription.
+// An app that acked everything and then stopped listening, its subscription dead while the link and the grant survive,
+// acks nothing more, so the clock above never runs and cellular would stay off for the whole connection. The bound has
+// to sit above the longest profile push, which runs while the app is not yet subscribed (the host checks hold the
+// transport through a 200 s push); 300 s is that with margin, and costs at most five minutes of frames that then go up
+// over cellular, none lost. Resubscribing, a forward ack or a resume returns the session to the phone.
+#ifndef RELAY_UNSUBSCRIBED_MAX_MS
+#define RELAY_UNSUBSCRIBED_MAX_MS 300000UL
+#endif
+
 // The oldest BLE protocol version this firmware still speaks (Helpers/ble_protocol.h): every nonce frame offers
 // "proto":[BLE_PROTO_MIN, BLE_PROTO_MAX], and a proof below it gets a session with no protocol (OTA and the log dump
 // only; ABD2 answers PROTO). The newest version, BLE_PROTO_MAX, is not a tunable: it is however many versions the

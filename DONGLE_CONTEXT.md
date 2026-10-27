@@ -190,7 +190,13 @@ ABD1 is notify-only, so the app has to say what it posted (`Helpers/ble_relay.h`
   moving forward, cellular takes over with every frame still queued; the next forward ack or a resume
   hands the transport back. Nothing outstanding is never late, and an update or a log dump (which pause
   polling) holds the clock without changing the state; the cellular gates hold off for both on their own.
-- **ABD9** answers with events (`{"relay":"lapsed","why":"timeout"|"stop"}`, `{"relay":"live"}`, as
+- **Unsubscribed, the second bound:** an app that acked everything and then stopped listening on ABD1 (its
+  subscription died, the link and grant did not) acks nothing more, so the ack clock never runs. Once frames have
+  been queued untagged for `RELAY_UNSUBSCRIBED_MAX_MS` (300 s, above the longest profile push, which runs before the
+  app subscribes) while it is not subscribed, the session lapses (`"why":"unsubscribed"`); subscribing again, a
+  forward ack or a resume hands the transport back. An update or a log dump holds this clock too. Only a frame with
+  data takes a seq, so an empty frame never starts the ack clock without being queued.
+- **ABD9** answers with events (`{"relay":"lapsed","why":"timeout"|"stop"|"unsubscribed"}`, `{"relay":"live"}`, as
   notifies that never replace the value) and a readable state, `{"relay":"live"|"lapsed","why":…,
   "acked":n,"sent":m,"queued":k}` (`{}` outside a v1 session; at most 93 B, checked at compile time),
   served from `onRead` under the relay lock. Writes are dropped unless the link holds a grant, and one over 64 B is
@@ -199,7 +205,8 @@ ABD1 is notify-only, so the app has to say what it posted (`Helpers/ble_relay.h`
   by `sessionChannelService()` — ack first, then the verb — and an entry from an ended grant is
   discarded (`BLE session stale grant`).
 - The session is one state machine: `NO_SESSION` → `GRANTED` (v0, no protocol) or `LIVE` (v1);
-  `LIVE` → `LAPSED(stop|timeout)`; back to `LIVE` on resume (or a forward ack after a timeout); any →
+  `LIVE` → `LAPSED(stop|timeout|unsubscribed)`; back to `LIVE` on resume (or a forward ack after a timeout or
+  unsubscribed lapse, or the app subscribing again after an unsubscribed one); any →
   `NO_SESSION` when the grant ends. An ack beyond the last seq sent is ignored, and a session's unacked
   frames lose their seq when it ends (sessions are counted by grant, so a reconnect between two loop
   passes still ends one), so the next session's acks cannot drop them. An ack still on its way when a
@@ -207,8 +214,9 @@ ABD1 is notify-only, so the app has to say what it posted (`Helpers/ble_relay.h`
 - **An app that does not negotiate gets v0 and is trusted as before**, frames byte-identical, so
   current apps keep #90 until they negotiate. Presence (the awake leash, the alarm gate) keys on
   `bleAuthenticated()`, which a lapse does not change.
-- Log lines: `BLE relay acks on`, `BLE relay lapsed … -> cellular`, `BLE relay stop by app`,
-  `BLE relay resume by app`, `BLE relay resumed ack=`, `BLE relay ack ignored`,
+- Log lines: `BLE relay acks on`, `BLE relay lapsed no ack … -> cellular`, `BLE relay lapsed unsubscribed for Ns
+  queued=k -> cellular`, `BLE relay stop by app`, `BLE relay resume by app`, `BLE relay resumed ack=`,
+  `BLE relay resubscribed`, `BLE relay ack ignored`,
   `BLE relay end acked= sent= unacked=`, `BLE session proto=N ignored key=K` (at most 8 keys a session, then
   `BLE session further ignored keys not logged`), `BLE session stale grant`.
   Valid acks themselves are not logged.

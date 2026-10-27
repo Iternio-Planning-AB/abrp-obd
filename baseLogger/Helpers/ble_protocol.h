@@ -34,7 +34,7 @@
 struct BleProtocol {
   uint8_t version;
   uint32_t (*nextSeq)();                                  // the seq the next ABD1 frame carries; 0: none
-  void (*frameNotified)(uint32_t seq);                    // a frame went out on ABD1 under seq
+  void (*frameQueued)(uint32_t seq);                      // a frame with data was queued under seq (0: untagged)
   bool (*phoneIsTransport)();                             // may cellular stand down for this authenticated phone?
   bool (*sessionApply)(uint32_t ack, RelayVerb verb);     // ABD9's relay ack (0: none) and verb; false: not this version
   bool setupAllowed;                                      // false: no-protocol session (no ABD1 relay, ABD2 PROTO)
@@ -55,7 +55,7 @@ constexpr BleProtocol kProtoV0 = { 0, bleNoSeq, bleNoFrame, bleAlways, bleNoSess
 // v1 (#90, Helpers/ble_relay.h): v0, plus the frames of a subscribed app carry "seq" beside "tlm" and stay queued until
 // it acks them on ABD9, the app can hand the transport back (relay stop/resume), and it stops being the transport when
 // its acks stall.
-constexpr BleProtocol kProtoV1 = { 1, relayNextSeq, relayFrameNotified, relayTransportLive, relaySessionApply, true };
+constexpr BleProtocol kProtoV1 = { 1, relayNextSeq, relayFrameQueued, relayTransportLive, relaySessionApply, true };
 
 constexpr const BleProtocol* kProtocols[] = { &kProtoV0, &kProtoV1 };
 static const uint8_t BLE_PROTO_MAX = sizeof(kProtocols) / sizeof(kProtocols[0]) - 1;

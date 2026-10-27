@@ -228,11 +228,12 @@ OBDVector pollFrame(unsigned i) {
   return frame;
 }
 const OBDVector* g_poll_values = nullptr; // a fixture's poll values instead of pollFrame's
+bool g_frame_has_data = true;             // false: a poll whose frame carries nothing to upload
 void poll() {
   services();
   ++polls;
   OBDVector current_frame = g_poll_values ? *g_poll_values : pollFrame(polls);
-  const bool frame_has_data = true;
+  const bool frame_has_data = g_frame_has_data;
   GeoMarks poll_geo{};
 #include "ble_send.inc"
 #include "upload_buffer.inc"
@@ -285,6 +286,7 @@ void resume() { sessionWrite("{\"relay\":\"resume\"}"); }
 const std::string kLapsedStop = "{\"relay\":\"lapsed\",\"why\":\"stop\"}";
 const std::string kLapsedTimeout = "{\"relay\":\"lapsed\",\"why\":\"timeout\"}";
 const std::string kLive = "{\"relay\":\"live\"}";
+const std::string kLapsedUnsubscribed = "{\"relay\":\"lapsed\",\"why\":\"unsubscribed\"}";
 
 // ---- The ABD8 handshake, from the point where the proof passed the HMAC check (auth_gate.h).
 
@@ -331,6 +333,7 @@ void reset() {
   g_relay_seq = 0;
   g_log.clear();
   g_extra_values.clear();
+  g_frame_has_data = true;
 }
 
 // A session of an app that does not negotiate: its proof carries no proto.
@@ -810,6 +813,83 @@ void seqFrame() {
 
 // A log dump pauses polling and keeps the phone busy on the link: it changes no relay state, but no cellular gate may
 // open under it, the modem reconnect included (it runs outside the poll block and can block the loop for seconds).
+// A v1 app that acked everything and then stopped listening on ABD1 (its subscription died, the link and grant did not)
+// acks nothing more, so the ack clock never runs: a second bound hands the transport to cellular once frames have been
+// queued untagged for RELAY_UNSUBSCRIBED_MAX_MS. Above the longest profile push, which runs before the app subscribes.
+void unsubscribedBound() {
+  check(RELAY_UNSUBSCRIBED_MAX_MS > RELAY_ACK_TIMEOUT_MS, "the bound is above the ack timeout the long-push check holds");
+  reset();
+  negotiate();
+  ack(1);
+  services();
+  ble.telemetry_subscribed = false;
+  const unsigned long first_untagged = fake_ms;
+  poll();
+  while (fake_ms < first_untagged + RELAY_UNSUBSCRIBED_MAX_MS - 1000) poll();
+  check(bleRelaying() && posts == 0 && queuedSeqs().empty(), "an unsubscribed v1 app keeps the transport until the bound");
+  fake_ms = first_untagged + RELAY_UNSUBSCRIBED_MAX_MS - 1;
+  check(bleRelaying(), "still 1 ms before it");
+  fake_ms = first_untagged + RELAY_UNSUBSCRIBED_MAX_MS;
+  check(!bleRelaying() && bleAuthenticated(), "and lapses exactly at the bound after its first untagged frame");
+  services();
+  check(ble.session_notifies.back() == kLapsedUnsubscribed && sessionState()["why"] == "unsubscribed" &&
+        logged("BLE relay lapsed unsubscribed") == 1, "notified, in the state and in the log: " + sessionRead());
+  // 300 s of polls overruns MAX_UPLOAD_BUFFER (the queue keeps the newest): every frame it holds goes up, in order.
+  std::vector<unsigned> expected = queuedPolls();
+  check(expected.size() == MAX_UPLOAD_BUFFER && expected.back() == polls, "the queue held the untagged frames");
+  poll();
+  expected.push_back(polls);
+  expected.erase(expected.begin()); // the new frame took the oldest one's place in the full queue
+  check(posts == 1 && uploadedPolls() == expected, "cellular sends every frame queued meanwhile, once, in order");
+  ble.telemetry_subscribed = true;
+  services();
+  check(bleRelaying() && ble.session_notifies.back() == kLive && logged("BLE relay resubscribed") == 1,
+        "resubscribing to ABD1 returns it to live");
+  ble.telemetry_subscribed = false;
+  poll();
+  fake_ms += RELAY_UNSUBSCRIBED_MAX_MS;
+  services();
+  check(!bleRelaying(), "lapsed again");
+  resume();
+  services();
+  check(bleRelaying(), "a resume also returns it to live");
+  const unsigned long next_untagged = fake_ms;
+  poll();
+  fake_ms = next_untagged + RELAY_UNSUBSCRIBED_MAX_MS - 1;
+  services();
+  check(bleRelaying(), "and the bound starts over from the next untagged frame");
+  g_logdump_active = true;
+  fake_ms += RELAY_UNSUBSCRIBED_MAX_MS;
+  services();
+  check(sessionState()["relay"] == "live", "a log dump holds the bound");
+  g_logdump_active = false;
+  fake_ms += RELAY_UNSUBSCRIBED_MAX_MS - 1;
+  check(bleRelaying(), "which restarts when it ends");
+
+  reset(); // never subscribed: the profile push case, held for less than the bound, lapsed past it
+  link();
+  prove(proofWith("1"));
+  const unsigned long granted = fake_ms;
+  while (fake_ms < granted + RELAY_UNSUBSCRIBED_MAX_MS - 1000) poll();
+  check(bleRelaying() && posts == 0, "a v1 app that never subscribes keeps the transport until the bound");
+  fake_ms = granted + RELAY_UNSUBSCRIBED_MAX_MS;
+  services();
+  check(!bleRelaying() && sessionState()["why"] == "unsubscribed", "and then lapses");
+
+  reset(); // a frame with nothing to upload never takes a seq, so it can never start the ack clock unqueued
+  negotiate();
+  ack(1);
+  services();
+  g_frame_has_data = false;
+  poll();
+  g_frame_has_data = true;
+  check(g_relay_seq == 1 && frameSeq(ble.values.back()) == 0 && queuedPolls().empty(),
+        "an empty frame is shown on ABD1 without a seq and queued nowhere");
+  fake_ms += RELAY_ACK_TIMEOUT_MS * 2;
+  services();
+  check(bleRelaying(), "so nothing is outstanding and the transport stays");
+}
+
 void dumpCellular() {
   reset();
   negotiate();
@@ -978,6 +1058,8 @@ struct Model {
   std::map<uint32_t, uint32_t> acked_by; // per grant: the highest ack its app wrote and the loop applied
   uint32_t sent_in_grant = 0;          // the highest seq notified under the current grant
   int version_grant = -1, version = -1;
+  unsigned long unsub_since = 0;       // when an untagged frame was first queued while unsubscribed (0: none)
+  uint32_t unsub_grant = 0;
 } model;
 
 uint32_t currentGrant() { return bleAuthenticated() ? bleAuthGrant() : 0; }
@@ -987,6 +1069,8 @@ void modelPoll() {
   const uint32_t grant = currentGrant();
   const size_t before = ble.values.size(), uploaded = network.received.size();
   const bool v0 = grant && !bleProtoTagsFrames(bleProto()) && bleProto()->setupAllowed;
+  const bool v1 = grant && bleProtoTagsFrames(bleProto());
+  const unsigned long at = fake_ms;
   poll();
   const unsigned p = polls;
   const uint32_t s = ble.values.size() > before ? frameSeq(ble.values.back()) : 0;
@@ -1001,6 +1085,10 @@ void modelPoll() {
   model.grant.push_back(grant);
   model.v0_relayed.push_back(v0 && !in_queue && !went_up);
   if (s) model.sent_in_grant = std::max(model.sent_in_grant, s);
+  if (v1 && !subscribed && !s && (in_queue || went_up) && !model.unsub_since) {
+    model.unsub_since = at;
+    model.unsub_grant = grant;
+  }
 }
 
 // then_reconnect: the ack and a stop land as the link drops, and a new v1 session is granted before the loop runs.
@@ -1017,8 +1105,9 @@ void modelAck(bool then_reconnect) {
     model.sent_in_grant = 0;
   }
   services();
-  if (!then_reconnect && grant) {
-    if (bleProtoTagsFrames(bleProto())) model.acked_by[grant] = std::max(model.acked_by[grant], seq);
+  if (!then_reconnect && grant && bleProtoTagsFrames(bleProto())) {
+    if (seq > model.acked_by[grant]) model.unsub_since = 0; // a forward ack: the app is posting, the bound starts over
+    model.acked_by[grant] = std::max(model.acked_by[grant], seq);
   }
 }
 
@@ -1049,6 +1138,11 @@ void modelCheck(bool was_stopped, uint32_t grant_before, bool resumed) {
   }
   if (grant && grant != grant_before && bleProtoTagsFrames(bleProto()))
     check(bleRelaying() && sessionState()["relay"] == "live", "invariant: a new v1 session starts live");
+  if (grant != model.unsub_grant) model.unsub_since = 0;
+  if (model.unsub_since && g_logdump_active) model.unsub_since = fake_ms; // a log dump holds the bound
+  if (grant && bleProtoTagsFrames(bleProto()) && !ble.telemetry_subscribed && model.unsub_since &&
+      fake_ms - model.unsub_since > RELAY_UNSUBSCRIBED_MAX_MS + 1000)
+    check(!bleRelaying(), "invariant: no unsubscribed v1 session holds cellular off with untagged frames queued past the bound");
   if (was_stopped && grant == grant_before && !resumed)
     check(!bleRelaying() && sessionState().value("why", "") == "stop", "invariant: only a resume ends a stop");
 }
@@ -1058,13 +1152,19 @@ enum Event { POLL, SUB, UNSUB, ACK, ACK_RECONNECT, STOP, RESUME, WAIT, DUMP, REP
 void apply(int e) {
   switch (e) {
     case POLL: modelPoll(); return;
-    case SUB: ble.telemetry_subscribed = ble.linked; break;
+    case SUB:
+      ble.telemetry_subscribed = ble.linked;
+      if (ble.linked) model.unsub_since = 0;
+      break;
     case UNSUB: ble.telemetry_subscribed = false; break;
     case ACK: modelAck(false); return;
     case ACK_RECONNECT: modelAck(true); return;
     case STOP: stop(); break;
-    case RESUME: resume(); break;
-    case WAIT: fake_ms += RELAY_ACK_TIMEOUT_MS; break;
+    case RESUME:
+      resume();
+      if (bleAuthenticated()) model.unsub_since = 0;
+      break;
+    case WAIT: fake_ms += RELAY_UNSUBSCRIBED_MAX_MS; break; // past both bounds (the ack timeout is shorter)
     case DUMP: g_logdump_active = !g_logdump_active; break;
     case REPROVE: if (bleAuthenticated()) prove(proofWith("0")); break;
     case DROP: if (ble.linked) { unlink(); g_ble_disconnect_ms = fake_ms; } break;
@@ -1251,7 +1351,7 @@ int main(int argc, char** argv) {
     {"sessions", sessions}, {"persistence", persistence},
     {"negotiation", negotiation}, {"grant", grant}, {"nonce", nonce},
     {"stop-resume", stopResume}, {"mailbox", mailbox}, {"state", state}, {"subscribed-seq", subscribedSeq},
-    {"seq-frame", seqFrame}, {"dump-cellular", dumpCellular}, {"fixtures", fixtures},
+    {"seq-frame", seqFrame}, {"dump-cellular", dumpCellular}, {"unsubscribed", unsubscribedBound}, {"fixtures", fixtures},
     {"enumerate", enumerateGroup},
   };
 #else

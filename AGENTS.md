@@ -425,7 +425,8 @@ itself are not exercised.
 
 Run `python3 tests/run_relay_checks.py` (groups `old-app`, `acking`, `stall`, `never-ack`, `resume`, `disconnect`,
 `presence`, `hold`, `sessions`, `persistence`, `negotiation`, `grant`, `nonce`, `stop-resume`, `mailbox`, `state`,
-`subscribed-seq`, `seq-frame`, `dump-cellular`, `fixtures`, `enumerate` with `--depth N`, default 4; and `no-protocol`)
+`subscribed-seq`, `seq-frame`, `dump-cellular`, `unsubscribed`, `fixtures`, `enumerate` with `--depth N`, default 4; and
+`no-protocol`)
 for the protocol version a session negotiates and whether a connected phone is the transport. It compiles the real
 `Helpers/ble_relay.h` (the session state machine and the ABD9 session channel), `ble_protocol.h` (negotiation and the
 per-version tables), auth_gate.h's `authSendNonce`, ble.h's predicates, the ABD1 frame builder, the upload queue, v2
@@ -439,13 +440,17 @@ sessions: a v0 app reads frames byte-identical to the pinned pre-#90 builder and
 stays (its ABD9 writes logged once by key and ignored); in v1 frames carry `seq` beside `tlm` only while the app is
 subscribed to ABD1, relayed frames are queued until acked on ABD9, the transport lapses exactly `RELAY_ACK_TIMEOUT_MS`
 after the first outstanding frame or the last ack that moved forward, cellular then sends every unacked frame once, in
-order, and a forward ack or a resume hands it back; a stop lapses at once and only a resume ends it; a burst of ABD9
+order, and a forward ack or a resume hands it back; an app unsubscribed from ABD1 with untagged frames queued lapses
+`RELAY_UNSUBSCRIBED_MAX_MS` after the first one, and subscribing again ends that; an empty frame takes no seq; a stop
+lapses at once and only a resume ends it; a burst of ABD9
 writes collapses (ack first, then the verb), and an entry from an ended grant is discarded; the readable state (at
 most 93 B) follows every transition and a notify never replaces it; a log dump keeps every cellular gate closed; a
 seq never reaches a body or the backlog. `enumerate` runs every 4-event sequence over 13 events from three starting
 points (about 86 k sequences, ~30 s under ASan) against the session invariants: no frame counted as relayed without
 being queued, no seq while unsubscribed, no tagged frame from an ended session, no frame dropped that its own session
-did not ack, the version fixed for the grant, a new v1 session starts live, only a resume ends a stop. `fixtures`
+did not ack, the version fixed for the grant, a new v1 session starts live, only a resume ends a stop, no unsubscribed
+v1 session holds cellular off with untagged frames queued past `RELAY_UNSUBSCRIBED_MAX_MS` (its wait event is that
+long). `fixtures`
 replays every file under `protocol/fixtures/` the firmware owns (see its README) and checks the main-firmware nonce
 frames against `authSendNonce` from the pinned main commit. Checked by position: the ABD2 handler (its `PROTO` gate
 right after `NOAUTH`, no `relay_ack` case left), the GATT table (ABD1-ABD8 as on the pinned main commit, ABD9/ABDA
