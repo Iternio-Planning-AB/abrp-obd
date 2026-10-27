@@ -21,7 +21,7 @@ compiler = shlex.split(os.environ.get("CXX", "clang++"))
 
 variants = [""] + re.findall(r'"(-D[^"]+)"', (ROOT / "baseLogger/tools/check_variants.sh").read_text())
 variants += ["-DENABLE_CELL=0 -DENABLE_WIFI=0"]
-assert len(variants) == 5, "check_variants.sh no longer lists its flag sets as quoted -D strings"
+assert len(variants) == 7, "check_variants.sh no longer lists its flag sets as quoted -D strings"
 
 failed = 0
 for flags in variants:

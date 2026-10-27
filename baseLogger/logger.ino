@@ -2128,7 +2128,7 @@ void loop() {
       if (!logging_message_printed) {
         Serial.printf("Logging data over BLE: ");
         logging_message_printed = true;
-#if ENABLE_LOGGING
+#if ENABLE_LOGGING && ENABLE_NETWORK // g_upload_held is the network queue's
         logEvent("BLE relay queued=%u free=%lu maxblock=%lu",
           (unsigned)(obd_result_vector.size() + g_upload_held.size()), (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getMaxAllocHeap());
 #endif
@@ -2340,7 +2340,7 @@ void loop() {
     // same as the skip path would have done immediately - the only difference is that a person had a couple
     // of minutes to reach the dongle first. A connected phone holds it open (the BLE state refreshes
     // last_active, and maintenance_mode covers a serial session), so this only fires when nobody came.
-    if (g_weak_rail_cold_boot && !maintenance_mode && !ble.connected() &&
+    if (g_weak_rail_cold_boot && !maintenance_mode && !bleConnected() &&
         millis() > WEAK_RAIL_COLD_BOOT_AWAKE_MS) {
 #if ENABLE_LOGGING
       logEvent("WEAK-RAIL cold-boot BLE window expired (nobody connected) -> deep sleep %dmin",

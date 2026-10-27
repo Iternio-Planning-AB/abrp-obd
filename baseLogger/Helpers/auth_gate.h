@@ -101,6 +101,7 @@ static bool g_auth_nonce_valid = false;
 /* Edge tracker for the greet-on-subscribe below (see authGateService). */
 static bool g_auth_prev_subscribed = false;
 
+#if ENABLE_BLE
 static void authNotifyJson(const char* s) {
   ble.notifyAuth((const uint8_t*)s, strlen(s));
 }
@@ -467,3 +468,6 @@ void authGateService() {
     return;
   }
 }
+#else
+void authGateService() {} // no BLE, no ABD8: nothing to authorize
+#endif

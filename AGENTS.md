@@ -52,7 +52,8 @@ the one check the `main` ruleset requires: a new job goes in that job's `needs`.
 because that gap is the single biggest difference from a normal repo.
 
 The `variants` job compiles the non-default `config.h` variants with `sh tools/check_variants.sh` from `baseLogger/`;
-it never builds the default image. `ENABLE_WIFI 1` (with `ENABLE_CELL 0`) only compiles, as it overflows IRAM, and its TLS is unverified: bench only.
+it never builds the default image. `ENABLE_LOGGING 0`, `ENABLE_BLE 0` and `ENABLE_NETWORK 0` (as `ENABLE_CELL 0`) are built and linked.
+`ENABLE_WIFI 1` (with `ENABLE_CELL 0`) only compiles, as it overflows IRAM, and its TLS is unverified: bench only.
 
 ## The rules that bite first
 
