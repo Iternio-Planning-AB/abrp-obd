@@ -27,6 +27,8 @@ side that does not negotiate (firmware: no `proto` in its nonce frame; app: no `
 | `v0/fw-0-1_app-malformed-*.json` | `[0,1]` | proof with a malformed `proto` (`"1"`, `-1`, `1.5`, `1.0`, 2^40) | v0 | firmware |
 | `v0/fw-malformed-*_app-0-1.json` | nonce with a malformed range (`1`, `[1]`, `[1,0]`, `["0",1]`, `[0,256]`) | `[0,1]` | v0 | app |
 | `v1/fw-0-1_app-0-1.json` | `[0,1]` | `[0,1]` | v1 | firmware, app |
+| `v1/fw-0-1_app-0-1-give-up.json` | `[0,1]` | `[0,1]`, its post of seq 2 failed | v1 (the app acks again only once the state shows `sent >= 2` and `oldest` 0 or above 2) | firmware (no step says a post failed) |
+| `v1/fw-0-1_app-0-1-unsubscribed.json` | `[0,1]` | `[0,1]`, its ABD1 subscription died | v1 (lapses `"why":"unsubscribed"` after 300 s, live again on resubscribing) | firmware (the app does not unsubscribe on purpose) |
 | `v1/fw-0-2_app-0-1.json` | `[0,2]` | `[0,1]` | v1 | app |
 | `v1/fw-0-1_app-0-2.json` | `[0,1]` | `[0,2]` | v1 | firmware, app |
 | `v1/fw-0-1_app-proof-7.json` | `[0,1]` | a proof asking for 7 | v1 (above the maximum: runs at it, echoes 1) | firmware |
@@ -90,7 +92,7 @@ Every file is one JSON object:
 | `{"from":"dongle","char":"ABD1","op":"value","poll":3,"values":{…},"json":{…}}` | One poll while the app is not subscribed to ABD1: `json` becomes ABD1's readable value, no notify goes out. |
 | `{"from":"dongle","char":"ABD1","op":"none","poll":3,"values":{…}}` | One poll in a no-protocol session: nothing is written to ABD1. |
 | `{"from":"app","char":"ABD9","op":"write","json":{…}}` | A session-channel write (`relay_ack`, `relay`). |
-| `{"from":"app","char":"ABD9","op":"read","json":{…}}` | The app reads ABD9; `json` is the value the dongle returns. |
+| `{"from":"app","char":"ABD9","op":"read","json":{…}}` | The app reads ABD9; `json` is the value the dongle returns: `{"relay":…[,"why":…],"sent":s,"oldest":o}` in a v1 session, where `sent` is the last seq notified this wake and `oldest` the lowest seq still in the dongle's cellular queue (0 for none). The dongle rebuilds it at the top of each loop pass, so a read right after a poll step does not show that poll's frame yet. |
 | `{"from":"dongle","char":"ABD9","op":"notify","json":{…}}` | A session-channel event. |
 | `{"from":"app","char":"ABD2","op":"write","text":"…"}` | A setup-channel write (raw text, as written). |
 | `{"from":"dongle","char":"ABD2","op":"notify","text":"…"}` | A setup-channel reply (plain text such as `PROTO`, compared exactly). The firmware replay checks only the sketch-side gate replies (`NOAUTH`, `PROTO`); the ABD2 handler itself is pinned structurally. |

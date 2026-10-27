@@ -198,12 +198,19 @@ ABD1 is notify-only, so the app has to say what it posted (`Helpers/ble_relay.h`
   data takes a seq, so an empty frame never starts the ack clock without being queued.
 - **ABD9** answers with events (`{"relay":"lapsed","why":"timeout"|"stop"|"unsubscribed"}`, `{"relay":"live"}`, as
   notifies that never replace the value) and a readable state, `{"relay":"live"|"lapsed","why":…,
-  "acked":n,"sent":m,"queued":k}` (`{}` outside a v1 session; at most 93 B, checked at compile time),
-  served from `onRead` under the relay lock. Writes are dropped unless the link holds a grant, and one over 64 B is
+  "sent":s,"oldest":o}` (`{}` outside a v1 session; at most 93 B, checked at compile time),
+  served from `onRead` under the relay lock. `sent` is the last seq notified this wake; `oldest` the lowest seq still
+  in the cellular queue (`obd_result_vector` and `g_upload_held`, tagged frames only), 0 for none. It is rebuilt at the
+  top of every loop pass and on each transition, so a frame shows from the pass after it was queued.
+  Writes are dropped unless the link holds a grant, and one over 64 B is
   not parsed (logged as key `?`); the
   Bluedroid callback keeps one grant-stamped mailbox (highest ack, last verb), applied on the loop task
   by `sessionChannelService()` — ack first, then the verb — and an entry from an ended grant is
   discarded (`BLE session stale grant`).
+- **The app's give-up rule:** after a failed post of seq N the app acks nothing until a state read shows `sent >= N`
+  and `oldest` 0 or above N; a cumulative ack before that would drop N from the queue unposted. `sent >= N` proves the
+  state was rebuilt after N was queued. A frame held for the next wake keeps `oldest` at or below it, so that app acks
+  nothing more this wake: cellular carries the frames, duplicates at worst, never a lost point.
 - The session is one state machine: `NO_SESSION` → `GRANTED` (v0, no protocol) or `LIVE` (v1);
   `LIVE` → `LAPSED(stop|timeout|unsubscribed)`; back to `LIVE` on resume (or a forward ack after a timeout or
   unsubscribed lapse, or the app subscribing again after an unsubscribed one); any →

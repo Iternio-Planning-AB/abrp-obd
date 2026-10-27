@@ -90,12 +90,16 @@ def abd9_write(frame, note=None):
     return step
 
 
-def state(relay, acked, sent, queued, why=None):
+def state(relay, sent, oldest, why=None, note=None):
+    # sent: the last seq notified this wake; oldest: the lowest seq still in the dongle's cellular queue, 0 for none.
     frame = {"relay": relay}
     if why:
         frame["why"] = why
-    frame.update({"acked": acked, "sent": sent, "queued": queued})
-    return {"from": "app", "char": "ABD9", "op": "read", "json": frame}
+    frame.update({"sent": sent, "oldest": oldest})
+    step = {"from": "app", "char": "ABD9", "op": "read", "json": frame}
+    if note:
+        step["note"] = note
+    return step
 
 
 def event(relay, why=None):
@@ -133,26 +137,26 @@ FIXTURES["v1/fw-0-1_app-0-1.json"] = fixture(
         ok(1),
         subscribe("ABD9"),
         subscribe("ABD1"),
-        state("live", 0, 0, 0),
+        state("live", 0, 0),
         poll(1, 1),
         poll(2, 2),
         abd9_write({"relay_ack": 2}, "the app posted the frames up to seq 2"),
-        state("live", 2, 2, 0),
+        state("live", 2, 0),
         check(transport="phone", queued=[], uploaded=[]),
         poll(3, 3),
         abd9_write({"relay": "stop"}, "the app went offline: it cannot post"),
         event("lapsed", "stop"),
-        state("lapsed", 2, 3, 1, why="stop"),
+        state("lapsed", 3, 3, why="stop"),
         check(transport="cellular", queued=[3], uploaded=[]),
         poll(4, 4),
         check(queued=[], uploaded=[3, 4]),
         abd9_write({"relay": "resume"}, "the app is online again"),
         event("live"),
-        state("live", 2, 4, 0),
+        state("live", 4, 0),
         check(transport="phone"),
         poll(5, 5),
         abd9_write({"relay_ack": 5}),
-        state("live", 5, 5, 0),
+        state("live", 5, 0),
         poll(6, 6),
         {"wait": 120000, "note": "the app stopped posting without saying so (e.g. iOS suspended it)"},
         event("lapsed", "timeout"),
@@ -161,8 +165,65 @@ FIXTURES["v1/fw-0-1_app-0-1.json"] = fixture(
         check(queued=[], uploaded=[3, 4, 6, 7]),
         abd9_write({"relay_ack": 7}, "the app caught up: a forward ack ends a timeout lapse"),
         event("live"),
-        state("live", 7, 7, 0),
+        state("live", 7, 0),
         check(transport="phone", queued=[], uploaded=[3, 4, 6, 7]),
+    ], 1, True)
+
+# The app's give-up rule: its post of seq 2 failed, so it acks nothing (an ack of 3 would take 2 off the dongle's queue
+# unposted) until a state read shows sent >= 2 and oldest 0 or above 2. Firmware only: no step says a post failed.
+FIXTURES["v1/fw-0-1_app-0-1-give-up.json"] = fixture(
+    "v1 firmware [0,1] x negotiating app [0,1]: after a failed post the app waits for the dongle to send that frame",
+    [0, 1], [0, 1], ["firmware"], [
+        nonce([0, 1]),
+        proof(1),
+        ok(1),
+        subscribe("ABD9"),
+        subscribe("ABD1"),
+        poll(1, 1),
+        abd9_write({"relay_ack": 1}),
+        dict(poll(2, 2), note="the app's post of seq 2 fails: it gives up on 2"),
+        state("live", 1, 0, note="rebuilt before seq 2 was queued: oldest 0, but sent 1 < 2, so no ack"),
+        dict(poll(3, 3), note="the app posts 3 but does not ack it"),
+        state("live", 2, 2, note="sent >= 2, but oldest 2: seq 2 is still queued, so no ack"),
+        {"wait": 120000, "note": "no ack has moved forward since seq 1"},
+        event("lapsed", "timeout"),
+        state("lapsed", 3, 2, why="timeout"),
+        poll(4, 4),
+        check(transport="cellular", queued=[], uploaded=[2, 3, 4]),
+        {"wait": 1000, "note": "the dongle's next loop pass rebuilds the state"},
+        state("lapsed", 4, 0, why="timeout", note="sent >= 2 and oldest 0: seq 2 went over cellular, the app may ack again"),
+        abd9_write({"relay_ack": 4}),
+        event("live"),
+        state("live", 4, 0),
+        check(transport="phone", queued=[], uploaded=[2, 3, 4]),
+    ], 1, True)
+
+# The second bound: the app's ABD1 subscription died with the link and the grant alive. Firmware only: the app does not
+# unsubscribe on purpose.
+FIXTURES["v1/fw-0-1_app-0-1-unsubscribed.json"] = fixture(
+    "v1 firmware [0,1] x negotiating app [0,1]: an app that stops listening on ABD1 lapses after 300 s",
+    [0, 1], [0, 1], ["firmware"], [
+        nonce([0, 1]),
+        proof(1),
+        ok(1),
+        subscribe("ABD9"),
+        subscribe("ABD1"),
+        poll(1, 1),
+        abd9_write({"relay_ack": 1}),
+        state("live", 1, 0),
+        {"from": "app", "char": "ABD1", "op": "unsubscribe", "note": "the subscription died; the link and grant did not"},
+        poll(2, op="value"),
+        {"wait": 300000, "note": "RELAY_UNSUBSCRIBED_MAX_MS since the first frame queued untagged"},
+        event("lapsed", "unsubscribed"),
+        state("lapsed", 1, 0, why="unsubscribed"),
+        check(transport="cellular", queued=[2]),
+        poll(3, op="value"),
+        check(queued=[], uploaded=[2, 3]),
+        subscribe("ABD1"),
+        event("live"),
+        state("live", 1, 0),
+        poll(4, 2),
+        check(transport="phone", queued=[4], uploaded=[2, 3]),
     ], 1, True)
 
 
@@ -216,13 +277,13 @@ for name, raw in (("number", "1"), ("one-element", "[1]"), ("reversed", "[1,0]")
 
 FIXTURES["v1/fw-0-2_app-0-1.json"] = fixture(
     "firmware [0,2] x negotiating app [0,1]: the app chooses 1", [0, 2], [0, 1], ["app"], [
-        nonce([0, 2]), proof(1), ok(1), subscribe("ABD9"), subscribe("ABD1"), state("live", 0, 0, 0),
-        poll(1, 1), abd9_write({"relay_ack": 1}), state("live", 1, 1, 0),
+        nonce([0, 2]), proof(1), ok(1), subscribe("ABD9"), subscribe("ABD1"), state("live", 0, 0),
+        poll(1, 1), abd9_write({"relay_ack": 1}), state("live", 1, 0),
     ], 1, True)
 FIXTURES["v1/fw-0-1_app-0-2.json"] = fixture(
     "v1 firmware [0,1] x negotiating app [0,2]: the app chooses 1", [0, 1], [0, 2], ["firmware", "app"], [
-        nonce([0, 1]), proof(1), ok(1), subscribe("ABD9"), subscribe("ABD1"), state("live", 0, 0, 0),
-        poll(1, 1), abd9_write({"relay_ack": 1}), state("live", 1, 1, 0), check(transport="phone", queued=[]),
+        nonce([0, 1]), proof(1), ok(1), subscribe("ABD9"), subscribe("ABD1"), state("live", 0, 0),
+        poll(1, 1), abd9_write({"relay_ack": 1}), state("live", 1, 0), check(transport="phone", queued=[]),
     ], 1, True)
 FIXTURES["v1/fw-0-1_app-proof-7.json"] = fixture(
     "v1 firmware [0,1] x a proof asking for 7: above the maximum runs at it, and the echo says 1",

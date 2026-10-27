@@ -11,10 +11,10 @@
     {"from": "dongle", "char": "ABD8", "op": "notify", "json": {"auth": "ok", "proto": 1}},
     {"from": "app", "char": "ABD9", "op": "subscribe"},
     {"from": "app", "char": "ABD1", "op": "subscribe"},
-    {"from": "app", "char": "ABD9", "op": "read", "json": {"relay": "live", "acked": 0, "sent": 0, "queued": 0}},
+    {"from": "app", "char": "ABD9", "op": "read", "json": {"relay": "live", "sent": 0, "oldest": 0}},
     {"from": "dongle", "char": "ABD1", "op": "notify", "poll": 1, "values": {"utc": 1791500001, "soc": 11, "voltage": 350, "current": -20}, "json": {"tlm": {"soc": 11, "voltage": 350, "current": -20}, "seq": 1}},
     {"from": "app", "char": "ABD9", "op": "write", "json": {"relay_ack": 1}},
-    {"from": "app", "char": "ABD9", "op": "read", "json": {"relay": "live", "acked": 1, "sent": 1, "queued": 0}},
+    {"from": "app", "char": "ABD9", "op": "read", "json": {"relay": "live", "sent": 1, "oldest": 0}},
     {"check": {"transport": "phone", "queued": []}}
   ],
   "expect": {"session": 1, "app_writes_abd9": true}

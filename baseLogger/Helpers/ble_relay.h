@@ -21,7 +21,13 @@
       app    -> {"relay":"stop"}      the app cannot post (offline, logged out, 401/403): cellular takes over at once
       app    -> {"relay":"resume"}    it can again; the only thing that ends a stop
       dongle -> {"relay":"lapsed","why":"timeout"|"stop"|"unsubscribed"} / {"relay":"live"}   on each transition
-      state     {"relay":"live"|"lapsed"[,"why":..],"acked":n,"sent":m,"queued":k} (readable; {} outside v1)
+      state     {"relay":"live"|"lapsed"[,"why":..],"sent":s,"oldest":o} (readable; {} outside v1)
+                sent: the last seq notified this wake; oldest: the lowest seq still in the cellular queue, 0 for none
+    An app whose post of seq N failed gives up on N and acks nothing until a state read shows sent >= N and oldest 0
+    or above N: until then a cumulative ack past N would take N off the queue unposted. sent >= N proves the state was
+    rebuilt after N was queued (the state is rebuilt at the top of every loop pass; N is notified and queued later in
+    one pass). A frame held for the next wake keeps oldest at or below its seq for the rest of the wake, so that app
+    acks nothing more this wake: duplicates over cellular, never a lost point.
     The timeout is the safety net for what the app cannot report (iOS suspending it): once tagged frames have waited
     RELAY_ACK_TIMEOUT_MS with no ack moving forward, cellular takes over with every frame still queued, and the next
     forward ack or a resume hands the transport back. Nothing outstanding, an update or a log dump holds the clock.
@@ -64,10 +70,7 @@ uint32_t g_session_ack_pending = 0;   // highest relay_ack waiting; 0 = none
 RelayVerb g_session_verb_pending = RELAY_VERB_NONE;
 char g_session_bad_pending[25] = "";  // the first key in the burst that no version could take ("?" if unloggable)
 char g_session_state[96] = "{}";      // ABD9's readable value, served by relaySessionRead
-// "queued" is clamped to RELAY_STATE_QUEUED_MAX (the queue holds MAX_UPLOAD_BUFFER frames plus a few held ones).
-static const unsigned long RELAY_STATE_QUEUED_MAX = 65535;
-static_assert(sizeof("{\"relay\":\"lapsed\",\"why\":\"unsubscribed\",\"acked\":4294967295,\"sent\":4294967295,"
-                     "\"queued\":65535}") - 1 <= 93,
+static_assert(sizeof("{\"relay\":\"lapsed\",\"why\":\"unsubscribed\",\"sent\":4294967295,\"oldest\":4294967295}") - 1 <= 93,
   "the ABD9 state must be one read at the MTU 96 floor, never a long read");
 static_assert(sizeof(g_session_state) > 93, "room for the worst-case state");
 
@@ -141,23 +144,6 @@ static size_t relayQueueSize() {
 #endif
 }
 
-// Rebuild ABD9's readable state. The loop task never calls setValue on ABD9: relaySessionRead hands this buffer to the
-// read callback under the lock, so a read can never race a write of the value, and a notify never replaces it.
-static void relayStateRefresh() {
-  char text[sizeof(g_session_state)];
-  if (!relaySession()) snprintf(text, sizeof(text), "{}");
-  else
-    snprintf(text, sizeof(text), "{\"relay\":\"%s\"%s,\"acked\":%lu,\"sent\":%lu,\"queued\":%lu}",
-      g_relay_state == RELAY_LIVE ? "live" : "lapsed",
-      g_relay_state == RELAY_LIVE ? "" : g_relay_why == RELAY_WHY_STOP ? ",\"why\":\"stop\""
-        : g_relay_why == RELAY_WHY_UNSUBSCRIBED ? ",\"why\":\"unsubscribed\"" : ",\"why\":\"timeout\"",
-      (unsigned long)g_relay_acked, (unsigned long)g_relay_seq,
-      std::min((unsigned long)relayQueueSize(), RELAY_STATE_QUEUED_MAX));
-  portENTER_CRITICAL(&g_relay_mux);
-  memcpy(g_session_state, text, sizeof(text));
-  portEXIT_CRITICAL(&g_relay_mux);
-}
-
 #if ENABLE_NETWORK
 // A frame's relay seq; 0 when it was not relayed to an app that acks.
 static uint32_t relaySeqOf(const OBDVector& frame) {
@@ -165,6 +151,39 @@ static uint32_t relaySeqOf(const OBDVector& frame) {
     if (isRelaySeqKey(value.first)) return (uint32_t)value.second;
   return 0;
 }
+#endif
+
+// The lowest relay seq still in the cellular queue, held frames included; 0 when no tagged frame is queued. The
+// state's "oldest": an app that gave up on a frame acks again only once this has moved past it.
+static uint32_t relayOldest() {
+  uint32_t oldest = 0;
+#if ENABLE_NETWORK
+  for (const auto* frames : { &obd_result_vector, &g_upload_held })
+    for (const auto& frame : *frames) {
+      const uint32_t seq = relaySeqOf(frame);
+      if (seq && (!oldest || seq < oldest)) oldest = seq;
+    }
+#endif
+  return oldest;
+}
+
+// Rebuild ABD9's readable state. The loop task never calls setValue on ABD9: relaySessionRead hands this buffer to the
+// read callback under the lock, so a read can never race a write of the value, and a notify never replaces it.
+static void relayStateRefresh() {
+  char text[sizeof(g_session_state)];
+  if (!relaySession()) snprintf(text, sizeof(text), "{}");
+  else
+    snprintf(text, sizeof(text), "{\"relay\":\"%s\"%s,\"sent\":%lu,\"oldest\":%lu}",
+      g_relay_state == RELAY_LIVE ? "live" : "lapsed",
+      g_relay_state == RELAY_LIVE ? "" : g_relay_why == RELAY_WHY_STOP ? ",\"why\":\"stop\""
+        : g_relay_why == RELAY_WHY_UNSUBSCRIBED ? ",\"why\":\"unsubscribed\"" : ",\"why\":\"timeout\"",
+      (unsigned long)g_relay_seq, (unsigned long)relayOldest());
+  portENTER_CRITICAL(&g_relay_mux);
+  memcpy(g_session_state, text, sizeof(text));
+  portEXIT_CRITICAL(&g_relay_mux);
+}
+
+#if ENABLE_NETWORK
 
 // Take the frames up to seq off the cellular queue.
 static void relayDropAcked(std::vector<OBDVector>& frames, uint32_t seq) {

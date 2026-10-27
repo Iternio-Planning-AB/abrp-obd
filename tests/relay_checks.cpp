@@ -609,13 +609,13 @@ void stopResume() {
   services();
   check(!bleRelaying() && bleAuthenticated() && g_ble_handoff_pending, "a stop hands the transport to cellular at once");
   check(ble.session_notifies == std::vector<std::string>({kLapsedStop}), "and notifies the lapse on ABD9");
-  check(sessionState() == json::parse("{\"relay\":\"lapsed\",\"why\":\"stop\",\"acked\":2,\"sent\":3,\"queued\":1}"),
+  check(sessionState() == json::parse("{\"relay\":\"lapsed\",\"why\":\"stop\",\"sent\":3,\"oldest\":3}"),
         "the readable state says so: " + sessionRead());
   check(logged("BLE relay stop by app") == 1, "and the log");
   ack(3); // a post that was already in flight when the app stopped
   services();
   check(!bleRelaying() && queuedSeqs().empty(), "an ack in flight takes its frames off, but does not end the stop");
-  check(sessionState()["acked"] == 3 && sessionState()["why"] == "stop", "the state shows it: " + sessionRead());
+  check(sessionState()["oldest"] == 0 && sessionState()["why"] == "stop", "the state shows it: " + sessionRead());
   stop();
   fake_ms += RELAY_ACK_TIMEOUT_MS * 3;
   services();
@@ -669,7 +669,8 @@ void mailbox() {
   ack(2);
   stop();
   services();
-  check(queuedSeqs().empty() && sessionState()["acked"] == 4 && sessionState()["why"] == "stop",
+  check(queuedSeqs().empty() && sessionState()["sent"] == 4 && sessionState()["oldest"] == 0 &&
+        sessionState()["why"] == "stop",
         "a burst between two loop passes collapses to the highest ack and the last verb: " + sessionRead());
   resume();
   services();
@@ -731,16 +732,16 @@ void state() {
   unlink();
   negotiate();
   services();
-  check(sessionState() == json::parse("{\"relay\":\"live\",\"acked\":0,\"sent\":1,\"queued\":1}"),
+  check(sessionState() == json::parse("{\"relay\":\"live\",\"sent\":1,\"oldest\":1}"),
         "in a v1 session it is the relay state: " + sessionRead());
   fake_ms += RELAY_ACK_TIMEOUT_MS;
   services();
   check(ble.session_notifies.back() == kLapsedTimeout &&
-        sessionState() == json::parse("{\"relay\":\"lapsed\",\"why\":\"timeout\",\"acked\":0,\"sent\":1,\"queued\":1}"),
+        sessionState() == json::parse("{\"relay\":\"lapsed\",\"why\":\"timeout\",\"sent\":1,\"oldest\":1}"),
         "a notify never takes the place of the state: " + sessionRead());
   ack(1);
   services();
-  check(sessionState() == json::parse("{\"relay\":\"live\",\"acked\":1,\"sent\":1,\"queued\":0}"),
+  check(sessionState() == json::parse("{\"relay\":\"live\",\"sent\":1,\"oldest\":0}"),
         "the state follows every transition: " + sessionRead());
   ble.session_subscribed = false;
   fake_ms += RELAY_ACK_TIMEOUT_MS;
@@ -752,6 +753,58 @@ void state() {
   unlink();
   services();
   check(sessionRead() == "{}", "and once the session ends it is empty again");
+
+  // "oldest": the lowest relay seq still in the cellular queue (tagged frames, held ones included), 0 for none.
+  reset();
+  negotiate();
+  poll();
+  poll();
+  services(); // the state is rebuilt at the top of a pass: the last poll's frame shows from the next one
+  check(sessionState() == json::parse("{\"relay\":\"live\",\"sent\":3,\"oldest\":1}"),
+        "oldest is the lowest queued seq, and the state carries no acked or queued: " + sessionRead());
+  ack(1);
+  services();
+  check(sessionState()["oldest"] == 2, "it moves past the frames an ack takes off: " + sessionRead());
+  ble.telemetry_subscribed = false;
+  poll();
+  ack(3);
+  services();
+  check(queuedPolls().size() == 1 && queuedSeqs().empty() && sessionState()["oldest"] == 0 && sessionState()["sent"] == 3,
+        "a plain cellular frame has no relay seq: with only it queued, oldest is 0: " + sessionRead());
+  ble.telemetry_subscribed = true;
+  poll();
+  poll();
+  // seq 5 held for the next wake (uploadBuffered holds a frame too big to send there, and sends held frames first)
+  g_upload_held.push_back(obd_result_vector.back());
+  obd_result_vector.pop_back();
+  services();
+  check(sessionState()["oldest"] == 4 && sessionState()["sent"] == 5,
+        "the lowest seq anywhere in the queue, held frames included: " + sessionRead());
+  ack(4);
+  services();
+  check(sessionState()["oldest"] == 5, "a held frame is still in the queue: " + sessionRead());
+  ack(5);
+  services();
+  check(sessionState()["oldest"] == 0 && g_upload_held.empty(), "and an ack takes it off too: " + sessionRead());
+
+  // The give-up drain (design §3.5): an app whose post of seq N failed acks nothing until a read shows sent >= N and
+  // oldest 0 or above N, because a cumulative ack before that would take N off the queue unposted.
+  reset();
+  negotiate();
+  ack(1);
+  poll(); // seq 2: the app's post fails, and it gives up on it
+  const uint32_t n = g_relay_seq;
+  check(sessionState() == json::parse("{\"relay\":\"live\",\"sent\":1,\"oldest\":0}"),
+        "a read before the next pass predates N (sent < N), however empty the queue looks: " + sessionRead());
+  poll(); // seq 3: posted, but not acked
+  check(sessionState()["sent"] == n && sessionState()["oldest"] == n,
+        "sent >= N, but oldest is N: the app may not ack yet: " + sessionRead());
+  fake_ms += RELAY_ACK_TIMEOUT_MS;
+  poll(); // the lapse: cellular sends N and everything after it
+  services();
+  const json s = sessionState();
+  check(posts == 1 && uploadedPolls() == std::vector<unsigned>({2, 3, 4}) && s["sent"] == 4 && s["oldest"] == 0,
+        "once cellular has sent N, oldest moves past it and the app may ack again: " + sessionRead());
 }
 
 void subscribedSeq() {
@@ -1045,7 +1098,7 @@ void fixtures() {
     replayFixture(doc);
     (firmware ? replayed : nonces) += 1;
   }
-  check(replayed >= (BLE_PROTO_MIN == 0 ? 9u : 1u) && (BLE_PROTO_MIN != 0 || nonces == 3),
+  check(replayed >= (BLE_PROTO_MIN == 0 ? 11u : 1u) && (BLE_PROTO_MIN != 0 || nonces == 3),
         "every fixture for this build was found (" + std::to_string(replayed) + " replayed, " + std::to_string(nonces) +
         " main nonce frames)");
   std::cout << "  " << replayed << " fixtures replayed, " << nonces << " main-firmware nonce frames checked\n";

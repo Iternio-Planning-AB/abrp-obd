@@ -445,7 +445,9 @@ order, and a forward ack or a resume hands it back; an app unsubscribed from ABD
 `RELAY_UNSUBSCRIBED_MAX_MS` after the first one, and subscribing again ends that; an empty frame takes no seq; a stop
 lapses at once and only a resume ends it; a burst of ABD9
 writes collapses (ack first, then the verb), and an entry from an ended grant is discarded; the readable state (at
-most 93 B) follows every transition and a notify never replaces it; a log dump keeps every cellular gate closed; a
+most 93 B, `sent` and `oldest`: the lowest seq still queued for cellular, held frames included, 0 for none) follows
+every transition and a notify never replaces it, and an app that gave up on seq N can tell when N has left the queue
+(the give-up drain: `sent >= N` and `oldest` 0 or above N); a log dump keeps every cellular gate closed; a
 seq never reaches a body or the backlog. `enumerate` runs every 4-event sequence over 15 events from three starting
 points (about 152 k sequences, ~50 s under ASan with the compile) against the session invariants: no frame counted as relayed without
 being queued, no seq while unsubscribed, no tagged frame from an ended session, no frame dropped that its own session
