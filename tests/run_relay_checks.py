@@ -9,8 +9,9 @@ relayAckService() and sessionChannelService() (from the top of loop()), the ABD1
 cellular gate's condition with the grace and handoff it reads. BLE, the HTTP transport, the clock and the heap are
 fakes; the gate's cadence term is zero. Today's ABD1 frame (for v0 sessions) comes from PIN's telemetry_format.h, the
 last commit before the seq existed. A second build raises BLE_PROTO_MIN to 1 for the no-protocol session. The
-`enumerate` group runs every sequence of `--depth` events (default 4) from three starting points with the session
-invariants checked after each.
+`enumerate` group runs every sequence of `--depth` events (default 4: 15 events, 151875 sequences, ~50 s with the
+compile) from three starting points with the session invariants checked after each, the ack timeout among them in both
+directions.
 
 Not exercised, and so pinned structurally below: the Bluedroid ABD2 handler (its PROTO refusal, and no relay_ack case
 left), the GATT table (ABD1-ABD8 as in PIN, ABD9/ABDA with an encrypted CCCD, 30 of 32 handles, the CCCDs cleared on

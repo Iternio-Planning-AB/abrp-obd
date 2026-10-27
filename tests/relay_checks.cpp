@@ -34,9 +34,10 @@ using portMUX_TYPE = int;
 #define portENTER_CRITICAL(mux) (void)(mux)
 #define portEXIT_CRITICAL(mux) (void)(mux)
 
+std::string g_trace; // the enumerated sequence being run, named on a failure
 void check(bool condition, const std::string& message) {
   if (!condition) {
-    std::cerr << "FAIL: " << message << '\n';
+    std::cerr << "FAIL: " << message << (g_trace.empty() ? "" : " after " + g_trace) << '\n';
     std::exit(1);
   }
 }
@@ -1052,6 +1053,13 @@ void fixtures() {
 
 // Every sequence of `depth` events from three starting points, with the session invariants (design §5.4) checked
 // after each event. The model tracks what each poll's frame may legitimately become.
+enum Event {
+  POLL, SUB, UNSUB, ACK, ACK_RECONNECT, STOP, RESUME, WAIT, WAIT_SHORT, WAIT_LONG, DUMP, REPROVE, DROP, V1, V0, EVENTS
+};
+const char* const kEventNames[EVENTS] = {"POLL", "SUB", "UNSUB", "ACK", "ACK_RECONNECT", "STOP", "RESUME", "WAIT",
+                                         "WAIT_SHORT", "WAIT_LONG", "DUMP", "REPROVE", "DROP", "V1", "V0"};
+const char* const kStarts[] = {"no phone", "v1 live", "v1 stopped"};
+
 struct Model {
   std::vector<uint32_t> seq, grant;   // per poll: its seq (0: none) and the grant it was sent under
   std::vector<bool> v0_relayed;        // relayed to a phone trusted without acks: not queued, by design
@@ -1060,11 +1068,62 @@ struct Model {
   int version_grant = -1, version = -1;
   unsigned long unsub_since = 0;       // when an untagged frame was first queued while unsubscribed (0: none)
   uint32_t unsub_grant = 0;
+  // The ack clock of the current v1 grant: when it last started (the session, a forward ack, a resume or resubscribe
+  // that ended a lapse, and every pass while nothing is outstanding or a log dump holds it), and whether the app stopped.
+  uint32_t clock_grant = 0;
+  unsigned long clock_since = 0;
+  bool stopped = false;
+  bool revived = false;                // this event started the session or ended a lapse
 } model;
 
+// What the app could see before an event: ABD9's readable state, and whether the phone was the transport.
+struct Observed {
+  bool v1 = false, relaying = false;
+  std::string relay, why;
+};
+
 uint32_t currentGrant() { return bleAuthenticated() ? bleAuthGrant() : 0; }
+bool modelV1() { return currentGrant() && bleProtoTagsFrames(bleProto()); }
+Observed observe() {
+  Observed o;
+  o.v1 = modelV1();
+  o.relaying = bleRelaying();
+  if (o.v1) {
+    const json s = sessionState();
+    o.relay = s.value("relay", "");
+    o.why = s.value("why", "");
+  }
+  return o;
+}
+// Tagged frames the current grant sent and its app has not acked: what the ack clock waits on.
+bool modelOutstanding() {
+  const auto it = model.acked_by.find(currentGrant());
+  return model.sent_in_grant > (it == model.acked_by.end() ? 0 : it->second);
+}
+
+// One loop pass's effect on the ack clock (relayAckService), at the pass's time, from the state before it.
+void modelClockPass(unsigned long now, const Observed& before) {
+  if (!modelV1()) return;
+  if (currentGrant() != model.clock_grant) { // a new session starts live, its clock with it
+    model.clock_grant = currentGrant();
+    model.clock_since = now;
+    model.stopped = false;
+    model.revived = true;
+    return;
+  }
+  const bool resubscribed = ble.telemetry_subscribed && before.relay == "lapsed" && before.why == "unsubscribed";
+  if (resubscribed) {
+    model.clock_since = now;
+    model.revived = true;
+  }
+  if ((before.relay == "live" || resubscribed) && (g_logdump_active || g_ota_active || !modelOutstanding()))
+    model.clock_since = now; // nothing to be late with, or held
+}
+
+Observed g_before; // set before every enumerated event
 
 void modelPoll() {
+  modelClockPass(fake_ms, g_before); // the pass at the top of the poll, before its frame
   const bool subscribed = ble.telemetry_subscribed;
   const uint32_t grant = currentGrant();
   const size_t before = ble.values.size(), uploaded = network.received.size();
@@ -1106,12 +1165,18 @@ void modelAck(bool then_reconnect) {
   }
   services();
   if (!then_reconnect && grant && bleProtoTagsFrames(bleProto())) {
-    if (seq > model.acked_by[grant]) model.unsub_since = 0; // a forward ack: the app is posting, the bound starts over
+    if (seq > model.acked_by[grant]) { // a forward ack: the app is posting, both clocks start over
+      model.unsub_since = 0;
+      model.clock_since = fake_ms;
+      model.revived |= !model.stopped; // it ends a timeout or unsubscribed lapse, never a stop
+    }
     model.acked_by[grant] = std::max(model.acked_by[grant], seq);
   }
 }
 
-void modelCheck(bool was_stopped, uint32_t grant_before, bool resumed) {
+void modelCheck(int e, const Observed& before, uint32_t grant_before) {
+  const bool was_stopped = before.v1 && before.why == "stop", resumed = e == RESUME;
+  if (e != POLL && e != EVENTS) modelClockPass(fake_ms, before); // a poll's pass ran before its frame, in modelPoll
   const uint32_t grant = currentGrant();
   const auto queued = queuedPolls();
   std::vector<unsigned> up = uploadedPolls();
@@ -1145,9 +1210,22 @@ void modelCheck(bool was_stopped, uint32_t grant_before, bool resumed) {
     check(!bleRelaying(), "invariant: no unsubscribed v1 session holds cellular off with untagged frames queued past the bound");
   if (was_stopped && grant == grant_before && !resumed)
     check(!bleRelaying() && sessionState().value("why", "") == "stop", "invariant: only a resume ends a stop");
+  // The ack timeout, both ways: an app that leaves tagged frames unacked past it hands the transport to cellular, and a
+  // live, subscribed one keeps it until then. The slack on the first allows for a poll's second; the second is exact.
+  // A session idle with everything acked must not lapse on its next frame: its clock restarted while nothing waited.
+  if (modelV1() && e != EVENTS) {
+    const unsigned long idle = fake_ms - model.clock_since;
+    if (modelOutstanding() && !g_logdump_active && !g_ota_active && idle >= RELAY_ACK_TIMEOUT_MS + 1000)
+      check(!bleRelaying(), "invariant: tagged frames unacked past RELAY_ACK_TIMEOUT_MS lapse the transport (idle " +
+            std::to_string(idle) + " ms)");
+    const bool unsub_past = model.unsub_since && fake_ms - model.unsub_since >= RELAY_UNSUBSCRIBED_MAX_MS;
+    if ((before.relay == "live" || model.revived) && ble.telemetry_subscribed && !model.stopped && !unsub_past &&
+        idle < RELAY_ACK_TIMEOUT_MS)
+      check(bleRelaying(), "invariant: a live v1 session never lapses before RELAY_ACK_TIMEOUT_MS (idle " +
+            std::to_string(idle) + " ms)");
+  }
+  model.revived = false;
 }
-
-enum Event { POLL, SUB, UNSUB, ACK, ACK_RECONNECT, STOP, RESUME, WAIT, WAIT_LONG, DUMP, REPROVE, DROP, V1, V0, EVENTS };
 
 void apply(int e) {
   switch (e) {
@@ -1159,13 +1237,26 @@ void apply(int e) {
     case UNSUB: ble.telemetry_subscribed = false; break;
     case ACK: modelAck(false); return;
     case ACK_RECONNECT: modelAck(true); return;
-    case STOP: stop(); break;
+    case STOP:
+      if (modelV1()) model.stopped = true;
+      stop();
+      break;
     case RESUME:
+      if (modelV1()) {
+        // It ends a lapse, including one this pass enters before the mailbox is read: so whenever the phone was not
+        // the transport just before.
+        if (!bleRelaying()) {
+          model.clock_since = fake_ms;
+          model.revived = true;
+        }
+        model.stopped = false;
+      }
       resume();
       if (bleAuthenticated()) model.unsub_since = 0;
       break;
-    case WAIT: fake_ms += RELAY_ACK_TIMEOUT_MS; break;           // past the ack timeout, short of the unsubscribed bound
-    case WAIT_LONG: fake_ms += RELAY_UNSUBSCRIBED_MAX_MS; break; // past both bounds
+    case WAIT: fake_ms += RELAY_ACK_TIMEOUT_MS; break;                // exactly the ack timeout, short of the other bound
+    case WAIT_SHORT: fake_ms += RELAY_ACK_TIMEOUT_MS - 2000; break;   // just short of the ack timeout: never lapses early
+    case WAIT_LONG: fake_ms += RELAY_UNSUBSCRIBED_MAX_MS; break;      // past both bounds
     case DUMP: g_logdump_active = !g_logdump_active; break;
     case REPROVE: if (bleAuthenticated()) prove(proofWith("0")); break;
     case DROP: if (ble.linked) { unlink(); g_ble_disconnect_ms = fake_ms; } break;
@@ -1183,6 +1274,7 @@ void apply(int e) {
 void start(int which) {
   reset();
   model = Model{};
+  g_before = Observed{};
   if (which == 0) return; // no phone
   link();
   prove(proofWith("1"));
@@ -1192,6 +1284,8 @@ void start(int which) {
   ack(1);
   services();
   model.acked_by[currentGrant()] = 1;
+  model.clock_grant = currentGrant();
+  model.clock_since = fake_ms; // the forward ack restarted it
   if (which == 2) apply(STOP); // v1 lapsed by a stop, one frame outstanding
 }
 
@@ -1201,13 +1295,15 @@ void enumerate(int depth) {
   for (int which = 0; which < 3; ++which) {
     std::fill(events.begin(), events.end(), 0);
     while (true) {
+      g_trace = std::string(kStarts[which]) + ":";
       start(which);
-      modelCheck(false, currentGrant(), false);
+      modelCheck(EVENTS, observe(), currentGrant());
       for (int e : events) {
-        const bool stopped = bleAuthenticated() && bleProtoTagsFrames(bleProto()) && sessionState().value("why", "") == "stop";
+        g_trace += std::string(" ") + kEventNames[e];
+        g_before = observe();
         const uint32_t grant_before = currentGrant();
         apply(e);
-        modelCheck(stopped, grant_before, e == RESUME);
+        modelCheck(e, g_before, grant_before);
       }
       ++sequences;
       int i = depth - 1;
@@ -1215,6 +1311,7 @@ void enumerate(int depth) {
       if (i < 0) break;
     }
   }
+  g_trace.clear();
   std::cout << "  " << sequences << " sequences of " << depth << " events\n";
 }
 int g_depth = 4;

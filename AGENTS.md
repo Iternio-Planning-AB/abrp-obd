@@ -446,11 +446,15 @@ order, and a forward ack or a resume hands it back; an app unsubscribed from ABD
 lapses at once and only a resume ends it; a burst of ABD9
 writes collapses (ack first, then the verb), and an entry from an ended grant is discarded; the readable state (at
 most 93 B) follows every transition and a notify never replaces it; a log dump keeps every cellular gate closed; a
-seq never reaches a body or the backlog. `enumerate` runs every 4-event sequence over 14 events from three starting
-points (about 115 k sequences, ~35 s under ASan) against the session invariants: no frame counted as relayed without
+seq never reaches a body or the backlog. `enumerate` runs every 4-event sequence over 15 events from three starting
+points (about 152 k sequences, ~50 s under ASan with the compile) against the session invariants: no frame counted as relayed without
 being queued, no seq while unsubscribed, no tagged frame from an ended session, no frame dropped that its own session
 did not ack, the version fixed for the grant, a new v1 session starts live, only a resume ends a stop, no unsubscribed
-v1 session holds cellular off with untagged frames queued past `RELAY_UNSUBSCRIBED_MAX_MS` (a short wait passes the ack timeout only, a long one both bounds). `fixtures`
+v1 session holds cellular off with untagged frames queued past `RELAY_UNSUBSCRIBED_MAX_MS` (a wait exactly the ack timeout passes it only, a long one both bounds),
+and the ack timeout both ways: tagged frames unacked past `RELAY_ACK_TIMEOUT_MS` (not held) lapse the transport, and a
+live, subscribed session keeps it until then (a wait 2 s short of the timeout; a session idle with everything acked
+must not lapse on its next frame). The model keeps each grant's ack clock (session start, forward ack, a resume or
+resubscribe ending a lapse, every pass with nothing outstanding or a log dump running); a failure names its sequence. `fixtures`
 replays every file under `protocol/fixtures/` the firmware owns (see its README) and checks the main-firmware nonce
 frames against `authSendNonce` from the pinned main commit. Checked by position: the ABD2 handler (its `PROTO` gate
 right after `NOAUTH`, no `relay_ack` case left), a connection starting with no grant (`onConnect` clears it), the GATT table (ABD1-ABD8 as on the pinned main commit, ABD9/ABDA
