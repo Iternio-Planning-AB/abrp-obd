@@ -2,7 +2,7 @@
 /*
   The relay session (#90) - whether a connected, authenticated phone is actually carrying the telemetry - and the ABD9
   session channel it is driven over.
-  Contains: the session state machine (relayAckService), v1's protocol entries (relayNextSeq, relayFrameNotified,
+  Contains: the session state machine (relayAckService), v1's protocol entries (relayNextSeq, relayFrameQueued,
   relayTransportLive, relaySessionApply), the Bluedroid-task ABD9 hooks (relaySessionWrite, relaySessionRead) and the
   loop-task service that applies what they stash (sessionChannelService).
 

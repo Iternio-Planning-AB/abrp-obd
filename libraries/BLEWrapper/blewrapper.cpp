@@ -783,9 +783,11 @@ void ServerCallbacks::onConnect(BLEServer* pServer, esp_ble_gatts_cb_param_t* pa
   // would carry an earlier session's hash - possibly another profile's - for the fast path to claim; and a stray
   // packet with no clean must not complete a push from an earlier session's profile and token. RAM only.
   wrapper->resetPushStaging();
-  // No connection inherits a grant. onDisconnect clears it, but it runs on the same task as this, and a disconnect and
-  // the next connect can both land between two loop passes; clearing here too means a grant is always this link's
-  // own, so bleProto() and the relay session (keyed on the grant) can never carry the last phone's over to this one.
+  // No connection inherits a grant that was already set: onDisconnect clears it too, and a disconnect and the next
+  // connect can both land between two loop passes. This does NOT make every grant this link's own: a proof the old
+  // link wrote is stashed by authGateHook and judged on the loop task later, so if the old link drops and the new one
+  // connects before that pass, the old link's proof can still grant the new link (known, pre-existing race; the nonce
+  // it answers is single-use and expires after AUTH_NONCE_TTL_MS, but it is not tied to the connection).
   wrapper->clearAuthentication();
   wrapper->set_device_connected(true);
 };

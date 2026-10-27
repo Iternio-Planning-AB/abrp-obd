@@ -1147,7 +1147,7 @@ void modelCheck(bool was_stopped, uint32_t grant_before, bool resumed) {
     check(!bleRelaying() && sessionState().value("why", "") == "stop", "invariant: only a resume ends a stop");
 }
 
-enum Event { POLL, SUB, UNSUB, ACK, ACK_RECONNECT, STOP, RESUME, WAIT, DUMP, REPROVE, DROP, V1, V0, EVENTS };
+enum Event { POLL, SUB, UNSUB, ACK, ACK_RECONNECT, STOP, RESUME, WAIT, WAIT_LONG, DUMP, REPROVE, DROP, V1, V0, EVENTS };
 
 void apply(int e) {
   switch (e) {
@@ -1164,7 +1164,8 @@ void apply(int e) {
       resume();
       if (bleAuthenticated()) model.unsub_since = 0;
       break;
-    case WAIT: fake_ms += RELAY_UNSUBSCRIBED_MAX_MS; break; // past both bounds (the ack timeout is shorter)
+    case WAIT: fake_ms += RELAY_ACK_TIMEOUT_MS; break;           // past the ack timeout, short of the unsubscribed bound
+    case WAIT_LONG: fake_ms += RELAY_UNSUBSCRIBED_MAX_MS; break; // past both bounds
     case DUMP: g_logdump_active = !g_logdump_active; break;
     case REPROVE: if (bleAuthenticated()) prove(proofWith("0")); break;
     case DROP: if (ble.linked) { unlink(); g_ble_disconnect_ms = fake_ms; } break;
