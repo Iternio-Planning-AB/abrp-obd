@@ -265,12 +265,14 @@
 #define BLE_UPLOAD_GRACE_MS 10000
 #endif
 
-// How long frames relayed to a phone that announced relay acks (ABD2 {"relay_ack":0}) may wait with no ack moving
-// forward before cellular takes over (Helpers/ble_relay.h, #90). A connected, authenticated phone used to count as relaying for as
-// long as it stayed connected: an ID.5 drove 65 minutes in the BLE state with the app posting nothing, and the
-// frames it was handed were never queued for cellular. At 120 s, over two of the dongle's own 50 s cellular
-// cycles, an app that batches or posts slowly keeps the transport, and a stalled one costs about 2 minutes
-// before cellular takes over with every frame it never acked. Apps that never announce are not timed.
+// How long frames relayed to a phone in a protocol v1 session (negotiated in the ABD8 handshake, Helpers/ble_protocol.h)
+// may wait with no ack moving forward on ABD9 before cellular takes over (Helpers/ble_relay.h, #90). A connected,
+// authenticated phone used to count as relaying for as long as it stayed connected: an ID.5 drove 65 minutes in the
+// BLE state with the app posting nothing, and the frames it was handed were never queued for cellular. At 120 s, over
+// two of the dongle's own 50 s cellular cycles, an app that batches or posts slowly keeps the transport, and a stalled
+// one costs about 2 minutes before cellular takes over with every frame it never acked. An app that knows it cannot
+// post says so ({"relay":"stop"}) and hands over at once; this is the safety net for what it cannot report (iOS
+// suspending it). v0 sessions, every app that does not negotiate, are not timed.
 #ifndef RELAY_ACK_TIMEOUT_MS
 #define RELAY_ACK_TIMEOUT_MS 120000UL
 #endif

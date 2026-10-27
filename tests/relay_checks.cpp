@@ -1,10 +1,12 @@
 // Relay acks (#90): run by tests/run_relay_checks.py, which extracts the production pieces this file includes.
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <iostream>
+#include <map>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -112,10 +114,11 @@ unsigned long g_ble_disconnect_ms = 0, last_broadcast = 0;
 
 struct FakeBle {
   bool linked = false, authenticated = false, setup_allowed = false;
+  bool telemetry_subscribed = false, session_subscribed = false; // the ABD1 and ABD9 CCCDs
   uint32_t grants = 0;
   uint32_t auth_grant() const { return grants; }
   uint16_t negotiated = 185;
-  std::vector<std::string> notifies, values, auth_notifies, calls;
+  std::vector<std::string> notifies, values, auth_notifies, session_notifies, calls;
   bool connected() { return linked; }
   bool get_authenticated() { return authenticated; }
   bool get_setup_allowed() { return setup_allowed; }
@@ -131,6 +134,7 @@ struct FakeBle {
     calls.push_back(v ? "setup_allowed=1" : "setup_allowed=0");
   }
   uint16_t mtu() { return negotiated; }
+  bool telemetrySubscribed() { return telemetry_subscribed; }
   bool logData(const std::string& notify, const std::string& value) {
     if (!linked || !authenticated) return false;
     notifies.push_back(notify);
@@ -141,9 +145,38 @@ struct FakeBle {
     auth_notifies.emplace_back((const char*)frame, len);
     return true;
   }
+  bool notifySession(const char* event) { // an indicate goes out only to an armed CCCD
+    if (!linked || !session_subscribed) return false;
+    session_notifies.push_back(event);
+    return true;
+  }
 } ble;
+
+// Every logEvent line the relay and protocol code writes, held to logEvent's buffer (119 characters).
+std::vector<std::string> g_log;
+void captureLog(const char* format, ...) {
+  char line[256];
+  va_list args;
+  va_start(args, format);
+  const int n = vsnprintf(line, sizeof(line), format, args);
+  va_end(args);
+  check(n >= 0 && n <= 119, std::string("a log line fits logEvent's buffer: ") + line);
+  g_log.push_back(line);
+}
+size_t logged(const std::string& text) { // lines starting with text
+  size_t n = 0;
+  for (const auto& line : g_log) n += line.compare(0, text.size(), text) == 0;
+  return n;
+}
+size_t loggedLine(const std::string& text) { // lines that are exactly text
+  size_t n = 0;
+  for (const auto& line : g_log) n += line == text;
+  return n;
+}
+#define logEvent captureLog
+
 bool bleProtoPhoneIsTransport();
-bool relayTransportLive();
+bool bleProtoRelayAcks();
 #include "ble_predicates.inc"
 #include "ble_relay.h"
 #include "ble_protocol.h"
@@ -154,12 +187,18 @@ namespace historical {
 #include "historical_ble_frame.inc"
 }
 
-// One loop iteration from relayAckService() to the cellular upload gate, all production code but the fakes.
+// The top of loop(): the relay session, then the ABD9 session channel, in production order.
+void services() {
+  relayAckService();
+  sessionChannelService();
+}
+
+// One loop iteration from the session services to the cellular upload gate, all production code but the fakes.
 const double T = 1791500000;
 unsigned polls = 0, posts = 0;
 OBDVector pollFrame(unsigned i) { return {{"utc", T + i}, {"soc", 10.0 + i}, {"voltage", 350}, {"current", -20}}; }
 void poll() {
-  relayAckService();
+  services();
   OBDVector current_frame = pollFrame(++polls);
   const bool frame_has_data = true;
   GeoMarks poll_geo{};
@@ -191,9 +230,59 @@ std::vector<unsigned> queuedSeqs() {
     for (const auto& value : frame) if (value.first == RELAY_SEQ_KEY) out.push_back((unsigned)value.second);
   return out;
 }
-uint32_t notifiedSeq(size_t i) {
-  const auto frame = json::parse(ble.notifies.at(i))["tlm"];
+std::vector<unsigned> queuedPolls() {
+  std::vector<unsigned> out;
+  for (const auto& frame : obd_result_vector)
+    for (const auto& value : frame) if (value.first == "soc") out.push_back((unsigned)(value.second + 0.5) - 10);
+  return out;
+}
+// The seq an ABD1 frame carries, 0 for none.
+uint32_t frameSeq(const std::string& text) {
+  const auto frame = json::parse(text)["tlm"];
   return frame.contains("seq") ? frame["seq"].get<uint32_t>() : 0;
+}
+uint32_t notifiedSeq(size_t i) { return frameSeq(ble.notifies.at(i)); }
+
+// ABD9, as BLEWrapper's SessionCallbacks drive it on the Bluedroid task.
+void sessionWrite(const std::string& text) { relaySessionWrite((const uint8_t*)text.data(), text.size()); }
+std::string sessionRead() {
+  uint8_t value[128];
+  const size_t n = relaySessionRead(value, sizeof(value));
+  check(n <= 93, "the ABD9 state is never a long read (<= 93 B)");
+  return std::string((const char*)value, n);
+}
+json sessionState() { return json::parse(sessionRead()); }
+void ack(uint32_t seq) { sessionWrite("{\"relay_ack\":" + std::to_string(seq) + "}"); }
+void stop() { sessionWrite("{\"relay\":\"stop\"}"); }
+void resume() { sessionWrite("{\"relay\":\"resume\"}"); }
+const std::string kLapsedStop = "{\"relay\":\"lapsed\",\"why\":\"stop\"}";
+const std::string kLapsedTimeout = "{\"relay\":\"lapsed\",\"why\":\"timeout\"}";
+const std::string kLive = "{\"relay\":\"live\"}";
+
+// ---- The ABD8 handshake, from the point where the proof passed the HMAC check (auth_gate.h).
+
+// The fixtures' proof: base64(HMAC-SHA256(secret, nonce)).
+const std::string kProof = "{\"proof\":\"sUiXJ7JgKg4EfLI3WApMeVqvkCPFvGsLhlx/oX4KI2c=\"";
+std::string proofWith(const char* proto) { return proto ? kProof + ",\"proto\":" + proto + "}" : kProof + "}"; }
+
+// What auth_gate.h does once the HMAC matched, and the reply it notifies.
+std::string prove(const std::string& proof) {
+  char reply[64];
+  bleProtoAccept(json::parse(proof), reply, sizeof(reply));
+  return reply;
+}
+
+void link(uint16_t mtu = 185) {
+  ble.linked = true;
+  ble.negotiated = mtu;
+  ble.calls.clear();
+}
+
+void unlink() { // ServerCallbacks::onDisconnect: clearAuthentication(), and the ABD1/ABD8/ABD9 CCCDs cleared
+  ble.linked = false;
+  ble.set_authenticated(false);
+  ble.telemetry_subscribed = ble.session_subscribed = false;
+  ble.calls.clear();
 }
 
 void reset() {
@@ -210,73 +299,90 @@ void reset() {
   g_logdump_active = false;
   g_ble_disconnect_ms = 0;
   last_broadcast = millis();
-  relayAckHook(0);       // a stale announce in the mailbox must not survive a session with no phone
-  relayAckService();
+  stop();     // a stale entry in the mailbox must not survive a session with no phone
+  services();
   g_relay_seq = 0;
+  g_log.clear();
 }
 
+// A session of an app that does not negotiate: its proof carries no proto.
 void connect() {
-  if (!ble.authenticated) ++ble.grants; // BLEWrapper::set_authenticated(true)
-  ble.linked = ble.authenticated = true;
+  link();
+  prove(proofWith(nullptr));
 }
 
-void announce() {
-  relayAckHook(0);
+// A session of an app that negotiated v1 and subscribed to ABD1 and ABD9, and its first poll.
+void negotiate() {
+  link();
+  prove(proofWith("1"));
+  ble.telemetry_subscribed = ble.session_subscribed = true;
   poll();
 }
+
+// ---- The locked acceptance scenarios (#90), as negotiated v1 sessions.
 
 void oldApp() {
-  reset();
-  connect();
-  for (int i = 0; i < 5; ++i) poll();
-  for (size_t i = 0; i < ble.notifies.size(); ++i) {
-    const auto expected = historical::bleTlmFrame(pollFrame(i + 1), bleNotifyBudget(ble.negotiated));
-    check(ble.notifies[i] == expected.notify && ble.values[i] == expected.full,
-          "an app that never announced reads frames byte-identical to today's");
+  for (const char* proto : {(const char*)nullptr, "0"}) {
+    const std::string who = proto ? "an app that negotiated v0" : "an app that does not negotiate";
+    reset();
+    link();
+    prove(proofWith(proto));
+    ble.telemetry_subscribed = true;
+    for (int i = 0; i < 5; ++i) poll();
+    check(ble.notifies.size() == 5, who + " is notified every frame");
+    for (size_t i = 0; i < ble.notifies.size(); ++i) {
+      const auto expected = historical::bleTlmFrame(pollFrame(i + 1), bleNotifyBudget(ble.negotiated));
+      check(ble.notifies[i] == expected.notify && ble.values[i] == expected.full,
+            who + " reads frames byte-identical to today's");
+    }
+    check(obd_result_vector.empty(), "frames relayed to " + who + " are not queued for cellular");
+    ack(3);
+    stop();
+    poll();
+    ack(4);
+    poll();
+    check(loggedLine("BLE session proto=0 ignored key=relay_ack") == 1 && loggedLine("BLE session proto=0 ignored key=relay") == 1,
+          "ABD9 messages in a v0 session are ignored, and logged once per key and session");
+    fake_ms += RELAY_ACK_TIMEOUT_MS * 10;
+    poll();
+    check(posts == 0 && bleRelaying(), who + " stays the transport however long it is connected");
   }
-  check(obd_result_vector.empty(), "frames relayed to an app without acks are not queued for cellular");
-  fake_ms += RELAY_ACK_TIMEOUT_MS * 10;
-  poll();
-  check(posts == 0 && bleRelaying(), "an app without acks stays the transport however long it is connected");
 }
 
 void acking() {
   reset();
-  connect();
-  announce();
-  check(notifiedSeq(0) == 1, "after the announce the frame carries seq 1");
+  negotiate();
+  check(notifiedSeq(0) == 1, "once negotiated v1, the frame carries seq 1");
   poll();
   poll();
   check(notifiedSeq(1) == 2 && notifiedSeq(2) == 3, "seqs count up per notified frame");
   check(queuedSeqs() == std::vector<unsigned>({1, 2, 3}), "relayed frames are queued under their seq until acked");
-  relayAckHook(2);
+  ack(2);
   poll();
-  check(queuedSeqs() == std::vector<unsigned>({3, 4}), "an ack takes the frames up to its seq off the queue");
+  check(queuedSeqs() == std::vector<unsigned>({3, 4}), "an ack on ABD9 takes the frames up to its seq off the queue");
   for (int i = 0; i < 100; ++i) {
-    relayAckHook(g_relay_seq);
+    ack(g_relay_seq);
     poll();
   }
   check(posts == 0 && bleRelaying(), "while acks keep coming the phone is the transport and cellular stays off");
   check(queuedSeqs().size() == 1, "only the frame relayed since the last ack is queued");
   ble.negotiated = 23;
   poll();
-  const auto notify = json::parse(ble.notifies.back())["tlm"];
-  const auto value = json::parse(ble.values.back())["tlm"];
-  check(value["seq"] == g_relay_seq && (!notify.contains("seq") || notify["seq"] == g_relay_seq),
+  const uint32_t notify = frameSeq(ble.notifies.back()), value = frameSeq(ble.values.back());
+  check(value == g_relay_seq && (notify == 0 || notify == g_relay_seq),
         "the readable value always carries the seq, and a notify that carries one carries the same");
   const uint32_t sent = g_relay_seq;
   const size_t queued = obd_result_vector.size();
-  relayAckHook(sent + 5);
+  ack(sent + 5);
   poll();
   check(obd_result_vector.size() == queued + 1, "an ack beyond any seq sent removes nothing");
 }
 
 void stall() {
   reset();
-  connect();
-  announce();
+  negotiate();
   for (int i = 0; i < 3; ++i) poll();
-  relayAckHook(2);
+  ack(2);
   poll();
   const unsigned long acked_at = fake_ms - 1000;
   for (int i = 0; i < 3; ++i) poll();
@@ -292,31 +398,29 @@ void stall() {
   check(uploadedPolls() == expected, "every frame the app never acked goes up once, in order");
   poll();
   check(posts == 2 && uploadedPolls().size() == expected.size() + 1, "and the frames after it follow over cellular");
-  relayAckHook(2);
+  ack(2);
   poll();
   check(!bleRelaying(), "an ack that does not move forward does not bring the transport back");
 }
 
 void neverAck() {
   reset();
-  connect();
-  announce();
-  const unsigned long announced_at = fake_ms - 1000;
-  while (fake_ms < announced_at + RELAY_ACK_TIMEOUT_MS - 1000) poll();
-  check(posts == 0 && bleRelaying(), "an announced app is the transport until the timeout");
-  fake_ms = announced_at + RELAY_ACK_TIMEOUT_MS;
-  check(!bleRelaying(), "an app that announced and never acked lapses at the timeout after the announce");
+  negotiate();
+  const unsigned long first_frame_at = fake_ms - 1000;
+  while (fake_ms < first_frame_at + RELAY_ACK_TIMEOUT_MS - 1000) poll();
+  check(posts == 0 && bleRelaying(), "a negotiated v1 app is the transport until the timeout");
+  fake_ms = first_frame_at + RELAY_ACK_TIMEOUT_MS;
+  check(!bleRelaying(), "one that never acks lapses at the timeout after the grant's first outstanding frame");
   const unsigned before = polls;
   poll();
   std::vector<unsigned> expected;
   for (unsigned p = 1; p <= before + 1; ++p) expected.push_back(p);
-  check(posts == 1 && uploadedPolls() == expected, "every frame since the announce goes up over cellular");
+  check(posts == 1 && uploadedPolls() == expected, "every frame since the grant goes up over cellular");
 }
 
-void resume() {
+void resumeAfterLapse() {
   reset();
-  connect();
-  announce();
+  negotiate();
   poll();
   fake_ms += RELAY_ACK_TIMEOUT_MS;
   poll();
@@ -325,24 +429,32 @@ void resume() {
   poll();
   const unsigned posted = posts;
   const uint32_t acked = g_relay_seq - 1;
-  relayAckHook(acked);
+  ack(acked);
   poll();
   check(bleRelaying(), "an ack after a lapse makes the phone the transport again");
   check(posts == posted, "and cellular stands down");
   for (unsigned seq : queuedSeqs()) check(seq > acked, "frames up to that ack are dropped");
   check(queuedSeqs().size() == 1, "only the frame relayed after that ack is left");
+  fake_ms += RELAY_ACK_TIMEOUT_MS;
+  poll();
+  check(!bleRelaying(), "lapsed again");
+  resume();
+  services();
+  check(bleRelaying(), "a resume after a timeout lapse also restores relaying");
+  const unsigned before = posts;
+  poll();
+  check(posts == before, "and cellular stands down");
 }
 
 void disconnect() {
   reset();
-  connect();
-  announce();
+  negotiate();
   poll();
   poll();
-  relayAckHook(1);
+  ack(1);
   poll();
-  relayAckHook(0); // lands as the link drops: the next session must not inherit it
-  ble.linked = ble.authenticated = false;
+  stop(); // lands as the link drops: the next session must not inherit it
+  unlink();
   g_ble_disconnect_ms = fake_ms; // changeState() on leaving BLE after a session that relayed
   g_ble_handoff_pending = true;
   poll();
@@ -351,97 +463,93 @@ void disconnect() {
   poll();
   check(posts == 1 && uploadedPolls() == std::vector<unsigned>({2, 3, 4, 5, 6}),
         "the frames the app never acked upload after the grace, with the ones polled since");
-  ble.linked = ble.authenticated = true;
+  check(loggedLine("BLE session stale grant") == 1, "the stop written as the link dropped is discarded, and logged");
+  connect();
+  ble.telemetry_subscribed = true;
   poll();
-  check(json::parse(ble.notifies.back())["tlm"].count("seq") == 0, "a new session starts unannounced");
+  check(frameSeq(ble.notifies.back()) == 0, "a new session that did not negotiate v1 carries no seq");
 }
 
 void presence() {
   reset();
-  connect();
-  announce();
+  negotiate();
   fake_ms += RELAY_ACK_TIMEOUT_MS;
   check(!bleRelaying() && bleAuthenticated(), "during a lapse the phone still counts as present for the leash and alarm gate");
-}
-
-std::vector<unsigned> queuedPolls() {
-  std::vector<unsigned> out;
-  for (const auto& frame : obd_result_vector)
-    for (const auto& value : frame) if (value.first == "soc") out.push_back((unsigned)(value.second + 0.5) - 10);
-  return out;
+  services();
+  check(!bleRelaying() && bleAuthenticated(), "also once the lapse is entered");
+  stop();
+  services();
+  check(!bleRelaying() && bleAuthenticated(), "and during a stop");
 }
 
 // A session's acks name its own frames only, however quickly the next session follows.
 void sessions() {
   reset();
-  connect();
-  announce();
+  negotiate();
   poll();
   poll();
-  relayAckHook(1);
+  ack(1);
   poll();
-  ble.linked = ble.authenticated = false;
+  unlink();
   g_ble_disconnect_ms = fake_ms;
   poll();
-  connect();
-  announce();
-  relayAckHook(g_relay_seq);
+  negotiate();
+  ack(g_relay_seq);
   poll();
   check(queuedPolls() == std::vector<unsigned>({2, 3, 4, 5, 7}),
         "a reconnect inside the grace: the new session's ack leaves the old session's unacked frames queued");
   check(queuedSeqs() == std::vector<unsigned>({g_relay_seq}), "and they lost their seq with their session");
 
   reset();
-  connect();
-  announce();
+  negotiate();
   poll();
-  ble.authenticated = false;
-  connect(); // dropped and granted again between two loop iterations, to an app that never announces
+  unlink();
+  connect(); // dropped and granted again between two loop passes, to an app that does not negotiate
+  ble.telemetry_subscribed = true;
   poll();
   check(ble.notifies.back() == historical::bleTlmFrame(pollFrame(polls), bleNotifyBudget(ble.negotiated)).notify,
-        "a session granted between two iterations starts unannounced");
+        "a session granted between two passes starts with its own version, here v0 with no seq");
   check(queuedPolls() == std::vector<unsigned>({1, 2}) && queuedSeqs().empty(),
         "and its relayed frames are not queued, while the last session's go up as plain frames");
 
   reset();
-  connect();
-  announce();
-  relayAckHook(g_relay_seq);
+  negotiate();
+  ack(g_relay_seq);
   poll();
-  relayAckHook(g_relay_seq);
+  ack(g_relay_seq);
   for (int i = 0; i < 3; ++i) {
     fake_ms += RELAY_ACK_TIMEOUT_MS;
-    relayAckService();
+    services();
   }
   check(bleRelaying(), "with nothing outstanding there is nothing to be late with");
 
   reset();
-  connect();
+  negotiate();
   poll();
-  relayAckHook(0); // stashed under this grant, serviced only after the next one, granted to an app that never announces
-  ble.authenticated = false;
-  connect();
+  stop(); // stashed under this grant, serviced only after the next one, granted to an app that negotiated v1 again
+  unlink();
+  link();
+  prove(proofWith("1"));
+  ble.telemetry_subscribed = true;
   poll();
-  check(json::parse(ble.notifies.back())["tlm"].count("seq") == 0 && obd_result_vector.empty(),
-        "an announce stashed in one session is never applied to the next");
+  check(bleRelaying() && queuedSeqs() == std::vector<unsigned>({g_relay_seq}),
+        "a stop stashed in one session is never applied to the next");
 
   uint32_t v = 7;
-  check(bleRelayAckValue(json::parse("0"), v) && v == 0 && bleRelayAckValue(json::parse("4294967295"), v) &&
-        v == 4294967295u && bleRelayAckWrite("{\"relay_ack\":12}"), "relay_ack takes any uint32 the app writes");
+  check(relayAckValue(json::parse("0"), v) && v == 0 && relayAckValue(json::parse("4294967295"), v) &&
+        v == 4294967295u, "relay_ack takes any uint32 the app writes");
   for (const char* bad : {"-1", "1.5", "\"3\"", "4294967296", "null"})
-    check(!bleRelayAckValue(json::parse(bad), v) && !bleRelayAckWrite(std::string("{\"relay_ack\":") + bad + "}"),
-          std::string("relay_ack refuses ") + bad + ", and the rx log keeps it");
+    check(!relayAckValue(json::parse(bad), v), std::string("relay_ack refuses ") + bad);
 }
 
-// A log dump or an update pauses polling, so an announced app has nothing to ack meanwhile.
+// A log dump or an update pauses polling, so a negotiated v1 app has nothing to ack meanwhile.
 void hold() {
   reset();
-  connect();
-  announce();
+  negotiate();
   for (int busy = 0; busy < 2; ++busy) {
     (busy ? g_ota_active : g_logdump_active) = true;
     fake_ms += RELAY_ACK_TIMEOUT_MS * 3;
-    relayAckService();
+    services();
     check(bleRelaying(), "the relay clock waits while a log dump or an update runs");
     g_ota_active = g_logdump_active = false;
     fake_ms += RELAY_ACK_TIMEOUT_MS - 1;
@@ -451,39 +559,331 @@ void hold() {
 
 void persistence() {
   reset();
-  connect();
-  announce();
+  negotiate();
   poll();
   check(queuedSeqs().size() == 2 && saveUploadBacklog() && LittleFS.exists("/upload_backlog.jsonl") &&
         LittleFS.contents().find("relay_seq") == std::string::npos, "a relay seq is never written to the backlog");
-  check(bleRelayAckWrite("{\"relay_ack\":3}") && !bleRelayAckWrite("{\"obd_alarm\":1}") &&
-        !bleRelayAckWrite("{\"relay_ack\":3,\"x\":1}"), "only a lone relay_ack write is left out of the rx log");
 }
 
-// ---- Protocol negotiation (Helpers/ble_protocol.h): the version is chosen once per grant, in the ABD8 handshake.
+// ---- The session channel (ABD9) and the session state machine (Helpers/ble_relay.h).
 
-// The fixtures' proof: base64(HMAC-SHA256(secret, nonce)). The HMAC itself is auth_gate.h's, which runs before this.
-const std::string kProof = "{\"proof\":\"sUiXJ7JgKg4EfLI3WApMeVqvkCPFvGsLhlx/oX4KI2c=\"";
-std::string proofWith(const char* proto) { return proto ? kProof + ",\"proto\":" + proto + "}" : kProof + "}"; }
-
-// The proof passed the HMAC check: what auth_gate.h does next, and the reply it notifies.
-std::string prove(const std::string& proof) {
-  char reply[64];
-  bleProtoAccept(json::parse(proof), reply, sizeof(reply));
-  return reply;
+void stopResume() {
+  reset();
+  negotiate();
+  poll();
+  ack(2);
+  poll();
+  stop();
+  services();
+  check(!bleRelaying() && bleAuthenticated() && g_ble_handoff_pending, "a stop hands the transport to cellular at once");
+  check(ble.session_notifies == std::vector<std::string>({kLapsedStop}), "and notifies the lapse on ABD9");
+  check(sessionState() == json::parse("{\"relay\":\"lapsed\",\"why\":\"stop\",\"acked\":2,\"sent\":3,\"queued\":1}"),
+        "the readable state says so: " + sessionRead());
+  check(logged("BLE relay stop by app") == 1, "and the log");
+  ack(3); // a post that was already in flight when the app stopped
+  services();
+  check(!bleRelaying() && queuedSeqs().empty(), "an ack in flight takes its frames off, but does not end the stop");
+  check(sessionState()["acked"] == 3 && sessionState()["why"] == "stop", "the state shows it: " + sessionRead());
+  stop();
+  fake_ms += RELAY_ACK_TIMEOUT_MS * 3;
+  services();
+  check(!bleRelaying() && ble.session_notifies.size() == 1, "a repeated stop is idempotent, and time does not end it");
+  resume();
+  services();
+  check(bleRelaying() && ble.session_notifies.back() == kLive && logged("BLE relay resume by app") == 1,
+        "only a resume ends a stop, notified live");
+  resume();
+  services();
+  check(ble.session_notifies.size() == 2, "a resume while live changes nothing");
+  poll();
+  fake_ms += RELAY_ACK_TIMEOUT_MS;
+  services();
+  check(!bleRelaying() && ble.session_notifies.back() == kLapsedTimeout, "a timeout lapse is notified too");
+  stop();
+  services();
+  check(ble.session_notifies.back() == kLapsedStop && sessionState()["why"] == "stop",
+        "a stop during a timeout lapse makes it a stop");
+  ack(g_relay_seq);
+  services();
+  check(!bleRelaying(), "which a forward ack does not end");
+  g_logdump_active = true;
+  resume();
+  services();
+  stop();
+  services();
+  check(!bleRelaying(), "a stop during a log dump is applied");
+  g_logdump_active = false;
+  services();
+  check(!bleRelaying() && sessionState()["why"] == "stop", "and still holds when the dump ends");
 }
 
-void link(uint16_t mtu = 185) {
-  ble.linked = true;
-  ble.negotiated = mtu;
-  ble.calls.clear();
+void mailbox() {
+  reset();
+  link();
+  stop();
+  ack(1);
+  services();
+  prove(proofWith("1"));
+  ble.telemetry_subscribed = ble.session_subscribed = true;
+  poll();
+  check(bleRelaying() && queuedSeqs() == std::vector<unsigned>({1}), "ABD9 writes before the grant are dropped");
+  poll();
+  poll();
+  poll();
+  ack(3);
+  ack(1);
+  resume();
+  ack(4);
+  ack(2);
+  stop();
+  services();
+  check(queuedSeqs().empty() && sessionState()["acked"] == 4 && sessionState()["why"] == "stop",
+        "a burst between two loop passes collapses to the highest ack and the last verb: " + sessionRead());
+  resume();
+  services();
+  poll();
+  fake_ms += RELAY_ACK_TIMEOUT_MS;
+  services();
+  const size_t before = ble.session_notifies.size();
+  stop();
+  ack(g_relay_seq);
+  services();
+  check(std::vector<std::string>(ble.session_notifies.begin() + before, ble.session_notifies.end()) ==
+        std::vector<std::string>({kLive, kLapsedStop}), "the ack is applied first, then the verb");
+  stop();
+  unlink();
+  negotiate();
+  check(bleRelaying() && logged("BLE session stale grant") == 1, "an entry stamped with an ended grant is discarded");
+  sessionWrite("{\"foo\":1}");
+  services();
+  sessionWrite("{\"foo\":2}");
+  services();
+  sessionWrite("not json");
+  services();
+  sessionWrite("{\"relay_ack\":-1}");
+  services();
+  sessionWrite("{\"relay\":\"sideways\"}");
+  services();
+  check(loggedLine("BLE session proto=1 ignored key=foo") == 1 && loggedLine("BLE session proto=1 ignored key=?") == 1 &&
+        loggedLine("BLE session proto=1 ignored key=relay_ack") == 1 && loggedLine("BLE session proto=1 ignored key=relay") == 1,
+        "a key the version does not know, or a value it does not take, is logged once per session by key");
+  check(bleRelaying(), "and changes nothing");
 }
 
-void unlink() { // ServerCallbacks::onDisconnect: clearAuthentication()
-  ble.linked = false;
-  ble.set_authenticated(false);
-  ble.calls.clear();
+void state() {
+  reset();
+  check(sessionRead() == "{}", "with no v1 session the ABD9 state is empty");
+  connect();
+  services();
+  check(sessionRead() == "{}", "and in a v0 session");
+  unlink();
+  negotiate();
+  services();
+  check(sessionState() == json::parse("{\"relay\":\"live\",\"acked\":0,\"sent\":1,\"queued\":1}"),
+        "in a v1 session it is the relay state: " + sessionRead());
+  fake_ms += RELAY_ACK_TIMEOUT_MS;
+  services();
+  check(ble.session_notifies.back() == kLapsedTimeout &&
+        sessionState() == json::parse("{\"relay\":\"lapsed\",\"why\":\"timeout\",\"acked\":0,\"sent\":1,\"queued\":1}"),
+        "a notify never takes the place of the state: " + sessionRead());
+  ack(1);
+  services();
+  check(sessionState() == json::parse("{\"relay\":\"live\",\"acked\":1,\"sent\":1,\"queued\":0}"),
+        "the state follows every transition: " + sessionRead());
+  ble.session_subscribed = false;
+  fake_ms += RELAY_ACK_TIMEOUT_MS;
+  poll();
+  fake_ms += RELAY_ACK_TIMEOUT_MS;
+  services();
+  check(ble.session_notifies.back() == kLive && sessionState()["relay"] == "lapsed",
+        "an app not subscribed to ABD9 reads the state instead");
+  unlink();
+  services();
+  check(sessionRead() == "{}", "and once the session ends it is empty again");
 }
+
+void subscribedSeq() {
+  reset();
+  link();
+  prove(proofWith("1"));
+  poll();
+  poll();
+  check(frameSeq(ble.values.back()) == 0 && queuedPolls() == std::vector<unsigned>({1, 2}) && queuedSeqs().empty(),
+        "before the app subscribes to ABD1, v1 frames carry no seq and are plain cellular frames");
+  for (int i = 0; i < 200; ++i) poll();
+  check(bleRelaying() && posts == 0, "a profile push longer than RELAY_ACK_TIMEOUT_MS does not lapse the transport");
+  ble.telemetry_subscribed = true;
+  poll();
+  check(frameSeq(ble.notifies.back()) == 1 && queuedSeqs() == std::vector<unsigned>({1}), "once subscribed, seqs start");
+  unlink();
+  link();
+  prove(proofWith("1"));
+  poll();
+  check(frameSeq(ble.values.back()) == 0, "after a reconnect within one wake, frames carry no seq until it resubscribes");
+  ble.telemetry_subscribed = true;
+  poll();
+  check(frameSeq(ble.notifies.back()) == 2, "and then they do");
+  const auto queued = queuedSeqs();
+  check(prove(proofWith("0")) == "{\"auth\":\"ok\",\"proto\":1}", "a second proof keeps v1");
+  poll();
+  check(queuedSeqs() == std::vector<unsigned>({2, 3}) && queued == std::vector<unsigned>({2}),
+        "and drops no unposted frame");
+  ble.telemetry_subscribed = false;
+  poll();
+  check(frameSeq(ble.values.back()) == 0, "unsubscribed, no seq");
+  fake_ms += RELAY_ACK_TIMEOUT_MS;
+  services();
+  check(!bleRelaying(), "an app that unsubscribes with frames unacked still lapses");
+}
+
+// Every sequence of `depth` events from three starting points, with the session invariants (design §5.4) checked
+// after each event. The model tracks what each poll's frame may legitimately become.
+struct Model {
+  std::vector<uint32_t> seq, grant;   // per poll: its seq (0: none) and the grant it was sent under
+  std::vector<bool> v0_relayed;        // relayed to a phone trusted without acks: not queued, by design
+  std::map<uint32_t, uint32_t> acked_by; // per grant: the highest ack its app wrote and the loop applied
+  uint32_t sent_in_grant = 0;          // the highest seq notified under the current grant
+  int version_grant = -1, version = -1;
+} model;
+
+uint32_t currentGrant() { return bleAuthenticated() ? bleAuthGrant() : 0; }
+
+void modelPoll() {
+  const bool subscribed = ble.telemetry_subscribed;
+  const uint32_t grant = currentGrant();
+  const size_t before = ble.values.size(), uploaded = network.received.size();
+  const bool v0 = grant && !bleProto()->relayNeedsSeq && bleProto()->setupAllowed;
+  poll();
+  const unsigned p = polls;
+  const uint32_t s = ble.values.size() > before ? frameSeq(ble.values.back()) : 0;
+  check(!s || subscribed, "invariant: no seq while the app is not subscribed to ABD1");
+  const auto queued = queuedPolls();
+  const bool in_queue = std::find(queued.begin(), queued.end(), p) != queued.end();
+  bool went_up = false;
+  for (size_t i = uploaded; i < network.received.size(); ++i)
+    went_up |= (unsigned)(network.received[i]["soc"]["frac"].get<double>() * 100 + 0.5) - 10 == p;
+  check(!s || in_queue || went_up, "invariant: no v1 frame counted as relayed without being queued");
+  model.seq.push_back(s);
+  model.grant.push_back(grant);
+  model.v0_relayed.push_back(v0 && !in_queue && !went_up);
+  if (s) model.sent_in_grant = std::max(model.sent_in_grant, s);
+}
+
+// then_reconnect: the ack and a stop land as the link drops, and a new v1 session is granted before the loop runs.
+void modelAck(bool then_reconnect) {
+  const uint32_t grant = currentGrant(), seq = model.sent_in_grant;
+  ack(seq);
+  if (then_reconnect) {
+    stop();
+    unlink();
+    g_ble_disconnect_ms = fake_ms;
+    link();
+    prove(proofWith("1"));
+    ble.telemetry_subscribed = ble.session_subscribed = true;
+    model.sent_in_grant = 0;
+  }
+  services();
+  if (!then_reconnect && grant) {
+    if (bleProto()->relayNeedsSeq) model.acked_by[grant] = std::max(model.acked_by[grant], seq);
+  }
+}
+
+void modelCheck(bool was_stopped, uint32_t grant_before, bool resumed) {
+  const uint32_t grant = currentGrant();
+  const auto queued = queuedPolls();
+  std::vector<unsigned> up = uploadedPolls();
+  for (size_t i = 0; i < model.seq.size(); ++i) {
+    const unsigned p = (unsigned)i + 1;
+    const bool kept = std::find(queued.begin(), queued.end(), p) != queued.end() ||
+                      std::find(up.begin(), up.end(), p) != up.end();
+    const uint32_t g = model.grant[i];
+    const bool acked = model.seq[i] && model.acked_by.count(g) && model.acked_by[g] >= model.seq[i];
+    check(kept || model.v0_relayed[i] || acked, "invariant: no frame dropped that its own session did not ack (poll " +
+          std::to_string(p) + ")");
+  }
+  for (const auto& frame : obd_result_vector) {
+    bool tagged = false;
+    for (const auto& value : frame) tagged |= value.first == RELAY_SEQ_KEY;
+    check(!tagged || (grant && bleProto()->relayNeedsSeq), "invariant: no tagged frame from an ended session");
+  }
+  if (grant) {
+    if (model.version_grant != (int)grant) {
+      model.version_grant = (int)grant;
+      model.version = bleProto()->version;
+    }
+    check(bleProto()->version == model.version, "invariant: the version is fixed for the grant");
+  }
+  if (grant && grant != grant_before && bleProto()->relayNeedsSeq)
+    check(bleRelaying() && sessionState()["relay"] == "live", "invariant: a new v1 session starts live");
+  if (was_stopped && grant == grant_before && !resumed)
+    check(!bleRelaying() && sessionState().value("why", "") == "stop", "invariant: only a resume ends a stop");
+}
+
+enum Event { POLL, SUB, UNSUB, ACK, ACK_RECONNECT, STOP, RESUME, WAIT, DUMP, REPROVE, DROP, V1, V0, EVENTS };
+
+void apply(int e) {
+  switch (e) {
+    case POLL: modelPoll(); return;
+    case SUB: ble.telemetry_subscribed = ble.linked; break;
+    case UNSUB: ble.telemetry_subscribed = false; break;
+    case ACK: modelAck(false); return;
+    case ACK_RECONNECT: modelAck(true); return;
+    case STOP: stop(); break;
+    case RESUME: resume(); break;
+    case WAIT: fake_ms += RELAY_ACK_TIMEOUT_MS; break;
+    case DUMP: g_logdump_active = !g_logdump_active; break;
+    case REPROVE: if (bleAuthenticated()) prove(proofWith("0")); break;
+    case DROP: if (ble.linked) { unlink(); g_ble_disconnect_ms = fake_ms; } break;
+    case V1: case V0:
+      if (!bleAuthenticated()) {
+        link();
+        prove(proofWith(e == V1 ? "1" : nullptr));
+        model.sent_in_grant = 0;
+      }
+      break;
+  }
+  services();
+}
+
+void start(int which) {
+  reset();
+  model = Model{};
+  if (which == 0) return; // no phone
+  link();
+  prove(proofWith("1"));
+  ble.telemetry_subscribed = ble.session_subscribed = true;
+  apply(POLL);
+  apply(POLL);
+  ack(1);
+  services();
+  model.acked_by[currentGrant()] = 1;
+  if (which == 2) apply(STOP); // v1 lapsed by a stop, one frame outstanding
+}
+
+void enumerate(int depth) {
+  std::vector<int> events(depth, 0);
+  unsigned long sequences = 0;
+  for (int which = 0; which < 3; ++which) {
+    std::fill(events.begin(), events.end(), 0);
+    while (true) {
+      start(which);
+      modelCheck(false, currentGrant(), false);
+      for (int e : events) {
+        const bool stopped = bleAuthenticated() && bleProto()->relayNeedsSeq && sessionState().value("why", "") == "stop";
+        const uint32_t grant_before = currentGrant();
+        apply(e);
+        modelCheck(stopped, grant_before, e == RESUME);
+      }
+      ++sequences;
+      int i = depth - 1;
+      while (i >= 0 && ++events[i] == EVENTS) events[i--] = 0;
+      if (i < 0) break;
+    }
+  }
+  std::cout << "  " << sequences << " sequences of " << depth << " events\n";
+}
+int g_depth = 4;
+void enumerateGroup() { enumerate(g_depth); }
 
 const std::vector<std::string> kSetupBeforeGrant{"setup_allowed=1", "authenticated=1"};
 
@@ -544,7 +944,8 @@ void grant() {
   check(bleProto()->version == 1, "in either direction");
   unlink();
   check(bleProto() == &kProtoV0, "with no session the protocol is v0");
-  connect();
+  ble.linked = true;
+  ble.set_authenticated(true); // a grant set without bleProtoAccept (none exists in the firmware)
   check(bleProto() == &kProtoV0, "and a grant no proof selected runs v0");
 }
 
@@ -604,17 +1005,25 @@ void noProtocol() {
 }
 
 int main(int argc, char** argv) {
+  std::string only;
+  for (int i = 1; i < argc; ++i) {
+    if (std::string(argv[i]) == "--depth" && i + 1 < argc) g_depth = std::atoi(argv[++i]);
+    else only = argv[i];
+  }
 #if BLE_PROTO_MIN == 0
   const std::vector<std::pair<std::string, void (*)()>> groups{
     {"old-app", oldApp}, {"acking", acking}, {"stall", stall}, {"never-ack", neverAck},
-    {"resume", resume}, {"disconnect", disconnect}, {"presence", presence}, {"hold", hold}, {"sessions", sessions}, {"persistence", persistence},
+    {"resume", resumeAfterLapse}, {"disconnect", disconnect}, {"presence", presence}, {"hold", hold},
+    {"sessions", sessions}, {"persistence", persistence},
     {"negotiation", negotiation}, {"grant", grant}, {"nonce", nonce},
+    {"stop-resume", stopResume}, {"mailbox", mailbox}, {"state", state}, {"subscribed-seq", subscribedSeq},
+    {"enumerate", enumerateGroup},
   };
 #else
   const std::vector<std::pair<std::string, void (*)()>> groups{{"no-protocol", noProtocol}};
 #endif
   for (const auto& group : groups) {
-    if (argc > 1 && group.first != argv[1]) continue;
+    if (!only.empty() && group.first != only) continue;
     group.second();
     std::cout << "ok " << group.first << '\n';
   }

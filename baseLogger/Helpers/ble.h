@@ -23,7 +23,8 @@ extern bool g_no_profile;
 void dropUnsavedPush(const char* why); // defined with the persisted profile below
 bool forgetProfile(const char* why);   // Helpers/auth_gate.h (after network_upload.h); AUTHCLEAR calls it too
 bool bleProtoPhoneIsTransport();       // Helpers/ble_protocol.h (after ble_relay.h)
-void relayAckHook(uint32_t v);         // Helpers/ble_relay.h: the ABD2 "relay_ack" stash
+void relaySessionWrite(const uint8_t* d, size_t n); // Helpers/ble_relay.h: the ABD9 session-channel stash
+size_t relaySessionRead(uint8_t* out, size_t size); // Helpers/ble_relay.h: ABD9's readable state
 
 /*
   Callbackfunction for BLEWrapper. To be called when config has been completely transferred over BLE
@@ -108,6 +109,24 @@ uint32_t bleAuthGrant() {
 #endif
 }
 
+// Whether the app has armed ABD1's CCCD (BLEWrapper clears it on disconnect). In v1 a frame carries a seq only then.
+bool bleTelemetrySubscribed() {
+#if ENABLE_BLE
+  return ble.telemetrySubscribed();
+#else
+  return false;
+#endif
+}
+
+// Notify a session-channel event on ABD9 (Helpers/ble_relay.h). Never touches ABD9's readable value.
+bool bleNotifySession(const char* event) {
+#if ENABLE_BLE
+  return ble.notifySession(event);
+#else
+  return false;
+#endif
+}
+
 // The phone is the transport: authenticated, and its session's protocol says so (Helpers/ble_protocol.h): always in
 // v0 (today's apps, trusted as before), in v1 only while its acks keep moving forward (Helpers/ble_relay.h), never in a
 // session with no protocol. This, not bleAuthenticated(), is what the cellular gates key on: an authenticated app that
@@ -149,8 +168,9 @@ void bleInitForWake() {
   // OBD-alarm flag writes (ABD2 "obd_alarm" - the save-screen toggle). The hook only stashes; the
   // NVS persist runs on the loop task (alarmGateService). See the forward declaration at the top.
   ble.set_alarm_flag_hook(alarmFlagHook);
-  // Relay acks (ABD2 "relay_ack", #90): stash only; relayAckService applies them on the loop task.
-  ble.set_relay_ack_hook(relayAckHook);
+  // The ABD9 session channel (#90, protocol v1): the write hook only stashes, sessionChannelService applies it on the
+  // loop task; the read hook copies the readable state out under its lock.
+  ble.set_session_hooks(relaySessionWrite, relaySessionRead);
   ble.init();
   ble.set_force_repush(BLE_FORCE_REPUSH); // DIAGNOSTIC: force full profile re-push on connect (see config.h)
   g_ble_up = true;

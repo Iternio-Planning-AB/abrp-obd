@@ -1239,9 +1239,12 @@ void loop() {
   // Bluedroid one - and republish the ABD5 info JSON. A cheap flag test when idle (alarm_gate.h).
   alarmGateService();
 
-  // Apply the app's relay announce and acks (ABD2 "relay_ack", #90): take acked frames off the cellular queue,
-  // log a lapse or a resume, and forget the session once the phone is gone. A cheap flag test when idle.
+  // The relay session (#90, Helpers/ble_relay.h): start it for a new grant whose protocol acks frames (selected just
+  // above, in authGateService), end it once the phone is gone, and lapse it to cellular when the acks stall. Then apply
+  // what the app wrote to ABD9 (acks, relay stop/resume) through the session's protocol and refresh ABD9's state.
+  // Cheap when idle.
   relayAckService();
+  sessionChannelService();
 
 #if ENABLE_BLE
   // A phone utc push set the clock without clockNoteRealSync(): the sleep and steps counted so far no longer
