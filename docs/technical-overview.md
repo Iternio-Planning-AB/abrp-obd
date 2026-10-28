@@ -355,9 +355,9 @@ breaking changes appear in the release notes and bump the version; `docs`, `ci`,
 
 The ABRP app fetches the newest signed release and streams it to the dongle over BLE; the dongle
 verifies the ECDSA signature before applying and rolls back if the new image fails its health check.
-The app currently reads releases from a private release repository, using an access token testers
-enter in the app's developer tools. Dongles trust the **signature**, not the repository, so a leaked
-token is a distribution problem, never a way onto a dongle: revoke it and mint a new one.
+The app reads the releases of this repository, which are public, so no token is needed. (Before the
+repository went public, releases lived in a private release repository that testers reached with an
+access token.) Dongles trust the **signature**, not where the image came from.
 
 Each release also carries `factory.bin` (bootloader, partitions and app in one image for
 `esptool.py write_flash 0x0`), which erases NVS and is meant for a blank unit.

@@ -13,7 +13,7 @@
 
   VERIFY BEFORE PARSE, ON THE VERBATIM BYTES. The signature covers the exact ASCII of
   "<header>.<payload>" as the backend emitted it. The app MUTATES the decoded profile after verifying
-  (maxValue/minValue are coerced to numbers by its signed-profile fetch) and this firmware used to reassemble
+  (it coerces maxValue/minValue to numbers) and this firmware used to reassemble
   the pushed key/value packages into key-sorted nlohmann JSON - so neither of those forms is what was
   signed. A detached signature over any "canonical" re-serialization would break on number formatting
   alone. Hence: the JWS travels verbatim, is verified as received, and only then is its own payload
@@ -35,8 +35,8 @@
 #include <mbedtls/sha256.h>
 
 /*
-  The ABRP profile-signing public key, byte-for-byte the one the APP already verifies against
-  (in its signed-profile fetch). Both ends must trust the same key or a profile the app accepts
+  The ABRP profile-signing public key, byte-for-byte the key the app pins to verify the profile JWS it
+  fetches from `/vehicles/obdble_get_pids`. Both ends must trust the same key or a profile the app accepts
   would be refused here. If it is ever rotated, both sides change together and the firmware side ships
   over OTA first - a dongle on the old key still accepts old-key profiles, so there is no flag day.
 */
