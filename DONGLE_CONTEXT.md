@@ -874,9 +874,17 @@ the handshake cannot get a session.
   without cancelling the BLE connection makes the next connect target a device the radio still holds,
   which fails as "already connected" until the OS drops the link. Any path that drops the device from
   app state must also cancel the radio connection.
+- **Relay acks are what keeps the phone the transport** (§2, #90). Negotiate in the ABD8 handshake (the
+  version is per BLE connection and shared by every caller of the handshake); in a v1 session read `seq`
+  beside `tlm`, ack on ABD9 only what a post actually stored, write `{"relay":"stop"}` when it cannot
+  post and `{"relay":"resume"}` when it can again, and send no acks while stopped. After a post of seq N
+  fails, ack nothing until ABD9's state shows `sent >= N` and `oldest` 0 or above N, since a later ack
+  would take N off the dongle's queue too. In a v0 session write nothing to ABD9. An app that stops
+  acking hands the car back to cellular after 120 s, which is safe; an app that acks what it did not
+  post loses those frames.
 
-Per-feature obligations: profile push → Appendix A §3; connect order and decline detection → Appendix A
-§7b; OTA → Appendix B §4, Appendix C §5; log dump → §5.
+Per-feature obligations: relay acks → §2 and the bullet above; profile push → Appendix A §3; connect
+order and decline detection → Appendix A §7b; OTA → Appendix B §4, Appendix C §5; log dump → §5.
 
 ---
 
