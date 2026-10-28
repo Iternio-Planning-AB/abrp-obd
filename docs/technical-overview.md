@@ -147,12 +147,14 @@ order and share its globals. See [`AGENTS.md`](../AGENTS.md) before adding one.
 | `network_upload.h` | Cellular upload, bulk POST, the offline backlog. |
 | `gzip_body.h` | gzip for the POST body: vendored zlib, state in PSRAM, each sent body verified by inflating it again. |
 | `geo_backlog.h` | Keeps location provenance in the backlog so stale positions are never uploaded as fresh. |
-| `ble.h` | The BLEWrapper instance, per-wake BLE bring-up/teardown, the persisted-profile loader, `bleRelaying()`. |
+| `ble.h` | The BLEWrapper instance, per-wake BLE bring-up/teardown, the persisted-profile loader, `bleAuthenticated()` and `bleRelaying()`. |
+| `ble_relay.h` | The relay session (protocol v1): whether a connected app is actually posting the telemetry, the frames it has not acked yet, and the ABD9 session channel (acks, relay stop/resume, the relay state). |
+| `ble_protocol.h` | BLE protocol versions: the version negotiated in the ABD8 handshake, bound to the session grant, and the per-version table the rest of the code calls instead of testing a version. |
 | `log_dump.h` | BLE log-retrieval protocol (ABD7). |
 | `ota_update.h` | BLE firmware-update engine (ABD5/ABD6): staging, ECDSA verify, rollback, the ABD5 info JSON. |
 | `ota_pubkey.h` | Embedded ECDSA public key for OTA image verification. |
 | `server_roots.h` | The root CAs the modem verifies the upload server against (generated). |
-| `auth_gate.h` | Access handshake (ABD8 nonce + HMAC) and the per-dongle secret. |
+| `auth_gate.h` | Access handshake (ABD8 nonce + HMAC, which also offers the protocol range) and the per-dongle secret. |
 | `auth_kex.h` | ECDH key agreement for provisioning that secret. |
 | `jws_verify.h` | RS256 JWS signature verification (mbedTLS) for signed profiles. |
 | `profile_sig.h` | Receives and verifies a signed profile over ABD2, then applies it. |

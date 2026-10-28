@@ -66,14 +66,14 @@ void BLEWrapper::init() {
   pServer = BLEDevice::createServer();
   pServer->setCallbacks(new ServerCallbacks(this));
   // 32 attribute handles, NOT the default 15. Cost: service declaration 1, each characteristic 2, each
-  // CCCD 1. Today: 1 + (10 chars x 2) + 7 CCCDs = 28, leaving 4 spare.
+  // CCCD 1. Today: 1 + (10 chars x 2) + 9 CCCDs = 30, leaving 2 spare.
   //   ABD1 +CCCD, ABD2 +CCCD, ABD3 +CCCD, ABD4 +CCCD, ABD5 +CCCD, ABD6, ABD7 +CCCD, ABD8 +CCCD,
-  //   ABD9, ABDA
+  //   ABD9 +CCCD, ABDA +CCCD  (the last two since #90: 28 -> 30)
   // History, so nobody trims this back: with the DEFAULT budget the table filled up at ABD5's value
   // handle (15/15) and ABD5's CCCD plus ALL of ABD6 were silently dropped from the ATT table - Bluedroid
   // reports out-of-handles only in a GATT event the Arduino core ignores, so phones saw "notify change
   // failed" on ABD5 and no ABD6 at all, which killed OTA and cost days to find.
-  // RAISE THIS NUMBER FIRST if the characteristic list ever grows past the spare 4 - but read the FROZEN
+  // RAISE THIS NUMBER FIRST if the characteristic list ever grows past the spare 2 - but read the FROZEN
   // TABLE note in blewrapper.h before adding anything, because changing the table's shape after bonding
   // is enabled has a user-visible cost. Must use the BLEUUID overload - the const char* one takes no
   // handle count.
@@ -180,16 +180,19 @@ void BLEWrapper::init() {
     BLECharacteristic::PROPERTY_WRITE |
     BLECharacteristic::PROPERTY_NOTIFY
   );
-  // RESERVED (ABD9/ABDA): placeholders so a future feature can be added WITHOUT changing the table's
-  // shape. READ|WRITE only, no CCCD - a notify-capable descriptor can be added later without shifting
-  // any other handle, whereas a whole new characteristic cannot. Inert: no callbacks, no hooks.
-  pReservedACharacteristic = pService->createCharacteristic(
-    RESERVED_A_CHARACTERISTIC_UUID,
-    BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE
+  // ABD9/ABDA were created RESERVED (READ|WRITE, no CCCD), placeholders so a future feature could be added
+  // WITHOUT changing the table's shape - a notify-capable descriptor can be added later without shifting any
+  // other handle, whereas a whole new characteristic cannot. That one change was made in #90, while no dongle
+  // firmware was public (see the FROZEN TABLE note in blewrapper.h): ABD9 is the BLE protocol's session channel
+  // (write in, notify events out, a readable state - Helpers/ble_relay.h), ABDA a notify-capable spare, still
+  // inert: no callbacks, no hooks.
+  pSessionCharacteristic = pService->createCharacteristic(
+    SESSION_CHARACTERISTIC_UUID,
+    BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_NOTIFY
   );
   pReservedBCharacteristic = pService->createCharacteristic(
     RESERVED_B_CHARACTERISTIC_UUID,
-    BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE
+    BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_NOTIFY
   );
   // NOTE: deliberately NOT compiled out behind the sketch's ENABLE_OTA. This library is its own translation
   // unit and never sees config.h (logger.ino includes blewrapper.h BEFORE config.h), so an #if here would
@@ -207,16 +210,17 @@ void BLEWrapper::init() {
     // plaintext link (no error response), which is fine: ABD6 is only ever written after START is
     // ACKed on ABD5, and that already forced encryption.
     // ABD8: pairing-before-authorization is the intended layering for the phase-2 HMAC handshake (the
-    // link encrypts, THEN the peer proves it holds the secret). ABD9/ABDA: inert, but an open window
-    // is an open window - a future use that needs pre-pairing access can flip a permission then
-    // (permissions are per-attribute metadata, not table shape).
+    // link encrypts, THEN the peer proves it holds the secret). ABD9: the session channel, used only
+    // after the grant, which needs an encrypted link anyway. ABDA: inert, but an open window is an open
+    // window - a future use that needs pre-pairing access can flip a permission then (permissions are
+    // per-attribute metadata, not table shape).
     esp_gatt_perm_t enc_rw = ESP_GATT_PERM_READ_ENCRYPTED | ESP_GATT_PERM_WRITE_ENCRYPTED;
     pDeveloperCharacteristic->setAccessPermissions(enc_rw);
     pErrorCharacteristic->setAccessPermissions(ESP_GATT_PERM_READ_ENCRYPTED); // no write property
     pOtaControlCharacteristic->setAccessPermissions(enc_rw);
     pOtaDataCharacteristic->setAccessPermissions(ESP_GATT_PERM_WRITE_ENCRYPTED); // write-only channel
     pAuthCharacteristic->setAccessPermissions(enc_rw);
-    pReservedACharacteristic->setAccessPermissions(enc_rw);
+    pSessionCharacteristic->setAccessPermissions(enc_rw);
     pReservedBCharacteristic->setAccessPermissions(enc_rw);
   }
 
@@ -233,6 +237,8 @@ void BLEWrapper::init() {
   pLogDumpCharacteristic->setCallbacks(new LogDumpCallbacks(this));
   // Auth-gate characteristic: forward-only callback (no auth logic here - see set_auth_hook)
   pAuthCharacteristic->setCallbacks(new AuthCallbacks(this));
+  // Session channel: forward-only callbacks (no protocol logic here - see set_session_hooks)
+  pSessionCharacteristic->setCallbacks(new SessionCallbacks(this));
 
   // https://www.bluetooth.com/specifications/gatt/viewer?attributeXmlFile=org.bluetooth.descriptor.gatt.client_characteristic_configuration.xml
   // Create a BLE Descriptor
@@ -257,6 +263,10 @@ void BLEWrapper::init() {
   pLogDumpCharacteristic->addDescriptor(pLogDumpCccd);
   BLE2902* pAuthCccd = new BLE2902();                      // CCCD - phase 2 notifies the nonce on ABD8
   pAuthCharacteristic->addDescriptor(pAuthCccd);
+  pSessionCccd = new BLE2902();                            // CCCD - the session channel's events (#90)
+  pSessionCharacteristic->addDescriptor(pSessionCccd);
+  BLE2902* pReservedBCccd = new BLE2902();                 // CCCD - so the spare can notify with no table change
+  pReservedBCharacteristic->addDescriptor(pReservedBCccd);
   if (bonding_enabled) {
     // Gate every CCCD like its value, for two reasons. Correctness: subscribing IS access, and an open
     // CCCD would let an unpaired peer arm the notify channel. Behaviour: the app subscribes BEFORE it
@@ -268,11 +278,19 @@ void BLEWrapper::init() {
     pOtaControlCccd->setAccessPermissions(enc_cccd);
     pLogDumpCccd->setAccessPermissions(enc_cccd);
     pAuthCccd->setAccessPermissions(enc_cccd);
+    pSessionCccd->setAccessPermissions(enc_cccd);
+    pReservedBCccd->setAccessPermissions(enc_cccd);
   }
-  // ABD9/ABDA get no descriptor on purpose (see their creation above)
 
   // Start the service
   pService->start();
+  // Every characteristic's value handle, now that start() has registered them. They follow heap-address order, not
+  // creation order (see the FROZEN TABLE note in blewrapper.h), and a bonded phone's cached table is only right while
+  // ABD1-ABD9's handles stay where they were: this line is how two firmware builds are compared from the log.
+  logEvt("GATT handles ABD1-A=%u,%u,%u,%u,%u,%u,%u,%u,%u,%u", pTelemetryCharacteristic->getHandle(),
+    pStartupCharacteristic->getHandle(), pDeveloperCharacteristic->getHandle(), pErrorCharacteristic->getHandle(),
+    pOtaControlCharacteristic->getHandle(), pOtaDataCharacteristic->getHandle(), pLogDumpCharacteristic->getHandle(),
+    pAuthCharacteristic->getHandle(), pSessionCharacteristic->getHandle(), pReservedBCharacteristic->getHandle());
 
   // Start advertising
   BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
@@ -327,7 +345,8 @@ void BLEWrapper::deinit() {
   pOtaDataCharacteristic = NULL;
   pLogDumpCharacteristic = NULL;    // notifyLogDump null-checks this too
   pAuthCharacteristic = NULL;
-  pReservedACharacteristic = NULL;
+  pSessionCharacteristic = NULL;    // notifySession null-checks this
+  pSessionCccd = NULL;
   pReservedBCharacteristic = NULL;
 }
 
@@ -549,6 +568,18 @@ void StartupCallbacks::onWrite(BLECharacteristic* pStartupCharacteristic) {
       pStartupCharacteristic->notify();
       return;
     }
+    // NO-PROTOCOL SESSION (Helpers/ble_protocol.h): the proof was accepted at a version below this firmware's
+    // BLE_PROTO_MIN, from an app that predates negotiation or is too old. The grant stands, so OTA (ABD5/ABD6) and
+    // the log dump (ABD7) still work and an old dongle firmware can still be fixed, but setup is versioned and this
+    // app does not speak a version we do: refuse every write, AUTH and profile packets included, with a reply
+    // distinct from NOAUTH. The bit is set on the loop task before the grant, so it is settled by the time a write
+    // gets past the gate above.
+    if (!wrapper->get_setup_allowed()) {
+      wrapper->logEvt("ABD2 refused: no protocol (app below BLE_PROTO_MIN)");
+      pStartupCharacteristic->setValue("PROTO");
+      pStartupCharacteristic->notify();
+      return;
+    }
     /*
       Dispatch AUTH on its CONTENT, not on the latch.
 
@@ -752,6 +783,12 @@ void ServerCallbacks::onConnect(BLEServer* pServer, esp_ble_gatts_cb_param_t* pa
   // would carry an earlier session's hash - possibly another profile's - for the fast path to claim; and a stray
   // packet with no clean must not complete a push from an earlier session's profile and token. RAM only.
   wrapper->resetPushStaging();
+  // No connection inherits a grant that was already set: onDisconnect clears it too, and a disconnect and the next
+  // connect can both land between two loop passes. This does NOT make every grant this link's own: a proof the old
+  // link wrote is stashed by authGateHook and judged on the loop task later, so if the old link drops and the new one
+  // connects before that pass, the old link's proof can still grant the new link (known, pre-existing race; the nonce
+  // it answers is single-use and expires after AUTH_NONCE_TTL_MS, but it is not tied to the connection).
+  wrapper->clearAuthentication();
   wrapper->set_device_connected(true);
 };
 
@@ -774,8 +811,12 @@ void ServerCallbacks::onDisconnect(BLEServer* pServer, esp_ble_gatts_cb_param_t*
   // without this a reconnect would look already-subscribed and the auth gate's greet-on-subscribe
   // (its rising-edge trigger) would fire before the app's CCCD write actually armed the pipe - the
   // exact race the greeting exists to eliminate. Safe on the Bluedroid task: one RAM byte, no flash.
-  // Deliberately only ABD8: the other CCCDs have no edge-triggered behaviour riding on them.
   wrapper->clearAuthSubscription();
+  // ABD1's and ABD9's for the same reason, since #90: in protocol v1 a frame carries a seq (and its loss is the app's
+  // to ack) only while the app is subscribed to ABD1, so a reconnect must start unsubscribed rather than inherit the
+  // last connection's byte; and ABD9's events go only to an app that armed it on this connection. Every app
+  // resubscribes to ABD1 on each connect. The other CCCDs have no behaviour riding on them.
+  wrapper->clearRelaySubscriptions();
   pServer->startAdvertising(); // restart advertising
 }
 
@@ -905,6 +946,35 @@ bool BLEWrapper::notifyAuth(const uint8_t* frame, size_t len) {
   pAuthCharacteristic->setValue((uint8_t*)frame, len);
   pAuthCharacteristic->notify();
   return true;
+}
+
+bool BLEWrapper::telemetrySubscribed() {
+  return pTelemetryCccd && pTelemetryCccd->getNotifications();
+}
+
+void BLEWrapper::clearRelaySubscriptions() {
+  if (pTelemetryCccd) pTelemetryCccd->setNotifications(false);
+  if (pSessionCharacteristic && pSessionCccd) pSessionCccd->setNotifications(false);
+}
+
+bool BLEWrapper::notifySession(const char* event) {
+  if (!device_connected || !pSessionCharacteristic || !pSessionCccd || !event || !pSessionCccd->getNotifications() ||
+      s_gatts_if == ESP_GATT_IF_NONE)
+    return false;
+  return esp_ble_gatts_send_indicate(s_gatts_if, s_conn_id, pSessionCharacteristic->getHandle(), strlen(event),
+    (uint8_t*)event, false) == ESP_OK;
+}
+
+/* Forward-only session-channel callbacks (Bluedroid task) - all handling happens in Helpers/ble_relay.h. The read
+   callback runs just before the library copies m_value into the read response, so the value it sets is the one read;
+   the state fits one read (<= 93 B, checked where it is built), so no follow-up blob read sees a later value. */
+void SessionCallbacks::onWrite(BLECharacteristic* pSessionCharacteristic) {
+  wrapper->dispatchSessionWrite(pSessionCharacteristic->getData(), pSessionCharacteristic->getLength());
+}
+
+void SessionCallbacks::onRead(BLECharacteristic* pSessionCharacteristic) {
+  uint8_t state[96];
+  pSessionCharacteristic->setValue(state, wrapper->readSession(state, sizeof(state)));
 }
 
 bool BLEWrapper::authSubscribed() {

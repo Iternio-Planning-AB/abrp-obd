@@ -158,10 +158,11 @@ static bool alarmSetupPermitActive() {
   // wizard, switching off, locking and walking away - polling a locked, armed car for the rest of
   // the window. The grace absorbs the 0-3s reconnect flaps the field logs show, so a blip during
   // the wizard does not kill the session's live PID test.
-// bleRelaying(), not bleConnected(): connected AND authenticated. Mere presence would let an
-// unpaired phone camping nearby satisfy the "human is here" half of a live setup permit.
+// bleAuthenticated(), not bleConnected(): connected AND authenticated. Mere presence would let an
+// unpaired phone camping nearby satisfy the "human is here" half of a live setup permit. Nor
+// bleRelaying(): an app whose relay acks lapsed (#90) is still a person with the app at the car.
 #if ENABLE_BLE
-  if (bleRelaying()) { g_alarm_ble_seen_ms = millis(); return true; }
+  if (bleAuthenticated()) { g_alarm_ble_seen_ms = millis(); return true; }
   return g_alarm_ble_seen_ms != 0 && (millis() - g_alarm_ble_seen_ms) <= ALARM_PERMIT_BLE_GRACE_MS;
 #else
   return true;
@@ -313,7 +314,7 @@ void alarmGateService() {
   // the setup permit alive (see alarmSetupPermitActive). It must not sit behind the early return
   // below, or the stamp would only update on the rare iterations that carry a pending flag write.
 #if ENABLE_BLE
-  if (bleRelaying()) g_alarm_ble_seen_ms = millis();
+  if (bleAuthenticated()) g_alarm_ble_seen_ms = millis();
 #endif
   if (g_alarm_flag_pending < 0) return;
   int v = g_alarm_flag_pending;

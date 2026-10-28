@@ -473,6 +473,8 @@ void changeState(ActivityState new_state);     // Helpers/state_machine.h
 #include "Helpers/gzip_body.h"
 #include "Helpers/tlm_signature.h" // pure builder used by network_upload.h
 #include "Helpers/network_upload.h"
+#include "Helpers/ble_relay.h"     // relay acks (#90): uses obd_result_vector, g_upload_held, logEvent; v1's table names it
+#include "Helpers/ble_protocol.h"  // BLE protocol versions: the per-session table bleRelaying() asks; before auth_gate.h
 #include "Helpers/gps_location.h"
 #include "Helpers/state_machine.h"
 #include "Helpers/misc.h"
@@ -1237,6 +1239,13 @@ void loop() {
   // Bluedroid one - and republish the ABD5 info JSON. A cheap flag test when idle (alarm_gate.h).
   alarmGateService();
 
+  // The relay session (#90, Helpers/ble_relay.h): start it for a new grant whose protocol acks frames (selected just
+  // above, in authGateService), end it once the phone is gone, and lapse it to cellular when the acks stall. Then apply
+  // what the app wrote to ABD9 (acks, relay stop/resume) through the session's protocol and refresh ABD9's state.
+  // Cheap when idle.
+  relayAckService();
+  sessionChannelService();
+
 #if ENABLE_BLE
   // A phone utc push set the clock without clockNoteRealSync(): the sleep and steps counted so far no longer
   // explain the clock's error, so restart the drift window rather than learn a wrong rate from it.
@@ -1364,7 +1373,10 @@ void loop() {
   // the instant the phone drops - which is exactly the OTA resume window - and a modem reconnect/POST there
   // would block the loop for seconds (starving sector ACKs) or, via the http=0 recovery ladder, deep-sleep
   // the device mid-transfer.
-  if (!g_weak_rail_cold_boot && !bleRelaying() && !g_ota_active && !network.connected() && (millis() - last_reconnect_try) > WIFI_RETRY_MS) {
+  // !g_logdump_active too, for the same reason (a window reply stalled behind a modem reconnect): the dump used to
+  // rely on the relay hold for it, which kept the transport on the phone while it ran. A v1 relay session (#90) may
+  // now lapse or stop during a dump without reopening cellular under it.
+  if (!g_weak_rail_cold_boot && !bleRelaying() && !g_ota_active && !g_logdump_active && !network.connected() && (millis() - last_reconnect_try) > WIFI_RETRY_MS) {
     Serial.printf("Network offline - retrying\n");
     network.reconnect();
     last_reconnect_try = millis();
@@ -1434,7 +1446,7 @@ void loop() {
       // upload, so an unpaired camping phone that also blocked clock recovery would starve cellular of
       // usable frames on top of blocking the POSTs.
       static unsigned long last_clock_retry = 0;
-      if (!t && !bleRelaying() && !g_ota_active && (millis() - last_clock_retry) > 30000UL) {
+      if (!t && !bleRelaying() && !g_ota_active && !g_logdump_active && (millis() - last_clock_retry) > 30000UL) {
         last_clock_retry = millis();
         if (!clockResync("loop")) clockNtpNoClock();  // before the poll, so its frame gets a utc
       }
@@ -2069,19 +2081,35 @@ void loop() {
 
 #if ENABLE_BLE
     const uint16_t ble_mtu = ble.mtu();
-    const BleTlmFrame ble_frame = bleTlmFrame(current_frame, bleNotifyBudget(ble_mtu));
-    // Sent before buffering: one answer decides whether the phone or cellular carries this frame.
-    const bool ble_relayed = ble.logData(ble_frame.notify, ble_frame.full);
+    const BleProtocol* proto = bleProto(); // the session's protocol version (Helpers/ble_protocol.h)
+    // 0 unless the session's version tags frames for the app to ack (#90): then the frame carries it beside tlm. Only a
+    // frame the buffer block below will queue takes one: an empty frame with a seq would start the ack clock for a
+    // frame cellular never had.
+    const uint32_t relay_seq = frame_has_data ? proto->nextSeq() : 0;
+    const BleTlmFrame ble_frame = bleTlmFrame(current_frame, bleNotifyBudget(ble_mtu), relay_seq);
+    // Sent before buffering: one answer decides whether the phone or cellular carries this frame. A session with no
+    // protocol is handed nothing, and a version that needs a seq counts a frame without one as not relayed: either
+    // way the frame stays queued for cellular.
+    const bool ble_relayed = proto->setupAllowed && ble.logData(ble_frame.notify, ble_frame.full) &&
+                             (relay_seq || !bleProtoTagsFrames(proto));
+    if (frame_has_data) proto->frameQueued(ble_relayed ? relay_seq : 0); // the buffer block below queues it either way
 #else
     const bool ble_relayed = false;
+    const uint32_t relay_seq = 0;
 #endif
 
     if (frame_has_data) { // skip frames that would carry only drivingState so we never POST a meaningless tlm
       driveFrameBuffered();
-      // A relayed frame is not queued too (no second post as ABRP_OTA); the frames already queued stay and
-      // drain over cellular once the session ends.
-      if (!ble_relayed) {
-        const bool queued = queueUploadFrame(obd_result_vector, current_frame);
+      // A frame relayed to an app without acks is not queued too (no second post as ABRP_OTA); the frames already
+      // queued stay and drain over cellular once the session ends. One relayed to an app that acks (#90) is
+      // queued under its seq until the ack takes it off, so a stalled app loses nothing.
+      if (!ble_relayed || relay_seq) {
+        OBDVector tagged;
+        if (ble_relayed && relay_seq) {
+          tagged = current_frame;
+          tagged.emplace_back(RELAY_SEQ_KEY, relay_seq);
+        }
+        const bool queued = queueUploadFrame(obd_result_vector, tagged.empty() ? current_frame : tagged);
 #if ENABLE_NETWORK
         if (queued) g_geo_queued = poll_geo;
 #endif
@@ -2113,7 +2141,7 @@ void loop() {
       if (!logging_message_printed) {
         Serial.printf("Logging data over BLE: ");
         logging_message_printed = true;
-#if ENABLE_LOGGING
+#if ENABLE_LOGGING && ENABLE_NETWORK // g_upload_held is the network queue's
         logEvent("BLE relay queued=%u free=%lu maxblock=%lu",
           (unsigned)(obd_result_vector.size() + g_upload_held.size()), (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getMaxAllocHeap());
 #endif
@@ -2126,8 +2154,11 @@ void loop() {
 #if PRINT
       Serial.printf("Successfully logged BLE\n");
 #endif
-    } else { // if logging data over BLE failed / no phone connected -> fall through to the cellular block
-      if (logging_message_printed) {
+    }
+    // No phone, or one that is not carrying the data: an app whose relay acks lapsed is still notified above,
+    // and cellular carries the frames it never acked (#90).
+    if (!bleRelaying()) {
+      if (!ble_relayed && logging_message_printed) {
         logging_message_printed = false;
         Serial.println(); // Newline to end line of single dots
       }
@@ -2177,7 +2208,7 @@ void loop() {
       // No token, no upload. Belt-and-braces since an unpaired dongle also never polls, so the buffer
       // should be empty anyway - but the alternative is powering the modem for a POST the API can only
       // answer 401, and this is the one condition where that is knowable in advance.
-      if (!bleRelaying() && !g_ota_active && !ble_upload_grace && !obd_result_vector.empty() &&
+      if (!bleRelaying() && !g_ota_active && !ble_upload_grace && !g_logdump_active && !obd_result_vector.empty() &&
           !tlm_push_token.empty() &&
           (ble_handoff_fire || dc_first_upload || ( millis() - last_broadcast ) > upload_delay)) {
         // Awake-aware backoff. The fail cap exists to stop the modem thrashing a SLEEPING car's 12V when
@@ -2322,7 +2353,7 @@ void loop() {
     // same as the skip path would have done immediately - the only difference is that a person had a couple
     // of minutes to reach the dongle first. A connected phone holds it open (the BLE state refreshes
     // last_active, and maintenance_mode covers a serial session), so this only fires when nobody came.
-    if (g_weak_rail_cold_boot && !maintenance_mode && !ble.connected() &&
+    if (g_weak_rail_cold_boot && !maintenance_mode && !bleConnected() &&
         millis() > WEAK_RAIL_COLD_BOOT_AWAKE_MS) {
 #if ENABLE_LOGGING
       logEvent("WEAK-RAIL cold-boot BLE window expired (nobody connected) -> deep sleep %dmin",

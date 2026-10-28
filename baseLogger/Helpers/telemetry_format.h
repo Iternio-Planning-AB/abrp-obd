@@ -25,6 +25,11 @@ bool isGeoMetaKey(const std::string& key) { return key.compare(0, 6, "__geo_") =
 
 bool isGeoValueKey(const std::string& key) { return key == "lat" || key == "lon" || key == "heading"; }
 
+// The ABD1 seq a queued frame was relayed under, so the app's ack can take it off the queue (Helpers/ble_relay.h,
+// #90). Seqs restart every wake, so it is never written to the backlog, and the v2 body never carries it.
+static const char* const RELAY_SEQ_KEY = "__relay_seq";
+bool isRelaySeqKey(const std::string& key) { return key == RELAY_SEQ_KEY; }
+
 void scrubGeoMetadata(OBDVector& frame) {
   for (auto it = frame.begin(); it != frame.end();) {
     if (isGeoMetaKey(it->first)) it = frame.erase(it);
@@ -114,9 +119,15 @@ static int bleTlmRank(const std::string& key) {
   return unlisted;
 }
 
-BleTlmFrame bleTlmFrame(const OBDVector& vec, size_t budget) {
+// seq > 0 (a protocol v1 session whose app is subscribed, #90) goes BESIDE tlm, {"tlm":{...},"seq":n}: frame
+// metadata, which released apps ignore (they read JSON.parse(value).tlm), so it can never collide with a profile key
+// or be forwarded to ABRP as telemetry. Its bytes are reserved from the budget before any field, so the trim drops
+// telemetry only: an ack names it. A negotiating session always has MTU >= 96 (the dongle picks v0 below it), so the
+// envelope and seq always fit. With seq 0 the frame is exactly what apps without acks have always read.
+BleTlmFrame bleTlmFrame(const OBDVector& vec, size_t budget, uint32_t seq = 0) {
   struct Field { std::string key, text; };
   std::vector<Field> fields;
+  const std::string meta = seq ? ",\"seq\":" + std::to_string(seq) : std::string();
   for (const auto& res : vec) {
     const std::string& k = res.first;
     if (isGeoMetaKey(k) || isGeoValueKey(k) || k == "utc" || !bleTlmKey(k)) continue;
@@ -135,7 +146,7 @@ BleTlmFrame bleTlmFrame(const OBDVector& vec, size_t budget) {
       first = false;
       out += fields[i].text;
     }
-    return out + "}}";
+    return out + "}" + meta + "}";
   };
 
   BleTlmFrame frame;
@@ -154,7 +165,7 @@ BleTlmFrame bleTlmFrame(const OBDVector& vec, size_t budget) {
   std::stable_sort(by_rank.begin(), by_rank.end(),
     [&](size_t a, size_t b) { return bleTlmRank(fields[a].key) < bleTlmRank(fields[b].key); });
   std::fill(keep.begin(), keep.end(), false);
-  size_t used = 10, kept = 0;
+  size_t used = 10 + meta.size(), kept = 0;
   for (size_t i : by_rank) {
     const size_t cost = fields[i].text.size() + (kept ? 1 : 0);
     if (used + cost > budget) continue;
@@ -217,8 +228,8 @@ static const char* const V2_PROVIDER = "ABRP_OTA";
 
 // Per-point keys that are metadata or are consumed by a state field below, so they never map 1:1.
 static bool isV2MetaKey(const std::string& k) {
-  return isGeoMetaKey(k) || k == "utc" || k == "is_parked" || k == "is_charging" || k == "is_dcfc" ||
-         k == "lat" || k == "lon";
+  return isGeoMetaKey(k) || isRelaySeqKey(k) || k == "utc" || k == "is_parked" || k == "is_charging" ||
+         k == "is_dcfc" || k == "lat" || k == "lon";
 }
 
 // RFC 3339 in UTC, which is what WithTime.time wants. One per VALUE in v2, where v1 had one integer utc

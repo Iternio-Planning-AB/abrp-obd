@@ -190,6 +190,12 @@ see. Ask us if you need access.
 
 If you changed the APN or the bands in step 3, update over USB instead; see the note there.
 
+**After the update that adds the upload status, pair your phone again once.** That update changes
+the dongle's Bluetooth layout, and a phone paired before it (iPhones especially) keeps using the old
+one. The dongle keeps working and keeps sending your data, but the app can't show whether the phone
+or the dongle is uploading straight away, and says your phone remembers an older version of the
+dongle. In your phone's Bluetooth settings, "forget" the dongle, then connect again from the app.
+
 ## Troubleshooting
 
 **Your log shows where the car has been.** It records the car's GPS position along with everything
@@ -212,6 +218,11 @@ and the bands are right for it (step 3). Then connect over USB, open the serial 
 The dongle decides whether the car is charging from its 12 V system voltage and from the charge
 current your car's profile reports. Either can be off for a car we haven't tested. Download the log
 from the app after a charging session and send it to us with your car model.
+
+**The app says your phone remembers an older version of this dongle.**
+Your phone was paired before a firmware update changed the dongle's Bluetooth layout (see
+"Firmware updates"). In your phone's Bluetooth settings, "forget" the dongle, then connect again
+from the app.
 
 **The app connects, then drops straight away, with no error.**
 Your phone and the dongle disagree about whether they're paired. In your phone's Bluetooth

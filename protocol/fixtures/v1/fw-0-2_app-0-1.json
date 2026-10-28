@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "title": "firmware [0,2] x negotiating app [0,1]: the app chooses 1",
+  "firmware": {"range": [0, 2]},
+  "app": {"range": [0, 1]},
+  "replay": ["app"],
+  "inputs": {"secret_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", "nonce_hex": "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf", "dongle_id": "A1B2C3D4E5F6", "mtu": 185, "reset_window": false},
+  "steps": [
+    {"from": "dongle", "char": "ABD8", "op": "notify", "json": {"nonce": "oKGio6SlpqeoqaqrrK2urw==", "id": "A1B2C3D4E5F6", "proto": [0, 2]}, "length": 70},
+    {"from": "app", "char": "ABD8", "op": "write", "json": {"proof": "sUiXJ7JgKg4EfLI3WApMeVqvkCPFvGsLhlx/oX4KI2c=", "proto": 1}},
+    {"from": "dongle", "char": "ABD8", "op": "notify", "json": {"auth": "ok", "proto": 1}},
+    {"from": "app", "char": "ABD9", "op": "subscribe"},
+    {"from": "app", "char": "ABD1", "op": "subscribe"},
+    {"from": "app", "char": "ABD9", "op": "read", "json": {"relay": "live", "sent": 0, "oldest": 0}},
+    {"from": "dongle", "char": "ABD1", "op": "notify", "poll": 1, "values": {"utc": 1791500001, "soc": 11, "voltage": 350, "current": -20}, "json": {"tlm": {"soc": 11, "voltage": 350, "current": -20}, "seq": 1}},
+    {"from": "app", "char": "ABD9", "op": "write", "json": {"relay_ack": 1}},
+    {"from": "app", "char": "ABD9", "op": "read", "json": {"relay": "live", "sent": 1, "oldest": 0}}
+  ],
+  "expect": {"session": 1, "app_writes_abd9": true}
+}

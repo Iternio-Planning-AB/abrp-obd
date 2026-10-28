@@ -52,7 +52,8 @@ the one check the `main` ruleset requires: a new job goes in that job's `needs`.
 because that gap is the single biggest difference from a normal repo.
 
 The `variants` job compiles the non-default `config.h` variants with `sh tools/check_variants.sh` from `baseLogger/`;
-it never builds the default image. `ENABLE_WIFI 1` (with `ENABLE_CELL 0`) only compiles, as it overflows IRAM, and its TLS is unverified: bench only.
+it never builds the default image. `ENABLE_LOGGING 0`, `ENABLE_BLE 0` and `ENABLE_NETWORK 0` (as `ENABLE_CELL 0`) are built and linked.
+`ENABLE_WIFI 1` (with `ENABLE_CELL 0`) only compiles, as it overflows IRAM, and its TLS is unverified: bench only.
 
 ## The rules that bite first
 
@@ -79,7 +80,10 @@ or software reset reloads it too (`DONGLE_CONTEXT.md` §11).
 
 **BLE callbacks run on the Bluedroid task and must only copy bytes and set a flag.** All NVS, crypto
 and OBD work happens on the loop task, in the matching `*Service()` function. This is stated as
-load-bearing in `auth_gate.h` and holds equally for OTA, the log dump and the profile push.
+load-bearing in `auth_gate.h` and holds equally for OTA, the log dump and the profile push. Two handlers parse small
+JSON there: ABD2's (`StartupCallbacks::onWrite`) and ABD9's (`relaySessionWrite`, at most 64 B, into a mailbox under a
+lock); neither does NVS, crypto or OBD work, and ABD9's also never logs or calls `ble` (pinned by
+`run_relay_checks.py`).
 
 **Tunables live in `config.h`**, each with the reasoning above it. Change the constant, and update the
 comment when the reasoning changes — several of them encode a measured field result, not a preference.
@@ -416,6 +420,54 @@ write, or a push that does not apply, invalidates the hash and removes the file,
 older token. The runner also checks that `otaFinalize` and `bleDeinitForSleep` drop a push still
 pending, after the boot-partition commit and after `ble.deinit()`, by position only. The BLE task, NVS and the reset
 itself are not exercised.
+
+## BLE protocol and relay-session checks (#90)
+
+Run `python3 tests/run_relay_checks.py` (groups `old-app`, `acking`, `stall`, `never-ack`, `resume`, `disconnect`,
+`presence`, `hold`, `sessions`, `persistence`, `negotiation`, `grant`, `nonce`, `stop-resume`, `mailbox`, `state`,
+`subscribed-seq`, `seq-frame`, `dump-cellular`, `unsubscribed`, `fixtures`, `enumerate` with `--depth N`, default 4; and
+`no-protocol`)
+for the protocol version a session negotiates and whether a connected phone is the transport. It compiles the real
+`Helpers/ble_relay.h` (the session state machine and the ABD9 session channel), `ble_protocol.h` (negotiation and the
+per-version tables), auth_gate.h's `authSendNonce`, ble.h's predicates, the ABD1 frame builder, the upload queue, v2
+body and backlog encoder, and from `loop()` the ABD1 send, the queue block, the modem reconnect gate and the upload
+gate with its grace and handoff; BLE, HTTP, the clock and `esp_random` are fakes. A second build with
+`-DBLE_PROTO_MIN=1` runs `no-protocol` and its fixture row; it is compiled only when no group or one of those two is
+named, and a group name that neither build has fails the run. Covered: the negotiation matrix (absent, 0, 1, 7, the
+malformed values, MTU < 96), the version bound to the grant (a repeat proof keeps it, a reconnect between two loop
+passes selects the new grant's), the nonce frame (70 B, 80 B with `"reset":1`), the no-protocol session (setup refused
+before the grant, nothing relayed, everything uploaded). The eight #90 acceptance scenarios run as negotiated v1
+sessions: a v0 app reads frames byte-identical to the pinned pre-#90 builder and keeps the transport however long it
+stays (its ABD9 writes logged once by key and ignored); in v1 frames carry `seq` beside `tlm` only while the app is
+subscribed to ABD1, relayed frames are queued until acked on ABD9, the transport lapses exactly `RELAY_ACK_TIMEOUT_MS`
+after the first outstanding frame or the last ack that moved forward, cellular then sends every unacked frame once, in
+order, and a forward ack or a resume hands it back; an app unsubscribed from ABD1 with untagged frames queued lapses
+`RELAY_UNSUBSCRIBED_MAX_MS` after the first one, and subscribing again ends that; an empty frame takes no seq; a stop
+lapses at once and only a resume ends it; a burst of ABD9
+writes collapses (ack first, then the verb), and an entry from an ended grant is discarded; the readable state (at
+most 93 B, `sent` and `oldest`: the lowest seq still queued for cellular, held frames included, 0 for none) follows
+every transition and a notify never replaces it, and an app that gave up on seq N can tell when N has left the queue
+(the give-up drain: `sent >= N` and `oldest` 0 or above N); a log dump keeps every cellular gate closed; a
+seq never reaches a body or the backlog. `enumerate` runs every 4-event sequence over 15 events from three starting
+points (about 152 k sequences, ~50 s under ASan with the compile) against the session invariants: no frame counted as relayed without
+being queued, no seq while unsubscribed, no tagged frame from an ended session, no frame dropped that its own session
+did not ack, the version fixed for the grant, a new v1 session starts live, only a resume ends a stop, no unsubscribed
+v1 session holds cellular off with untagged frames queued past `RELAY_UNSUBSCRIBED_MAX_MS` (a wait exactly the ack timeout passes it only, a long one both bounds),
+and the ack timeout both ways: tagged frames unacked past `RELAY_ACK_TIMEOUT_MS` (not held) lapse the transport, and a
+live, subscribed session keeps it until then (a wait 2 s short of the timeout; a session idle with everything acked
+must not lapse on its next frame). The model keeps each grant's ack clock (session start, forward ack, a resume or
+resubscribe ending a lapse, every pass with nothing outstanding or a log dump running); a failure names its sequence. `fixtures`
+replays every file under `protocol/fixtures/` the firmware owns (see its README) and checks the main-firmware nonce
+frames against `authSendNonce` from the pinned main commit. Checked by position: the ABD2 handler (its `PROTO` gate
+right after `NOAUTH`, no `relay_ack` case left), a connection starting with no grant (`onConnect` clears it), the GATT table (ABD1-ABD8 as on the pinned main commit, ABD9/ABDA
+with notify and an encrypted CCCD, 30 of 32 handles, the ABD1/ABD8/ABD9 CCCDs cleared on disconnect, the boot handle
+log), auth_gate.h around `bleProtoAccept` (after the HMAC check, the only grant, its reply notified straight after), version numbers outside
+`ble_protocol.h`, which gates key on `bleAuthenticated()`, and the ABD5 info JSON's worst-case length. A phone, the
+app, the GATT stack and the modem are not exercised: the bench procedure is a local document next to the design.
+
+Run `python3 tests/run_protocol_fixture_checks.py` (no compiler) for `protocol/fixtures/`: `SHA256SUMS` lists every
+file and nothing else, every file is what `generate.py` writes, follows the README's schema, and every proof is
+recomputed with hashlib. The app copies the directory with its sums; `v0/` is frozen, `v1/` freezes when v1 ships.
 
 ## Config macro checks
 

@@ -1551,6 +1551,7 @@ void geoLegacy() {
 // The real poll-upload gate, buffer push and pre-sleep trip-end marker (logger.ino, sleep_power.h).
 bool park_marker_owed = false;
 void bufferPoll(OBDVector current_frame, bool ble_relayed = false) {
+  const uint32_t relay_seq = 0; // an app without relay acks; those are tests/run_relay_checks.py's (#90)
 #include "upload_gate.inc"
 #include "upload_buffer.inc"
 }

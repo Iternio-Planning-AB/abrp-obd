@@ -169,6 +169,9 @@ void sm_buffer(OBDVector& current_frame, bool frame_has_data) {{
   int g_geo_queued = 0, poll_geo = 0;
   (void)g_geo_queued;
   const bool ble_relayed = false; // no phone in this harness; OLD ignores both
+  const uint32_t relay_seq = 0; // nor relay acks (#90, tests/run_relay_checks.py); OLD has neither
+  const char* const RELAY_SEQ_KEY = "__relay_seq";
+  (void)relay_seq; (void)RELAY_SEQ_KEY;
 {buffer}}}
 void sm_marker() {{
 {marker}}}
