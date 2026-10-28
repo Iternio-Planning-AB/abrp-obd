@@ -228,10 +228,10 @@
 // allowed either way - without them the handshake could not complete at all.
 //
 // ONE lockout scenario to know before flipping: the app falls back to a package push when it holds no
-// JWS for the vehicle's typecode (an unsigned fetch, or a profile cached before obdPidsJws existed).
-// With this at 1 the dongle refuses that push and setup fails until the app refetches - which it does
-// on the next app start, since the store transform clears obdPidsRefreshed. A stale cache therefore
-// costs one app restart, not a bricked dongle. Revert is this one line.
+// JWS for the vehicle's typecode (an unsigned fetch, or a profile cached before the app kept the JWS).
+// With this at 1 the dongle refuses that push and setup fails until the app refetches the profile,
+// which it does on its next start. A stale cache therefore costs one app restart, not a bricked
+// dongle. Revert is this one line.
 #ifndef PROFILE_REQUIRE_SIGNATURE
 #define PROFILE_REQUIRE_SIGNATURE 0
 #endif

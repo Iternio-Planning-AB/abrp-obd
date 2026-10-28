@@ -665,7 +665,7 @@ static std::vector<std::string> valInputs(const std::string& equation) {
 }
 
 // Virtual keys (isVirtual, an equation over other keys' VAL{name}, no reply of their own; MEB's soc is one). The
-// app evaluates them over a poll's merged values after the poll (postProcessTlm), and so does this, so a profile
+// app evaluates them over a poll's merged values after the poll, and so does this, so a profile
 // reads the same through either. A key whose inputs did not all arrive is skipped, as the app's throw skips it.
 // The result is clamped to the key's min/max, as the app clamps, and a non-finite one is dropped. One virtual key
 // may read another, in any order: each pass evaluates those whose inputs are all there.

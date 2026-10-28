@@ -335,7 +335,7 @@ static bool value(const OBDVector& results, const std::string& key, double& out)
 static bool near(double a, double b) { return a > b - 5e-4 && a < b + 5e-4; }
 
 static void checkProfile() {
-  // The app's MEB cases (abrp-app-new src/state/obdble/tests/MEBsw6.test.ts), each reply in command order:
+  // The app's MEB test cases, each reply in command order:
   // 22028C, 222AB2, 222AB8; "" is no answer.
   struct Case { const char* name; std::string soc, cap, soe; double expected; };
   const std::vector<Case> cases = {
