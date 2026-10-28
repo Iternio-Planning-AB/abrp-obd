@@ -26,7 +26,7 @@
     accel         PARKED                car on, sustained motion, no charge latch       UNCONFIRMED  hold = now, LEASH line
     accel         PARKED, UNCONFIRMED   ... and discharge > DRIVE_DISCHARGE_KW          DRIVING      hold, LEASH line
     accel         DRIVING               car on, sustained motion, no charge latch       DRIVING      hold (continuation, no log)
-    accel         UNCONFIRMED           charge latch set                                PARKED       LEASH line, no freeze
+    accel         UNCONFIRMED           charge latch set, or the car off                PARKED       LEASH line, no freeze
     poll end      UNCONFIRMED           hold = last motion; now - hold > ACTIVE_TIMER   PARKED       LEASH line, no freeze
     poll end      DRIVING               now - last hold > ACTIVE_TIMER                  PARKED       freeze, LEASH re-latch line
     idle          DRIVING               activity state -> CHARGING or STANDBY           PARKED       freeze
@@ -58,6 +58,11 @@ struct DriveEvidence {
   bool discharge;         // the battery is discharging above DRIVE_DISCHARGE_KW
   bool charge_latched;    // the charge latch (recently_charging) is set
 };
+// rail_read: the build reads the rail (ENABLE_IO36_RAIL); without it g_last_io36 stays 0 and only the answer counts.
+inline bool driveCarOn(bool rail_read, float rail, bool obd_recent) {
+  if (!rail_read) return obd_recent;
+  return rail >= RAIL_AWAKE_VOLTS || (obd_recent && rail >= IO36_LOCKOUT_LOW);
+}
 // Why a fresh moving GNSS fix may not start a drive, or nullptr when it may. A drive already under way just
 // continues on it: no new gate.
 inline const char* driveGnssRefusal(const DriveRegion& r, const DriveEvidence& e) {
@@ -74,7 +79,7 @@ inline DriveRegion driveOnMoving(DriveRegion r, unsigned long now_ms) {
   return r;
 }
 inline DriveRegion driveOnAccel(DriveRegion r, const DriveEvidence& e, unsigned long now_ms) {
-  if (r.state == DRIVE_UNCONFIRMED && e.charge_latched) {
+  if (r.state == DRIVE_UNCONFIRMED && (e.charge_latched || !e.car_on)) {
     r.state = DRIVE_PARKED;
     return r;
   }
@@ -145,9 +150,7 @@ inline DriveSample driveSample(const OBDVector* frame) {
   const unsigned long now = millis();
   DriveSample s = {};
   s.obd_recent = g_last_obd_answer_ms && now - g_last_obd_answer_ms < (unsigned long)ACTIVE_TIMER;
-  // A rail under IO36_LOCKOUT_LOW is no car on the port (USB or bench): the last OBD answer predates the unplug.
-  s.evidence.car_on = g_last_io36 >= RAIL_AWAKE_VOLTS ||
-                      (s.obd_recent && (!ENABLE_IO36_RAIL || g_last_io36 >= IO36_LOCKOUT_LOW));
+  s.evidence.car_on = driveCarOn(ENABLE_IO36_RAIL, g_last_io36, s.obd_recent);
   s.evidence.motion_recent = g_last_motion_ms && now - g_last_motion_ms <= (unsigned long)DRIVE_MOTION_RECENT_MS;
 #if ENABLE_MEMS
   s.evidence.motion_sustained = motionSustained(g_drive_motion, now, &s.act_pct);
@@ -212,7 +215,7 @@ inline void driveAccel(const OBDVector& frame) {
       logEvent("LEASH unconfirmed accel act=%u%% rail=%.2f obd=%d -> live location, no drivingState", s.act_pct,
         g_last_io36, s.obd_recent ? 1 : 0);
     else
-      logEvent("LEASH unconfirmed charging -> parked");
+      logEvent("LEASH unconfirmed %s -> parked", s.evidence.charge_latched ? "charging" : "car-off");
 #endif
   } else if (next.last_hold_ms == region.last_hold_ms) {
     return;

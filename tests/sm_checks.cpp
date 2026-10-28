@@ -778,28 +778,49 @@ void rules() {
   // Unplugged and carried on USB power: the car answered a poll a few seconds ago, so that answer is still within
   // ACTIVE_TIMER, but the rail now reads ~5.6 V, under IO36_LOCKOUT_LOW: there is no car on the port. Field: an
   // UNCONFIRMED line quoting rail=5.65 obd=1, then a walking-pace fix unlatched DRIVE.
-  auto usb = [](bool gnss, double rail = 5.65) {
+  const double usb_rail = 5.65;
+  auto usbCarried = [](double rail) {
     SmEvent e = Silent(rail);
-    e.gnss = gnss, e.gnss_kmh = 6.6, e.motion = SM_MOVE_NOW, e.sustained = !gnss;
-    e.name += gnss ? "+gnss,motion" : "+motion,sustained";
+    e.motion = SM_MOVE_NOW, e.sustained = true;
+    e.name += "+motion,sustained";
+    return e;
+  };
+  auto usbWalkingFix = [&] {
+    SmEvent e = Silent(usb_rail);
+    e.gnss = true, e.gnss_kmh = 6.6, e.motion = SM_MOVE_NOW;
+    e.name += "+gnss,motion";
     return e;
   };
   begin();
   playCur(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NONE, false), t);
   playCur(Advance(10000), t);
-  playCur(usb(false), t);
+  playCur(usbCarried(usb_rail), t);
   check(is_currently_parked && !drive_unconfirmed && countLog("LEASH unconfirmed") == 0,
         "a fresh OBD answer does not make a USB-powered dongle's car on: sustained motion stays PARKED", t);
   playCur(Advance(5000), t);
-  playCur(usb(true), t);
+  playCur(usbWalkingFix(), t);
   check(is_currently_parked && !drive_unconfirmed && countLog("LEASH driving") == 0 &&
         logged("LEASH gnss=6.6km/h refused reason=car-off") && sm_published == 1 && !park_marker_owed,
         "nor a walking-pace fix with motion: refused car-off, the frame says PARK", t);
   begin();
+  SmEvent answered_on_usb = Rules(quiet, SM_CAR_OBD, SM_MOVE_NOW, true);
+  answered_on_usb.poll_rail = usb_rail;
+  playCur(answered_on_usb, t);
+  check(is_currently_parked && !drive_unconfirmed, "not even an answer in the same poll as the USB rail", t);
+  begin();
   playCur(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NONE, false), t);
   playCur(Advance(10000), t);
-  playCur(usb(false, IO36_LOCKOUT_LOW), t);
+  playCur(usbCarried(IO36_LOCKOUT_LOW), t);
   check(drive_unconfirmed, "at IO36_LOCKOUT_LOW a recent OBD answer still counts as the car being on", t);
+  // Unplugged while already UNCONFIRMED: it ends at once instead of holding live location on every motion window.
+  enterUnconfirmed();
+  playCur(Advance(5000), t);
+  playCur(usbCarried(usb_rail), t);
+  check(is_currently_parked && !drive_unconfirmed && logged("LEASH unconfirmed car-off -> parked") && sm_freezes == 0 &&
+        !park_marker_owed, "UNCONFIRMED ends when the car is off: PARKED, no freeze, no marker", t);
+  // With no rail reading (ENABLE_IO36_RAIL 0, g_last_io36 stays 0) a recent OBD answer alone is the car on.
+  check(driveCarOn(false, 0.0f, true) && !driveCarOn(false, 0.0f, false) && !driveCarOn(true, (float)usb_rail, true) &&
+        driveCarOn(true, (float)RAIL_AWAKE_VOLTS, false), "the car-on rule with and without a rail reading", t);
 
   // 3. Discharge confirms DRIVING without a fix: the power key, else current x voltage; neither cannot confirm.
   begin();

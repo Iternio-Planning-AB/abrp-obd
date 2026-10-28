@@ -766,14 +766,14 @@
 // Low-rail lockout BAND (using the true rail, not ATRV). If the rail sits in [LOW, HIGH) we treat the
 // battery as weak-but-alive and SUPPRESS all polling (incl. cold boot + heartbeat) so we don't push a
 // recoverable 12V over the edge - the original dead-overnight scenario. The car recovers the moment it's
-// driven (rail jumps to ~14V charging). Field data: healthy rest ~12.1V, charging ~14V, bench/USB ~4.5V.
+// driven (rail jumps to ~14V charging). Field data: healthy rest ~12.1V, charging ~14V, bench/USB ~4.5-5.7V.
 //   HIGH 11.0: clearly below the 12.1V healthy rest (with ADC margin) -> no false lockout on a good battery.
 //   LOW  8.0 : ABOVE bench/no-car (~4.5V), so plugging into USB to DUMP is NOT locked out (rail < LOW ->
 //              "no car / bench", allowed to run normally; a dead car's OBD won't answer anyway, no harm).
 //              The drive rules read LOW too (drive_state.h driveSample): below it, an OBD answer from the last
 //              ACTIVE_TIMER is stale, not a car that is on. FIELD: unplugged and carried on USB (rail 5.65 V), a
-//              seconds-old answer let a walking-pace fix report DRIVE. Raising LOW above a real car's resting rail
-//              would refuse drives on cars whose driving rail sits under RAIL_AWAKE_VOLTS.
+//              seconds-old answer let a walking-pace fix report DRIVE. Raising LOW above a car's driving rail would refuse its drives
+//              whenever that rail is under RAIL_AWAKE_VOLTS (they rely on the OBD answer).
 #define IO36_LOCKOUT_LOW  8.0f
 #define IO36_LOCKOUT_HIGH 11.0f
 

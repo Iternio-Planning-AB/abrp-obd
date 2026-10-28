@@ -289,7 +289,7 @@ awake.** Polling a sleeping EV wakes its ECUs, which then stay awake on the *car
   3.6 V); **IO36 is the trustworthy one**.
 - **Weak-battery lockout band** (`IO36_LOCKOUT_LOW/HIGH` = 8.0/11.0 V): suppress *all* polling so a
   recoverable 12 V isn't pushed over the edge. Below 8 V = bench/no-car (allowed, so USB DUMP works). The drive
-  rules read the same floor: below it, a recent OBD answer no longer counts as the car being on.
+  rules read the same floor (§6a, park/drive).
 - `RAIL_AWAKE_VOLTS 13.3` is **calibrated to one car with almost no margin.** Measured over 1016 field
   samples: moving 13.25–15.2 V (mode 13.4), switched-off 12.5–13.2 V. The bands nearly touch, so
   there's no room for a lower release threshold and **no hysteresis is possible**. Measure any new
@@ -438,7 +438,7 @@ Sustained motion (`DRIVE_SUSTAINED_ACT_PCT` of at least `DRIVE_SUSTAINED_MIN_SAM
 `is_currently_parked` true (every parked-gated guard, the backstop included, treats it as parked) but the frame has no
 `is_parked` key (so no `drivingState`, no `chargingState`, an empty CSV cell), the live location replaces the frozen
 spot and no PARK marker is owed. It leaves for DRIVING on a speed key, a GNSS fix with the evidence above, or discharge;
-for PARKED when the charge latch sets, `ACTIVE_TIMER` passes with no motion, or the ladder goes idle, never with a freeze.
+for PARKED when the charge latch sets, the car is off (as above, so also when unplugged), `ACTIVE_TIMER` passes with no motion, or the ladder goes idle, never with a freeze.
 The OBD-alarm gate takes none of this.
 
 **A location or heading goes up once per GPS observation** (#14). `bulkStringV2` omits a `location` equal to
