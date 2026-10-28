@@ -49,7 +49,7 @@ with tempfile.TemporaryDirectory(prefix="obd-heading-checks-") as temporary:
     buffer_end = logger.index("\n    }\n", buffer_start) + len("\n    }\n")
     (build / "upload_buffer.inc").write_text(logger[buffer_start:buffer_end])
     relay_start = logger.index("    if (ble_relayed) {")
-    relay = logger[relay_start:logger.index("\n    } else {", relay_start)]
+    relay = logger[relay_start:logger.index("\n    }\n    // No phone", relay_start)]
     if re.search(r"(obd_result_vector|g_upload_held)\.(clear|erase|swap)|BacklogPath|[sS]pill|saveUploadBacklog|loadUploadBacklog|queueUploadFrame", relay):
         raise RuntimeError("the BLE relay branch must leave the cellular upload queue in PSRAM, untouched (#91)")
     ota = (root / "baseLogger/Helpers/ota_update.h").read_text()

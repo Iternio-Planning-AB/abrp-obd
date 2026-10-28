@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "title": "v1 firmware [0,1] x negotiating app [0,1]: after a failed post the app waits for the dongle to send that frame",
+  "firmware": {"range": [0, 1]},
+  "app": {"range": [0, 1]},
+  "replay": ["firmware"],
+  "inputs": {"secret_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", "nonce_hex": "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf", "dongle_id": "A1B2C3D4E5F6", "mtu": 185, "reset_window": false},
+  "steps": [
+    {"from": "dongle", "char": "ABD8", "op": "notify", "json": {"nonce": "oKGio6SlpqeoqaqrrK2urw==", "id": "A1B2C3D4E5F6", "proto": [0, 1]}, "length": 70},
+    {"from": "app", "char": "ABD8", "op": "write", "json": {"proof": "sUiXJ7JgKg4EfLI3WApMeVqvkCPFvGsLhlx/oX4KI2c=", "proto": 1}},
+    {"from": "dongle", "char": "ABD8", "op": "notify", "json": {"auth": "ok", "proto": 1}},
+    {"from": "app", "char": "ABD9", "op": "subscribe"},
+    {"from": "app", "char": "ABD1", "op": "subscribe"},
+    {"from": "dongle", "char": "ABD1", "op": "notify", "poll": 1, "values": {"utc": 1791500001, "soc": 11, "voltage": 350, "current": -20}, "json": {"tlm": {"soc": 11, "voltage": 350, "current": -20}, "seq": 1}},
+    {"from": "app", "char": "ABD9", "op": "write", "json": {"relay_ack": 1}},
+    {"from": "dongle", "char": "ABD1", "op": "notify", "poll": 2, "values": {"utc": 1791500002, "soc": 12, "voltage": 350, "current": -20}, "json": {"tlm": {"soc": 12, "voltage": 350, "current": -20}, "seq": 2}, "note": "the app's post of seq 2 fails: it gives up on 2"},
+    {"from": "app", "char": "ABD9", "op": "read", "json": {"relay": "live", "sent": 1, "oldest": 0}, "note": "rebuilt before seq 2 was queued: oldest 0, but sent 1 < 2, so no ack"},
+    {"from": "dongle", "char": "ABD1", "op": "notify", "poll": 3, "values": {"utc": 1791500003, "soc": 13, "voltage": 350, "current": -20}, "json": {"tlm": {"soc": 13, "voltage": 350, "current": -20}, "seq": 3}, "note": "the app posts 3 but does not ack it"},
+    {"from": "app", "char": "ABD9", "op": "read", "json": {"relay": "live", "sent": 2, "oldest": 2}, "note": "sent >= 2, but oldest 2: seq 2 is still queued, so no ack"},
+    {"wait": 120000, "note": "no ack has moved forward since seq 1"},
+    {"from": "dongle", "char": "ABD9", "op": "notify", "json": {"relay": "lapsed", "why": "timeout"}},
+    {"from": "app", "char": "ABD9", "op": "read", "json": {"relay": "lapsed", "why": "timeout", "sent": 3, "oldest": 2}},
+    {"from": "dongle", "char": "ABD1", "op": "notify", "poll": 4, "values": {"utc": 1791500004, "soc": 14, "voltage": 350, "current": -20}, "json": {"tlm": {"soc": 14, "voltage": 350, "current": -20}, "seq": 4}},
+    {"check": {"transport": "cellular", "queued": [], "uploaded": [2, 3, 4]}},
+    {"wait": 1000, "note": "the dongle's next loop pass rebuilds the state"},
+    {"from": "app", "char": "ABD9", "op": "read", "json": {"relay": "lapsed", "why": "timeout", "sent": 4, "oldest": 0}, "note": "sent >= 2 and oldest 0: seq 2 went over cellular, the app may ack again"},
+    {"from": "app", "char": "ABD9", "op": "write", "json": {"relay_ack": 4}},
+    {"from": "dongle", "char": "ABD9", "op": "notify", "json": {"relay": "live"}},
+    {"from": "app", "char": "ABD9", "op": "read", "json": {"relay": "live", "sent": 4, "oldest": 0}},
+    {"check": {"transport": "phone", "queued": [], "uploaded": [2, 3, 4]}}
+  ],
+  "expect": {"session": 1, "app_writes_abd9": true}
+}

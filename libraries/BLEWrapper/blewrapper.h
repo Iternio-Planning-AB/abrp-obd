@@ -35,17 +35,26 @@ using json = nlohmann::json;
 
   iOS caches a peripheral's GATT table across connections, and BONDED devices cache it harder: once
   bonding is enabled (phase 1.2), a table that changes shape can leave a phone unable to see the new
-  attributes until the user manually forgets the device in system settings. This firmware implements
-  neither Service Changed nor the GATT Database Hash (the Arduino BLE library provides neither, and
-  hand-rolling Database Hash means an AES-CMAC over a spec-defined serialization of the attribute
-  table), so there is no way to tell a phone "re-discover me".
+  attributes until the user manually forgets the device in system settings. Nothing here tells a bonded
+  phone "re-discover me" yet: the Arduino BLE library has no Service Changed or GATT Database Hash API,
+  and while Bluedroid's own GATT service probably carries the Service Changed characteristic (the
+  prebuilt SDK config sets CONFIG_BT_GATTS_SEND_SERVICE_CHANGE_AUTO), AUTO fires when the service starts,
+  which is every wake before any phone is connected, so it reaches nobody. Whether a manual indication
+  on the first encrypted connection after a table change works is the Service Changed spike (#90).
 
-  The mitigation is to never change the shape again: ABD9/ABDA are RESERVED, created now, unused. A
-  future feature repurposes one of them instead of appending a new UUID. Handles are assigned in
-  creation order, so appending at the END of this list keeps ABD1-ABD8 at their existing handles - which
-  is what makes the phase-1.1 update safe to deliver over OTA to already-paired phones.
+  The mitigation is to never change the shape again. ABD9/ABDA were created RESERVED so a future feature
+  repurposes one instead of appending a new UUID. They were changed exactly once, while no dongle firmware
+  was public (#90): ABD9 became the protocol's session channel and ABDA a notify-capable spare, each gaining
+  notify and a CCCD - so a later channel needs no table change even if Service Changed never works. ABD1-ABD8
+  are untouched: the released app (7.1.13) uses them, and a phone bonded on the old table still finds them.
+
+  Handles are NOT assigned in creation order: BLEService::start() registers characteristics in the order of
+  a map keyed by object POINTER, so the order follows heap addresses. Each CCCD lands right after its own
+  value, so the two new CCCDs move only handles after ABD9's value (ABDA's), as long as ABD9 and ABDA are
+  allocated last - which nothing guarantees. init() therefore logs every characteristic's handle at boot,
+  and a table change is checked by comparing esp_ble_gatts_show_local_database() dumps on the bench.
 */
-#define RESERVED_A_CHARACTERISTIC_UUID  "ABD9"
+#define SESSION_CHARACTERISTIC_UUID     "ABD9"
 #define RESERVED_B_CHARACTERISTIC_UUID  "ABDA"
 
 #ifndef PRINT
@@ -112,7 +121,17 @@ public:
   bool authenticate(std::string auth_token);
   void clearAuthentication() { auth_token = "false"; set_authenticated(false); setup_unlocked = false; }
   bool get_authenticated() { return authenticated; }
-  void set_authenticated(bool auth) { authenticated = auth; };
+  void set_authenticated(bool auth) { if (auth && !authenticated) ++auth_grants; if (!auth) setup_allowed = false; authenticated = auth; };
+  /* Whether this grant's protocol version allows the ABD2 setup channel (Helpers/ble_protocol.h). False in a session
+     with no protocol - a proof below the firmware's BLE_PROTO_MIN - where the grant is kept so OTA and the log dump
+     still work, and every ABD2 write is answered PROTO. The loop task sets it BEFORE set_authenticated(true), because
+     StartupCallbacks::onWrite decides on the Bluedroid task and cannot see the loop task's protocol; ending the grant
+     clears it. */
+  void set_setup_allowed(bool allowed) { setup_allowed = allowed; }
+  bool get_setup_allowed() { return setup_allowed; }
+  /* Counts session grants: a new one on every false -> true. The relay acks (Helpers/ble_relay.h) are per session, and
+     a disconnect, reconnect and AUTH can all land between two loop iterations, where authenticated alone looks unchanged. */
+  uint32_t auth_grant() const { return auth_grants; }
   bool get_setup_unlocked() { return setup_unlocked; }
   /* Phase B lockdown, passed in from config.h PROFILE_REQUIRE_SIGNATURE the same way - see there for
      what it refuses and the single lockout scenario. */
@@ -213,6 +232,25 @@ public:
      NVS on the loop task. Reaches here only past ABD2's authorization gate. */
   void set_alarm_flag_hook(void (*h)(int v)) { alarm_flag_cb = h; }
   void dispatchAlarmFlag(int v) { if (alarm_flag_cb) alarm_flag_cb(v); }
+  /* Session-channel plumbing (ABD9, the BLE protocol's channel after the grant - Helpers/ble_relay.h). Same
+     forward-only pattern: the write hook stashes on the Bluedroid task (it drops writes from a link without a
+     session grant) and the loop task applies them; the read hook copies the readable state out under its own
+     lock, just before the library builds the read response, so the loop task never calls setValue on ABD9. */
+  void set_session_hooks(void (*write)(const uint8_t*, size_t), size_t (*read)(uint8_t*, size_t)) {
+    session_write_cb = write;
+    session_read_cb = read;
+  }
+  void dispatchSessionWrite(const uint8_t* d, size_t n) { if (session_write_cb) session_write_cb(d, n); }
+  size_t readSession(uint8_t* out, size_t size) { return session_read_cb ? session_read_cb(out, size) : 0; }
+  /* Send a session event on ABD9 as a notify straight to the stack (esp_ble_gatts_send_indicate, no confirm),
+     like logData does for ABD1, so it never replaces ABD9's readable value. False when not connected or the app has not armed ABD9's CCCD. */
+  bool notifySession(const char* event);
+  /* TRUE when the central has armed ABD1's CCCD. In protocol v1 a frame carries a seq only while it has, and
+     onDisconnect clears it (clearRelaySubscriptions), so a reconnect starts unsubscribed. */
+  bool telemetrySubscribed();
+  /* Clear ABD1's and ABD9's CCCD flags. Called from onDisconnect: both are per-connection state the relay
+     session reads (see the note there). RAM-only, safe on the Bluedroid task. */
+  void clearRelaySubscriptions();
   bool notifyAuth(const uint8_t* frame, size_t len);
   /* TRUE when the central has armed ABD8's CCCD. The auth gate GREETS on this flag's rising edge -
      the dongle speaks first, so the app's first frame arrives exactly when its subscription is
@@ -282,14 +320,17 @@ private:
   BLECharacteristic* pOtaDataCharacteristic = NULL;     // ABD6: firmware data in (write-no-response)
   BLECharacteristic* pLogDumpCharacteristic = NULL;     // ABD7: commands in, log chunks notify out
   BLECharacteristic* pAuthCharacteristic = NULL;        // ABD8: nonce out, HMAC proof in (phase 2)
-  BLECharacteristic* pReservedACharacteristic = NULL;   // ABD9: reserved, see FROZEN TABLE above
-  BLECharacteristic* pReservedBCharacteristic = NULL;   // ABDA: reserved, see FROZEN TABLE above
+  BLECharacteristic* pSessionCharacteristic = NULL;     // ABD9: the session channel, see FROZEN TABLE above
+  BLE2902* pSessionCccd = NULL;                         // ABD9's CCCD: are session events wanted?
+  BLECharacteristic* pReservedBCharacteristic = NULL;   // ABDA: spare, notify-capable, see FROZEN TABLE above
 
   /*
     Authentication, no new device connected without correct token
   */
   std::string auth_token{ "false" };
-  bool authenticated = false;   // the SESSION GRANT - see the authenticate() block above
+  volatile bool authenticated = false; // the SESSION GRANT - see the authenticate() block above; read on both tasks
+  volatile uint32_t auth_grants = 0; // see auth_grant()
+  volatile bool setup_allowed = false; // see set_setup_allowed()
   bool setup_unlocked = false;  // the ABD2 state-machine latch - see the same block
   bool profile_require_signature{ false }; // set from config.h PROFILE_REQUIRE_SIGNATURE, before init
 
@@ -331,6 +372,9 @@ private:
   void (*auth_cb)(const uint8_t*, size_t) = nullptr;
   /* OBD-alarm flag hook (see set_alarm_flag_hook) */
   void (*alarm_flag_cb)(int) = nullptr;
+  /* Session-channel hooks (see set_session_hooks) */
+  void (*session_write_cb)(const uint8_t*, size_t) = nullptr;
+  size_t (*session_read_cb)(uint8_t*, size_t) = nullptr;
 
   /* Profile-signature chunk hook (see set_profile_sig_hook) - null until the sketch wires it */
   bool (*profile_sig_cb)(int, int, const char*, size_t) = nullptr;
@@ -443,6 +487,19 @@ public:
 private:
   void onWrite(BLECharacteristic* pLogDumpCharacteristic);
   void onStatus(BLECharacteristic* pLogDumpCharacteristic, Status s, uint32_t code);
+  BLEWrapper* wrapper;
+};
+
+/* ABD9 (session channel). Forward-only: onWrite hands the bytes to the sketch's stash, onRead fills the value
+   from the sketch's state buffer just before the library reads it. Neither logs (an ack arrives per app post) nor
+   touches flash. */
+class SessionCallbacks : public BLECharacteristicCallbacks {
+public:
+  SessionCallbacks(BLEWrapper* wrapper) : wrapper{ wrapper } { };
+
+private:
+  void onWrite(BLECharacteristic* pSessionCharacteristic);
+  void onRead(BLECharacteristic* pSessionCharacteristic);
   BLEWrapper* wrapper;
 };
 

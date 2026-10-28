@@ -635,6 +635,7 @@ struct {
 } sys;
 int normal_sleep_calls = 0;
 bool bleRelaying() { return false; }
+bool g_logdump_active = false; // the reconnect gate holds off during a BLE log dump too (#90)
 unsigned long millis() { return 600000UL; }
 const unsigned long WIFI_RETRY_MS = 20000;
 unsigned long last_reconnect_try = 0;

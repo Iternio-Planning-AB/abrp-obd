@@ -81,24 +81,63 @@ remains affects only an opted-in car: see §7 and `ALARM_GATE_FIELD_FINDINGS.md`
 
 ## 2. The BLE protocol (GATT service ABD0)
 
-**FROZEN TABLE.** The service is created with a fixed handle budget. Characteristics are assigned
-handles in creation order, so **appending at the end** keeps ABD1–ABD8 at their existing handles.
-ABD9/ABDA exist as reserved placeholders for exactly that reason. iOS caches the GATT table and the
-Arduino BLE library implements neither Service Changed nor Database Hash, so a table that shifts
-handles silently breaks already-paired iPhones.
+**FROZEN TABLE.** The service is created with a fixed handle budget (32; 30 used). iOS caches the GATT
+table, bonded phones harder, and nothing here tells a phone to rediscover it: the Arduino BLE library
+has no Service Changed or Database Hash API, and Bluedroid's own automatic Service Changed fires when
+the service starts, every wake, before any phone is connected. So a table that shifts handles silently
+breaks already-paired phones. **Handles are not assigned in creation order**: `BLEService::start()`
+registers characteristics in the order of a map keyed by object pointer, i.e. by heap address. Each
+CCCD lands right after its own value. `init()` logs every value handle at boot (`GATT handles
+ABD1-A=…`), and a table change is checked by comparing `esp_ble_gatts_show_local_database()` dumps.
+
+ABD9/ABDA were created as reserved placeholders so a feature could reuse one instead of reshaping the
+table. That one change was made in #90, while no dongle firmware was public: ABD9 became the protocol's
+session channel and ABDA a notify-capable spare, each gaining notify and an encrypted CCCD (28 → 30
+handles). ABD1–ABD8 are unchanged, because the released app (7.1.13) uses them. Whether a manual
+Service Changed indication on the first encrypted connection after a table change makes bonded phones
+rediscover is the Service Changed spike (`spike/service-changed`, bench only); until it is proven, a
+phone bonded on the old table sees ABD9 without notify until its cache refreshes (the app polls ABD9's
+state then).
 
 | UUID | Purpose |
 |---|---|
 | `ABD0` | The service |
-| `ABD1` | Telemetry (notify + read) — the live frame |
-| `ABD2` | Setup/config: token handshake, profile push, `obd_alarm` flag |
+| `ABD1` | Telemetry (notify + read) — the live frame; in a v1 session `{"tlm":{…},"seq":n}` |
+| `ABD2` | Setup/config: token handshake, profile push, `obd_alarm` flag; `PROTO` in a no-protocol session |
 | `ABD3` | Developer |
 | `ABD4` | Error |
 | `ABD5` | OTA control + the readable info JSON (installed fw, state, `alarm`) |
 | `ABD6` | OTA data (write-only firmware payload) |
 | `ABD7` | Log dump |
-| `ABD8` | Auth handshake (nonce + HMAC) |
-| `ABD9`, `ABDA` | **Reserved — do not repurpose casually** (see FROZEN TABLE) |
+| `ABD8` | Auth handshake (nonce + HMAC), and the protocol version negotiation |
+| `ABD9` | Session channel (v1+): write, notify, readable state — relay acks, stop/resume, relay state |
+| `ABDA` | Spare: read, write, notify + CCCD, inert (**do not repurpose casually**, see FROZEN TABLE) |
+
+### Protocol versions (`Helpers/ble_protocol.h`)
+
+Every nonce frame offers the versions this firmware speaks, `"proto":[BLE_PROTO_MIN,BLE_PROTO_MAX]`
+(`[0,1]`). An app that negotiates answers with the version it chose in its proof
+(`{"proof":…,"proto":1}`), and the `ok` names the session's version only when the proof carried one
+(`{"auth":"ok","proto":1}`), so an app that does not negotiate reads exactly what it always has.
+Absent means 0; malformed means absent (a version is a JSON unsigned integer token 0–255, so `"1"`,
+`-1`, `1.5`, `1.0` and 2^40 are not); a version above the maximum runs at the maximum; below MTU 96 at
+the proof the dongle picks v0. The version belongs to the session grant: a further proof on the same
+grant keeps it (`AUTH2 ok - session kept proto=N (asked M)`), and with no grant the protocol is v0.
+
+- **v0** is today's protocol: an authenticated phone is the transport while connected, its frames
+  carry no `seq` and are not queued, ABD9 carries nothing (messages there are logged once by key and
+  ignored).
+- **v1** (#90) adds the relay session below.
+- A proof **below `BLE_PROTO_MIN`** (`config.h`, 0, so unreachable today) gets a session with **no
+  protocol**: OTA and the log dump work, nothing is relayed on ABD1 (frames stay queued for cellular),
+  and every ABD2 write is answered `PROTO`, decided on the Bluedroid task from a `setup_allowed` bit the
+  loop task sets before the grant. Raising the minimum strands apps that do not negotiate; judge it
+  from the `app=M` field of `AUTH2 ok - session granted proto=N app=M range=MIN-MAX`, never guess.
+- Callers never test a version number: they call the session's table (`bleProto()`). A new version
+  builds its table from the one below; a message the other side may ignore goes on ABD9 freely, one it
+  must act on needs a version.
+- Contract tests: `protocol/fixtures/` holds one golden exchange per firmware × app pairing, replayed
+  by the firmware (`tests/run_relay_checks.py fixtures`) and copied into the app with its `SHA256SUMS`.
 
 ### Hard-won BLE facts
 
@@ -128,6 +167,66 @@ handles silently breaks already-paired iPhones.
 - **Clearing a bond on one side only looks like a hardware fault.** The phone keeps its half of the
   key, offers it, and the link drops before pairing runs — a connect flap with no error anywhere.
   `BONDCLEAR` prints the "forget the device on the phone too" reminder for this reason.
+
+### Relay acks: is the phone actually carrying the data? (#90, protocol v1)
+
+A connected, authenticated phone used to count as the transport for as long as it stayed connected, and
+a frame notified on ABD1 was never queued for cellular. An app that stopped posting (backgrounded, logged
+out, offline) silenced the car: an ID.5 drove 65 minutes in the `BLE` state with nothing reaching ABRP.
+ABD1 is notify-only, so the app has to say what it posted (`Helpers/ble_relay.h`). In a v1 session:
+
+- An ABD1 frame sent **while the app is subscribed to ABD1** carries `"seq":n` beside `tlm`, counting
+  from 1 every wake, and is also queued for cellular under that seq. Its bytes are reserved from the
+  notify budget, so the trim drops telemetry only. A frame sent while the app is not subscribed (e.g.
+  during the profile push) carries no seq and is queued as a plain cellular frame, so a long push cannot
+  run the clock. ABD1's CCCD is cleared on disconnect: a reconnect starts unsubscribed.
+- **Ack:** after each successful `APP_OBD` post the app writes `{"relay_ack":n}` to **ABD9**,
+  cumulative over the frames it posted (it posts the latest frame per tick); acked frames come off the
+  queue. **Stop/resume:** `{"relay":"stop"}` when it knows it cannot post (offline, logged out, a 401
+  pause, a 403) hands the transport to cellular at once; `{"relay":"resume"}` is the only thing that
+  ends a stop (an ack from a post already in flight does not). Not on backgrounding: the app relays with
+  the phone locked.
+- **Timeout, the safety net:** once tagged frames have waited `RELAY_ACK_TIMEOUT_MS` (120 s) with no ack
+  moving forward, cellular takes over with every frame still queued; the next forward ack or a resume
+  hands the transport back. Nothing outstanding is never late, and an update or a log dump (which pause
+  polling) holds the clock without changing the state; the cellular gates hold off for both on their own.
+- **Unsubscribed, the second bound:** an app that acked everything and then stopped listening on ABD1 (its
+  subscription died, the link and grant did not) acks nothing more, so the ack clock never runs. Once frames have
+  been queued untagged for `RELAY_UNSUBSCRIBED_MAX_MS` (300 s, above the longest profile push, which runs before the
+  app subscribes) while it is not subscribed, the session lapses (`"why":"unsubscribed"`); subscribing again, a
+  forward ack or a resume hands the transport back. An update or a log dump holds this clock too. Only a frame with
+  data takes a seq, so an empty frame never starts the ack clock without being queued.
+- **ABD9** answers with events (`{"relay":"lapsed","why":"timeout"|"stop"|"unsubscribed"}`, `{"relay":"live"}`, as
+  notifies that never replace the value) and a readable state, `{"relay":"live"|"lapsed","why":…,
+  "sent":s,"oldest":o}` (`{}` outside a v1 session, and to any link or grant it was not built for; at most 93 B,
+  checked at compile time), served from `onRead` under the relay lock. `sent` is the last seq notified this wake;
+  `oldest` the lowest seq still in the cellular queue (`obd_result_vector` and `g_upload_held`, tagged frames only),
+  0 for none. It is rebuilt at the top of every loop pass and on each transition, so a frame shows from the pass
+  after it was queued. Writes are dropped unless the link holds a grant, and one over 64 B is
+  not parsed (logged as key `?`); the
+  Bluedroid callback keeps one grant-stamped mailbox (highest ack, last verb), applied on the loop task
+  by `sessionChannelService()` — ack first, then the verb — and an entry from an ended grant is
+  discarded (`BLE session stale grant`).
+- **The app's give-up rule:** after a failed post of seq N the app acks nothing until a state read shows `sent >= N`
+  and `oldest` 0 or above N; a cumulative ack before that would drop N from the queue unposted. `sent >= N` proves the
+  state was rebuilt after N was queued. A frame held for the next wake keeps `oldest` at or below it, so that app acks
+  nothing more this wake: cellular carries the frames, duplicates at worst, never a lost point.
+- The session is one state machine: `NO_SESSION` → `GRANTED` (v0, no protocol) or `LIVE` (v1);
+  `LIVE` → `LAPSED(stop|timeout|unsubscribed)`; back to `LIVE` on resume (or a forward ack after a timeout or
+  unsubscribed lapse, or the app subscribing again after an unsubscribed one); any →
+  `NO_SESSION` when the grant ends. An ack beyond the last seq sent is ignored, and a session's unacked
+  frames lose their seq when it ends (sessions are counted by grant, so a reconnect between two loop
+  passes still ends one), so the next session's acks cannot drop them. An ack still on its way when a
+  session ends is lost with it: a duplicate point over cellular, never a lost one.
+- **An app that does not negotiate gets v0 and is trusted as before**, frames byte-identical, so
+  current apps keep #90 until they negotiate. Presence (the awake leash, the alarm gate) keys on
+  `bleAuthenticated()`, which a lapse does not change.
+- Log lines: `BLE relay acks on`, `BLE relay lapsed no ack … -> cellular`, `BLE relay lapsed unsubscribed for Ns
+  queued=k -> cellular`, `BLE relay stop by app`, `BLE relay resume by app`, `BLE relay resumed ack=`,
+  `BLE relay resubscribed`, `BLE relay ack ignored`,
+  `BLE relay end acked= sent= unacked=`, `BLE session proto=N ignored key=K` (at most 8 keys a session, then
+  `BLE session further ignored keys not logged`), `BLE session stale grant`.
+  Valid acks themselves are not logged.
 
 ---
 
@@ -177,10 +276,15 @@ profile write.
   not scrubbed: a raw read of the flash chip can still recover them, and a reset does not touch the coredump
   partition, BLE bonds (`BONDCLEAR`), the OBD-alarm flag or the clock and OTA NVS. The in-app reset needs only the
   power-on window, not a grant, so anyone in range then can erase the log.
+- **The handshake also negotiates the BLE protocol version** (§2): every nonce frame carries
+  `"proto":[MIN,MAX]` (70 B, 80 B with `"reset":1`, 84 B at worst, held under the 93 B notify of the MTU
+  96 floor at compile time), the proof may carry the version the app chose, and the `ok` names the
+  session's version when it did. The version is chosen after the HMAC check, never before it.
 - **Greet on the CCCD rising edge.** The dongle speaks first, when the app's subscription is armed,
   which removes the subscribe-vs-write race entirely — no retries, no timeouts.
 - **Two flags, deliberately:** `setup_unlocked` (the ABD2 state-machine latch) vs `authenticated`
-  (the session grant). Conflating them made enforcement impossible.
+  (the session grant). Conflating them made enforcement impossible. Both are cleared on disconnect and again on
+  connect, so a grant is always the current link's own (the protocol version and the relay session are keyed on it).
 - Why it exists: the old handshake sent the vehicle's **cloud push token in plaintext on every
   connect**. Sniff it once and you could push fabricated telemetry for that vehicle forever.
 
@@ -454,13 +558,14 @@ backend silently dropped counts as sent until then too. `UPLOAD body` logs `loc=
 `ldup=` (suppressed repeats).
 
 **A phone taking the transport keeps the cellular queue** (#58). The BLE notify goes out before the frame is
-buffered, and its answer decides both: a relayed frame is not queued (the phone posts it as `APP_OBD`), and
+buffered, and its answer decides both: a frame relayed in a v0 session is not queued (the phone posts it as
+`APP_OBD`; in a v1 session it is queued under its seq until the app acks it, §2), and
 frames already queued (failed-POST retries, a slow drain, a restored backlog) are kept while cellular stands
 down. They stay in PSRAM for the whole session (an earlier version spilled them to the backlog file, which freed no
 internal heap and cost about 6 s of flash writes; #91 removed it). Cellular stands down while the phone relays;
 when relaying ends the loop's upload drains them oldest first, at most `UPLOAD_MAX_BATCHES_PER_CYCLE` x
 `MAX_FRAMES_PER_POST` per cycle, and a sleep in the session flushes them over cellular first and saves what is
-left (an overwrite of the backlog file). A backlog file over the cap restores only the newest frames. A frame the phone relayed never goes over cellular, including the dongle's own fix (BLE trims
+left (an overwrite of the backlog file). A backlog file over the cap restores only the newest frames. A frame the phone relayed in a v0 session, or that a v1 app acked, never goes over cellular, including the dongle's own fix (BLE trims
 `lat`/`lon`/`heading`; the phone supplies its own). A profile push with a different (or, after an unreadable
 profile, an unknown) `tlm_push_token` discards the queue and the backlog file (`UPLOAD discarded n=…
 reason=token`): those frames may be another vehicle's history. The cap drops the oldest frame past
@@ -769,9 +874,17 @@ the handshake cannot get a session.
   without cancelling the BLE connection makes the next connect target a device the radio still holds,
   which fails as "already connected" until the OS drops the link. Any path that drops the device from
   app state must also cancel the radio connection.
+- **Relay acks are what keeps the phone the transport** (§2, #90). Negotiate in the ABD8 handshake (the
+  version is per BLE connection and shared by every caller of the handshake); in a v1 session read `seq`
+  beside `tlm`, ack on ABD9 only what a post actually stored, write `{"relay":"stop"}` when it cannot
+  post and `{"relay":"resume"}` when it can again, and send no acks while stopped. After a post of seq N
+  fails, ack nothing until ABD9's state shows `sent >= N` and `oldest` 0 or above N, since a later ack
+  would take N off the dongle's queue too. In a v0 session write nothing to ABD9. An app that stops
+  acking hands the car back to cellular after 120 s, which is safe; an app that acks what it did not
+  post loses those frames.
 
-Per-feature obligations: profile push → Appendix A §3; connect order and decline detection → Appendix A
-§7b; OTA → Appendix B §4, Appendix C §5; log dump → §5.
+Per-feature obligations: relay acks → §2 and the bullet above; profile push → Appendix A §3; connect
+order and decline detection → Appendix A §7b; OTA → Appendix B §4, Appendix C §5; log dump → §5.
 
 ---
 
@@ -923,7 +1036,8 @@ internals removed; see the note at its top).
 ## 11. If you change one thing, know this
 
 1. **Release through the workflow** (`RELEASING.md`); `OTA_FW_VERSION` comes from the tag, not an edit.
-2. **Don't reorder the GATT table** — append only (FROZEN TABLE).
+2. **Don't reorder the GATT table** — nor change it at all: ABD9/ABDA used up the one change (#90), and handle order
+   follows heap addresses, not creation order (FROZEN TABLE). Compare the boot `GATT handles` line and a table dump.
 3. **Don't do flash/crypto/OBD work on a BLE callback** — stash and let the loop task handle it.
 4. **Don't add a peripheral-initiated pairing request** — gate an attribute instead.
 5. **Measure `RAIL_AWAKE_VOLTS` per car** before trusting any rail-based decision.
@@ -942,6 +1056,11 @@ internals removed; see the note at its top).
    the latch) withholds the frame's `is_parked`, switches `addGpsData` to the live fix and owes no marker; everything
    else keeps reading `is_currently_parked`. A new parked-gated guard needs no change; one that must tell the states
    apart reads `drive_unconfirmed`. `tests/run_sm_checks.py rules` pins the transitions.
+11. **Never branch on a BLE protocol version number outside `ble_protocol.h`** — call the session's table
+   (`bleProto()`), and add a field to it when a version needs to differ. A new message the app must act on, a changed
+   format or a removed one needs a new version; one the other side may ignore goes on ABD9 freely; ABD2 and the
+   inside of `tlm` gain nothing (released apps fold unknown ABD2 keys into the profile and forward `tlm` as
+   telemetry). Released versions' wire fixtures (`protocol/fixtures/`) are frozen.
 
 
 ---
@@ -1365,6 +1484,10 @@ dongle → {"nonce":"<16 random bytes, base64>"}      // esp_random(), single-us
 app    → {"proof":"<HMAC-SHA256(secret, nonce), base64>"}
 dongle: recompute, constant-time compare → authenticated
 ```
+
+(As built, the nonce frame also carries the dongle `"id"`, `"reset":1` while the key-reset window is open, and,
+since #90, the protocol range `"proto":[MIN,MAX]`; the proof may carry `"proto":v` and the reply is then
+`{"auth":"ok","proto":v}`. See §2 and §3.)
 
 No backend call. HMAC-SHA256 is microseconds on the ESP32 and mbedTLS is already linked.
 

@@ -22,6 +22,9 @@ extern bool g_obd_needs_init;
 extern bool g_no_profile;
 void dropUnsavedPush(const char* why); // defined with the persisted profile below
 bool forgetProfile(const char* why);   // Helpers/auth_gate.h (after network_upload.h); AUTHCLEAR calls it too
+bool bleProtoPhoneIsTransport();       // Helpers/ble_protocol.h (after ble_relay.h)
+void relaySessionWrite(const uint8_t* d, size_t n); // Helpers/ble_relay.h: the ABD9 session-channel stash
+size_t relaySessionRead(uint8_t* out, size_t size); // Helpers/ble_relay.h: ABD9's readable state
 
 /*
   Callbackfunction for BLEWrapper. To be called when config has been completely transferred over BLE
@@ -83,19 +86,54 @@ bool bleConnected() {
 #endif
 }
 
-// TRUE only when a connected phone has ALSO completed the AUTH handshake on ABD2 - i.e. the app is
-// actually taking the telemetry and relaying it to the cloud. This, not bleConnected(), is what the
-// cellular gates must key on: with the GATT table encryption-gated, a phone that DECLINED the pairing
-// dialog (or any stranger) stays connected but can read nothing - and keying cellular off mere presence
-// made the dongle buffer silently while such a phone camped (data flowed NOWHERE live; field-found).
-// authenticated is session-scoped: set by AUTH OK, cleared on disconnect/deinit - and AUTH can only
-// arrive over a paired link, so this is exactly "the phone is a working transport".
-bool bleRelaying() {
+// TRUE only when a connected phone has ALSO completed the AUTH handshake on ABD2. With the GATT table
+// encryption-gated, a phone that DECLINED the pairing dialog (or any stranger) stays connected but can read
+// nothing - and keying cellular off mere presence made the dongle buffer silently while such a phone camped
+// (data flowed NOWHERE live; field-found). authenticated is session-scoped: set by AUTH OK, cleared on
+// disconnect/deinit - and AUTH can only arrive over a paired link. This says a person with the app is at the
+// car: the awake leash and the alarm gate's "human is here" key on it.
+bool bleAuthenticated() {
 #if ENABLE_BLE
   return ble.connected() && ble.get_authenticated();
 #else
   return false;
 #endif
+}
+
+// Which session grant authenticated() belongs to (BLEWrapper::auth_grant): the protocol version (Helpers/ble_protocol.h)
+// and the relay session (Helpers/ble_relay.h) belong to one grant each.
+uint32_t bleAuthGrant() {
+#if ENABLE_BLE
+  return ble.auth_grant();
+#else
+  return 0;
+#endif
+}
+
+// Whether the app has armed ABD1's CCCD (BLEWrapper clears it on disconnect). In v1 a frame carries a seq only then.
+bool bleTelemetrySubscribed() {
+#if ENABLE_BLE
+  return ble.telemetrySubscribed();
+#else
+  return false;
+#endif
+}
+
+// Notify a session-channel event on ABD9 (Helpers/ble_relay.h). Never touches ABD9's readable value.
+bool bleNotifySession(const char* event) {
+#if ENABLE_BLE
+  return ble.notifySession(event);
+#else
+  return false;
+#endif
+}
+
+// The phone is the transport: authenticated, and its session's protocol says so (Helpers/ble_protocol.h): always in
+// v0 (today's apps, trusted as before), in v1 only while its acks keep moving forward (Helpers/ble_relay.h), never in a
+// session with no protocol. This, not bleAuthenticated(), is what the cellular gates key on: an authenticated app that
+// stopped posting (backgrounded, logged out, offline) kept cellular off for a 65-minute drive (#90).
+bool bleRelaying() {
+  return bleAuthenticated() && bleProtoPhoneIsTransport();
 }
 
 #if ENABLE_BLE
@@ -131,6 +169,9 @@ void bleInitForWake() {
   // OBD-alarm flag writes (ABD2 "obd_alarm" - the save-screen toggle). The hook only stashes; the
   // NVS persist runs on the loop task (alarmGateService). See the forward declaration at the top.
   ble.set_alarm_flag_hook(alarmFlagHook);
+  // The ABD9 session channel (#90, protocol v1): the write hook only stashes, sessionChannelService applies it on the
+  // loop task; the read hook copies the readable state out under its lock.
+  ble.set_session_hooks(relaySessionWrite, relaySessionRead);
   ble.init();
   ble.set_force_repush(BLE_FORCE_REPUSH); // DIAGNOSTIC: force full profile re-push on connect (see config.h)
   g_ble_up = true;

@@ -5,7 +5,7 @@ json encodeUploadFrame(const OBDVector& frame) {
   for (const auto& res : frame) {
     if (isGeoValueKey(res.first) || res.first == "__geo_loc_utc" || res.first == "__geo_head_utc")
       geo[res.first] = res.second;
-    else if (!isGeoMetaKey(res.first)) core[res.first] = res.second;
+    else if (!isGeoMetaKey(res.first) && !isRelaySeqKey(res.first)) core[res.first] = res.second;
   }
   double utc = core.value("utc", 0.0);
   double loc_utc = geo.value("__geo_loc_utc", 0.0), head_utc = geo.value("__geo_head_utc", 0.0);

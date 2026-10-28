@@ -86,6 +86,7 @@ static bool profileSigAppend(int index, int total, const char* data, size_t len)
   The profile that gets applied is the signed payload - deliberately NOT a reassembly of anything the
   app sent as separate values. That is the whole point: what runs is what was signed.
 */
+#if ENABLE_BLE
 void profileSigService() {
   if (profile_jws_failed) {
     profile_jws_failed = false;
@@ -153,6 +154,9 @@ void profileSigService() {
   profile_jws_expected = 0;
   ble.notifySetup("JWS OK");
 }
+#else
+void profileSigService() {} // no BLE, no ABD2 push to verify
+#endif
 
 /*
   Serial-only proof that verification actually DISCRIMINATES, not merely that it returns true.
