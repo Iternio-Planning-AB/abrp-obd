@@ -775,6 +775,32 @@ void rules() {
   playCur(Rules(quiet, SM_CAR_OFF, SM_MOVE_NOW, true, 12.5), t);
   check(is_currently_parked && !drive_unconfirmed && countLog("LEASH") == 0, "sustained motion on a car that is off does nothing", t);
 
+  // Unplugged and carried on USB power: the car answered a poll a few seconds ago, so that answer is still within
+  // ACTIVE_TIMER, but the rail now reads ~5.6 V, under IO36_LOCKOUT_LOW: there is no car on the port. Field: an
+  // UNCONFIRMED line quoting rail=5.65 obd=1, then a walking-pace fix unlatched DRIVE.
+  auto usb = [](bool gnss, double rail = 5.65) {
+    SmEvent e = Silent(rail);
+    e.gnss = gnss, e.gnss_kmh = 6.6, e.motion = SM_MOVE_NOW, e.sustained = !gnss;
+    e.name += gnss ? "+gnss,motion" : "+motion,sustained";
+    return e;
+  };
+  begin();
+  playCur(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NONE, false), t);
+  playCur(Advance(10000), t);
+  playCur(usb(false), t);
+  check(is_currently_parked && !drive_unconfirmed && countLog("LEASH unconfirmed") == 0,
+        "a fresh OBD answer does not make a USB-powered dongle's car on: sustained motion stays PARKED", t);
+  playCur(Advance(5000), t);
+  playCur(usb(true), t);
+  check(is_currently_parked && !drive_unconfirmed && countLog("LEASH driving") == 0 &&
+        logged("LEASH gnss=6.6km/h refused reason=car-off") && sm_published == 1 && !park_marker_owed,
+        "nor a walking-pace fix with motion: refused car-off, the frame says PARK", t);
+  begin();
+  playCur(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NONE, false), t);
+  playCur(Advance(10000), t);
+  playCur(usb(false, IO36_LOCKOUT_LOW), t);
+  check(drive_unconfirmed, "at IO36_LOCKOUT_LOW a recent OBD answer still counts as the car being on", t);
+
   // 3. Discharge confirms DRIVING without a fix: the power key, else current x voltage; neither cannot confirm.
   begin();
   playCur(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, true, 12.5), t);

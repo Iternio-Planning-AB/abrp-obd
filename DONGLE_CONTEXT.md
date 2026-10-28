@@ -288,7 +288,8 @@ awake.** Polling a sleeping EV wakes its ECUs, which then stay awake on the *car
   co-processor) and `R35/R37 → STM32 PB0` (surfaced as `ATRV`). ATRV is unreliable (diverges up to
   3.6 V); **IO36 is the trustworthy one**.
 - **Weak-battery lockout band** (`IO36_LOCKOUT_LOW/HIGH` = 8.0/11.0 V): suppress *all* polling so a
-  recoverable 12 V isn't pushed over the edge. Below 8 V = bench/no-car (allowed, so USB DUMP works).
+  recoverable 12 V isn't pushed over the edge. Below 8 V = bench/no-car (allowed, so USB DUMP works). The drive
+  rules read the same floor: below it, a recent OBD answer no longer counts as the car being on.
 - `RAIL_AWAKE_VOLTS 13.3` is **calibrated to one car with almost no margin.** Measured over 1016 field
   samples: moving 13.25–15.2 V (mode 13.4), switched-off 12.5–13.2 V. The bands nearly touch, so
   there's no room for a lower release threshold and **no hysteresis is possible**. Measure any new
@@ -426,8 +427,11 @@ phone supplies its own position — so a BLE frame is smaller than the cellular 
 
 **Park / drive / unconfirmed** (`Helpers/drive_state.h`, #6). The drive latch has three states. A speed key above 0
 is DRIVING, as always. A fresh moving GNSS fix starts DRIVING only with the car on (rail ≥ `RAIL_AWAKE_VOLTS`, or an
-OBD answer within `ACTIVE_TIMER`), an accelerometer hit within `DRIVE_MOTION_RECENT_MS` and no charge latch; a fix
-without them (desk drift, a garage) is refused and logged once per streak (`LEASH gnss=… refused reason=motion|car-off|charging`).
+OBD answer within `ACTIVE_TIMER` while the rail is at least `IO36_LOCKOUT_LOW`), an accelerometer hit within
+`DRIVE_MOTION_RECENT_MS` and no charge latch; a fix without them (desk drift, a garage) is refused and logged once per
+streak (`LEASH gnss=… refused reason=motion|car-off|charging`). The rail floor is there because the OBD answer outlives
+the car: a dongle unplugged and carried on USB power (rail ~5.6 V) still had an answer from seconds earlier, and a
+walking-pace fix with motion reported DRIVE (field, after #93).
 Sustained motion (`DRIVE_SUSTAINED_ACT_PCT` of at least `DRIVE_SUSTAINED_MIN_SAMPLED_MS` sampled, over
 `DRIVE_SUSTAINED_WINDOW_MS`) on a car that is on, with no charge latch, is UNCONFIRMED; with a discharge above
 `DRIVE_DISCHARGE_KW` (the frame's `power`, else current × voltage) it is DRIVING. UNCONFIRMED keeps

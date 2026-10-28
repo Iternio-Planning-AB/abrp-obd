@@ -193,7 +193,7 @@ drive region in `Helpers/drive_state.h`, and the runner fails if anything outsid
 `is_currently_parked`, `g_last_speed_ms`, `park_marker_owed`, `drive_unconfirmed` or `g_drive_gnss_refused`, if `alarm_gate.h` names drive state, or if
 a call into the drive region sits outside the blocks it extracts. The pin rule and what the harness
 cannot prove (32-bit `millis()` wrap, other flag sets, code outside the extracted blocks) are in the
-runner's header. The `rules` group (#6) also runs CUR alone, as absolute checks: the named driving-rule scenarios (desk drift, late-fix drive, discharge, charge block, UNCONFIRMED exit) over Poll inputs for the car, motion, sustained motion, power and charge latch, whose defaults make CUR agree with OLD.
+runner's header. The `rules` group (#6) also runs CUR alone, as absolute checks: the named driving-rule scenarios (desk drift, late-fix drive, discharge, charge block, UNCONFIRMED exit, and a dongle unplugged and carried on USB power with a seconds-old OBD answer) over Poll inputs for the car, motion, sustained motion, power and charge latch, whose defaults make CUR agree with OLD.
 
 Since 0b-1 (#81) the differential also covers the poll-side energy block: the rail refresh and `loop()`'s block from
 the `is_charging` verdict through `dcAwakeTrack()` (release latch and silent hold, taper stall count, DC session,

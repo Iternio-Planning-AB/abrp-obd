@@ -285,7 +285,7 @@ during setup, and parked charge sampling is suppressed. The remaining limits for
 | `GPS_JUMP_MARGIN_M` / `GPS_JUMP_MAX_MPS` (in `FreematicsPlus.cpp`) | `2000` m / `70` m/s | A new GNSS fix is accepted within this margin plus this speed times the seconds since the anchor fix's receiver time last changed; three consistent fresh fixes outside it, at most 60 s apart, replace a bad anchor. |
 | `GPS_JUMP_ALT_MARGIN_M` / `GPS_JUMP_ALT_MAX_MPS` (in `FreematicsPlus.cpp`) | `500` m / `3` m/s | The same rule for altitude, which refuses a fix that is horizontally plausible but far off vertically (logged as `gps_read=coord`, `gps_field=4`). An altitude of 0, as a 2D fix may report, is not checked. |
 | `GPS_JUMP_CONFIRM` (in `FreematicsPlus.cpp`) | `2` | A wake's first fix is held (`gps_read=unconfirmed`) until the next fresh fix, at most 120 s later, agrees with it on both bounds; the agreeing fix is the first one used (`GPS first fix confirmed held=N`). A held fix without one is replaced by the next (`GPS first fix unconfirmed`, once a wake). Costs about one poll on each wake that powers the GNSS. |
-| `IO36_LOCKOUT_LOW` / `_HIGH` | 8.0 / 11.0 V | Weak-battery band: suppress all polling so a recoverable 12 V isn't pushed over the edge. |
+| `IO36_LOCKOUT_LOW` / `_HIGH` | 8.0 / 11.0 V | Weak-battery band: suppress all polling so a recoverable 12 V isn't pushed over the edge. Below the low end there is no car (USB or bench): polling is allowed, and a recent OBD answer no longer counts as the car being on for the drive rules. |
 
 `RAIL_AWAKE_VOLTS` was calibrated on one car with almost no margin: driving 13.25–15.2 V,
 switched off 12.5–13.2 V. Measure a new car's rail while driving and while switched off and locked

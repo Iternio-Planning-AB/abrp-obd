@@ -51,7 +51,8 @@ struct DriveRegion {
   unsigned long last_hold_ms;  // millis() of the last speed, GNSS or session hold; UNCONFIRMED: of the last motion
 };
 struct DriveEvidence {
-  bool car_on;            // the 12 V rail is up, or the car answered an OBD poll within ACTIVE_TIMER
+  bool car_on;            // the 12 V rail is up, or the car answered an OBD poll within ACTIVE_TIMER and the
+                          // rail still reads a car (>= IO36_LOCKOUT_LOW)
   bool motion_recent;     // a detectMovement hit within DRIVE_MOTION_RECENT_MS
   bool motion_sustained;  // the rolling window shows motion on enough of its sampled time
   bool discharge;         // the battery is discharging above DRIVE_DISCHARGE_KW
@@ -144,7 +145,9 @@ inline DriveSample driveSample(const OBDVector* frame) {
   const unsigned long now = millis();
   DriveSample s = {};
   s.obd_recent = g_last_obd_answer_ms && now - g_last_obd_answer_ms < (unsigned long)ACTIVE_TIMER;
-  s.evidence.car_on = g_last_io36 >= RAIL_AWAKE_VOLTS || s.obd_recent;
+  // A rail under IO36_LOCKOUT_LOW is no car on the port (USB or bench): the last OBD answer predates the unplug.
+  s.evidence.car_on = g_last_io36 >= RAIL_AWAKE_VOLTS ||
+                      (s.obd_recent && (!ENABLE_IO36_RAIL || g_last_io36 >= IO36_LOCKOUT_LOW));
   s.evidence.motion_recent = g_last_motion_ms && now - g_last_motion_ms <= (unsigned long)DRIVE_MOTION_RECENT_MS;
 #if ENABLE_MEMS
   s.evidence.motion_sustained = motionSustained(g_drive_motion, now, &s.act_pct);
