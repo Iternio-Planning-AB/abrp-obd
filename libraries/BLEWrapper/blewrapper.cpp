@@ -25,8 +25,8 @@ void BLEWrapper::init() {
     // CCCD in the service is gated (*_ENCRYPTED): a phone pairs at the first thing it touches -
     // normally ABD2's CCCD, the setup subscribe - and an unpaired peer can connect but read/write
     // NOTHING. ABD1/ABD2 gating is the "cellular until paired" behaviour; the rollout went
-    // ABD7 -> ABD1/ABD2 -> everything, each step field-validated before the next. The app maps the
-    // ATT insufficient-authentication refusal to an "awaiting pairing" state (listener/setup thunks)
+    // ABD7 -> ABD1/ABD2 -> everything, each step field-validated before the next. The app treats the
+    // ATT insufficient-authentication refusal as the pairing-declined state and keeps the link,
     // instead of a teardown-reconnect loop - keep dongle and app in step if gating ever changes.
     // BLEDevice keeps this as a STATIC pointer, so it must outlive init() - and must not be re-allocated
     // if init() ever runs twice in one boot (today it runs once, from setup()).
@@ -94,10 +94,10 @@ void BLEWrapper::init() {
   );
   if (bonding_enabled) {
     // ABD1 gated = "cellular until paired": an unpaired phone can connect but gets no telemetry -
-    // the dongle's own cellular uplink carries the data meanwhile. The app understands the refusal
-    // (its listener/setup thunks map ATT insufficient-authentication to an "awaiting pairing" state
-    // instead of a teardown-reconnect loop) - ship dongle and app together, an OLD app against this
-    // firmware would loop reconnect->prompt on a declined dialog.
+    // the dongle's own cellular uplink carries the data meanwhile. The app treats the ATT
+    // insufficient-authentication refusal as the pairing-declined state and keeps the link, instead
+    // of a teardown-reconnect loop - ship dongle and app together, an OLD app against this firmware
+    // would loop reconnect->prompt on a declined dialog.
     // Same _ENCRYPTED / never _ENC_MITM reasoning as ABD7 below. No write perm on ABD1 - it has no
     // write property.
     pTelemetryCharacteristic->setAccessPermissions(ESP_GATT_PERM_READ_ENCRYPTED);
@@ -540,9 +540,9 @@ void StartupCallbacks::onWrite(BLECharacteristic* pStartupCharacteristic) {
     // carries the vehicle profile (the PID list) and the tlm push token, so an unauthorized peer that
     // could write here could inject arbitrary PIDs at the CAN bus. Pairing alone does NOT earn that -
     // it only proves the link is private, not that the peer is allowed. So the whole channel needs
-    // the ABD8 session grant, and the app proves BEFORE it pushes (see the poller's connect
-    // sequence). Refused writes get a distinct reply so the app can tell "not authorized" from
-    // "malformed".
+    // the ABD8 session grant, and the app proves BEFORE it pushes (the poller's connect order: ABD8
+    // proof -> ABD2 profile push -> ABD1 telemetry subscribe). Refused writes get a distinct reply so
+    // the app can tell "not authorized" from "malformed".
     if (!wrapper->get_authenticated()) {
       wrapper->logEvt("ABD2 refused: not authorized (no ABD8 proof yet)");
       pStartupCharacteristic->setValue("NOAUTH");

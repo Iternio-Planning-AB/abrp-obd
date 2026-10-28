@@ -119,7 +119,7 @@ jobs:
       - name: Build the variants
         run: sh baseLogger/tools/check_variants.sh
 
-  # The one check the main ruleset requires (cloudops tf/abrp-obd), so a new job joins `needs` here and the ruleset
+  # The one check the main ruleset requires (managed outside this repo), so a new job joins `needs` here and the ruleset
   # stays as it is. always(): a skipped required check counts as passed, so this must run, and fail, when a need fails.
   ci:
     if: always()
