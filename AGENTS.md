@@ -355,7 +355,7 @@ battery/calendar formatting for dates after 2038; that broader firmware limitati
 Clock groups `drift`, `resync`, `bounds` and `modem` drive the real `clock_sync.h` (compensation, `setClock`,
 the drift learner, `clockResync`, both NTP triggers, the parsers, NVS) against a fake microsecond clock, `millis()`
 and a scripted modem; `modem` runs the real `CellWrapper::syncNtp`/`readClock` against a scripted UART. They also
-compile logger.ino's two NTP call sites against their globals, check every log line fits logEvent's buffer (at
+compile logger.ino's two NTP call sites and the pre-sleep flush's NTP teach (`sleep_power.h`) against their globals, check every log line fits logEvent's buffer (at
 most 119 chars), and check that a post-OTA trial boot zeroes the clock. The source policy is in DONGLE_CONTEXT.md
 §6a. Still needing a dongle and a parked night: the real RC rate, RTC retention, NVS across a re-plug, what
 `AT+CNTP` mode 1 does, NTP right after a POST, and real NITZ quality (look for `CLOCK drift ... src=` and

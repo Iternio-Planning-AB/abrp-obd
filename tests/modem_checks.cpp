@@ -49,6 +49,13 @@ struct Wake {
     std::vector<OBDVector> obd_result_vector;
     int upload_fail_count = 0, upload_attempts = 0, ble_teardowns = 0;
     uint32_t clock_sleep_enter_epoch = 0;
+    // The flush's NTP teach (clock_sync.h, covered by run_clock_range_checks.py): only counted here.
+    unsigned long g_last_obd_answer_ms = 0;
+    float g_last_io36 = 12.4f;
+    bool recently_charging = false;
+    int ntp_offers = 0;
+    const char* clockCarActive(bool, bool, float, bool) { return nullptr; }
+    bool clockNtpAfterUpload(int, const char*) { ++ntp_offers; return false; }
     static constexpr int MAX_UPLOAD_FAILS_PER_WAKE = 3, WOM_THRESHOLD_LSB = 4, WOM_INT_PIN = 39;
     static constexpr float WOM_THRESHOLD_G = 0.05f;
     struct { uint32_t getEpoch() const { return 0; } } rtc;
@@ -58,7 +65,8 @@ struct Wake {
     Wake() { fake_ms = 1000; overshoot_delays = false; park_marker_owed = false; Serial.output.clear(); Serial.messages.clear(); }
     bool bleRelaying() const { return relaying; }
     void esp_task_wdt_reset() {}
-    bool uploadBuffered(bool) { ++upload_attempts; return false; }
+    bool upload_ok = false;  // the flush's uploadBuffered sends the whole queue
+    bool uploadBuffered(bool) { ++upload_attempts; if (upload_ok) obd_result_vector.clear(); return upload_ok; }
     void bleDeinitForSleep() { ++ble_teardowns; }
     bool wdtStreakModemMayBeOn() { return false; }
     void wdtStreakModem(bool) {}
@@ -217,7 +225,22 @@ void parked() {
     g_fixture_session_opens = true;
     check(relayed.sleep(true) && relayed.upload_attempts == 1,
           "a pre-sleep flush during a relay session still sends the queue over cellular (#91)");
+    check(relayed.ntp_offers == 0, "a flush that did not send everything offers no NTP teach (#101)");
+    Wake flushed;
+    flushed.sys.uart->attach_at = 0;
+    check(flushed.boot() && flushed.network.connected(), "flush fixture has a usable link");
+    flushed.obd_result_vector = {{{"utc", 1}, {"soc", 50}}};
+    flushed.upload_ok = true;
+    check(flushed.sleep(true) && flushed.upload_attempts == 1 && flushed.ntp_offers == 1,
+          "a whole pre-sleep flush offers the NTP teach once, before the modem goes down (#101)");
     g_fixture_session_opens = false;
+    Wake unopened;
+    unopened.sys.uart->attach_at = 0;
+    check(unopened.boot() && unopened.network.connected(), "open-failure fixture has a usable link");
+    unopened.obd_result_vector = {{{"utc", 1}, {"soc", 50}}};
+    unopened.upload_ok = true;
+    check(unopened.sleep(true) && unopened.upload_attempts == 0 && unopened.ntp_offers == 0,
+          "a flush whose session never opened offers no NTP teach (#101)");
     Wake legacy;
     const uint64_t legacy_before = fake_ms;
     check(!legacy.network.init(false), "existing init(bool) still returns offline without coverage");

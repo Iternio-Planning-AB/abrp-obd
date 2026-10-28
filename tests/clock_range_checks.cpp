@@ -247,6 +247,13 @@ float g_last_io36 = 12.4f;
 void uploadOk(int sent) {
 #include "clock_call_site.inc"
 }
+// sleep_power.h's pre-sleep flush: n frames queued, obd_result_vector what the flush left.
+unsigned long g_last_obd_answer_ms = 0;
+std::vector<int> obd_result_vector;
+void flushOk(int n) {
+    const bool ok = true;
+#include "clock_flush_site.inc"
+}
 void loopRecovery() {
 #include "clock_loop_site.inc"
 }
@@ -476,6 +483,21 @@ void resyncChecks() {
     check(network.calls == 1 && last("CLOCK ntp=") == "CLOCK ntp=ok/900ms on=upload+drive for=teach",
           "logger.ino: the same upload while driving does");
     is_currently_parked = true;
+
+    // The pre-sleep flush, the only upload a parked wake makes: the car answering OBD makes it in use.
+    reset();
+    sleepFor(2 * 3600, 0);
+    g_last_obd_answer_ms = 0; g_last_io36 = RAIL_AWAKE_VOLTS - 1;
+    network.cclk = cclkAt(real(), 4); network.utc = ntpAt(real());
+    flushOk(3);
+    check(network.calls == 0, "sleep_power.h: a flush on a wake the car slept through does not ask NTP");
+    g_last_obd_answer_ms = 1234;
+    flushOk(3);
+    check(network.calls == 1 && last("CLOCK ntp=") == "CLOCK ntp=ok/900ms on=upload+obd for=teach",
+          "sleep_power.h: a parked flush after the car answered teaches the clock");
+    flushOk(3);
+    check(network.calls == 1, "sleep_power.h: once per wake");
+    g_last_obd_answer_ms = 0; g_last_io36 = 12.4f;
 
     // NTP is unauthenticated: with a valid clock its step is bounded.
     reset();

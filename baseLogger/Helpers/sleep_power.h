@@ -147,6 +147,14 @@ void enterDeepSleep(bool modem_on, const char* reason = nullptr) {
           n - (int)obd_result_vector.size(), (int)obd_result_vector.size(), up_s,
           network.lastOpenTrace().c_str());
 #endif
+#if ENABLE_CELL
+        // A parked wake uploads only here, so without this a parked car is never NTP-taught: a field Scenic with
+        // no NITZ ran 3.8 days on a wrong learned rate and drifted 208 s. Same once-per-wake, interval and
+        // car-in-use rules as loop()'s upload (clockNtpAfterUpload), and like it only after a whole flush: a link
+        // that just failed would hold the modem up to ~28 s and back off the next teach.
+        if (ok) clockNtpAfterUpload(n - (int)obd_result_vector.size(),
+          clockCarActive(g_last_obd_answer_ms != 0, !is_currently_parked, g_last_io36, recently_charging));
+#endif
         network.disconnect();
       }
     }
