@@ -16,10 +16,10 @@
 > disabled, then partially fixed — the status banners say which.
 >
 > **This file is self-contained.** Part I (below) is the distilled context; **Part II embeds the
-> full source documents verbatim** — the BLE security plan, the OTA architecture/protocol/app spec,
-> the power docs, and the alarm-gate architecture and field findings. Named references like
-> `ALARM_GATE_FIELD_FINDINGS.md` point to the matching appendix in Part II. Nothing outside this
-> repo is required.
+> full source documents** (with app internals removed; see the note at its top) — the BLE security
+> plan, the OTA architecture, protocol and design review, the power docs, and the alarm-gate
+> architecture and field findings. Named references like `ALARM_GATE_FIELD_FINDINGS.md` point to the
+> matching appendix in Part II. Nothing outside this repo is required.
 
 **Last substantive update:** 2026-08-28.
 
@@ -44,7 +44,7 @@ the ELM327 command set, and that rules some cars out entirely (BMW i3/iX3 among 
 
 **Two repos:**
 - Firmware: `abrp-obd` (this one).
-- App: the ABRP React Native app — `tlm_type: 'abrpobd'` identifies this dongle; the older generic
+- App: the ABRP app (closed source) — `tlm_type: 'abrpobd'` identifies this dongle; the older generic
   dongle lane is `'obdble'`. **The two lanes must stay separate** — see §8.
 
 ---
@@ -107,7 +107,7 @@ handles silently breaks already-paired iPhones.
   *deterministically lost*. Measured, after being wrong about it.
 - **A notify carries at most MTU−3 bytes and is never fragmented.** Chunk sizes are derived from the
   negotiated MTU for this reason.
-- **Android stays at MTU 23** until the app calls `requestMTU`. iOS negotiates ~185 itself.
+- **Android stays at MTU 23** until the app requests a larger MTU. iOS negotiates ~185 itself.
 - **ABD1's notify is fitted to MTU−3; its readable value is the full frame.** Numbers are `%.2f` with
   trailing zeros dropped (same value as the 2 dp contract, shorter text). If the frame is still too
   long, the notify drops fields by `bleTlmRank` (SoC, power/current/voltage, speed and the three flags
@@ -185,7 +185,9 @@ profile write.
   connect**. Sniff it once and you could push fabricated telemetry for that vehicle forever.
 
 ### Layer 3 — Sign: is this payload legitimate?
-A vehicle profile is only applied if it carries a valid backend RS256 JWS signature.
+A pushed JWS is applied only if its backend RS256 signature verifies. With `PROFILE_REQUIRE_SIGNATURE 1`
+that is the only way in; the default in `config.h` is 0, so raw per-key packages are still accepted
+(see above).
 
 - The backend already returns the profile as a JWS; the app used to verify it and throw the signature
   away. It now forwards the JWS **verbatim** in ~180-byte chunks; the dongle verifies RSA-2048
@@ -245,7 +247,8 @@ streams it over BLE.
 
 ## 5. Log retrieval (ABD7)
 
-- App-driven pull; the dongle never streams unprompted.
+- App-driven pull; the dongle never streams unprompted. While a dump runs the poller stands back, as
+  for OTA.
 - Over USB serial the same log comes from `DUMP`, `DUMP n` or `DUMP SINCE <utc>` (§9).
 - `{"LOGDUMP":"START"}` → size/chunk/window header; `{"LOGDUMP":<offset>}` → a window of binary
   chunks then `{"eow","eof"}`; `{"LOGDUMP":"END"}`.
@@ -496,9 +499,10 @@ forward (bad NITZ/NTP, spoofed GNSS) drops the queue stamped before it; accepted
 useful only fresh. A 400 for a point past the server's 30 days logs `err=too_old`.
 
 **Where the PID list / vehicle profile comes from:** the app fetches it from the ABRP backend by
-`typecode` (`getObdBlePids`), gets back `{ obdPids, jws }`, and pushes it to the dongle over ABD2.
-The `obdPids` is the per-model map of PIDs → CAN commands + equations that `OBDWrapper` evaluates; the
-`jws` is the same profile signed (used only when `PROFILE_REQUIRE_SIGNATURE` is on). So a new vehicle
+`typecode` (`/vehicles/obdble_get_pids` with `signed=true`); that signed fetch returns the JWS, the app
+takes the profile from its payload, and pushes it to the dongle over ABD2.
+The profile is the per-model map of PIDs → CAN commands + equations that `OBDWrapper` evaluates; the
+JWS is the same profile signed (required only when `PROFILE_REQUIRE_SIGNATURE` is on). So a new vehicle
 is supported by adding its profile **on the backend**, not by reflashing — the dongle is generic and
 carries no profile of its own at all. It used to: a dozen `init*()` PID blobs in `obdwrapper.cpp`, one
 of which ran as a pre-pairing stand-in. Removed, because a profile for the wrong car does not merely
@@ -506,8 +510,8 @@ return nothing — `init_commands` is arbitrary CAN, so it puts wrong frames on 
 The one thing a profile cannot add is a new telemetry key: BLE forwards every key, but the cellular
 upload drops one until `bulkStringV2` has a line mapping it to a v2 field.
 
-**A profile is evaluated as the app evaluates it** (`dataParserCommon.ts`, `postProcessTlm.ts` and `grammar.pegjs` in the
-app), because one profile serves both. `readPIDs()` follows the same rules (#84):
+**A profile is evaluated as the app evaluates it** (its reply parser, equation grammar and post-poll step), because
+one profile serves both. `readPIDs()` follows the same rules (#84):
 - A key's `command` may list several commands (`"22028C,222AB8"`). The key is evaluated on each reply, and a later
   value replaces an earlier one.
 - A byte the reply lacks is NaN, as the app's `undefined` is. `ifgreaterthan(C+1, 0, …)` then takes its else branch, which
@@ -738,13 +742,13 @@ value counts, never the frame's presence.
 
 ## 8. App side — the rules that matter
 
-The app is the ABRP React Native app (Redux Toolkit, redux-persist + MMKV, `react-native-ble-plx`) —
-a **separate, closed-source repository**; app paths in this document refer to it. This dongle's code lives under `src/state/ble/abrpObd/`,
-`src/state/firmwareUpdate/`, and the `ObdBleSetup` screen; the OBD-BLE test screens are behind
-developer options. Build/run is standard for that repo (`yarn`, its own README) — not covered here.
-Note the protocol level of the app you test against matters: the firmware requires the ABD8
-handshake unconditionally and bonding is on (§1), so an app build without the handshake cannot get a
-session.
+The app is the ABRP app, which is **closed source**; this document describes only what it must do on
+the wire, never how it is built. Note the protocol level of the app you test against matters: the
+firmware requires the ABD8 handshake unconditionally and bonding is on (§1), so an app build without
+the handshake cannot get a session.
+
+**The poller** is the app's background loop that reconnects to a bound dongle and runs the connect order
+(Appendix A §7b); the setup wizard and the OTA and log-dump flows make it stand back.
 
 - **`tlm_type: 'abrpobd'`** = this dongle. **`'obdble'`** = the older generic dongle lane.
   **Everything added for this dongle must be an add-on that leaves the obdble lane byte-identical.**
@@ -754,19 +758,20 @@ session.
   rides the account is therefore applied by phones that were never asked.
 - **The dongle secret is device-local by design** (no backend). That was a deliberate decision — the
   backend-auth phases were struck. Device policy should stay consistent with it.
-- **Keep dispatch counts low.** Telemetry frames are buffered and drained into a reducer rather than
-  dispatched per frame; every dispatch runs the whole middleware chain.
-- **i18n everything** user-facing; developer-only screens use plain strings with `disableTranslation`.
-- **Timeouts are not house style.** Prefer making the protocol deterministic (e.g. the dongle greeting
-  on the CCCD rising edge) over adding a timeout or a retry, both of which add failure modes.
-- **`awaitingPairing`** means a *confirmed decline*, detected by the sustained telemetry subscription.
-  Never latch it from a one-shot operation: the first gated access is what **triggers** pairing, so it
-  races the procedure it started. Mapping that to "user declined" made every first-ever connect fail
-  and succeed only on retry.
-- **Redux-vs-radio desync is a recurring bug class.** Several paths null `state.ble.deviceId` without
-  calling `cancelDeviceConnection`; the next connect then decides from Redux that it should connect,
-  against a device the radio still holds → `DeviceAlreadyConnected` until the OS drops the link.
-  Any path that drops the device from app state must also cancel the radio connection.
+- **No timeout or retry where the protocol can be made deterministic** (e.g. the greet on the CCCD
+  rising edge): both add failure modes.
+- **"Pairing declined" is a *confirmed decline*, detected by the sustained telemetry subscription.**
+  Never conclude it from a one-shot operation: the first gated access is what **triggers** pairing, so
+  it races the procedure it started. Mapping that to "user declined" made every first-ever connect
+  fail and succeed only on retry. A confirmed decline puts the app in the pairing-declined state
+  (Appendix A §7b).
+- **App state and the radio drifting apart is a recurring bug class.** A path that forgets the dongle
+  without cancelling the BLE connection makes the next connect target a device the radio still holds,
+  which fails as "already connected" until the OS drops the link. Any path that drops the device from
+  app state must also cancel the radio connection.
+
+Per-feature obligations: profile push → Appendix A §3; connect order and decline detection → Appendix A
+§7b; OTA → Appendix B §4, Appendix C §5; log dump → §5.
 
 ---
 
@@ -896,7 +901,8 @@ session.
 
 ## 10. Where to look for what
 
-Everything below except `README.md` and `docs/` is embedded verbatim in **Part II** of this file.
+Everything below except `README.md` and `docs/` is embedded in **Part II** of this file (with app
+internals removed; see the note at its top).
 
 | Question | File |
 |---|---|
@@ -904,8 +910,8 @@ Everything below except `README.md` and `docs/` is embedded verbatim in **Part I
 | Flags, file map, state machine | `docs/technical-overview.md` (in repo) |
 | BLE security design + phase history | Appendix A |
 | OTA wire protocol (authoritative) | Appendices C, B |
-| OTA app-side spec | Appendix D |
-| Signed firmware binaries + manifest | Private release repository (token entered in-app) |
+| OTA transport decision + design review | Appendix D |
+| Signed firmware binaries + manifest | Public GitHub Releases of this repo, no token (§4; once a private release repository) |
 | Power measurements + deferred work | Appendices H, G, F |
 | OBD-alarm architecture + decisions | Appendix I |
 | Why the alarm gate is off + fix plan | Appendix J |
@@ -941,20 +947,22 @@ Everything below except `README.md` and `docs/` is embedded verbatim in **Part I
 ---
 ---
 
-# PART II — FULL SOURCE DOCUMENTS (verbatim)
+# PART II — FULL SOURCE DOCUMENTS
 
 > Everything below is embedded **unmodified** from the original single-topic documents, so no detail
 > was lost to summarisation. They were written at different times — where one contradicts Part I or
 > the code, **the code wins, then Part I** (which is newer). Internal cross-references between these
 > documents (e.g. "see DEFERRED_POWER_WORK.md §1c") resolve to the matching appendix here.
-> App-side paths (`src/…`) refer to the closed-source ABRP app repository, not to this one.
+> Exception: the ABRP app is closed source, so its implementation detail (code paths, state, UI
+> structure, tooling) is removed and what the app must do is restated in protocol terms. Where that
+> emptied a section, sections are renumbered and cross-references retargeted.
 
 | Appendix | Document | Original filename |
 |---|---|---|
 | A | BLE security plan (design + phase history) | `BLE_SECURITY_PLAN.md` |
 | B | OTA update architecture (v1) | `ota-update-architecture-v1.md` |
 | C | OTA wire-protocol reference (authoritative) | `ota-protocol-reference.md` |
-| D | OTA app-side spec | `OTA_UPDATE_APP_SPEC.md` |
+| D | OTA app-side spec (transport decision and design review only) | `OTA_UPDATE_APP_SPEC.md` |
 | E | Backend expectations | `backend_implements.md` |
 | F | Power management | `POWER_MANAGEMENT.md` |
 | G | Power budget (bench measurements) | `POWER_BUDGET.md` |
@@ -975,8 +983,8 @@ Everything below except `README.md` and `docs/` is embedded verbatim in **Part I
 Design plan spanning the app and the firmware (`baseLogger`). Nothing here is
 implemented yet except where marked. Written 2026-08-18.
 
-Companion docs: `ota-protocol-reference.md` (ABD5/ABD6 contract), `ABRPOBD_REIMPLEMENTATION.md` (telemetry
-lane), `baseLogger/DEFERRED_POWER_WORK.md` (power work).
+Companion docs: `ota-protocol-reference.md` (ABD5/ABD6 contract), `baseLogger/DEFERRED_POWER_WORK.md`
+(power work).
 
 ---
 
@@ -1012,30 +1020,13 @@ For protecting what is *on the device* (someone with physical access dumping fla
 
 ---
 
-## 2. Phase A — developer gating (app only, no firmware) — READY
+## 2. Phase A — developer gating (app only, no firmware) — DONE
 
-Purpose: the Update-firmware and Dongle-logs screens are currently visible to every user. They are internal
-tools. This is **product gating, not security** — the characteristics still exist and still accept writes.
-
-The app already has the scaffolding:
-- `hasDeveloperRoleSelector` — reads `state.session.user?.roles` for `'devel'`, **server-driven**, a normal
-  user cannot flip it.
-- `isDeveloperUserSelector` — that role, minus a local kill-switch (`state.device.isDeveloperDisabled`); it
-  already gates the "Developer options" row in Settings.
-- `state.device` is **persisted** and already holds this class of local preference (`quickBarEnabled`).
-
-| Change | File |
-|---|---|
-| `obdDongleToolsEnabled?: boolean` + setter (mirror `quickBarEnabled`) | `src/state/device/deviceSlice.ts` |
-| Toggle row, default off | `src/domain/DeveloperOptions/index.tsx` (existing `DeveloperOptionRow`) |
-| Gate the two `ListItem`s | `src/components/vehicleSettings/ConnectLiveData.tsx` |
-| Early guard (deep-link / stale nav protection) | `flashFirmwareThunk`, `fetchDongleLogsThunk` |
-| New keys | `translations/en.json` |
-
-Gate expression: `isDeveloperUserSelector(state) && state.device.obdDongleToolsEnabled === true`.
-
-Deliberately leaving `obd_pid_editor` ungated — it shipped before this work, and changing its visibility is a
-behaviour change nobody asked for. Trivial to add to the same gate later.
+Purpose: the app's firmware-update and dongle-log tools were visible to every user. They are internal
+tools, so the app was changed to show them only to developer accounts (a server-side role a normal user
+cannot set) that have also switched them on; the QR give/receive tool later shipped behind the same
+switch. This is **product gating, not security** — the characteristics still exist and still accept
+writes, which is why the later phases exist. No firmware change.
 
 ---
 
@@ -1050,9 +1041,7 @@ behaviour change nobody asked for. Trivial to add to the same gate later.
 > | RS256 verify (RSA-2048, mbedTLS), base64url, `alg` pinned | `Helpers/jws_verify.h` |
 > | Chunk buffer, verify-then-apply on the LOOP task | `Helpers/profile_sig.h` |
 > | ABD2 `{"JWS":{"i","n","d"}}` branch + `notifySetup` | `blewrapper.cpp/.h` |
-> | JWS kept instead of discarded | `getObdBlePids.ts` |
-> | `obdPidsJws` map (separate from `obdPids`) | `obdbleSlice.ts` |
-> | Chunked push, `JWS OK`/`JWS BAD` handling | `abrpObd/setupThunk.ts` |
+> | JWS kept beside the parsed profile, chunked push, `JWS OK`/`JWS BAD` handling | the app |
 >
 > **Wire protocol:** after `CLEAN OK` the app writes `{"JWS":{"i":<idx>,"n":<total>,"d":"<180-char
 > slice>"}}` in order (each ACKed), the dongle assembles, then verifies on the loop task and answers
@@ -1061,12 +1050,13 @@ behaviour change nobody asked for. Trivial to add to the same gate later.
 > balances: the signed payload supplies the PID values, the two packages supply the rest.
 >
 > **Isolation, per the add-on rule.** ABD2 is abrpobd's own characteristic — the generic obdble lane
-> (FFF0/18F0/FFE0) cannot reach any of it, and `setupThunk` already early-rejects `!isAbrpObd`. The one
-> genuinely shared thing is `obdPids`, which `bleWriteThunk` reads through `obdVehicleJsonSelector` for
-> the obdble lane — so the JWS is stored in its OWN map and `obdPids` keeps its exact shape and bytes.
-> That also preserves the CRC version tag (Trap 1): folding the JWS into `obdPids` would have changed
-> the tag's input and dropped every reconnect onto the slow full-repush + `ATZ` path. Verified: zero
-> diff in `bleWriteThunk.ts` and `src/state/dataSource/`.
+> (FFF0/18F0/FFE0) cannot reach any of it, and the abrpobd profile push runs only for an abrpobd
+> dongle. The one genuinely shared thing is the parsed profile, which the obdble lane also uses — so
+> the app keeps the JWS separately and the parsed profile keeps its exact shape and bytes. That also
+> preserves the profile `HASH` (Trap 1: never change what `HASH` is computed over; Trap 2: change only
+> how the profile is acquired, never how it is applied — both spelled out under *Remaining* below):
+> folding the JWS into the profile would have changed `HASH`'s input and dropped every reconnect onto
+> the slow full-repush + `ATZ` path. The obdble lane's writes were verified unchanged.
 >
 > **On `JWS BAD` the app does NOT fall back to an unsigned push** — that would hand the dongle the very
 > profile it just refused to trust, defeating the phase. It rejects and says so in the event log.
@@ -1078,7 +1068,7 @@ behaviour change nobody asked for. Trivial to add to the same gate later.
 > loop task where it belongs.
 >
 > **Trap 1 confirmed intact on device:** later boots reported `HASH OK` → `SETUP OK (fast path, hash
-> matched)`, so the version tag still matches and the JWS did not change what it is computed over.
+> matched)`, so `HASH` still matches and the JWS did not change what it is computed over.
 > Note the JWS rides the SLOW path only — on `HASH OK` the app sends just `utc`, so a normal reconnect
 > transfers no chunks at all and costs nothing.
 >
@@ -1112,27 +1102,33 @@ behaviour change nobody asked for. Trivial to add to the same gate later.
 > access only, and is exactly what confirms a dongle still trusts the right key after a key rotation,
 > without pushing anything.
 >
-> **SIGNATURES NOW REQUIRED (`PROFILE_REQUIRE_SIGNATURE 1`).** A raw profile value is refused with
-> `UNSIGNED`; only a signature-verified JWS can change what this dongle runs on the CAN bus. The
-> refusal is scoped to profile CONTENT - `keys`, `HASH`, `tlm_push_token` and `utc` still pass, since
-> they are handshake data and the push could not complete without them. The app treats `UNSIGNED` as a
+> **SIGNATURES CAN BE REQUIRED (`PROFILE_REQUIRE_SIGNATURE 1`) — but the default in `config.h` is
+> still 0, accept-both.** This heading once read "SIGNATURES NOW REQUIRED"; the shipping default is 0
+> and stays so until the signed-profile path has been seen succeeding in the field
+> (`docs/technical-overview.md`). With the flag at 1, a raw profile value is refused with `UNSIGNED`;
+> only a signature-verified JWS can change what this dongle runs on the CAN bus. The refusal is scoped
+> to profile CONTENT - `keys`, `HASH`, `tlm_push_token` and `utc` still pass, since they are handshake
+> data and the push could not complete without them. The app treats `UNSIGNED` as a
 > clear failure rather than waiting out a timeout.
 >
 > (The flag had been described in a comment before it existed - the same doc/implementation mismatch
-> made once with `AUTH_ENFORCE`. Both are now real.)
+> made once with `AUTH_ENFORCE`. Both became real; `AUTH_ENFORCE` was later removed when the auth gate
+> became unconditional.)
 >
 > **One lockout scenario, by design:** the app falls back to a package push when it holds no JWS for the
-> typecode (unsigned fetch, or a profile cached before `obdPidsJws` existed). That push is now refused -
-> but the poller refetches on the next app start, because the store transform clears `obdPidsRefreshed`.
-> A stale cache costs one app restart, not a bricked dongle. Reverting is one line in `config.h`.
+> typecode (unsigned fetch, or a profile cached before the app kept the JWS). With the flag at 1 that
+> push is refused - but the app refetches the profile the first time it reconnects after its next
+> start. A stale cache costs one app restart, not a bricked dongle. Reverting is one line in
+> `config.h`.
 >
 > ---
 > *Step-1 detail, retained:* the firmware verifier
-> (`Helpers/jws_verify.h`). It embeds the SAME RSA-2048 public key the app already verifies against
-> (`getObdBlePids.ts`), does base64url (URL alphabet, unpadded — mbedTLS needs it translated and
-> re-padded), rejects any header not declaring `RS256`, and verifies RSASSA-PKCS1-v1_5/SHA-256 over
-> the verbatim `<header>.<payload>` ASCII. It hands back the payload's LOCATION rather than its
-> contents, so a caller cannot accidentally parse before the signature is proved.
+> (`Helpers/jws_verify.h`). It embeds the SAME RSA-2048 public key the app pins to verify the profile
+> JWS it fetches from `/vehicles/obdble_get_pids` (`signed=true`), does base64url (URL alphabet,
+> unpadded — mbedTLS needs it translated and re-padded), rejects any header not declaring `RS256`,
+> and verifies RSASSA-PKCS1-v1_5/SHA-256 over the verbatim `<header>.<payload>` ASCII. It hands back
+> the payload's LOCATION rather than its contents, so a caller cannot accidentally parse before the
+> signature is proved.
 >
 > **The `alg` check is not decoration.** `alg` is attacker-controlled until the signature verifies, so
 > trusting whatever it names is the classic JWS confusion bug (`alg:none`, or an HMAC alg verified
@@ -1146,8 +1142,8 @@ behaviour change nobody asked for. Trivial to add to the same gate later.
 > `AUTHOFF` idea was dropped as redundant.)
 >
 > **Remaining, in order:**
-> 1. App: stop discarding the JWS in `getObdBlePids.ts` `transformResponse` (it verifies at line 71,
->    then splits the payload off and drops the signature) — carry it through obdble state to setup.
+> 1. App: stop discarding the JWS after verifying it (it split the payload off and dropped the
+>    signature) — carry it through to the profile push.
 > 2. Transport: a chunked verbatim push on ABD2 (~1.8 KB for a typical profile: the persisted profile
 >    is ~1 KB, base64url ≈1.4 KB, plus a 342-char signature — so ~10-20 writes at MTU 247).
 > 3. Firmware: assemble, verify, then decode the JWS's OWN payload into `configJson` — the profile
@@ -1155,24 +1151,25 @@ behaviour change nobody asked for. Trivial to add to the same gate later.
 > 4. App: send the JWS instead of the per-key PID packages (`tlm_push_token` and `utc` still go
 >    separately — the token is not in the profile and is not the CAN-injection risk).
 >
-> **Both traps still apply.** Do not change what the CRC version tag is computed over (still
-> `CRC32(JSON.stringify({...sanitizedVehicleJson, tlm_push_token}))`, app-side, dongle never
-> recomputes it) or every reconnect drops to the slow path with a full `ATZ` re-init. And change only
-> ACQUISITION: `completeSetup` / `configCallback`, the loop-task apply, the identical-profile ATZ skip,
-> the LittleFS persist and `invalidateHash()` all stay untouched.
+> **Both traps still apply.** Trap 1: do not change what `HASH` is computed over — a CRC32 of the
+> JSON serialisation of the sanitised profile object with `tlm_push_token` added as its last key
+> (serialised once), sent as `{"HASH":<unsigned decimal>}`; computed app-side, the dongle stores and
+> compares it and never recomputes it — or every reconnect drops to the slow path with a full `ATZ`
+> re-init. Trap 2: change only ACQUISITION: `completeSetup` / `configCallback`, the loop-task apply,
+> the identical-profile ATZ skip, the LittleFS persist and `invalidateHash()` all stay untouched.
 
 **The hole:** a pushed profile carries `init_commands` (raw AT, including `ATSH` to set arbitrary CAN headers
 and `ATSP` to choose the protocol) plus `data_commands` as arbitrary hex. That is arbitrary CAN injection with
 the dongle as transport. On a gatewayed port that is mostly UDS — which is exactly where routine-control and
 I/O-control-by-identifier live. **This hole predates every feature in this plan.**
 
-**The fix already exists, half-built.** `src/api/vehicles/getObdBlePids.ts` requests `signed=true` and receives
-a **JWS compact string, RS256**, verified in-app against a hardcoded RSA-2048 public key. Today the app
-verifies it and then **throws the signature away**, pushing only the parsed object. Forward the JWS instead and
-let the dongle verify it.
+**The fix already exists, half-built.** The app's profile fetch (`/vehicles/obdble_get_pids`) requests
+`signed=true` and receives a **JWS compact string, RS256**, verified in-app against a hardcoded RSA-2048
+public key. Today the app verifies it and then **throws the signature away**, pushing only the parsed
+object. Forward the JWS instead and let the dongle verify it.
 
 **Critical constraint discovered while designing this:** the app *mutates* the payload after verifying
-(`value.maxValue = Number(value.maxValue)`), and the dongle reassembles the pushed key/value packages into
+(it coerces `maxValue` to a number), and the dongle reassembles the pushed key/value packages into
 key-sorted nlohmann JSON. The bytes the dongle holds are therefore **not** the bytes that were signed. So a
 detached signature over any "canonical" form is a trap — it would break on number formatting alone. The signed
 artifact must be transported **verbatim** and verified *before* parsing, exactly like OTA hashes the bytes it
@@ -1195,15 +1192,14 @@ JWS size ≈ 1.5 KB (≈1 KB payload + 342-char RSA-2048 signature + header) →
 
 | Change | Where |
 |---|---|
-| Keep the raw JWS beside the parsed object, per typecode | `src/state/obdble/obdbleSlice.ts`, `src/api/vehicles/getObdBlePids.ts` |
-| Send JWS chunks instead of per-key packages | `src/state/ble/abrpObd/setupThunk.ts` |
+| Keep the raw JWS per typecode; push it in chunks instead of per-key packages | app |
 | Reassembly + verify + apply | `libraries/BLEWrapper/blewrapper.cpp` (`StartupCallbacks::onWrite`), `baseLogger/Helpers/ble.h` |
 | Pinned key | new `baseLogger/Helpers/pid_pubkey.h` (RSA-2048, same key the app pins) |
 | RS256 verify | mbedTLS RSA, ~10–30 ms on ESP32. Alternative: have the backend also emit ECDSA-P256 so the dongle reuses the OTA verify path — but that *is* backend work, and the JWS route needs none |
 
 ### The escape hatch this needs
 
-The **PID editor authors unsigned profiles** (`customObdPids`, plus the `FreematicsEmu` dev profile). Strict
+The app's **PID editor authors unsigned profiles** (custom PIDs). Strict
 enforcement would break it. So the dongle needs an unsigned-accept mode that is **physical-access gated**: a
 serial console command (`UNSIGNED ON`), **RAM-only** so a reboot clears it. Never an app-side toggle — an
 app-flippable bypass is not a security boundary.
@@ -1233,15 +1229,12 @@ app-flippable bypass is not a security boundary.
 > The cleartext `provision` verb that shipped alongside `kex` has been **deleted** — it took the
 > shared secret as a plaintext BLE write, which is the exact thing `kex` exists to avoid, and it was
 > reachable by any peer that reached an unprovisioned dongle. A secret now only ever gets *derived*.
-> **App side shipped too:** `abrpObdAuthThunk` runs fire-and-forget after a *fulfilled* setup (gated on
-> `isFulfilled` — a `.then` alone also runs for rejected thunks, and after a declined pairing a write to
-> encryption-gated ABD8 would re-prompt; the thunk also early-rejects on `awaitingPairing`). HMAC-SHA256
-> is built on expo-crypto's SHA-256 (`hmacSha256.ts`, validated against the RFC 4231 vectors — no new
-> native dependency), TOFU generates the 32-byte secret with `getRandomBytesAsync`, and the keyring is
-> `obdble.dongleSecrets` (redux-persist/MMKV — decided: same at-rest model as the account access token;
-> note the tlm_push_token itself is NOT at rest on the phone, only in memory). The keyring entry is
-> persisted the moment the dongle confirms `provisioned` — deliberately NOT after the proof round, so a
-> BLE drop between the two cannot strand a provisioned dongle with a secret the app never saved.
+> **App side shipped too.** The handshake first ran after a *successful* setup only (the order was
+> later inverted, below): after a declined pairing a write to encryption-gated ABD8 would re-prompt, so
+> the app never writes ABD8 once a decline is known. HMAC-SHA256 is validated against the RFC 4231
+> vectors, and TOFU generates the 32-byte secret from a cryptographic RNG. The keyring entry is
+> persisted the moment the dongle confirms `provisioned` — deliberately NOT after the proof round, so
+> a BLE drop between the two cannot strand a provisioned dongle with a secret the app never saved.
 > **Android greet loss — fixed (2026-08-21).** The greet fires on the ABD8 subscribe, which on Android
 > happens BEFORE MTU negotiation. A notify carries at most MTU-3 bytes and is never fragmented, so at
 > Android's unnegotiated default of 23 the 20-byte ceiling silently dropped both greet payloads
@@ -1249,14 +1242,15 @@ app-flippable bypass is not a security boundary.
 > which negotiates ~247 on its own before the greet, provisioned first time. Same trap the log dump
 > already guarded with `{"err":"mtu"}`; the auth gate had no such guard. Two-sided fix: the firmware
 > folds `mtu() >= 64` into the greet's edge condition, so a too-narrow pipe DEFERS the greet and it
-> fires the moment MTU rises (no extra state, no timer), and the app requests `PREFERRED_MTU` **before**
-> subscribing — subscribing is what triggers the greet, so widening afterwards would be too late.
+> fires the moment MTU rises (no extra state, no timer), and the app requests MTU 517 (the dongle caps
+> it at 247) **before** subscribing — subscribing is what triggers the greet, so widening afterwards
+> would be too late.
 >
 > **Keyring is keyed by the DONGLE's own reported id.** The dongle now sends a stable identity
 > (`authDongleId()`, eFuse-MAC derived, 12 hex) in every ABD8 greet, and the app keys its keyring by
 > that. Neither obvious alternative works: the **BLE device id** differs per phone (iOS hands out a
-> per-central UUID, Android an address — which is why a vehicle stores an *array* in
-> `obd_ble_device_ids`), so it could never be shared phone-to-phone and a QR code carrying one would
+> per-central UUID, Android an address — which is why a vehicle stores an *array* of BLE device
+> ids), so it could never be shared phone-to-phone and a QR code carrying one would
 > hand the receiver a key it cannot match; and the **vehicle id** is wrong in principle — the secret
 > belongs to the dongle, not the car, so pushing a new vehicle profile must not change who may talk to
 > the dongle, and moving a dongle between cars must not invalidate anyone's access. (Vehicle-keying was
@@ -1306,43 +1300,35 @@ app-flippable bypass is not a security boundary.
 > obtain it (only `AUTHCLEAR` over serial).
 >
 > **Handshake verified end to end (2026-08-24):** `greet: unprovisioned` → `provisioned` →
-> `AUTH2 ok (ENFORCED - session granted)`, all in ONE session. Two fixes got it there. First, the
-> keyring was written by a matcher reading the thunk's *fulfilled payload* — three things had to line
-> up, and when any failed the dongle had committed a secret to NVS that the app never saved
-> (unrecoverable except by `AUTHCLEAR`, with no symptom but an unanswered nonce). The keyring now has
-> exactly ONE writer, `setDongleSecret`, dispatched explicitly the moment the dongle confirms, shared
-> with the QR receive path. Second, provisioning alone proved nothing, so under enforcement no session
-> was ever granted and telemetry stayed dark; the app now sends `{"challenge":1}` straight after
-> provisioning and proves in the same session.
+> `AUTH2 ok (ENFORCED - session granted)`, all in ONE session. Two fixes got it there. First, a
+> dongle could commit a secret to NVS that the app never saved (unrecoverable except by `AUTHCLEAR`,
+> with no symptom but an unanswered nonce); the rule is that the app persists the secret when the
+> dongle confirms `provisioned`, through one write path. Second, provisioning alone proved
+> nothing, so under enforcement no session was ever granted and telemetry stayed dark; the app now
+> sends `{"challenge":1}` straight after provisioning and proves in the same session.
 >
 > **ABD2 (the vehicle profile) is now authorization-gated, and the connect order was inverted for it.**
 > ABD2 carries the PID list and the tlm push token, so a peer that can write there can inject arbitrary
 > PIDs at the CAN bus — the worst case in §0's table, and worse than reading telemetry. Pairing alone
 > does not earn that: it proves the link is private, not that the peer is allowed. Under
 > `AUTH_ENFORCE` the dongle now refuses ABD2 with `NOAUTH` until the ABD8 proof lands, and the app
-> dispatches the auth handshake **before** `abrpObdSetupThunk` (it used to push the profile first and
+> runs the auth handshake **before** the profile push (it used to push the profile first and
 > prove afterwards, which would fail on every first connect under enforcement). Correct layering:
 > pair → prove → data. The handshake stays non-fatal so old firmware and declined pairings still
 > complete setup; under enforcement the *dongle* is what says no, not the app.
 >
-> **QR give/receive shipped.** `ObdBleShareSecretScreen`, third row under Advanced OBD settings behind
-> the same developer toggle (whose description names all three screens). Receive is the first control;
-> below it a list of held secrets, each row showing a user-set name with the dongle id beneath (the id
-> always stays visible — it is what matches the dongle's own `AUTH2 greet … id=` line). An edit view
-> per row renames or deletes; it is a dedicated view rather than the shared `InputOptionsDialog`, which
-> is used by unrelated flows, seeds its input from `description` rather than a real prefill, and puts
-> its buttons under the keyboard — the last of which silently swallowed the first Save tap.
-> `dongleNames` is a separate map from `dongleSecrets` (a name is cosmetic, the secret is not, and that
-> shape is already persisted); deleting a secret drops its name too. The payload codec validates hard —
-> version, 12-hex id, secret decoding to exactly 32 bytes — because a camera hands the app any QR in
-> view and a malformed keyring entry produces a dongle that silently refuses this phone.
+> **QR give/receive shipped** in the app, behind the Phase A developer switch. Each held secret is
+> listed with the dongle id it belongs to, and the id always stays visible — it is what matches the
+> dongle's own `AUTH2 greet … id=` line. The QR payload is validated hard — version, 12-hex id,
+> secret decoding to exactly 32 bytes — because a camera hands the app any QR in view and a malformed
+> keyring entry produces a dongle that silently refuses this phone.
 >
 > **`AUTH_ENFORCE` is 1** — flipped and field-confirmed (`AUTH2 ok (ENFORCED - session granted)`).
 >
 > **The vestibule/bouncer is STRUCK, and replaced by something better.** Dropping a connection that
 > never authorizes cannot work here: the dongle cannot distinguish a camping stranger from a user
-> mid-pairing-decision, and dropping the link makes the app's poller reconnect and re-raise the OS
-> pairing prompt every cycle — precisely the churn `awaitingPairing` was built to prevent.
+> mid-pairing-decision, and dropping the link makes the poller reconnect and re-raise the OS
+> pairing prompt every cycle — precisely the churn the app's pairing-declined state was built to prevent.
 >
 > What the vestibule was actually for was denying a camper the two things it could still cost us:
 > holding the dongle awake, and occupying a connection slot. So instead the **awake-hold now keys on
@@ -1392,8 +1378,7 @@ backend-stored-secret idea above):
   command (physical access; already shipped; does not revoke a live session).
 - **One secret per dongle, no per-person slots** — slots mean chasing every holder down for rotation.
   Sharing access = the app shows the secret as a **QR code** ("give") and scans it ("receive"), phone to
-  phone, in person. No MITM surface: you show a QR in a controlled space. The app keeps its per-dongle
-  secrets in the OS keystore.
+  phone, in person. No MITM surface: you show a QR in a controlled space.
 - The provisioning write crosses BLE **encrypted** (Phase E gated ABD8 before this phase started), so the
   original "provisioning crosses in the clear" caveat is retired.
 
@@ -1404,8 +1389,8 @@ drops never-authenticating connections) is a later, deliberate flip — same pat
 encryption rollout safe.
 
 **Honest limit that remains:** B2 removes the token from *every connect*, but the token is still part of a
-**full profile push** (it is one of the pushed keys and is inside the CRC), so it still crosses the air —
-now encrypted by Phase E — whenever the profile is re-pushed.
+**full profile push** (it is one of the pushed keys and is inside `HASH`'s input), so it still crosses the
+air — now encrypted by Phase E — whenever the profile is re-pushed.
 
 ---
 
@@ -1441,8 +1426,8 @@ dongle: verify ECDSA-P256 over  "ABRPAUTH1" | dongle_id | nonce  → privileged 
   shared `Helpers/ecdsa_verify.h` so OTA and auth share one proven implementation.
 - Privileged flag is **RAM-only**, cleared on disconnect and after a timeout.
 - Enforcement: `log_dump.h` START gates on `ble.privileged()`.
-- App: new `src/state/ble/abrpObd/authorizeDongleThunk.ts`, called by `fetchDongleLogsThunk`; new endpoint
-  client next to the existing pairing call, which is where the ownership record already lives.
+- App: an authorization step before the log fetch, calling a new endpoint next to the existing pairing
+  call, which is where the ownership record already lives.
 
 Backend: one endpoint, an ownership check, and private-key storage (KMS/HSM rather than a config file).
 
@@ -1520,7 +1505,7 @@ network assumed available, that is simply a second backend call — no cached ti
 > and the data flowed **nowhere** live (frames only buffered). They now key on `bleRelaying()` =
 > connected **and** authenticated (`Helpers/ble.h`) — AUTH on ABD2 is only possible over a paired link, so
 > it's exactly "the phone is a working transport", and it is the dongle-side mirror of the app's
-> `awaitingPairing` (both flip on the same AUTH event). The state machine's awake-hold deliberately stays
+> pairing-declined state (both flip on the same AUTH event). The state machine's awake-hold deliberately stays
 > on `bleConnected()`: sleeping mid-pairing-prompt would drop the link and cause reconnect→re-prompt
 > churn; `MAX_AWAKE` bounds a camping phone. Accepted cost: a POST may now overlap the few seconds
 > between CONNECT and AUTH OK. Residual, by design: each NEW connection session prompts once — an
@@ -1535,18 +1520,16 @@ network assumed available, that is simply a second backend call — no cached ti
 > ATT silently drops write commands to an encryption-required attribute on a plaintext link (no error
 > response), which is fine since ABD6 is only written after START is ACKed on ABD5, which forced
 > encryption. ABD8 gated = pairing-before-authorization, the intended layering for the phase-2 HMAC
-> handshake. App impact of gating ABD3–ABDA: none — ABD3 is declared but unused, ABD4 is only read via a
-> `.catch`-guarded error path, and ABD5–7 live in dev-gated one-shot engines reached only by already-paired
+> handshake. App impact of gating ABD3–ABDA: none — ABD3 is declared but unused, ABD4 is only read on an
+> error path that tolerates a refusal, and ABD5–7 are developer tools reached only by already-paired
 > sessions.
 >
-> **The former app-side blocker is resolved.** The app now maps ATT security refusals (insufficient
-> authentication/authorization/encryption/key-size, detected via `attErrorCode` in `isBleAuthError.ts`)
-> to an `awaitingPairing` state instead of a lost connection: the listener and setup thunks reject with a
-> sentinel, `bleSlice` matches it and **keeps the connection** (a teardown would reconnect and re-prompt
-> every poll cycle), and the data-source status shows "Pairing required – data via cellular"
-> (`obd_pairing_required`). The flag clears on disconnect/reconnect or when a frame arrives. Detection
-> must happen where the original `BleError` still exists — the thunks' wrap-into-plain-Error paths drop
-> `attErrorCode`. **Ship dongle and app together**: an old app against ABD1/2-gated firmware loops
+> **The former app-side blocker is resolved.** The app now treats ATT security refusals (insufficient
+> authentication/authorization/encryption/key-size) as the pairing-declined state (shown as "Pairing
+> required – data via cellular") instead of a lost connection: it **keeps the connection** (a teardown
+> would reconnect and re-prompt every poll cycle). That state clears on disconnect/reconnect or when a
+> frame arrives. The refusal must be recognised from the ATT error code itself, before any generic error
+> handling discards it. **Ship dongle and app together**: an old app against ABD1/2-gated firmware loops
 > reconnect→prompt on a declined dialog.
 >
 > Two diagnostic dead ends recorded so they are not repeated: `esp_ble_auth_cmpl_t.key_present` cannot
@@ -1612,12 +1595,12 @@ There are TWO connect sequences in the app, not one, and both must authorize bef
 
 | Path | Where | Order |
 |---|---|---|
-| Steady state | `ObdBlePoller.connect()` | connect → **auth** → setup → listener |
-| First-time pairing | `ObdBleSetupConnectionScreen` | connect → **auth** → setup → listener |
+| Steady state | the poller | connect → **ABD8 proof** → ABD2 profile push → ABD1 telemetry subscribe |
+| First-time pairing | the setup wizard | connect → **ABD8 proof** → ABD2 profile push → ABD1 telemetry subscribe |
 
 The wizard was missed when the poller was reordered, and it does not inherit the fix: the poller
-deliberately stands down while `isObdBleSetupOngoing` is set, so nothing else can authorize on the
-wizard's behalf. The symptom was that pairing a NEW dongle to a vehicle always failed at "error writing
+deliberately stands down while the wizard runs, so nothing else can authorize on the wizard's
+behalf. The symptom was that pairing a NEW dongle to a vehicle always failed at "error writing
 init commands" (ABD2 answering `NOAUTH`), while already-paired dongles kept working because their
 secret predated enforcement — so the regression was invisible until someone claimed a fresh dongle.
 
@@ -1626,20 +1609,20 @@ pairing it to a vehicle, so first-connect is exactly when the secret should be m
 
 **A gated-channel refusal is NOT proof the user declined.** Whichever operation is FIRST to touch a
 gated attribute is the one that TRIGGERS pairing, so it races the procedure it started — "pairing still
-in flight" and "user declined" look identical at that instant. Latching `awaitingPairing` off such a
-one-shot made every first-ever connect fail: the flag was set, `setupThunk` refused on it, the wizard
-reported "OBD connection failed", and a retry then worked because the bond existed by then. Field-
-reported and fixed.
+in flight" and "user declined" look identical at that instant. Latching "declined" off such a
+one-shot made every first-ever connect fail: the state was set, the profile push refused on it, the
+wizard reported "OBD connection failed", and a retry then worked because the bond existed by then.
+Field-reported and fixed.
 
-So the rule is: **only the SUSTAINED subscription latches.** `listenerThunk` keeps a long-lived
-telemetry monitor, so a refusal there really does mean access is being denied. `authThunk` and
-`setupThunk` are one-shots — they log the refusal and reject plainly. `setupThunk` still *reads* the
-flag on entry (a decline the listener already detected should short-circuit the next cycle), it just
-no longer sets it.
+So the rule is: **only the SUSTAINED subscription latches.** The telemetry subscription (ABD1 notify)
+is long-lived, so a refusal there really does mean access is being denied. The ABD8 handshake and the
+ABD2 profile push are one-shots — they log the refusal and fail plainly. The push still *honours* a
+decline the subscription already detected (it should short-circuit the next cycle); it just never
+concludes one itself.
 
-In both paths the handshake is dispatched WITHOUT `unwrap()`. A rejection must not abort the flow —
-firmware without ABD8 rejects it and that firmware's ABD2 accepts the push regardless. If
-authorization was genuinely required and did not happen, the setup step is what reports it.
+In both paths a handshake failure must not abort the flow — firmware without ABD8 rejects it and that
+firmware's ABD2 accepts the push regardless. If authorization was genuinely required and did not
+happen, the setup step is what reports it.
 
 ---
 
@@ -1670,10 +1653,9 @@ then D last, once the override exists.
 # Firmware OTA over BLE — v1 build specification
 
 End-to-end specification for the ESP32 dongle firmware update system, covering **both
-sides** — the dongle (ESP32, PlatformIO/arduino-esp32) and the mobile app (React
-Native / RTK) — and how they interact over BLE. This is a v1-only build spec: it
-describes exactly what gets built now. Deferred ideas are deliberately omitted to keep
-the implementation focused.
+sides** — the dongle (ESP32, PlatformIO/arduino-esp32) and the mobile app — and how
+they interact over BLE. This is a v1-only build spec: it describes exactly what gets
+built now. Deferred ideas are deliberately omitted to keep the implementation focused.
 
 The two sides share one contract: a protocol over two GATT characteristics
 (`ABD5`/`ABD6`) on the existing `ABD0` service, fixed sector/ACK framing, and a strict
@@ -1767,19 +1749,20 @@ until the sector retries cleanly.
 ### 2.4 Resume anchor
 The ACK carries `cur_sector` — the last successfully-written sector. On reconnect the
 device reports it so the app can resume mid-transfer rather than restart a multi-minute
-upload. During OTA the app's OTA screen owns reconnect (the poller is suppressed, §4.5).
+upload. During OTA the app's update flow owns reconnect (the poller stands back, §4).
 
 ### 2.5 MTU / connection interval (throughput)
 - **Dongle:** request a large MTU for the OTA session (up to 517; the existing `setMTU(185)`
   telemetry path still works at a higher ceiling). Payload/packet = `MTU − 6`. Request the
   fastest connection interval **only during OTA** (7.5 ms; min=max=0x06, latency=0,
   supervision=4 s) and revert afterward.
-- **App reality check — this bounds the negotiation:** the app does **not** call `requestMTU`
-  today. On **Android** it can raise it (`connectToDevice({ requestMTU })` / `requestMTUForDevice`)
-  — a real lever. On **iOS**, MTU is OS-negotiated and **cannot be forced to 517** (you get
-  ~185). So the dongle's request-517 is honored on Android and capped by iOS otherwise; plan
-  iOS transfer time around the lower MTU. Raise MTU only for the OTA session; don't disturb
-  the telemetry path.
+- **App reality check — this bounds the negotiation:** when this was written the app did not
+  request an MTU. *Superseded:* it now requests 517 before subscribing (Appendix A §4, the
+  Android greet fix), and the dongle caps the MTU at 247 (`BLEDevice::setMTU(247)`; Part I §2
+  *Hard-won BLE facts*: at 517 large notifications are lost), so Android negotiates 247. On
+  **iOS**, MTU is OS-negotiated and **cannot be forced** (you get ~185); plan iOS transfer time
+  around the lower MTU. (The original "raise MTU only for the OTA session" advice is superseded
+  too: the request now comes before the subscribe that triggers the auth greet.)
 
 ### 2.6 Throughput expectation (shared reality)
 Closest reference (fbiego, NimBLE, optimized): ~1,038,544 B in 85 s ≈ **12 KB/s** →
@@ -1897,142 +1880,52 @@ for v1 by design.
 
 ## 4. APP SIDE
 
-House rules: RTK slices in `src/state`, Biome + TS-strict, i18n for every string
-(`no-hardcoded-jsx-strings` fails the build otherwise), unit tests from
-`src/state`/`src/util`, additive-only changes that leave the telemetry core untouched.
+What the dongle relies on the app doing:
 
-### 4.1 Navigation + UI
-- **New screen** `src/screens/FirmwareUpdateScreen.tsx`, registered in
-  `VehicleSettingsModalNavigator.tsx` with route `FirmwareUpdate` (add to `navigation/types.tsx`
-  param list). No new navigator, no change to existing routes.
-- **Entry point:** one row under the same advanced-OBD area as the PID editor, reusing existing
-  List/ListItem components.
-- **Gating:** show only when the selected vehicle is OBD-paired (`tlm_type` `obdble`/`abrpobd`)
-  and BLE-connected — mirror the OBD-screen checks. Keep it **developer-gated for v1**
-  (`isDeveloperUserSelector`); open up once proven.
-
-### 4.2 State — dedicated `firmwareUpdate` RTK slice
-Add `src/state/firmwareUpdate/firmwareUpdateSlice.ts` and `SliceNames.FIRMWARE_UPDATE`
-(`src/state/sliceNames.ts`). A slice (not component state) because the flow spans navigation,
-survives re-render, must be observable by the poller (§4.5), and needs unit tests.
-```ts
-type FirmwareUpdatePhase =
-  | 'idle' | 'checking' | 'available' | 'upToDate'
-  | 'downloading'   // fetching the signed blob to the phone
-  | 'transferring'  // streaming to the dongle
-  | 'verifying'     // dongle verifying + committing (from status notifications)
-  | 'rebooting' | 'success'
-  | 'failed'        // verify-fail, power-refusal, timeout
-  | 'rolledBack';   // rebooted but version did not advance
-
-interface FirmwareUpdateState {
-  phase: FirmwareUpdatePhase;
-  currentVersion: number | null;    // read from the dongle
-  availableVersion: number | null;  // from the release source
-  progress: number;                 // 0..1, from ACK cur_sector / total sectors
-  error: string | null;             // i18n key/code, never a raw secret
-}
-```
-Actions: `setPhase`, `setVersions`, `setProgress`, `setError`, `reset`. Async in thunks via
-`createAppAsyncThunk`. **Throttle progress** before Redux (per-sector / a few Hz) so a
-400-sector transfer doesn't dispatch hundreds of actions/sec. **Blacklist the slice from
-redux-persist** — it's transient.
-
-### 4.3 Distribution access (public GitHub Releases)
-- The signed `.bin` + manifest are public GitHub Releases; no token. HTTP via the
-  already-present `axios`; the blob is saved with the already-present `expo-file-system`.
-- Select the newest image by `manifest.version` (see Appendix C §2.2), never by tag order.
-
-### 4.4 BLE transfer layer — reuse, don't rebuild
-Additive on the **existing** connection. **Do not open a second BLE connection** — reuse
-`state.ble.deviceId`.
-- Talk to `ABD5`/`ABD6` **directly via `bleManager`** by UUID — the exact pattern
-  `abrpObd/setupThunk.ts` uses (`writeCharacteristicWithResponseForDevice`,
-  `monitorCharacteristicForDevice`, `readCharacteristicForDevice`). **`bleConnectThunk` does
-  not change** (keeps early-returning for `ABD0`); OTA thunks address `ABD5`/`ABD6` by UUID like
-  `setupThunk` addresses `ABD2`.
-- Control frames (START/END/ABORT + metadata + signature) →
-  `writeCharacteristicWithResponseForDevice(deviceId, ABD0, ABD5, base64)`; the ~106 B START uses
-  the existing long-write path. Data packets →
-  `writeCharacteristicWithoutResponseForDevice(…, ABD6, …)`.
-- ACK/status → `monitorCharacteristicForDevice(deviceId, ABD0, ABD5, cb)`; parse the 20-byte
-  frame; pace the next sector on ACK (stop-and-wait). Remove the subscription on done/abort.
-- **Packetization / framing / CRC16 are pure functions** in `src/state/firmwareUpdate/utils/`
-  (`buildSectorPackets`, `parseAckFrame`, `crc16Ccitt`, `compareVersions`) — unit-testable
-  without a device.
-- Keep the byte-transfer logic in this one `transfer` module so the slice/UI don't depend on how
-  bytes move (clean seam; nothing beyond BLE is built in v1).
-
-### 4.5 Coordination with the poller — the one place the app must touch core (safely)
-During an update the dongle is `UPDATING` and stops telemetry; the app must not fight it.
-**Mirror the proven `isObdBleSetupOngoing` flag — do not invent a new mechanism:**
-- Add `isFirmwareUpdateOngoing: boolean` + `setFirmwareUpdateOngoing` to `bleSlice` (next to
-  `isObdBleSetupOngoing`). `FirmwareUpdateScreen` sets it true on mount / false on unmount; the
-  OTA thunks own it across the transfer.
-- `ObdBlePoller` already reads `isObdBleSetupOngoing` in two spots (connected zombie-teardown
-  guard, `connect()` wizard guard). Extend **those same two conditions** to also honor
-  `isFirmwareUpdateOngoing` — one line each — so the poller neither tears down nor reconnects/
-  streams mid-update.
-- **Reconnect ownership during OTA is the OTA screen, not the poller.** On a mid-transfer drop,
-  the OTA thunk reconnects to `deviceId`, reads `cur_sector` from `ABD5`, resumes. On the final
-  reboot, the OTA screen reconnects and reads the version.
-- **Do not touch** `getTelemetryUpdate`, merge/attribution, `updateVehicleTelemetry`, the generic
-  `obdble` lane, `bleConnectThunk` discovery, or `ABD1`–`ABD4`.
-
-### 4.6 UX & platform considerations
-- **iOS backgrounding:** a 2.5–5 min transfer must survive foregrounding; `bluetooth-central`
-  background mode keeps the link but throttles background transfers and can suspend a long-idle
-  app. Keep the screen active (disable the idle timer during OTA), warn "keep the app open," and
-  **rely on the `cur_sector` resume anchor** if the OS suspends.
-- **Interruptions** (back-nav, call, low battery) → treat as abort: send ABORT on `ABD5`, clean
-  up, release the flag. The dongle inactivity timeout is the backstop if the app vanishes.
-- **Progress honesty:** drive the bar from `cur_sector / total` in the ACK, not local bytes
-  written (local writes lead what the dongle has committed).
-- **No silent failure:** every terminal state maps to a distinct i18n message (verify-failed,
-  power-refused, timed-out, rolled-back).
-
-### 4.7 Testing (coverage from `src/state`/`src/util`)
-Unit-test (jest-expo) every pure protocol/security function: `compareVersions` (incl. malformed),
-`crc16Ccitt` (known vectors), `buildSectorPackets` (4 KB sectoring, headers, last-packet/last-
-sector markers, MTU sizing), `parseAckFrame` (status decode, `cur_sector`, CRC validation,
-reject corrupt), `firmwareUpdateSlice` reducers (phase transitions, progress throttle, error
-set/reset). The live BLE transfer is **not** unit-tested (needs the real `bleManager`) — covered
-by bench testing. Gate loop before commit: `yarn format` → `yarn lint` → `yarn type:check` →
-`yarn circular` → `yarn test`.
-
-### 4.8 Additive vs. changed files
-- **New (additive, isolated):** `FirmwareUpdateScreen.tsx`; `src/state/firmwareUpdate/` (slice,
-  thunks, `utils/`); route entry in `VehicleSettingsModalNavigator.tsx` + `types.tsx`;
-  `SliceNames.FIRMWARE_UPDATE`, translations, store wiring; one advanced-OBD list row.
-- **Touched (minimal, mirror the flag pattern):** `bleSlice.ts` (+`isFirmwareUpdateOngoing`);
-  `ObdBlePoller.ts` (extend the two existing guards).
-- **Explicitly NOT touched:** telemetry merge/attribution, `updateVehicleTelemetry`, the generic
-  `obdble` lane, `bleConnectThunk` discovery, `ABD1`–`ABD4`, redux-persist migrations.
+- **Discovery:** select the newest image by `manifest.version` (see Appendix C §2.2), never by tag
+  order. The signed `.bin` + manifest are public GitHub Releases; no token. Show the update only for
+  an OBD-paired, BLE-connected vehicle; keep it developer-gated for v1, open up once proven.
+- **Transport — reuse, don't rebuild.** Use the **existing** BLE connection; never open a second one.
+  Address `ABD5`/`ABD6` by UUID on the `ABD0` service. Control frames (START/END/ABORT + metadata +
+  signature) are writes with response on `ABD5`, the ~106 B START as a long write; data packets are
+  writes without response on `ABD6`. Subscribe to `ABD5` notifications **before** the first write
+  (Appendix C §3.1), parse the 20-byte frame, and pace the next sector on its ACK (stop-and-wait).
+  Unsubscribe on done/abort.
+- **Stand back during the transfer.** The dongle is `UPDATING` and stops telemetry; while an update
+  runs the poller must neither tear the connection down nor reconnect or stream.
+  The update flow owns reconnect: on a mid-transfer drop it reconnects, reads `cur_sector` from
+  `ABD5` and resumes; after the final reboot it reconnects and reads the version. Nothing else in the
+  telemetry path, the generic `obdble` lane or `ABD1`–`ABD4` changes.
+- **UX obligations:** drive progress from `cur_sector / total` in the ACK, not local bytes written
+  (local writes lead what the dongle has committed). Treat interruptions (back-navigation, a call,
+  low battery) as an abort: send ABORT on `ABD5`; the dongle's inactivity timeout is the backstop if
+  the app vanishes. On iOS a backgrounded app has its BLE transfer throttled and may be suspended, so
+  a 2.5–5 min transfer must survive backgrounding: keep the screen awake, warn "keep the app open",
+  and **rely on the `cur_sector` resume anchor** if the OS suspends. Every terminal state
+  (verify-failed, power-refused, timed-out, rolled-back) is reported distinctly.
 
 ---
 
-## 5. End-to-end flow (both sides, mapped to code)
+## 5. End-to-end flow (both sides)
 
-1. **Enter** `FirmwareUpdateScreen` → app `setFirmwareUpdateOngoing(true)`; read the dongle's
-   current version. Poller backs off.
-2. **Check** → `checkFirmwareUpdateThunk`: `axios.get` the manifest (GitHub
-   Releases) → `compareVersions` → `available` / `upToDate`.
+1. **Enter** the update flow → the poller stands back; read the dongle's current version.
+2. **Check** → fetch the manifest (GitHub Releases), compare versions → available / up to date.
 3. **Confirm** (user taps Update) → app shows a precondition pre-warning (park, engine off, keep
    the app open, ~N min). The **dongle** enforces the real gate and refuses START if driving /
    weak rail.
-4. **Download** → `axios` → `expo-file-system` temp file (`phase: downloading`).
+4. **Download** → the image to a temporary file on the phone.
 5. **START** → app writes `0x0001` on `ABD5` (`image_size`+`version`+`sha256`+`signature`).
    Dongle checks preconditions + anti-downgrade, `esp_ota_begin` on the inactive slot, arms.
 6. **Transfer** → app streams 4 KB sectors on `ABD6`, stop-and-wait on `ABD5` ACKs; dongle hands
-   each sector to the loop task, `esp_ota_write`s, ACKs with `cur_sector`. App updates throttled
-   `progress` (`phase: transferring`).
+   each sector to the loop task, `esp_ota_write`s, ACKs with `cur_sector`. App shows progress
+   from the ACKs.
 7. **END / verify / commit** → app writes `0x0002`; dongle `esp_ota_end` → read-back SHA-256 →
-   ECDSA verify → `esp_ota_set_boot_partition` → `esp_restart` (`phase: verifying` → `rebooting`).
-8. **Reboot → reconnect → confirm** → connection drops; the OTA screen reconnects and reads the
-   version: advanced → `success`; unchanged → `rolledBack`. Meanwhile the dongle boots
+   ECDSA verify → `esp_ota_set_boot_partition` → `esp_restart`.
+8. **Reboot → reconnect → confirm** → connection drops; the update flow reconnects and reads the
+   version: advanced → success; unchanged → rolled back. Meanwhile the dongle boots
    `PENDING_VERIFY`, runs the hardware self-test, and marks valid or invalid.
-9. **Exit / cleanup** → app deletes the temp file, removes the notify subscription,
-   `setFirmwareUpdateOngoing(false)`, `reset`. Dongle releases `maintenance_mode`; poller resumes.
+9. **Exit / cleanup** → app deletes the temp file and removes the notify subscription; the poller
+   resumes. Dongle releases `maintenance_mode`.
 
 ---
 
@@ -2053,16 +1946,16 @@ by bench testing. Gate loop before commit: `yarn format` → `yarn lint` → `ya
   mark-valid/rollback. **First task: confirm the stock arduino mark-valid timing** (§3.3) — the
   one genuine unknown. Two GATT chars + sector framing + stop-and-wait ACK + loop-task hand-off
   (§3.6) + power/sleep gating (§3.7) + USB recovery proven. Measure real BLE transfer time.
-- App: `firmwareUpdate` slice + `FirmwareUpdateScreen` + poller back-off flag + read dongle
-  version + `ABD5`/`ABD6` write/notify wrappers. Prove it drives an *unsigned* bench transfer and
-  the poller backs off cleanly (no contention, no zombie teardown, clean reconnect after reboot).
+- App: update flow + poller back-off + read dongle version + `ABD5`/`ABD6` write/notify. Prove
+  it drives an *unsigned* bench transfer and the poller backs off cleanly (no contention, no
+  zombie teardown, clean reconnect after reboot).
 
 **Phase 2 — real update (security + full flow)**
 - Dongle: ECDSA-P256 signature + read-back verify before commit (§3.4); NVS anti-downgrade (§3.8);
   PlatformIO post-build signing step.
-- App: manifest check + `compareVersions` + download + full sector protocol with stop-and-wait +
-  `cur_sector` resume + throttled progress + all terminal states + i18n. Android `requestMTU`
-  raise as the throughput lever. Signature verified **on the dongle**; the app just carries bytes.
+- App: manifest check + version compare + download + full sector protocol with stop-and-wait +
+  `cur_sector` resume + progress + all terminal states. Android MTU raise as the throughput
+  lever. Signature verified **on the dongle**; the app just carries bytes.
 
 
 ---
@@ -2206,8 +2099,7 @@ Service `ABD0` (unchanged, existing pairing/bonding/auth flow untouched). Two ch
 A GATT write to `ABD5` only gets an ATT-layer ack (the write succeeded as a write) —
 the *logical* accept/reject arrives asynchronously as a notification. If you haven't
 subscribed to `ABD5` yet, you write START and get no application-level response at all
-and no error. Always call your notify-subscribe (`monitorCharacteristicForDevice` /
-equivalent) on `ABD5` first, then write.
+and no error. Always subscribe to notifications on `ABD5` first, then write.
 
 ### 3.2 Control writes on ABD5 (app → dongle)
 
@@ -2408,14 +2300,15 @@ logic to stay well inside both.
 - **`ABD1`–`ABD4` and the existing pairing/bonding flow are completely unaffected.** No
   new service, no new pairing step — OTA rides on the connection you already have.
 - **Don't open a second BLE connection** for OTA; address `ABD5`/`ABD6` on the existing
-  `deviceId`, same as the setup thunk already addresses `ABD2`.
+  connection, the same way the profile push addresses `ABD2`.
 - **BLE preserves write order** within one connection/characteristic — packet *loss* is
   the failure mode the protocol defends against, not reordering. That's why a mismatch is
   handled as "resend the sector," not a reorder buffer.
-- **MTU**: request the largest MTU you can before starting (up to 517 on Android via
-  `requestMTU`; iOS is OS-capped around ~185 and cannot be forced higher) — this is the
-  main throughput lever. Expect **~2.5–5 minutes** for the current ~1.7MB image; plan the
-  UI (keep-screen-awake, "don't close the app") around that.
+- **MTU**: request the largest MTU you can before starting (the app requests 517 before its first
+  subscribe; the dongle caps it at 247, so Android gets 247; iOS is OS-capped around ~185 and
+  cannot be forced higher) — this is the main throughput lever.
+  Expect **~2.5–5 minutes** for the current ~1.7MB image; plan the UI (keep-screen-awake,
+  "don't close the app") around that.
 - **Every update must currently be signed.** The dongle has a real ECDSA-P256 key
   compiled in and `OTA_REQUIRE_SIGNATURE` is on. `tools/ota_sign.py` is the only supported
   way to produce a `manifest.json`/`firmware.bin` pair that a dongle will accept — hand-
@@ -2426,16 +2319,14 @@ logic to stay well inside both.
 
 # Appendix D — OTA app-side spec
 
-> Original file: `OTA_UPDATE_APP_SPEC.md`
+> Original file: `OTA_UPDATE_APP_SPEC.md`. That document was mostly an implementation spec for the
+> closed-source app (navigation, state, code layout, testing, file lists); those sections are omitted.
+> The protocol obligations it set out are in Appendix B §4 and Appendix C §4–5. What remains is the
+> guiding principle, the transport decision and its review of the dongle design.
 
 # Firmware OTA — App-side implementation spec (v1)
 
-Companion to `ota-update-architecture-v4.md` (dongle side). This document covers **only the app
-side**: how the update surfaces in the UI, the Redux/state shape, how it reuses (and must not
-break) the existing BLE stack, and the considerations that fall out of *how this app actually
-works today*. It is written to the repo's house rules (`AGENTS.md`/`CLAUDE.md`): RTK slices in
-`src/state`, Biome + TS-strict, i18n for every string, unit tests from `src/state`/`src/util`,
-additive-only changes that leave the telemetry core untouched.
+Companion to `ota-update-architecture-v4.md` (dongle side).
 
 ---
 
@@ -2449,10 +2340,10 @@ system depends on. Its job is only:
 2. get the bytes to the dongle (or tell the dongle to fetch them),
 3. show progress/result and stay out of the way.
 
-Everything below is designed so that if the app is buggy, killed, or malicious, the worst case
+Everything is designed so that if the app is buggy, killed, or malicious, the worst case
 is a *failed/aborted* update — never a bricked dongle and never an unsigned image running. That
-already falls out of the dongle design; the app spec just must not undermine it (e.g. by fighting
-the transfer with the telemetry poller — see §6).
+already falls out of the dongle design; the app just must not undermine it (e.g. by fighting
+the transfer with the poller — see Appendix B §4).
 
 ---
 
@@ -2465,245 +2356,24 @@ This single decision determines how much app code exists.
 |---|---|---|
 | App work | Large: PAT/secure-store, 1.72 MB download, the full `ABD5`/`ABD6` sector protocol, resume, MTU tuning, backgrounding survival, poller back-off | Tiny: one "check/trigger" write + parse status notifications |
 | Transfer time | ~2.5–5 min BLE, human-present, parked, app foregrounded the whole time | Dongle's cellular speed, phone can walk away |
-| New dependencies | secure-storage lib (§4) unless PAT is dropped | none |
-| Credentials on device | PAT lives in the **app** | fetch cred lives on the **dongle** (or public CDN) |
+| New dependencies | secure-storage lib unless PAT is dropped | none |
+| Credentials on device | PAT lives in the **app** (later dropped: releases are public) | fetch cred lives on the **dongle** (or public CDN) |
 | Failure surface | iOS BLE backgrounding, MTU-on-iOS ceiling, drop/resume | dongle's existing cellular retry |
 
 The dongle already authenticates and POSTs telemetry to `/1/tlm/bulk` over cellular — it has the
 exact muscle needed to `GET` a signed blob. Model **B** deletes the hardest ~70% of the app work
-(the entire §5 transfer layer) and the narrow "keep the phone glued to the dongle for 5 minutes"
+(the entire BLE transfer layer) and the narrow "keep the phone glued to the dongle for 5 minutes"
 window. v4 defers a "WiFi-HTTP transport" but the dongle's cellular is *already there*.
 
 **Recommendation:** make the app's OTA layer **transport-agnostic** — a state machine + status UI
 that is identical whether the bytes move over BLE or cellular — and treat BLE transfer as the
-*fallback* for a dongle with no signal, not the default. The spec below writes the full BLE path
-(so v1 can ship without dongle-cellular-fetch work) but isolates it behind one `transfer` module
-so switching to B later changes ~one file, not the UI/state.
+*fallback* for a dongle with no signal, not the default. v1 ships the full BLE path (so it needs no
+dongle-cellular-fetch work), with the transfer isolated so switching to B later does not touch the
+rest of the flow.
 
 ---
 
-## 2. Where it lives (navigation + UI)
-
-The advanced-OBD screens are registered in
-`src/navigation/VehicleSettingsModalNavigator.tsx`
-(`ObdPidEditorScreen`, `ObdPidEditorTestScreen`, …). Add the feature exactly like those:
-
-- **New screen:** `src/screens/FirmwareUpdateScreen.tsx`, registered in
-  `VehicleSettingsModalNavigator` with a route `FirmwareUpdate` (add to the param list in
-  `src/navigation/types.tsx`). No new navigator, no change to existing routes.
-- **Entry point:** a row under the same advanced-OBD area the PID editor is reached from
-  (same gating as `ObdPidEditorScreen` — it already sits behind the advanced/developer surface).
-  Reuse the existing List/ListItem components (as `ConnectLiveData`/PID editors do); no new UI kit.
-- **Gating:** show the row only when the selected vehicle is OBD-paired (`tlm_type` is `obdble`
-  or `abrpobd`) and BLE-connected — mirror the checks already used for the OBD screens. Consider
-  keeping it developer-gated for v1 (`isDeveloperUserSelector`) since it's a risky power feature,
-  then opening it up once proven.
-
-House rule: **every visible string goes through `t()`** and into `translations/` — the Biome grit
-plugin (`no-hardcoded-jsx-strings`) fails the build otherwise.
-
----
-
-## 3. State — a dedicated `firmwareUpdate` RTK slice
-
-Add `src/state/firmwareUpdate/firmwareUpdateSlice.ts` and a `SliceNames.FIRMWARE_UPDATE` entry
-(the enum in `src/state/sliceNames.ts` — same place `BLE`/`OBD_BLE` live; the review-comment we
-just handled shows the codebase wants slice-name constants, so use one here from day one).
-
-Why a slice (not component state): the flow spans navigation, survives screen re-render, must be
-observable by the poller (§6), and needs to be unit-tested — all reasons the app already uses
-slices for BLE/vehicle state.
-
-```ts
-type FirmwareUpdatePhase =
-  | 'idle'
-  | 'checking'        // querying the release source
-  | 'available'       // newer version found, awaiting user confirm
-  | 'upToDate'
-  | 'downloading'     // fetching the signed blob to the phone (BLE model only)
-  | 'transferring'    // streaming to the dongle
-  | 'verifying'       // dongle verifying + committing (from ACK/status notifications)
-  | 'rebooting'       // dongle restarting into the new image
-  | 'success'
-  | 'failed'          // includes verify-fail, power-refusal, timeout
-  | 'rolledBack';     // rebooted but version did not advance
-
-interface FirmwareUpdateState {
-  phase: FirmwareUpdatePhase;
-  currentVersion: number | null;   // read from the dongle
-  availableVersion: number | null; // from the release source
-  progress: number;                // 0..1, driven by ACK cur_sector / total sectors
-  error: string | null;            // i18n key or code, never a raw secret
-}
-```
-
-Actions: `setPhase`, `setVersions`, `setProgress`, `setError`, `reset`. Async work lives in
-thunks built with `createAppAsyncThunk` (from `src/state/service`), same as every BLE thunk.
-Progress must be **throttled** before it hits Redux (e.g. update at most a few Hz, or per-sector)
-so a 400-sector transfer doesn't dispatch hundreds of actions/sec — this is the same "keep
-middleware traffic low" concern the reviewer raised about the telemetry lane.
-
----
-
-## 4. No repository token
-
-The channel is untrusted and the signature is the only thing that matters, so distribution is a
-public signed artifact: the app `GET`s a public manifest + asset. No secret to store, no new
-dependency, no native change. HTTP is done with the already-present `axios`; the blob is saved
-with the already-present `expo-file-system`.
-
----
-
-## 5. The BLE transfer layer (Model A) — reuse, don't rebuild
-
-All of this is *additive* on top of the existing connection. **Do not open a second BLE
-connection** — reuse `state.ble.deviceId` (the live session the poller/wizard already manage).
-
-- **New characteristics** `ABD5` (control, WRITE+NOTIFY) and `ABD6` (data, WRITE_NO_RESPONSE) on
-  the existing `ABD0` service. The app talks to them **directly via `bleManager`** using the known
-  service/char UUIDs — the exact pattern `abrpObd/setupThunk.ts` already uses
-  (`writeCharacteristicWithResponseForDevice`, `monitorCharacteristicForDevice`,
-  `readCharacteristicForDevice`). This means **`bleConnectThunk` does not need to change** (it can
-  keep early-returning for the `ABD0` service); the OTA thunks address `ABD5`/`ABD6` by UUID the
-  same way `setupThunk` addresses `ABD2`. Additive, zero risk to the connect path.
-- **Writes:** control frames (START/END/ABORT + metadata + signature) →
-  `writeCharacteristicWithResponseForDevice(deviceId, ABD0, ABD5, base64)`. Data packets →
-  `writeCharacteristicWithoutResponseForDevice(…, ABD6, …)` for throughput. The long START frame
-  (~106 B) uses the same long-write path the config push already relies on.
-- **ACK/status:** `monitorCharacteristicForDevice(deviceId, ABD0, ABD5, cb)` — parse the 20-byte
-  frame (echoed sector, status, `cur_sector`, CRC16-CCITT). Pace the next sector on ACK
-  (stop-and-wait), exactly as v4 §6.3 specifies. Remove the subscription on done/abort.
-- **Packetization / framing / CRC16 are pure functions** — put them in
-  `src/state/firmwareUpdate/utils/` (`buildSectorPackets`, `parseAckFrame`, `crc16Ccitt`,
-  `compareVersions`) so they're unit-testable without a device (see §9). This mirrors how the
-  abrpobd lane keeps `postProcessTlm`/`stripObdProvidedTelemetry` as testable utils.
-- **MTU reality check:** the app does **not** currently call `requestMTU`. On **Android** the app
-  can raise it (`connectToDevice({ requestMTU })` or `requestMTUForDevice`) — a real throughput
-  lever. On **iOS**, MTU is OS-negotiated and **cannot be forced to 517**; you'll get whatever iOS
-  gives (~185). So v4's "request 517" is Android-only; plan the iOS transfer time around the lower
-  MTU. Raise MTU only for the OTA session if you add it, and don't disturb the telemetry path.
-
----
-
-## 6. Coordination with the poller/telemetry — the one place we *must* touch core (safely)
-
-This is the critical "don't break the app" section. During an update the dongle is in its
-`UPDATING` state and stops telemetry; the app must not fight it. We already have the exact,
-proven pattern for this: the `isObdBleSetupOngoing` flag added for the setup wizard.
-
-**Mirror it — do not invent a new mechanism:**
-
-- Add `isFirmwareUpdateOngoing: boolean` to `bleSlice` (next to `isObdBleSetupOngoing`), with a
-  `setFirmwareUpdateOngoing` action. The `FirmwareUpdateScreen` sets it `true` on mount / `false`
-  on unmount (dedicated effect, like the wizard), and the OTA thunks own it across the transfer.
-- `ObdBlePoller` already reads `state.ble.isObdBleSetupOngoing` in two spots (the connected
-  zombie-teardown guard and the `connect()` wizard guard). Extend **those same two conditions** to
-  also honor `isFirmwareUpdateOngoing` — so the poller neither tears down the connection nor
-  reconnects/streams while an update runs. One-line-each change, identical shape to what's there.
-- The abrpobd listener / `abrpFrameWriter` will naturally see no frames (the dongle stopped
-  sending), but the flag also prevents the poller from restarting them mid-update.
-- **Whoever owns reconnect during OTA is the OTA screen, not the poller** — because the poller is
-  suppressed. On a mid-transfer drop, the OTA thunk reconnects to `deviceId`, reads `cur_sector`
-  from `ABD5`, and resumes. On the final reboot, the OTA screen reconnects and reads the version.
-
-**Do not touch** anything else in the telemetry core: `getTelemetryUpdate`, the merge/attribution,
-`updateVehicleTelemetry`, the generic `obdble` lane, or the existing `ABD1`–`ABD4` characteristics.
-
----
-
-## 7. Flow (app perspective), mapped to code
-
-1. **Enter** `FirmwareUpdateScreen` → dispatch `setFirmwareUpdateOngoing(true)`; read the dongle's
-   current version (a small read on a control char, or from the existing startup/telemetry data).
-2. **Check** → `checkFirmwareUpdateThunk`: `axios.get` the public manifest, `compareVersions`,
-   set `available`/`upToDate`.
-3. **Confirm** (user taps Update) → precondition gate message ("park the car, engine off, keep the
-   app open, ~N min") — the dongle enforces the real gate and will refuse START if driving/weak
-   rail; the app just pre-warns.
-4. **Download** (Model A) → `axios` → `expo-file-system` temp file (`phase: downloading`).
-5. **Transfer** → `transferFirmwareThunk`: START on `ABD5` (size+version+sha256+sig) → stream 4 KB
-   sectors on `ABD6`, stop-and-wait on `ABD5` ACKs, update throttled `progress` (`phase:
-   transferring`).
-6. **Verify/commit** → dongle verifies + `esp_ota_set_boot_partition`; app reflects status frames
-   (`phase: verifying` → `rebooting`).
-7. **Reboot → reconnect → confirm** → connection drops; OTA screen reconnects, reads version:
-   advanced → `success`; unchanged → `rolledBack` (self-test failed on the dongle).
-8. **Exit / cleanup** → delete temp file, remove notify subscription, `setFirmwareUpdateOngoing
-   (false)`, `reset`. The poller resumes normal telemetry.
-
----
-
-## 8. UX & platform considerations (fallout from how the app runs)
-
-- **iOS backgrounding:** a 2.5–5 min BLE transfer must survive the app being foregrounded; iOS
-  `bluetooth-central` background mode keeps the link but **throttles/greatly slows** background
-  transfers and can suspend a long-idle app. So: keep the screen active (disable idle timer during
-  OTA), warn "keep ABRP open," and **rely on resume** (`cur_sector`) if the OS suspends — don't
-  assume an uninterrupted foreground window. This is another argument for Model B.
-- **Interruptions:** back-navigation, call, low battery → treat as abort (send ABORT on `ABD5`,
-  clean up, release the flag). The dongle's inactivity timeout is the backstop if the app vanishes.
-- **Progress honesty:** drive the bar from `cur_sector / total` in the ACK, not from bytes written
-  locally (local writes are ahead of what the dongle has committed).
-- **No silent failure:** every terminal state maps to a distinct i18n message (verify-failed,
-  power-refused, timed-out, rolled-back) so a reviewer/user can tell what happened — the same
-  "truthful status" bar philosophy as the connectivity UI.
-
----
-
-## 9. Testing (house rule: coverage from `src/state`/`src/util`)
-
-Everything security- or protocol-critical on the app side is a **pure function** and must be unit
-tested (jest-expo), matching how the abrpobd lane is covered:
-
-- `compareVersions` (newer/older/equal, malformed).
-- `crc16Ccitt` against known vectors.
-- `buildSectorPackets` (correct 4 KB sectoring, headers, last-packet/last-sector markers, MTU
-  sizing).
-- `parseAckFrame` (status decode, `cur_sector`, CRC validation, reject corrupt frames).
-- `firmwareUpdateSlice` reducers (phase transitions, progress throttle, error set/reset).
-
-The live BLE transfer itself is **not** unit-tested (same reasoning as the telemetry listener —
-it needs the real `bleManager`); it's covered by on-device bench testing per the dongle phasing.
-Standard gate loop before commit: `yarn format` → `yarn lint` → `yarn type:check` → `yarn circular`
-→ `yarn test`.
-
----
-
-## 10. What is additive vs. what changes existing files
-
-**New (additive, isolated):**
-- `src/screens/FirmwareUpdateScreen.tsx`
-- `src/state/firmwareUpdate/` (slice, thunks, `utils/`)
-- route entry in `src/navigation/VehicleSettingsModalNavigator.tsx` + `types.tsx`
-- `SliceNames.FIRMWARE_UPDATE`, translations, store wiring for the new slice
-- one advanced-OBD list row (entry point)
-
-**Touched existing (minimal, mirror the proven flag pattern):**
-- `bleSlice.ts`: add `isFirmwareUpdateOngoing` + action (parallels `isObdBleSetupOngoing`)
-- `ObdBlePoller.ts`: extend the two existing setup-guard conditions to also honor the new flag
-
-**Explicitly NOT touched:** telemetry merge/attribution, `updateVehicleTelemetry`, the generic
-`obdble` lane, `bleConnectThunk` discovery, existing `ABD1`–`ABD4` characteristics, redux-persist
-migrations (the `firmwareUpdate` slice should be **blacklisted from persistence** — it's transient).
-
----
-
-## 11. Phasing (app side, mirrors the dongle's highest-risk-first order)
-
-1. **Plumbing, no security:** the `firmwareUpdate` slice + `FirmwareUpdateScreen` + the poller
-   back-off flag + reading the dongle version + the `ABD5`/`ABD6` write/notify wrappers. Prove the
-   app can drive an *unsigned* bench transfer and that the poller correctly backs off (no telemetry
-   contention, no zombie teardown, clean reconnect after the dongle reboots).
-2. **Real update:** public-manifest check + `compareVersions` + download + full sector protocol
-   with stop-and-wait + resume + progress + all terminal states + i18n. Signature is verified
-   *on the dongle*; the app just carries bytes.
-3. **Polish / optional:** Android MTU raise, throttled-progress tuning, resume-after-drop UX,
-   and — if you go that way — swap the BLE `transfer` module for the cellular-trigger module
-   (Model B) with the same slice/UI untouched.
-
----
-
-## 12. Architecture feedback on v4 (dongle side)
+## 2. Architecture feedback on v4 (dongle side)
 
 v4 is genuinely strong and has clearly absorbed the earlier round: dropped encryption for the
 right reason, USB recovery as a non-negotiable, native `esp_ota_ops` over `Update.h`, read-back-
@@ -2713,7 +2383,7 @@ gating, and a real app-coordination state (`UPDATING`). The read-back verify and
 
 Points worth weighing:
 
-1. **Cellular self-OTA (biggest one).** You already ship telemetry over cellular; the whole §6
+1. **Cellular self-OTA (biggest one).** You already ship telemetry over cellular; v4's whole §6
    BLE transfer protocol, the 2.5–5 min window, MTU-on-iOS limits, and the backgrounding risk are
    avoidable if the dongle fetches its own signed image. v4 defers "WiFi-HTTP" but the transport
    you actually have is cellular. I'd at least prototype dongle-side `GET`+verify+`esp_ota_write`
@@ -2783,8 +2453,8 @@ need lead time to ship firmware first.
 
 ### C2 — Please confirm the payload's JSON types  *(most likely to cause a silent failure)*
 
-The app currently coerces numeric fields after verifying (`Number(value.maxValue)`), which **masks any field that
-is emitted as a quoted string**. The dongle will consume the signed payload directly and will **not** coerce.
+The app currently coerces numeric fields to numbers after verifying, which **masks any field that is emitted as a
+quoted string**. The dongle will consume the signed payload directly and will **not** coerce.
 
 So numeric fields — `minValue`, `maxValue`, and any similar — must be **genuine JSON numbers** in the signed
 payload, e.g. `"maxValue": 90` and not `"maxValue": "90"`. If any are currently strings, everything looks fine in
@@ -3648,9 +3318,9 @@ out; the in-use copy has not. Low risk, but it's a library edit that deserves it
 - **OTA ACK-timeout resync (MEDIUM).** On a single lost ACK notification the app aborts a *healthy* session,
   and because ABORT reaches a live dongle it destroys the 90 s resume anchor, so the retry restarts from
   sector 0. The machinery to fix it already exists: the dongle `setValue`s every ACK before notifying, and
-  `readLatestFrame()` can read it back — it's currently only used when the *subscription* was refused. Fix =
-  on ACK timeout, try one read-back (or an INFO probe, whose ARMED reply carries `ota_cur_sector`) before
-  aborting. Deferred because it touches field-proven OTA code for a rare, self-healing case.
+  the app can read it back with a GATT read of ABD5 — it currently does so only when the *subscription* was
+  refused. Fix = on ACK timeout, try one read-back (or an INFO probe, whose ARMED reply carries
+  `ota_cur_sector`) before aborting. Deferred because it touches field-proven OTA code for a rare, self-healing case.
 - **Stale RESUMEWAIT blocks a different image for up to 90 s** with `OTA_ERR_BUSY`. On a parameter mismatch
   from an authenticated client, reset the stale session and accept the fresh START.
 - **Buffer `logEvent` to RAM during a log dump** (reuse the `bleLogQueue` pattern) so the documented "no
@@ -3674,8 +3344,6 @@ out; the in-use copy has not. Low risk, but it's a library edit that deserves it
   race window in the protocol.
 - **Log-dump notify log spam (§8).** 355 `[E]` lines per healthy dump, from the backpressure retry succeeding.
   Cosmetic, but it buries real errors; the fix is written out in §8 and gated on the multi-peer decision there.
-- **App-side poller tests** for `isFirmwareUpdateOngoing` / `isDongleLogFetchOngoing`, mirroring the existing
-  wizard/PID-test cases. The three guard sites are exactly the poller behaviour that branch changed.
 - ~~**`ota_sign.py` should derive the version**~~ Done: the version is injected at build time and `ota_sign.py`
   refuses an image whose `FW_BUILD_TAG` doesn't match. Three stale-binary releases preceded it (v2-over-v1,
   v5-over-v4, 3-over-v2).
@@ -4175,7 +3843,7 @@ Deny the moment every term fails — speed drops, fix lost, rail drops, pin off.
 with the user stationary in the car, and its Save button requires a live PID read — which the
 driving term can never satisfy while parked. A completed **full profile push** (CLEAN → SETUP OK,
 the config-apply block) is proof a human is actively driving the wizard at the car, so it grants a
-bounded permit (`ALARM_SETUP_PERMIT_MINUTES`, 10 min). The background reconnect fast path (HASH OK)
+bounded permit (`ALARM_SETUP_PERMIT_MINUTES`, 10 min). The poller's fast path (HASH OK)
 deliberately does **not** qualify: the phone auto-reconnects from a pocket, so "any authenticated
 BLE traffic ⇒ unlocked" would re-create the 2 a.m. garage alarm — a phone within range of an armed
 car at home relays with nobody touching anything.
@@ -4184,7 +3852,7 @@ car at home relays with nobody touching anything.
 unchanged profile *takes the fast path* — HASH matches the persisted profile — so the wizard got no
 permit, its PID test saw only gate-denied frames (`is_parked`/`is_charging`, no `soc`), and Save
 never enabled. Since the fast path must stay permit-free, the wizard now **forces the full push**
-(`setupThunk` sends CLEAN instead of HASH when `isObdBleSetupOngoing`). The dongle already skips
+(during the setup wizard the app sends CLEAN instead of HASH). The dongle already skips
 the OBD re-init for an identical profile, so the cost is the transfer alone. Rule to keep: the
 dongle never infers "wizard" from traffic shape — the app declares it by pushing fully, and only a
 completed full push grants the permit. The WOM wake-and-wait behaviour this enables
@@ -4324,34 +3992,29 @@ access gate instead of the device-local HMAC secret. Routing a safety-critical s
 account while access control deliberately avoids it is exactly the split that rots. Same discipline
 as the secret: stored on the device, authoritative locally, no round-trip.
 
-Note the vehicle *binding* is server-side — `save()` stores it on the account and
-`updateLocalVehicle` only caches it. That is why
-the flag must **not** ride there: a second phone signed into the same account syncs `tlm_type` and
-`obd_ble_device_ids` and can connect and relay **without ever opening the save screen**. An
-account-carried flag would therefore be applied by phones that were never asked the question.
+Note the vehicle *binding* is server-side — saving stores it on the account and the phone only
+caches it. That is why the flag must **not** ride there: a second phone signed into the same account
+syncs `tlm_type` and the dongle's BLE device ids and can connect and relay **without ever reaching the
+setup wizard's save step**. An account-carried flag would therefore be applied by phones that were
+never asked the question.
 
-### 10.2 Where it is set: the pairing/save screen, once
+### 10.2 Where it is set: the setup wizard's save step, once
 
 The flag is a **property of the car**, in the same category as typecode — not a user preference that
 drifts. Set-once at binding is the correct lifecycle.
 
-- **Placement:** inside the existing `isAbrpObd` branch of `ObdBleSetupConnectionScreen`, above
-  Save. `save()` already dispatches `updateVehicleObdBleThunk({ tlmType, vinHash, obdBleDeviceId })`
-  — the toggle's value is written to the dongle in the same action.
+- **Placement:** the setup wizard's save step for an abrpobd dongle, above Save. The toggle's value is
+  written to the dongle (ABD2 `obd_alarm`) as part of the same save that binds the vehicle.
 - **Label:** *"OBD port Alarmed?"* — Yes / No. Precise, and for this audience clearer than a
-  symptom description.
-- **Component:** `MultiToggle` with `type="ToggleButton"`; its `OptionValue` already admits
-  `boolean`, so `Option<boolean>[]` needs no string mapping, and its `tooltip` slot carries the
-  one-line consequence. (`SwitchCard` is the switch-shaped alternative — its `title`/`description`
-  are typed `TranslationKeys`, so i18n is compiler-enforced.) New strings need translation keys.
+  symptom description, with a one-line note on the consequence.
 - **Scope: abrpobd only.** Technically justified, not just rule-compliance: obdble polls only while
   a phone drives the session, so the "parked and armed for hours" exposure barely arises. The
   autonomous dongle is the one at risk.
 
-**Only one write path exists, and that is the point.** Because the save screen is the sole writer,
-a second phone holding a shared QR secret cannot disturb the setting — it authenticates and relays
-but never reaches the toggle. No tri-state wire contract, no reconciliation, no account field: there
-is only ever one copy of the value, held by the device that enforces it.
+**Only one write path exists, and that is the point.** Because the setup wizard's save step is the
+sole writer, a second phone holding a shared QR secret cannot disturb the setting — it authenticates
+and relays but never reaches the toggle. No tri-state wire contract, no reconciliation, no account
+field: there is only ever one copy of the value, held by the device that enforces it.
 
 ### 10.3 Default: Alarmed when nothing is stored
 
@@ -4364,8 +4027,8 @@ would live:
 
 | Situation | Resolution |
 |---|---|
-| Fresh save screen, dongle reports no stored value | Toggle shows **Alarmed** |
-| Save screen, dongle reports a stored value | Toggle shows **the stored value** — never the default |
+| Fresh save step, dongle reports no stored value | Toggle shows **Alarmed** |
+| Save step, dongle reports a stored value | Toggle shows **the stored value** — never the default |
 | Dongle NVS empty / never written (any firmware) | Resolve to **Alarmed** |
 
 The middle row is not cosmetic: without it, anyone re-running setup on a car deliberately marked
@@ -4398,16 +4061,16 @@ The app stores nothing. To initialise the toggle (§10.3, middle row) and to dis
 anywhere it matters, the dongle **publishes the flag in the readable info JSON on ABD5**, beside the
 installed firmware version already exposed by `setOtaInfo()`. That is the established
 "dongle-publishes-its-own-state" channel, it is one more field, and it costs **zero GATT handles** —
-the frozen table stays frozen. The dongle is authenticated and connected by the time the save screen
-renders, so the read is available exactly when needed.
+the frozen table stays frozen. The dongle is authenticated and connected by the time the setup wizard's
+save step renders, so the read is available exactly when needed.
 
 One copy, owned by the device that enforces it, readable by anyone authorised.
 
 ### 10.5 Changing it later: unlink and re-pair
 
-Once the binding is saved, reconnecting goes through the poller, not the setup wizard — so the
-toggle does not reappear. The edit path is **unlink the dongle from the vehicle and re-pair**: done
-on the phone, at the car, in about a minute.
+Once the binding is saved, reconnecting goes through the poller, not the setup
+wizard — so the toggle does not reappear. The edit path is **unlink the dongle from the vehicle and
+re-pair**: done on the phone, at the car, in about a minute.
 
 **Deliberately no serial command for this.** An earlier draft proposed `ALARM 1`/`ALARM 0` beside
 `AUTHCLEAR`/`BONDCLEAR` as a "lighter" path; it is the opposite. Serial means a laptop, a cable, and
@@ -4477,7 +4140,7 @@ invalidate or unlock a large branch, so neither should sit behind implementation
 | 0a | **`ATM1` silence test** (§9) — locked, armed, ten minutes | Ten minutes decides whether §12 exists at all. Largest branch, smallest cost. |
 | 0b | **Bench test: +12 V into pins 1/8/9/13** (§3) — watch `ATRV`, IO36, logs | Settles whether our board revision differs from r14 before any harness work. |
 | 1 | **The gate** (§8) — one pure default-deny function, conjunctive instantaneous permit, deferred init, per-wake logging | **IMPLEMENTED 2026-08-27** (`Helpers/alarm_gate.h`, wake-gate + poll-site wiring, per-PID guard in `OBDWrapper::readPIDs`, no-factory-fallback). |
-| 2 | **Toggle + read-back** (§10) — save-screen toggle, NVS flag, ABD5 info field | **IMPLEMENTED 2026-08-27** (app: toggle on the save screen, `obd_alarm` ABD2 key, `alarm` field in the ABD5 info JSON, read-back before display). |
+| 2 | **Toggle + read-back** (§10) — save-step toggle, NVS flag, ABD5 info field | **IMPLEMENTED 2026-08-27** (app: toggle on the setup wizard's save step, `obd_alarm` ABD2 key, `alarm` field in the ABD5 info JSON, read-back before display). |
 | 3 | **Silence verification** (§10.6) — park, lock, two wake cycles, fetch log, expect zero transmissions | Proves the property rather than assuming it. Do before trusting it on a real alarm car. |
 | 4 | **GPIO34 tap harness + calibration** (§6, §7) — only if 0b says the pins carry anything | Optional accuracy layer; recovers the stationary-ignition-on case. |
 | 5 | **Passive frame decoding** (§12) — only if 0a passed | Research track, i3 first. |
@@ -4500,7 +4163,7 @@ why they run first rather than when 4–5 are reached.
 | OBD link lifecycle decoupled from the permit | **New** — gate requests, not the link; avoids re-init churn (§8.3) |
 | One pure default-deny gate function, every call site through it | **New rule**, the reliability keystone (§8.4) |
 | Defer OBD init until a permit exists | **New**, stronger than validating init commands (§8.4) |
-| "OBD port Alarmed?" toggle at pairing/save, abrpobd only | **New**, small — sole write path (§10.2) |
+| "OBD port Alarmed?" toggle at the setup wizard's save step, abrpobd only | **New**, small — sole write path (§10.2) |
 | Flag in dongle NVS, device-local, **no backend** | **Decision** — consistency with the HMAC access gate (§10.1) |
 | Default Alarmed when unstored; toggle reads back stored value | **New**, both defaults kept distinct (§10.3) |
 | Flag published in ABD5 info JSON for read-back | **New**, zero GATT handles (§10.4) |
@@ -4539,7 +4202,7 @@ that one switch — but do not flip it before the Phase-1 fixes below are in.
 `BLEWrapper::clean()` (blewrapper.cpp ~398-411) clears `config_keys`, `configJson`,
 `tlm_push_token`, `hash_ok` — but not the `setup_unlocked` latch (reset only by
 `clearAuthentication()` on disconnect and by `deinit()`). When the app writes `{"AUTH":…}` again on
-the same connection (a retried setupThunk), the AUTH handler at blewrapper.cpp ~549 is skipped
+the same connection (a retried setup), the AUTH handler at blewrapper.cpp ~549 is skipped
 (latch already set) and the write falls through to the generic package path:
 
 - replies `ACK` (~619-620), then
@@ -4550,7 +4213,7 @@ Field trail (flash log): AUTH → AUTH OK → clean → CLEAN OK → five refuse
 no `keys`/`HASH`/`JWS`/`SETUP OK (push complete)`. Consequences cascade: `completeSetup()` never
 runs → the loop's config-apply never fires → `alarmGrantSetupPermit()` never called →
 `setup_permit=0` on every ALARMGATE line → PID test gate-denied → wizard shows the generic
-"OBD Connection Failed" checklist (the real reason, `no soc`, goes only to the eventlog).
+"OBD Connection Failed" checklist (the real reason, `no soc`, goes only to the app's log).
 
 **This also made the flag unrecoverable from the app**: Save requires the PID test, the PID test
 requires the permit, the permit requires the push, the push was broken. NOTE: this bug is
@@ -4596,7 +4259,7 @@ Compounding: on a denied cycle while the phone is relaying, the BLE frame is str
 `{is_parked,is_charging}` (telemetry_format.h strips lat/lon/utc), the BLE send succeeds, so
 logger.ino ~1360 **clears the upload buffer** (fixed in #58, see §6a), and `bleRelaying()` stands cellular down — data
 flows nowhere; only the flash CSV survives. The app compounds it: after 5 min without telemetry the
-UI reports "Not connected" on a perfectly healthy link (bleStateThunk/ConnectivityStatus).
+UI reports "Not connected" on a perfectly healthy link.
 
 **Fixes (Phase 1):** `g_gps_powered = <actual gpsBegin() result>`; when it failed on a
 motion/cold wake, re-attempt `gpsBegin()` from the loop, one attempt per poll cycle until it takes
@@ -4646,38 +4309,21 @@ Also found in the chain (record, low priority):
 
 ## App-side findings
 
-**A1 (real bug, abrpobd-only, Phase 3):** `setupThunk`'s prologue guards use `return reject(...)`
-where `reject` returns void — the async thunk **fulfils with `undefined`**. "Not connected",
-"not abrpobd", "awaiting pairing", "no PIDs", "no packages" all look like SUCCESSFUL setup to
-`.unwrap()` callers, produce unhandled rejections, and make the `OBD_BLE_AWAITING_PAIRING` branch
-in bleSlice unreachable from setup. (setupThunk.ts ~78-163.)
+What the app's half of the trace means on the wire, and what the firmware relies on the app to get
+right:
 
-**A2 (abrpobd-only, Phase 3):** `listenerThunk` has no silence handling — a connected dongle that
-never pushes `tlm` leaves the promise pending forever with a live monitor subscription. In the
-wizard, the leaked subscription's late error/frame runs a STALE continuation during the next
-attempt: its `stopCountdown()` kills the new stage's only timeout (shared countdown ref), or a late
-good frame flips stage 3 to Success mid-retry (Save enabled on a mid-reconnect link). Fix: cancel
-the listener subscription when stage 3's countdown fires.
+- **A1 (real bug, abrpobd-only, Phase 3):** a profile push that stopped early (not connected, not an
+  abrpobd dongle, the pairing-declined state, no PIDs) was reported to the wizard as a successful
+  setup. A push that did not end in `SETUP OK` must be reported as a failure.
+- **A2 (abrpobd-only, Phase 3):** a telemetry subscription on a connected dongle that never sends a
+  frame stayed open forever, and its late error or frame then acted on the wizard's *next* attempt
+  (cancelling that attempt's timeout, or marking a mid-reconnect link good). Fix: cancel the ABD1
+  subscription when the wizard's wait for telemetry expires.
+- **A3 (verified present and correct):** the fix for a gated access in flight during pairing keeps
+  the connection rather than dropping it (Appendix A §7, §7b). Gap: a fast retry can race the OS's
+  teardown of the previous connection.
 
-**A3 (verified PRESENT and correct):** the hand-applied desync fix — `OBD_BLE_GATED_IN_FLIGHT`
-sentinel, bleSlice early-return branch preserving deviceId/isAbrpObd, three `stopCountdown()`
-calls. The gated-in-flight path is closed. Gaps: no test covers the new branch; `disconnect`'s
-`cancelDeviceConnection` is fire-and-forget so a fast retry can race the native teardown.
-
-**Shared code, NOT touched (owner decision):**
-- `bleConnectThunk` rejects after a successful `connectToDevice` without cancelling
-  (:66-69 discovery failure, :109-111 missing config) → same Redux-vs-radio desync shape, reachable
-  from stage 2 for BOTH lanes → retry storm of `DeviceAlreadyConnected` until the OS drops the link.
-- The shared single-slot countdown ref (useObdBleSetupIcons) lets any stale `stopCountdown()`
-  disarm the current stage.
-- `pauseCountdown()` on `bt_bond_state: 'bonding'` is never auto-resumed if the user ignores the OS
-  dialog — stage 3 spins forever with a frozen number.
-- Poller: no backoff/background-gating — a sleeping dongle costs a connect attempt every ~15 s or
-  continuous `allowDuplicates` scanning, and floods the 300-entry eventlog ring (evicting the very
-  evidence a bug report needs).
-- While driving with the gate denying, the app is fail-silent: the poller never inspects `soc`,
-  `awaitingPairing` is never set (not an ATT error), and after 5 min the UI shows "Not connected"
-  for a healthy link.
+Other app-side issues found by the trace are tracked with the app.
 
 ---
 
@@ -4690,10 +4336,9 @@ calls. The gated-in-flight path is closed. Gaps: no test covers the new branch; 
 | 1 | Periodic DENY re-log with per-term breakdown | alarm_gate.h |
 | 2 | Handshake-activity leash feed (kills the 5-min mid-wizard death) | blewrapper + state_machine |
 | 2 | DECISION: advertise on suppressed stationary wakes, or stay radio-silent | logger.ino |
-| 3 | setupThunk fulfil-instead-of-reject bug | app, abrpobd only |
-| 3 | Wizard-scoped listener-subscription cleanup on countdown expiry | app, abrpobd only |
+| 3 | Profile-push failures reported as success (A1) | app, abrpobd only |
+| 3 | Cancel the wizard's telemetry subscription when its wait expires (A2) | app, abrpobd only |
 | 4 | Real fix-time freshness key (closes the garage exposure) | gps_location.h |
-| — | Shared-code items above | owner decision |
 
 **Re-enable checklist:** Phase 1 complete → flash → wizard on the flagged car (expect full push,
 `setup_permit=1`, PID test green) → one real drive with the periodic DENY log captured → only then

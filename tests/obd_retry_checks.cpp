@@ -298,7 +298,7 @@ static void checkFailures() {
 
 // ---- profile evaluation as the app does it (#84): virtual keys, multi-command keys, the MEB soc ----
 
-// The MEB profile's soc and its inputs (obd/MEB.json), on one bus for the scripted link.
+// The backend's MEB profile: its soc and the inputs soc reads, on one bus for the scripted link.
 static const char* MEB = R"P({
   "obd_protocol": "7",
   "init_commands": { "command": ["ATZ"] },
@@ -314,7 +314,7 @@ static const char* MEB = R"P({
     "minValue": -2, "maxValue": 200 }
 })P";
 
-// A co-processor reply with headers off: the app's test strings with the line breaks it removed put back.
+// A co-processor reply with headers off: a reference reply below, with the line breaks taken out of it put back.
 static std::string reply(const std::string& app) {
   if (app.empty()) return "NO DATA" + PROMPT;
   if (app.find(':') == std::string::npos) return app + PROMPT;
@@ -335,8 +335,8 @@ static bool value(const OBDVector& results, const std::string& key, double& out)
 static bool near(double a, double b) { return a > b - 5e-4 && a < b + 5e-4; }
 
 static void checkProfile() {
-  // The app's MEB cases (abrp-app-new src/state/obdble/tests/MEBsw6.test.ts), each reply in command order:
-  // 22028C, 222AB2, 222AB8; "" is no answer.
+  // Reference MEB SoC cases, shared with the app (software 6.0 and older, plus missing-reply fallbacks; the
+  // expected values are the app's), each reply in command order: 22028C, 222AB2, 222AB8; "" is no answer.
   struct Case { const char* name; std::string soc, cap, soe; double expected; };
   const std::vector<Case> cases = {
     { "Enyaq SW 6.0", "62028C3F", "622AB206160400", "00B0:622AB80000071:5200000000AAAA", 63 },

@@ -185,8 +185,8 @@ Later updates don't need the USB cable: the ABRP app downloads the signed firmwa
 the dongle over Bluetooth. The dongle checks the signature before installing it, and goes back to
 the previous version on its own if the new one doesn't start.
 
-During testing, firmware updates are in the app's developer tools and need an access token from the
-project. Ask us for one.
+During testing, firmware updates are in the app's developer tools, which only developer accounts
+see. Ask us if you need access.
 
 If you changed the APN or the bands in step 3, update over USB instead; see the note there.
 

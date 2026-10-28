@@ -147,7 +147,7 @@ is not verified by a bench test, and saying so is part of reporting it.
 | Cloud upload, profiles, where they come from | §6a |
 | Co-processor command limits, cars it can't read (BMW i3 …) | §6b |
 | The OBD-alarm gate (per vehicle) | §7 |
-| App-side rules, `abrpobd` vs `obdble` | §8 |
+| App-side obligations, `abrpobd` vs `obdble` | §8 |
 | Diagnosing a dongle that went quiet | §9 |
 | Invariants to check before changing something | §11 |
 
@@ -165,7 +165,7 @@ and `Helpers/auth_gate.h` (ABD8).
   (setup, step by step) and `docs/technical-overview.md` (code layout, settings, console). Keep the
   car table and the settings tables current when the code changes.
 - Check `git remote -v` before reaching for a forge CLI: `gh` only works if the remote is GitHub.
-- The app side lives in the ABRP app repository (closed source) and has its own `AGENTS.md`. Protocol changes
+- The app is the closed-source ABRP app, in its own repository. Protocol changes
   touch both repos and land together; a firmware change that moves a wire format without the app is a broken pair.
   From outside, describe the app-side change a PR needs in its description.
 
@@ -395,12 +395,11 @@ that threw part-way through being applied. `failures` covers what `readPIDs()` k
 refused AT filter, no data, a refusal, an out-of-range value and a reply too short for its equation, each with the
 command's index and reply, cleared each poll. It also covers `loop()`'s logging block, compiled from `logger.ino`:
 once per command, 4 a poll, only on a poll the car answered, the 8 slots kept for commands not yet logged, again
-after a new profile. `profile` runs the app's MEB SoC cases (`MEBsw6.test.ts`, 11 replies
-including the missing-reply fallbacks) through the real `readPIDs()` and expects the app's numbers: virtual `VAL{}`
-keys in any order with min/max clamping, multi-command keys, missing bytes as NaN, the multi-frame index digit,
-`==` and refused `!=`, and the parser refusing a function it has no node for. Fixtures are
-scrubbed co-processor replies (the MEB ones are the app's, with their line breaks put back); the co-processor
-itself is not exercised.
+after a new profile. `profile` runs the reference MEB SoC cases (11 replies including the missing-reply fallbacks)
+through the real `readPIDs()` and expects the app's numbers: virtual `VAL{}` keys in any order with min/max
+clamping, multi-command keys, missing bytes as NaN, the multi-frame index digit, `==` and refused `!=`, and the
+parser refusing a function it has no node for. Fixtures are scrubbed co-processor replies (the MEB ones shared
+with the app, with their line breaks put back); the co-processor itself is not exercised.
 
 ## Profile push checks
 
