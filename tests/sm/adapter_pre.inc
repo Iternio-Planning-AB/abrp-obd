@@ -100,7 +100,11 @@ enum SmReset { ESP_RST_POWERON = 1, ESP_RST_PANIC = 4, ESP_RST_TASK_WDT = 6, ESP
   X(float, sm_atrv, 13.5f) \
   X(int, g_alarm_flag, -1) \
   X(bool, sm_cold_boot, false) \
-  X(bool, sm_ble_connected, false)
+  X(bool, sm_ble_connected, false) \
+  X(bool, sm_run_on, false) \
+  X(unsigned long, sm_run_ms, 0) \
+  X(uint32_t, sm_run_budget, 0) \
+  X(const char*, sm_budget_broken, nullptr)
 
 #define SM_DEFINE(T, name, value) T name = value;
 SM_RAM(SM_DEFINE)

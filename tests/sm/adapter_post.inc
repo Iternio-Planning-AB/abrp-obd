@@ -55,6 +55,50 @@ void restore(const Snap& s) {
   sm_serial.resize(s.serial_n);
 }
 
+// The fast-cadence budget (#83), checked against the adapter's own record rather than the code that keeps it. The
+// firmware judges staleness at a moment inside the block or gate, against evidence the block may stamp, so a reset is
+// allowed when the charge could be stale by then, and owed when it was stale before and stayed so.
+struct BudgetBefore { uint32_t fast; uint64_t evidence_us, now_us; };
+BudgetBefore budgetBefore() { return {charging_fast_minutes, charge_last_evidence_us, esp_rtc_get_time_us()}; }
+bool staleAt(uint64_t now_us, uint64_t evidence_us) {
+  return now_us < evidence_us || now_us - evidence_us >= (uint64_t)CHARGE_STALE_RESET_MINUTES * 60000000ULL;
+}
+bool mayBeStale(const BudgetBefore& b) { return staleAt(esp_rtc_get_time_us(), b.evidence_us); }
+// A block that stamps evidence makes the charge fresh; one that resets clears the stamp along with the budget.
+bool mustBeStale(const BudgetBefore& b) {
+  return staleAt(b.now_us, b.evidence_us) && (charge_last_evidence_us == b.evidence_us || !charge_last_evidence_us);
+}
+bool reasonIs(const char* r) { return g_cadence_reason && !strcmp(g_cadence_reason, r); }
+// After the energy block. The charging branch is the one that arms a fast tier with no cadence reason: the follow-up
+// and the post-drive window arm WAKE_CHARGING_MINUTES too, past the cap by design (once per charge; POST_DRIVE_*).
+void budgetCheck(const BudgetBefore& b, unsigned long energy_ms) {
+  const bool charging = !g_cadence_reason &&
+    (g_next_wake_minutes == WAKE_CHARGING_MINUTES || g_next_wake_minutes == WAKE_DC_CHARGING_MINUTES);
+  const bool released = (!g_cadence_reason && g_next_wake_minutes == WAKE_PARKED_MINUTES) || reasonIs("pdw") ||
+                        reasonIs("followup");
+  if (charging && b.fast >= (uint32_t)WAKE_CHARGING_MAX_MINUTES)
+    sm_budget_broken = "a charging poll armed a fast cadence with the fast budget spent";
+  // Only a streaming release or a stale charge resets it: a sample poke's release is a pause in the same charge.
+  const bool owed = (released && !g_sample_poke) || ((released || reasonIs("parked-held")) && mustBeStale(b));
+  if (b.fast && !charging_fast_minutes && !owed && !mayBeStale(b))
+    sm_budget_broken = "a poll reset a budget not yet stale";
+  if (owed && charging_fast_minutes) sm_budget_broken = "a streaming release or a stale charge kept its budget";
+  // A sample poke, and a streaming wake's first charging poll, add the tier armed; the polls after it add the whole
+  // minutes since then (a log line moves the clock 1 ms, so allow one minute either way).
+  if (!charging) { sm_run_on = false; return; }
+  if (g_sample_poke || !sm_run_on) {
+    if (b.fast < (uint32_t)WAKE_CHARGING_MAX_MINUTES && charging_fast_minutes != b.fast + (uint32_t)g_next_wake_minutes)
+      sm_budget_broken = "a charging poll did not add the tier it armed";
+    sm_run_on = true;
+    sm_run_ms = energy_ms;
+    sm_run_budget = charging_fast_minutes;
+    return;
+  }
+  const long expected = (long)sm_run_budget + (long)((energy_ms - sm_run_ms) / 60000UL);
+  if (std::labs((long)charging_fast_minutes - expected) > 1)
+    sm_budget_broken = "a streaming charge's budget does not follow its time on the fast cadence";
+}
+
 #define SM_RESET(T, name, value) name = value;
 // A boot: RAM back to its initialisers, the RTC sanitize and the debt restore, then the setup() gate. A cold boot
 // zeroes the clock, as setup() does, until a poll sets it.
@@ -68,6 +112,7 @@ void boot(const SmEvent& e, SmReset reset) {
   sm_reset = reset;
   if (reset == ESP_RST_DEEPSLEEP) g_wake_reason = e.cause == SM_MOTION ? "MOTION" : "TIMER";
   if (e.cause == SM_COLD) sm_clock_ok = false;
+  sm_run_on = false;  // the fast anchor is RAM
   chargeWakeStateSanitize(reset == ESP_RST_DEEPSLEEP);
   sm_restore();
   // A charge latch the trace asserts (a charge some earlier, unmodelled poll saw); otherwise the energy block's own.
@@ -83,9 +128,13 @@ void boot(const SmEvent& e, SmReset reset) {
   backlog.swap(obd_result_vector);
   sm_backlog_file = !backlog.empty();
   const uint32_t polls = polls_count;
+  const BudgetBefore budget = budgetBefore();
   sm_wake_gate(e.cause == SM_COLD ? ESP_SLEEP_WAKEUP_UNDEFINED : e.cause == SM_MOTION ? ESP_SLEEP_WAKEUP_EXT0
                                                                                        : ESP_SLEEP_WAKEUP_TIMER);
   sm_gate_open = polls_count != polls;
+  if (budget.fast && !charging_fast_minutes && !mayBeStale(budget)) sm_budget_broken = "a skip wake reset a budget not yet stale";
+  if (sm_asleep && !sm_gate_open && budget.fast && charging_fast_minutes && mustBeStale(budget))
+    sm_budget_broken = "a skip wake kept a stale charge's budget";
   backlog.swap(obd_result_vector);
   sm_backlog_file = false;
   if (sm_asleep) return;
@@ -171,7 +220,10 @@ void poll(const SmEvent& e) {
   sm_emplace(current_frame);
   sm_published = -1;
   for (const auto& res : current_frame) if (res.first == "is_parked") sm_published = res.second;
+  const BudgetBefore budget = budgetBefore();
+  const unsigned long energy_ms = sm_now;
   sm_energy(current_frame, obd_count);
+  budgetCheck(budget, energy_ms);
   sm_buffer(current_frame, e.has_data);
   sm_marker_set();
   sm_weak_recovered();  // the car switched on during a weak-rail cold boot (#104)
@@ -226,6 +278,7 @@ void step(const SmEvent& e) {
 
 // Properties of one side after event e, against its state before it. Null when they hold.
 const char* propertyBroken(const Snap& pre, const SmEvent& e) {
+  if (sm_budget_broken) return sm_budget_broken;
   if (e.k == SmKind::WAKE && sm_gate_weak && sm_gate_open) return "the gate opened on a weak rail";
   // A weak-rail cold boot stays up for BLE, but its loop's poll condition vetoes every cycle (#104), so no wake on a
   // weak rail asks the car anything.

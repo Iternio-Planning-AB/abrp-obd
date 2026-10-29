@@ -254,6 +254,30 @@ void start(std::vector<SmEvent>& trace) {
   if (!diff.empty()) fail("OLD and CUR differ at power-on: " + diff, trace);
 }
 
+// The fast budget's cap (720 min) and the stale reset (360 min) are far past depth 5 from a cold start, so enumerate and
+// random also start from these, set identically on both sides: a charge one fast poke short of the cap, and a charge
+// with a budget one parked wake short of stale, released or still latched.
+enum { SEED_NEAR_CAP, SEED_NEAR_STALE, SEED_LATCHED_STALE };
+const char* const SEED_NAMES[] = {"SEED(near-cap)", "SEED(near-stale)", "SEED(latched-stale)"};
+#define SM_SEED(ns, kind)                                                                                         \
+  do {                                                                                                            \
+    ns::recently_charging = kind != SEED_NEAR_STALE;                                                              \
+    if (kind == SEED_NEAR_CAP) {                                                                                  \
+      ns::charging_fast_minutes = (uint32_t)(WAKE_CHARGING_MAX_MINUTES - WAKE_CHARGING_MINUTES);                  \
+    } else {                                                                                                      \
+      ns::sm_rtc_ms += (unsigned long)CHARGE_STALE_RESET_MINUTES * 60000UL;                                       \
+      ns::charging_fast_minutes = 120;                                                                            \
+    }                                                                                                             \
+    ns::charge_last_evidence_us = ns::esp_rtc_get_time_us() -                                                     \
+      (kind == SEED_NEAR_CAP ? 0 : (uint64_t)(CHARGE_STALE_RESET_MINUTES - WAKE_PARKED_MINUTES) * 60000000ULL);   \
+  } while (0)
+void startSeeded(std::vector<SmEvent>& trace, int kind) {
+  start(trace);
+  SM_SEED(sm_old, kind);
+  SM_SEED(sm_cur, kind);
+  trace.push_back(SmEvent{SmKind::ADVANCE, SEED_NAMES[kind]});
+}
+
 const unsigned long AT = (unsigned long)(ACTIVE_TIMER);
 const unsigned long MAX_AWAKE_MS = (unsigned long)MAX_AWAKE_MINUTES * 60UL * 1000UL;
 
@@ -278,6 +302,13 @@ const std::vector<SmEvent> ENERGY_ALPHABET = {
 // the lockout's top), latched wakes in the taper band, the charge-end band, below it and on a weak rail, a latched
 // motion wake, motion at the ATRV threshold and just under it, a weak cold boot, and an alarm-enforced poke and
 // motion wake.
+// From a seed, the energy symbols and an odd advance: a streaming charge's minutes, and a clock off the round values.
+const std::vector<SmEvent> SEEDED_ALPHABET = [] {
+  std::vector<SmEvent> a = ENERGY_ALPHABET;
+  a.push_back(Advance(61007));
+  return a;
+}();
+
 const std::vector<SmEvent> WAKE_ALPHABET = {
   Wake(SM_TIMER, 13.3f), Wake(SM_TIMER, 13.0f), Wake(SM_TIMER, 12.2f), Wake(SM_TIMER, 11.0f),
   Wake(SM_TIMER, 13.1f, true, true), Wake(SM_TIMER, 12.5f, true, true), Wake(SM_TIMER, 12.0f, true, true),
@@ -345,6 +376,13 @@ void randomGroup() {
     std::mt19937 rng(seed);
     for (int sequence = 0; sequence < 1000; ++sequence) {
       start(trace);
+      for (int i = 0; i < 30; ++i) play(randomEvent(rng), trace);
+    }
+  }
+  for (int kind : {SEED_NEAR_CAP, SEED_NEAR_STALE, SEED_LATCHED_STALE}) {  // own seeds: the cold-start sequences above stay as they were
+    std::mt19937 rng(100 + kind);
+    for (int sequence = 0; sequence < 500; ++sequence) {
+      startSeeded(trace, kind);
       for (int i = 0; i < 30; ++i) play(randomEvent(rng), trace);
     }
   }
@@ -631,6 +669,27 @@ void scenarios() {
     poke(Charge(30));
   }, "a stale cap");
   check(charging_fast_minutes == 0, "the first answered poke once stale drops the cap and the budget", t);
+  // A streaming wake's charge counts its time on the fast cadence: 30 minutes of 5 s polls is 30 minutes of budget
+  // beyond the first poll's tier (the budget property checks every poll on the way).
+  start(t);
+  play(Advance(CONFIRM_MS), t);
+  play(Charge(-50, 380, 0.5), t);
+  const uint32_t first = charging_fast_minutes;
+  for (int i = 0; i < 360; ++i) { play(Advance(5000), t); play(Charge(-50, 380, 0), t); }
+  check(!g_sample_poke && charging_fast_minutes >= first + 29 && charging_fast_minutes <= first + 31,
+        "a streaming charge adds its 30 minutes", t);
+  // Past the cap, a release at a poke arms the follow-up: one silent high-rail poke after it looks again at the
+  // charging cadence, with the cap still latched. By design, once per charge, and not the charging branch.
+  start(t);
+  until([&] { return charging_cap_latched; }, [&] { poke(Charge(-50, 380, 0.5)); }, "the cap");
+  poke(Charge(0.479));
+  poke(Charge(0.479));
+  check(!recently_charging && charging_cap_latched && charge_followup == 1, "released past the cap, follow-up armed", t);
+  poke(Silent());
+  check(charging_cap_latched && g_next_wake_minutes == WAKE_CHARGING_MINUTES && g_cadence_reason &&
+        std::string(g_cadence_reason) == "followup" && charge_followup == 0, "one follow-up look past the cap", t);
+  poke(Silent());
+  check(g_next_wake_minutes == WAKE_PARKED_MINUTES, "and only one", t);
 
   // Corroboration: a charging current with a flat soc for CHARGE_CORROBORATE_MINUTES goes slow; a rise restores it.
   start(t);
@@ -1048,7 +1107,7 @@ int main(int argc, char** argv) {
   }
   if (group == "all" || group == "random") {
     randomGroup();
-    std::cout << "PASS: random (5 seeds x 1000 sequences x 30 events)\n";
+    std::cout << "PASS: random (5 seeds x 1000 sequences x 30 events, and 3 x 500 from near the cap, near stale and latched near stale)\n";
   }
   if (group == "all" || group == "enumerate") {
     const auto t0 = clock::now();
@@ -1061,10 +1120,17 @@ int main(int argc, char** argv) {
     const unsigned long energy_leaves = leaves - drive_leaves;
     start(trace);
     enumerate(depth, trace, WAKE_ALPHABET);
+    const unsigned long wake_leaves = leaves - drive_leaves - energy_leaves;
+    for (int kind : {SEED_NEAR_CAP, SEED_NEAR_STALE, SEED_LATCHED_STALE}) {
+      startSeeded(trace, kind);
+      enumerate(depth - 1, trace, SEEDED_ALPHABET);
+    }
     const double s = std::chrono::duration<double>(clock::now() - t0).count();
     std::cout << "PASS: enumerate depth " << depth << " over " << ALPHABET.size() << " drive, " << ENERGY_ALPHABET.size()
               << " energy and " << WAKE_ALPHABET.size() << " wake symbols, " << drive_leaves << " + " << energy_leaves
-              << " + " << leaves - drive_leaves - energy_leaves << " sequences in " << s << "s\n";
+              << " + " << wake_leaves << " sequences, and the energy symbols at depth " << depth - 1
+              << " with an odd advance, from near the cap, near stale and latched near stale (" << leaves - drive_leaves - energy_leaves - wake_leaves
+              << "), in " << s << "s\n";
   }
   if (group == "all" || group == "crash") {
     crashes(depth);

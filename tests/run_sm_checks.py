@@ -21,7 +21,8 @@ tests/sm_checks.cpp compiles each side into its own namespace around the same ha
 every event: the latch, the leash and hold times, the marker debt and its crash copy, published is_parked,
 buffered frames, alarm speed notes, freezes, every energy and gate RTC field and RAM output, the next-wake
 minutes, and the exact logEvent and Serial sequences; the gate's poll or skip shows in its counters. It also checks
-the weak-rail gate, the weak-rail cold boot's modem-off sleep and the max-awake backstop as properties. Groups:
+the weak-rail gate, the weak-rail cold boot's modem-off sleep, the max-awake backstop and the fast-cadence budget
+(#83) as properties. Groups:
 enumerate (exhaustive over a drive, an energy and a wake alphabet, --depth, default 5), random (fixed seeds), scenarios (named field and charge cases), crash (CUR alone: a panic,
 also inside the pre-sleep flush, never loses the marker debt; an absolute property, not a comparison), rules
 (CUR alone: absolute checks of the #6 driving rules), or all. A Charge or Silent poll keeps the wake's rail and
