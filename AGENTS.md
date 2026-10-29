@@ -249,6 +249,17 @@ firmware's read inside the block allows, either way. The follow-up and post-driv
 the cap by design (once per charge; `POST_DRIVE_*`), named in a scenario. The cap and the stale reset are out of
 depth-5 reach from a cold start, so enumerate (energy symbols and an odd advance, at depth 4) and random also start
 from a charge one poke short of the cap and a charge one parked wake short of stale, released or still latched.
+It also runs the OBD-alarm permit: `alarm_gate.h` from the setup grant through `alarmGateAllowsPoll()`, pinned for OLD,
+as the last term of `loop()`'s poll condition, after the weak-rail veto, and pinned by position (the car is asked,
+`readPIDs` and the deferred `obd.initialize`, only inside that condition, compiled in the default build, after the rail
+and GNSS refresh). On an enforced car a poll asks the car
+exactly when an oracle kept from the trace's inputs permits it (the setup window with an authenticated phone or within its BLE grace, or the
+rail awake and a moving fix no older than `ALARM_GNSS_MAX_AGE_MS` or a speed note within `ALARM_SPEED_HOLD_MS`, a
+sustained collapse voiding the note), and every DENY line carries a `tx=` that never moves between two of them (a check
+of the transition logging: only the gated branch moves the counter here). Scenarios cover a parked car, a
+moving fix, a tunnel on the speed hold, a stale fix, a short dip and a switch-off, and the wizard's setup permit with
+the phone leaving, each boundary to the millisecond; random
+adds 500 sequences on an enforced car with fix ages around the bound. The per-PID guard inside `readPIDs` is not covered.
 
 ## Diagnostic host checks
 

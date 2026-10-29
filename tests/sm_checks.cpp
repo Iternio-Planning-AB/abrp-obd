@@ -23,7 +23,7 @@
 
 #include "../libraries/OBDWrapper/obd_vector.h"
 
-enum class SmKind { POLL, ADVANCE, LADDER, HOLD, SLEEP, WAKE, MAINT, CRASH };
+enum class SmKind { POLL, ADVANCE, LADDER, HOLD, SLEEP, WAKE, MAINT, CRASH, SETUP };
 enum class SmTo { ACTIVE, BLE, CHARGING, STANDBY };
 enum { SM_NONE, SM_SPEED, SM_VRS, SM_BOTH };  // which speed keys the poll carries (BOTH: speed, then vrs)
 enum { SM_TIMER, SM_MOTION, SM_COLD };   // wake cause
@@ -65,6 +65,7 @@ struct SmEvent {
   double soc_step = 0, kwh_step = NAN, soe_step = NAN;
   double power = NAN, current = NAN, voltage = NAN, dcfc = NAN;
   double poll_rail = NAN;  // the rail this cycle read; NaN keeps the last
+  unsigned long fix_age_ms = 0;  // POLL: how old the GNSS fix is
 };
 
 SmEvent Poll(int key, double speed, bool gnss = false, double kmh = 0, bool has_data = true, double speed2 = 0) {
@@ -168,6 +169,18 @@ SmEvent Alarmed(SmEvent e) {
   e.alarm = true;
   return named(e, ",alarm");
 }
+// A poll whose GNSS fix is ms old.
+SmEvent Aged(SmEvent e, unsigned long ms) {
+  e.fix_age_ms = ms;
+  return named(e, ",fix=" + std::to_string(ms) + "ms");
+}
+// A completed full profile push from the wizard, which grants the alarm gate's setup permit; the phone leaving.
+SmEvent Setup() {
+  SmEvent e{SmKind::SETUP, "SETUP"};
+  e.on = true;
+  return e;
+}
+SmEvent Leave() { return SmEvent{SmKind::SETUP, "PHONE-LEFT"}; }
 
 namespace sm_old {
 #include "old_side.inc"
@@ -214,7 +227,7 @@ std::string difference(const sm_old::Snap& a, const sm_cur::Snap& b) {
   const auto& fa = sm_old::obd_result_vector;
   const auto& fb = sm_cur::obd_result_vector;
 #define SM_CMP(T, name, value) if (!same(a.name, b.name)) return #name ": OLD " + text(a.name) + " | CUR " + text(b.name);
-  SM_RAM(SM_CMP) SM_RTC(SM_CMP) SM_STUB(SM_CMP)
+  SM_RAM(SM_CMP) SM_RTC(SM_CMP) SM_STUB(SM_CMP) SM_WAKE(SM_CMP)
 #undef SM_CMP
   if (a.gps_speed != b.gps_speed) return "gps speed";
   bool frames = fa.size() == fb.size();
@@ -384,6 +397,23 @@ void randomGroup() {
     for (int sequence = 0; sequence < 500; ++sequence) {
       startSeeded(trace, kind);
       for (int i = 0; i < 30; ++i) play(randomEvent(rng), trace);
+    }
+  }
+  // An enforced car (#83): every wake enforced, and each poll's fix around ALARM_GNSS_MAX_AGE_MS, from its own
+  // generator so the draws above stay as they were.
+  std::mt19937 rng(200), ages(201);
+  const unsigned long fix_ages[] = {0, ALARM_GNSS_MAX_AGE_MS, ALARM_GNSS_MAX_AGE_MS + 1, 60000};
+  for (int sequence = 0; sequence < 500; ++sequence) {
+    start(trace);
+    play(Sleep(), trace);
+    play(Alarmed(Wake(SM_MOTION, 13.6f)), trace);
+    for (int i = 0; i < 30; ++i) {
+      SmEvent e = randomEvent(rng);
+      if (e.k == SmKind::POLL) e = Aged(e, fix_ages[std::uniform_int_distribution<int>(0, 3)(ages)]);
+      if (e.k == SmKind::WAKE && !e.alarm) e = Alarmed(e);
+      const int phone = std::uniform_int_distribution<int>(0, 29)(ages);
+      if (phone < 2) e = phone ? Setup() : Leave();
+      play(e, trace);
     }
   }
 }
@@ -831,6 +861,82 @@ void scenarios() {
         "an enforced alarm flag suppresses a stationary poke", t);
   wakeAt(Alarmed(Wake(SM_MOTION, 13.6f)));
   check(sm_gate_open && !sm_asleep, "but not a motion wake", t);
+
+  // The OBD-alarm permit (#83) on an enforced car woken by motion, rail awake: parked, nothing is asked and one DENY
+  // line says so; a moving fix asks; a speed note at ALARM_SPEED_HOLD_KMH carries a tunnel for ALARM_SPEED_HOLD_MS
+  // after the last one; a fix older than ALARM_GNSS_MAX_AGE_MS is no evidence.
+  const SmEvent tunnel = Poll(SM_SPEED, ALARM_SPEED_HOLD_KMH), crawl = Poll(SM_SPEED, 10), parked = Poll(SM_NONE, 0);
+  auto enforced = [&] { start(t); wakeAt(Alarmed(Wake(SM_MOTION, 13.6f))); };
+  auto at = [&](unsigned long ms) {  // the clock to ms exactly, which a log line may already have passed
+    check(sm_now <= ms, "the scenario's clock is past the boundary it means to hit", t);
+    play(Advance(ms - sm_now), t);
+  };
+  enforced();
+  play(parked, t);
+  play(Advance(5000), t);
+  play(parked, t);
+  check(sm_tx == 0 && countLog("ALARMGATE DENY") == 1, "parked on an enforced car: nothing asked, one DENY line", t);
+  play(Poll(SM_SPEED, 60, true, 60), t);
+  check(sm_tx == SM_POLL_COMMANDS && countLog("ALARMGATE PERMIT") == 1, "a moving fix asks the car", t);
+  for (int i = 0; i < 12; ++i) {
+    play(Advance(5000), t);
+    play(tunnel, t);
+  }
+  check(sm_tx == 13 * SM_POLL_COMMANDS, "a speed note at the hold threshold carries each poll through a tunnel", t);
+  const unsigned long last_note = sm_now;
+  for (bool held = true; held;) {  // ends: the clock moves on
+    play(Advance(5000), t);
+    held = sm_now - last_note < ALARM_SPEED_HOLD_MS;
+    const unsigned long asked = sm_tx;
+    play(crawl, t);
+    check((sm_tx != asked) == held, "a slow speed neither extends the hold nor ends it", t);
+  }
+  const unsigned long asked = sm_tx;
+  play(Aged(Poll(SM_NONE, 0, true, 60), ALARM_GNSS_MAX_AGE_MS + 1), t);
+  check(sm_tx == asked && sm_log.back().compare(0, 14, "ALARMGATE DENY") == 0,
+        "the hold expired, and a moving fix older than ALARM_GNSS_MAX_AGE_MS is denied", t);
+  play(Aged(Poll(SM_NONE, 0, true, 60), ALARM_GNSS_MAX_AGE_MS), t);
+  check(sm_tx == asked + SM_POLL_COMMANDS, "one exactly ALARM_GNSS_MAX_AGE_MS old is not", t);
+
+  // A switch-off: the rail falls under RAIL_AWAKE_VOLTS. The next poll is denied at once; a dip shorter than
+  // ALARM_RAIL_COLLAPSE_MS keeps the hold, a sustained one voids it, and a charger bringing the rail back up then gets
+  // nothing.
+  const SmEvent off = Rules(Poll(SM_NONE, 0), SM_CAR_OFF, SM_MOVE_NOW, false), on = Poll(SM_NONE, 0);
+  for (bool sustained : {false, true}) {
+    enforced();
+    play(Poll(SM_SPEED, 60, true, 60), t);
+    play(Advance(1000), t);
+    play(off, t);
+    at(sm_low_ms + ALARM_RAIL_COLLAPSE_MS - (sustained ? 0 : 1));
+    play(off, t);
+    check(sm_tx == SM_POLL_COMMANDS, "a switched-off car is denied at once", t);
+    play(on, t);
+    check(sm_tx == (sustained ? 1 : 2) * SM_POLL_COMMANDS && (g_alarm_speed_hold_until == 0) == sustained,
+          sustained ? "a sustained collapse voids the hold: the rail back up asks nothing"
+                    : "a dip shorter than ALARM_RAIL_COLLAPSE_MS keeps it", t);
+  }
+
+  // The setup permit: a completed full push from an authenticated phone asks a parked car for
+  // ALARM_SETUP_PERMIT_MINUTES.
+  enforced();
+  play(Setup(), t);
+  play(parked, t);
+  check(sm_tx == SM_POLL_COMMANDS && countLog("ALARMGATE setup-session permit granted") == 1,
+        "the wizard's push asks a parked enforced car", t);
+  play(Leave(), t);
+  at(sm_seen_ms + ALARM_PERMIT_BLE_GRACE_MS);
+  play(parked, t);
+  check(sm_tx == 2 * SM_POLL_COMMANDS, "the phone gone, for ALARM_PERMIT_BLE_GRACE_MS", t);
+  at(sm_seen_ms + ALARM_PERMIT_BLE_GRACE_MS + 1);
+  play(parked, t);
+  check(sm_tx == 2 * SM_POLL_COMMANDS, "and not after", t);
+  play(Setup(), t);
+  at(sm_setup_ms - 1);
+  play(parked, t);
+  check(sm_tx == 3 * SM_POLL_COMMANDS, "a new push opens a new window", t);
+  at(sm_setup_ms);
+  play(parked, t);
+  check(sm_tx == 3 * SM_POLL_COMMANDS, "until ALARM_SETUP_PERMIT_MINUTES", t);
 }
 
 
@@ -1107,7 +1213,7 @@ int main(int argc, char** argv) {
   }
   if (group == "all" || group == "random") {
     randomGroup();
-    std::cout << "PASS: random (5 seeds x 1000 sequences x 30 events, and 3 x 500 from near the cap, near stale and latched near stale)\n";
+    std::cout << "PASS: random (5 seeds x 1000 sequences x 30 events, and 3 x 500 from near the cap, near stale and latched near stale, and 500 on an alarm-enforced car)\n";
   }
   if (group == "all" || group == "enumerate") {
     const auto t0 = clock::now();
