@@ -240,6 +240,16 @@ a sample poke, and `FILE_TEST` excepted), if setup()'s boot clock resync loses i
 if the recovery block leaves its place directly ahead of the expiry. GNSS power itself is not modelled: a poll's GNSS
 input is the event's.
 
+Since #83 the fast-cadence budget is checked as properties on both sides, against the adapter's own record: a poll on
+the charging branch (a fast tier, no cadence reason) never comes with the budget already at `WAKE_CHARGING_MAX_MINUTES`;
+a sample poke, and a streaming wake's first charging poll, add exactly the tier they arm, and the polls after it the
+whole minutes since; a streaming release, and a stale charge on a release, the silent hold or a skip wake, reset the
+budget, and nothing else does (a sample poke's release keeps it until stale). Staleness is judged as loosely as the
+firmware's read inside the block allows, either way. The follow-up and post-drive looks arm the charging cadence past
+the cap by design (once per charge; `POST_DRIVE_*`), named in a scenario. The cap and the stale reset are out of
+depth-5 reach from a cold start, so enumerate (energy symbols and an odd advance, at depth 4) and random also start
+from a charge one poke short of the cap and a charge one parked wake short of stale, released or still latched.
+
 ## Diagnostic host checks
 
 Run `python3 tests/run_log_diagnostics_checks.py` for actual DataLogger, CSV, and GPS-selection checks.
