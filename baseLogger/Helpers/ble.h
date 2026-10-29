@@ -241,6 +241,16 @@ bool loadPersistedProfile() {
     config.erase("utc"); // clock side-channel captured during the push, not a profile field
     tlm_push_token = newConfig.at("tlm_push_token").get<std::string>();
     obd.setVehicleCommands(config);
+    // A weak-rail cold boot (setup()'s gate set the flag before this runs) sends nothing to the bus at all
+    // (#104): defer the init the same way. loop()'s poll condition vetoes the lazy init for the whole wake,
+    // so it runs on the next boot that is not a weak-rail cold boot.
+    if (g_weak_rail_cold_boot) {
+      g_obd_needs_init = true;
+      Serial.printf("BLE-pushed vehicle profile restored (%d bytes) - OBD init deferred (weak-rail cold boot)\n",
+        (int)s.length());
+      logEvent("PROFILE restored from flash (%d bytes) - OBD init deferred (weak-rail cold boot)", (int)s.length());
+      return true;
+    }
     // On an alarm-flagged vehicle, boot-time initialize() (ATZ + the profile's init commands) is
     // bus-adjacent traffic with no permit yet - defer it to the first permitted poll cycle (§8.4:
     // the OBD link is not brought up until a permit exists). Unflagged: unchanged, init here.

@@ -10,6 +10,7 @@ void enterDeepSleep(bool modem_on, const char* reason) {
   if (modem_on && sm_flush_ok) obd_result_vector.clear();  // the pre-sleep flush sent everything
   sm_flush_ok = false;
   sm_marker_clear();
+  sm_ble_connected = false;  // bleDeinitForSleep(): the phone goes with the radio
   sm_armed_minutes = g_next_wake_minutes;
   sm_asleep = true;
   sm_sleeps++;
@@ -135,8 +136,13 @@ OBDVector carFrame(const SmEvent& e) {
 }
 
 void poll(const SmEvent& e) {
-  sm_polls++;
-  OBDVector current_frame = carFrame(e);
+  // Whether the cycle asks the car is loop()'s own poll condition (from the tree, for both sides). A vetoed cycle (a
+  // weak-rail cold boot, #104) reads nothing and runs on as one the car did not answer, as a gate-denied one does.
+  OBDVector current_frame;
+  if (sm_poll_reaches_car()) {
+    sm_polls++;
+    current_frame = carFrame(e);
+  }
   const int obd_count = (int)current_frame.size();
   // The rail the top of the cycle reads: the event's; else for a drive poll the rules' car-on input, and for a
   // charge poll the last one read. An answered poll stamps the last OBD answer, as loop() does. Then the motion
@@ -161,7 +167,8 @@ void poll(const SmEvent& e) {
   sm_energy(current_frame, obd_count);
   sm_buffer(current_frame, e.has_data);
   sm_marker_set();
-  sm_weak_expiry();
+  sm_weak_recovered();  // the car switched on during a weak-rail cold boot (#104)
+  if (!sm_asleep) sm_weak_expiry();  // the device's sleep never returns
   if (sm_asleep) return;
   if (sm_poke_sleeps()) enterDeepSleep(true);  // a poke the DC hold does not keep sleeps after its one poll
 }
@@ -213,8 +220,9 @@ void step(const SmEvent& e) {
 // Properties of one side after event e, against its state before it. Null when they hold.
 const char* propertyBroken(const Snap& pre, const SmEvent& e) {
   if (e.k == SmKind::WAKE && sm_gate_weak && sm_gate_open) return "the gate opened on a weak rail";
-  // A weak-rail cold boot stays up for BLE, and its loop still polls the car (#104): this holds for the rest.
-  if (sm_gate_weak && !sm_cold_boot && sm_polls != pre.sm_polls) return "a poll ran on a weak-rail wake";
+  // A weak-rail cold boot stays up for BLE, but its loop's poll condition vetoes every cycle (#104), so no wake on a
+  // weak rail asks the car anything.
+  if (sm_gate_weak && sm_polls != pre.sm_polls) return "a poll ran on a weak-rail wake";
   if (g_weak_rail_cold_boot && !sm_cold_boot) return "the weak-rail BLE window opened on a deep-sleep wake";
   if (!pre.sm_asleep && sm_asleep && pre.g_weak_rail_cold_boot && sm_sleep_modem)
     return "a weak-rail cold boot slept with the modem on (marker, flush)";

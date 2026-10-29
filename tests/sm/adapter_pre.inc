@@ -99,7 +99,8 @@ enum SmReset { ESP_RST_POWERON = 1, ESP_RST_PANIC = 4, ESP_RST_TASK_WDT = 6, ESP
   X(bool, sm_sleep_modem, false) \
   X(float, sm_atrv, 13.5f) \
   X(int, g_alarm_flag, -1) \
-  X(bool, sm_cold_boot, false)
+  X(bool, sm_cold_boot, false) \
+  X(bool, sm_ble_connected, false)
 
 #define SM_DEFINE(T, name, value) T name = value;
 SM_RAM(SM_DEFINE)
@@ -172,10 +173,15 @@ void alarmNoteSpeed(double kmh) { sm_alarm_calls++; sm_alarm_last = kmh; }
 // The OBD-alarm flag, per wake: the gate's ALARMGATE branch and the energy vetoes read it. The loop's per-cycle
 // permit is not modelled: an enforced car's polls still reach the car here.
 bool alarmEnforced() { return g_alarm_flag == 1; }
-// No phone in this harness.
-bool bleConnected() { return false; }
+// No phone in this harness, except where a scenario connects one (sm_ble_connected, reset at power-on): the extracted
+// blocks see a phone only through bleConnected().
+bool bleConnected() { return sm_ble_connected; }
 // The wake cause setup() reads, as the ESP-IDF values.
 enum SmWakeCause { ESP_SLEEP_WAKEUP_UNDEFINED = 0, ESP_SLEEP_WAKEUP_EXT0 = 2, ESP_SLEEP_WAKEUP_TIMER = 4 };
+// loop()'s poll condition (sm_poll_reaches_car) reads these beside the weak-rail flag: a profile is always loaded here,
+// and the per-cycle alarm permit is not modelled (run_sm_checks.py's header), so both pass.
+const bool g_no_profile = false;
+bool alarmGateAllowsPoll() { return true; }
 // ATRV, the co-processor's pin-16 read: the event's.
 struct { float getVoltage() const { return sm_atrv; } } obd;
 // The RTC microsecond clock runs on through deep sleep and every reset but a power loss: the time of earlier

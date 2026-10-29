@@ -222,8 +222,20 @@ zeroes the clock. A wake alphabet (17 symbols, about 1.4 M sequences at depth 5:
 every give-up band, the ATRV threshold, a weak cold boot, an alarm-enforced poke) is enumerated beside the other two,
 and named scenarios cover the taper budget to its give-up, the charge-end read once per latch, a weak cold boot's BLE
 window and its modem-off expiry, and the counters and `since_poll` across wakes. setup()'s last-poll stamp, the weak-rail
-window's expiry and the sleep's modem override for it are shared context. A weak cold boot still polls the car during
-its window, as the firmware does (#104).
+window's expiry and the sleep's modem override for it are shared context. So is `loop()`'s poll condition (#104): a
+poll reaches the car only when it holds, so the property "a poll ran on a weak-rail wake" holds a weak cold boot to the
+firmware's own veto (`!g_weak_rail_cold_boot`), and the named scenario checks that its window's cycles ask the car
+nothing. The veto never lifts within the wake, which ends when the window expires with no phone connected or when a
+cycle's rail reaches `RAIL_AWAKE_VOLTS` (the car switched on), sleeping `WEAK_RAIL_RECOVERED_WAKE_MINUTES` with the
+modem off; a connected phone holds that recovery off only inside the key-reset window (`authResetWindowOpen()`,
+extracted from `auth_gate.h` as shared context with the recovery block). A named scenario covers it with no phone, and
+with a connected phone (`sm_ble_connected`, the harness's only phone) inside the key-reset window, holding the BLE
+window open past its length, and after the key-reset window, when the rail ends it. The
+runner fails if the condition loses that term or stops guarding the lazy init and `readPIDs()`, if any
+`obd.readPIDs(` or `sys.gpsBegin()` in `logger.ino` sits outside a block vetoed on it (`dcPromotePoke()`, which needs
+a sample poke, and `FILE_TEST` excepted), if setup()'s boot clock resync loses its `!g_weak_rail_cold_boot` guard, or
+if the recovery block leaves its place directly ahead of the expiry. GNSS power itself is not modelled: a poll's GNSS
+input is the event's.
 
 ## Diagnostic host checks
 
@@ -430,9 +442,10 @@ token and queue kept; an empty log still erases. `completeSetup`, the per-connec
 both key-reset call sites are checked by position. A full push writes `/vehicle_profile.json` even when
 the profile is unchanged (a token-only re-push survives a reboot, with the re-init still skipped), and a failed
 write, or a push that does not apply, invalidates the hash and removes the file, so the next boot cannot restore an
-older token. The runner also checks that `otaFinalize` and `bleDeinitForSleep` drop a push still
-pending, after the boot-partition commit and after `ble.deinit()`, by position only. The BLE task, NVS and the reset
-itself are not exercised.
+older token. On a weak-rail cold boot (#104) the restore and a push take the profile and token, persist and commit as
+usual, and leave `obd.initialize()` deferred (`g_obd_needs_init`); the next wake's restore runs it. The runner also
+checks that `otaFinalize` and `bleDeinitForSleep` drop a push still pending, after the boot-partition commit and after
+`ble.deinit()`, by position only. The BLE task, NVS and the reset itself are not exercised.
 
 ## BLE protocol and relay-session checks (#90)
 

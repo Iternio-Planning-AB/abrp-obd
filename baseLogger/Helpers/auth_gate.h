@@ -489,4 +489,5 @@ void authGateService() {
 }
 #else
 void authGateService() {} // no BLE, no ABD8: nothing to authorize
+static inline bool authResetWindowOpen() { return false; } // no BLE, no key reset: its window never opens (logger.ino)
 #endif

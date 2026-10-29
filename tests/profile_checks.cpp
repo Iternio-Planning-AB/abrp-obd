@@ -78,6 +78,7 @@ struct FakeBle {
 std::string tlm_push_token;
 bool g_ota_active = false, g_logdump_active = false, g_obd_needs_init = false, g_no_profile = true,
      config_initialized = false;
+bool g_weak_rail_cold_boot = false; // set by setup()'s ATRV gate before the restore runs (#104)
 std::vector<OBDVector> obd_result_vector, g_upload_held;
 void alarmGrantSetupPermit() {}
 bool alarmEnforced() { return false; }
@@ -258,5 +259,40 @@ int main() {
             "and a log that would not erase touches nothing else");
     applyPending();
   }
+
+  // A weak-rail cold boot sends nothing to the bus (#104): the boot restore and a push on that wake both take the
+  // profile and its token but leave the init deferred, for loop()'s lazy init, which that wake's poll veto never runs.
+  auto logged = [](const std::string& prefix, const std::string& suffix) {
+    for (const auto& e : events)
+      if (e.rfind(prefix, 0) == 0 && e.size() >= suffix.size() && e.compare(e.size() - suffix.size(), suffix.size(), suffix) == 0)
+        return true;
+    return false;
+  };
+  push(profile, "token-l", 24);
+  applyPending();
+  g_weak_rail_cold_boot = true;
+  g_obd_needs_init = false;
+  events.clear();
+  reboot();
+  check(obd.inits == 0 && g_obd_needs_init, "a weak cold boot's restore defers the OBD init");
+  check(tlm_push_token == "token-l" && obd.commands == json{{"soc", {{"cmd", "2201"}}}}, "but still takes the profile and token");
+  check(logged("PROFILE restored from flash (", " bytes) - OBD init deferred (weak-rail cold boot)"), "and says why");
+  const json weak = {{"soc", {{"cmd", "2203"}}}};
+  push(weak, "token-m", 25);
+  applyPending();
+  check(obd.inits == 0 && g_obd_needs_init && obd.commands == weak, "a push on that wake applies with its init deferred");
+  check(logged("CONFIG applied from BLE push (", " bytes) - OBD init deferred (weak-rail cold boot)"), "and says so");
+  check(savedToken() == "token-m" && ble.nvs_hash == 25, "it is persisted and its hash committed as any push");
+  g_weak_rail_cold_boot = false;
+  g_obd_needs_init = false;
+  reboot();
+  check(obd.inits == 1 && !g_obd_needs_init && obd.commands == weak && tlm_push_token == "token-m",
+        "the next wake restores that push and initializes it");
+  // Off that wake, a changed profile initializes at once and logs the line it always has.
+  push(json{{"soc", {{"cmd", "2204"}}}}, "token-m", 26);
+  applyPending();
+  check(obd.inits == 2 && !g_obd_needs_init, "a push off a weak cold boot initializes the profile");
+  check(logged("CONFIG applied from BLE push (", " bytes, on loop task)"), "and logs it as before");
+  for (const auto& e : events) check(e.size() <= 119, "a logEvent line is longer than the 119 characters it keeps: " + e);
   std::puts("profile checks passed");
 }

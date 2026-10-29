@@ -396,6 +396,14 @@ awake.** Polling a sleeping EV wakes its ECUs, which then stay awake on the *car
   3.6 V); **IO36 is the trustworthy one**.
 - **Weak-battery lockout band** (`IO36_LOCKOUT_LOW/HIGH` = 8.0/11.0 V): suppress *all* polling so a
   recoverable 12 V isn't pushed over the edge. Below 8 V = bench/no-car (allowed, so USB DUMP works).
+  A power-on in the band (`g_weak_rail_cold_boot`) stays up `WEAK_RAIL_COLD_BOOT_AWAKE_MS` for BLE only, so a person
+  who just plugged it in can reach it: no OBD request, no GNSS, no modem. Every site checks the flag itself (#104,
+  which found `loop()` polling the car for the whole window): the poll condition vetoes the cycle as a gate-denied
+  one, the boot restore and a BLE profile push defer `obd.initialize()` to the next boot that is not a weak-rail cold
+  boot, and the boot clock resync is skipped. The veto never lifts within the wake, so the wake ends instead: the
+  window expires with no phone connected (parked cadence), or a cycle's rail reaches `RAIL_AWAKE_VOLTS` (the car was
+  switched on) and it sleeps `WEAK_RAIL_RECOVERED_WAKE_MINUTES` so the normal wake follows. A connected phone holds
+  that off only inside the key-reset window, which the sleep would close (the reset needs a power-on boot).
 - `RAIL_AWAKE_VOLTS 13.3` is **calibrated to one car with almost no margin.** Measured over 1016 field
   samples: moving 13.25–15.2 V (mode 13.4), switched-off 12.5–13.2 V. The bands nearly touch, so
   there's no room for a lower release threshold and **no hysteresis is possible**. Measure any new
