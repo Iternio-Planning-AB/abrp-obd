@@ -28,6 +28,7 @@ side that does not negotiate (firmware: no `proto` in its nonce frame; app: no `
 | `v0/fw-malformed-*_app-0-1.json` | nonce with a malformed range (`1`, `[1]`, `[1,0]`, `["0",1]`, `[0,256]`) | `[0,1]` | v0 | app |
 | `v1/fw-0-1_app-0-1.json` | `[0,1]` | `[0,1]` | v1 | firmware, app |
 | `v1/fw-0-1_app-0-1-give-up.json` | `[0,1]` | `[0,1]`, its post of seq 2 failed | v1 (the app acks again only once the state shows `sent >= 2` and `oldest` 0 or above 2) | firmware (no step says a post failed) |
+| `v1/fw-0-1_app-0-1-give-up-stop.json` | `[0,1]` | `[0,1]`, its post of seq 2 failed, and it stops the relay at once | v1 (cellular sends 2 without waiting for the timeout; the app resumes once the state shows `sent >= 2` and `oldest` 0 or above 2) | firmware (no step says a post failed) |
 | `v1/fw-0-1_app-0-1-unsubscribed.json` | `[0,1]` | `[0,1]`, its ABD1 subscription died | v1 (lapses `"why":"unsubscribed"` after 300 s, live again on resubscribing) | firmware (the app does not unsubscribe on purpose) |
 | `v1/fw-0-2_app-0-1.json` | `[0,2]` | `[0,1]` | v1 | app |
 | `v1/fw-0-1_app-0-2.json` | `[0,1]` | `[0,2]` | v1 | firmware, app |

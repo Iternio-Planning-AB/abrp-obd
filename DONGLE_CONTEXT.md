@@ -210,7 +210,10 @@ ABD1 is notify-only, so the app has to say what it posted (`Helpers/ble_relay.h`
 - **The app's give-up rule:** after a failed post of seq N the app acks nothing until a state read shows `sent >= N`
   and `oldest` 0 or above N; a cumulative ack before that would drop N from the queue unposted. `sent >= N` proves the
   state was rebuilt after N was queued. A frame held for the next wake keeps `oldest` at or below it, so that app acks
-  nothing more this wake: cellular carries the frames, duplicates at worst, never a lost point.
+  nothing more this wake: cellular carries the frames, duplicates at worst, never a lost point. The app also writes
+  `{"relay":"stop"}` as soon as it gives up on N, so cellular sends N at once instead of after the 120 s timeout, and
+  `{"relay":"resume"}` once the state shows N gone (and it can post). No firmware change: both verbs and the drain
+  rule are v1 as released (`v1/fw-0-1_app-0-1-give-up-stop.json`).
 - The session is one state machine: `NO_SESSION` → `GRANTED` (v0, no protocol) or `LIVE` (v1);
   `LIVE` → `LAPSED(stop|timeout|unsubscribed)`; back to `LIVE` on resume (or a forward ack after a timeout or
   unsubscribed lapse, or the app subscribing again after an unsubscribed one); any →
