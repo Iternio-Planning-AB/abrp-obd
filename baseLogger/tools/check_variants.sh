@@ -1,5 +1,5 @@
 #!/bin/sh
-# Build the non-default config.h variants. Run from anywhere:
+# Build the non-default config.h variants (CI builds the default image in a step of its own first). Run from anywhere:
 #   sh baseLogger/tools/check_variants.sh
 # Needs `pio` on PATH (see AGENTS.md, Build).
 #
