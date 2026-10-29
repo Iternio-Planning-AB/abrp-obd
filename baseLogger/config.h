@@ -813,6 +813,12 @@
 //              "no car / bench", allowed to run normally; a dead car's OBD won't answer anyway, no harm).
 #define IO36_LOCKOUT_LOW  8.0f
 #define IO36_LOCKOUT_HIGH 11.0f
+// Sleep after a weak-rail cold boot (a power-on inside the band above, kept up for BLE with no poll) whose rail then
+// reaches RAIL_AWAKE_VOLTS: the car's DC-DC is on, so the 12V is being charged and the lockout no longer protects
+// anything, while that wake's veto would keep the car unpolled for as long as a phone holds it open (#104); a phone
+// delays it only inside the key-reset window, which the sleep would close. 1 min so the normal wake (gate, modem,
+// GNSS, profile init) follows quickly; WOM wakes it at once if the car is moving.
+#define WEAK_RAIL_RECOVERED_WAKE_MINUTES 1
 
 // OBD-ALARM GATE (IGNITION_SENSE_ARCHITECTURE.md §8/§10). Some vehicles (BMW i3 field-confirmed)
 // sound their anti-theft alarm when a device transmits on the OBD bus while the car is locked and

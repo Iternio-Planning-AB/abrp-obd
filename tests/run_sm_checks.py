@@ -12,9 +12,10 @@ the ATRV read, the taper bridge and its give-up, the charge-end read, the follow
 suppression, the counters and log lines, the weak-rail cold boot and the skip path. All are extracted with the same
 anchors from two places: OLD from the pinned commit (git show), CUR from the working tree. The context around them
 (the post-drive window at the ladder end, a sample poke's sleep after its poll, setup()'s last-poll stamp, the
-weak-rail window's expiry and every sleep's modem override for it, the backstop, the delays) comes from the working
-tree for both sides, so a deliberate change there cannot fail the differential; a property checks that the shared
-backstop never sleeps a driving car.
+weak-rail window's expiry and the recovery ahead of it, every sleep's modem override for that wake, loop()'s poll
+condition that decides whether a poll asks the car, the backstop, the delays) comes from the working tree for both
+sides, so a deliberate change there cannot fail the differential; a property checks that the shared backstop never
+sleeps a driving car.
 tests/sm_checks.cpp compiles each side into its own namespace around the same harness
 (tests/sm/adapter_*.inc) and runs identical event sequences through both, asserting equal outputs after
 every event: the latch, the leash and hold times, the marker debt and its crash copy, published is_parked,
@@ -27,7 +28,15 @@ also inside the pre-sleep flush, never loses the marker debt; an absolute proper
 motion; any answered poll stamps the last OBD answer. A wake carries the rail, the ATRV read, the alarm flag and an
 optional charge latch; the RTC clock and epoch run through sleeps, and a cold boot zeroes the clock until a poll.
 Before compiling, it checks that only drive_state.h assigns the park/drive storage, that alarm_gate.h names no
-drive state, and that every drive call is in an extracted block.
+drive state, and that every drive call is in an extracted block. A poll reaches the car only when loop()'s poll
+condition holds (around it a profile is always loaded and the per-cycle alarm permit passes), so the property "a
+poll ran on a weak-rail wake" holds a weak-rail cold boot to the firmware's own veto (#104); it also checks that the
+condition has the veto as a term and guards the lazy init and the bus read, that every obd.readPIDs( and
+sys.gpsBegin() in logger.ino sits behind it (dcPromotePoke's and FILE_TEST's excepted), that dcPromotePoke still
+needs a sample poke, that setup()'s one boot clock resync skips that wake, and that the weak-rail recovery (a cycle's
+rail at RAIL_AWAKE_VOLTS ends the wake, held by a phone only inside the key-reset window, whose production
+predicate is shared context) sits under #if ENABLE_IO36_RAIL directly ahead of the window's expiry. A phone
+exists only where a scenario connects one (sm_ble_connected, read through bleConnected(), dropped at every sleep).
 
 The pin. SM_PIN is the main commit a step is measured against: a refactor step must leave both regions equal to
 it. Re-pin only when a behaviour change to a compared region lands on main between steps, to the merge-base of
@@ -41,8 +50,9 @@ SAMPLE_POLL line, the modem, detectMovement timing, RTC retention, hardware); th
 the gate; resets other than a deep-sleep wake, a power loss, a panic and a WDT (a brownout or software reset reloads
 RTC as those do, so the sanitize cannot show); the heartbeat (ENABLE_PARKED_HEARTBEAT 0, so the branch and
 heartbeat_asleep_streak are not compiled); the loop's per-cycle alarm permit (an enforced car's polls reach the car
-here); since_poll at the target's 32-bit width. A weak-rail cold boot's polls still reach the car, as the firmware's do
-(#104). The energy properties and the multi-region layer are #83.
+here); since_poll at the target's 32-bit width; GNSS power (a poll's GNSS input is the event's, also on a weak-rail
+cold boot, whose GNSS the firmware never powers: that is checked by position only), the boot profile restore and a
+profile push (tests/run_profile_checks.py). The energy properties and the multi-region layer are #83.
 """
 
 import os
@@ -98,6 +108,12 @@ LOGGED_DCFC = "        static int logged_dcfc = -1;"
 # the counters and log lines, the weak-rail cold boot and the skip path, as one brace-matched block.
 WAKE_GATE = "  {\n    g_last_voltage = obd.getVoltage();\n"
 WEAK_EXPIRY = "    if (g_weak_rail_cold_boot && !maintenance_mode && !bleConnected() &&"
+WEAK_RECOVERED = ("    if (g_weak_rail_cold_boot && !maintenance_mode && g_last_io36 >= RAIL_AWAKE_VOLTS && "
+                  "!(bleConnected() && authResetWindowOpen())) {")
+BOOT_RESYNC = '  if (!g_weak_rail_cold_boot && clockNeedsSync() && !clockResync("boot")) clockNtpNoClock();'
+# loop()'s poll condition (the OBD_ALARM_GATE branch, the one config.h builds): whether a poll cycle asks the car.
+POLL_IF = "    if (!g_no_profile && "
+POLL_VETO = "!g_weak_rail_cold_boot"
 POKE_SLEEP = "    if (g_sample_poke && !maintenance_mode && !dcAwakeHeld(current_state)) {"
 
 
@@ -182,11 +198,16 @@ void sm_wake_gate(SmWakeCause wake_cause) {{
 #pragma GCC diagnostic pop
 void sm_stamp() {{
 {stamp}}}
+{auth_window}void sm_weak_recovered() {{
+#if ENABLE_IO36_RAIL
+{weak_recovered}#endif
+}}
 void sm_weak_expiry() {{
 {weak_expiry}}}
 void sm_modem_override(bool& modem_on) {{
 {modem_override}}}
 bool sm_poke_sleeps() {{ return {poke_sleep}; }}
+bool sm_poll_reaches_car() {{ return {poll_condition}; }}
 void sm_buffer(OBDVector& current_frame, bool frame_has_data) {{
   int g_geo_queued = 0, poll_geo = 0;
   (void)g_geo_queued;
@@ -243,6 +264,41 @@ cur["stamp"] = line(logger, "  if (clockValid()) last_poll_epoch = rtc.getEpoch(
 cur["weak_expiry"] = block(logger, WEAK_EXPIRY, PATHS["logger"])
 if not logger.index(cur["marker_set"]) < find(logger, WEAK_EXPIRY, what=PATHS["logger"]) < logger.index(POKE_SLEEP):
     sys.exit("FAIL: the weak-rail window expiry must follow the poll's buffer and marker set, before the poke's sleep")
+# Its sibling (#104): a weak-rail cold boot whose cycle reads a rail at RAIL_AWAKE_VOLTS (the car switched on) sleeps,
+# so the next wake takes the normal path; a connected phone holds it only inside the key-reset window. Shared context
+# from the tree too. It must sit alone under #if ENABLE_IO36_RAIL (sm_weak_recovered keeps the guard) and directly
+# ahead of the expiry: only #endif and comments between, so it runs on every cycle the expiry does, after the poll, and
+# before the expiry can take the parked sleep.
+recovered = find(logger, WEAK_RECOVERED, what=PATHS["logger"])
+cur["weak_recovered"] = block(logger, WEAK_RECOVERED, PATHS["logger"])
+# The key-reset window that recovery waits out under a connected phone: the production predicate and its constant, from
+# the tree (auth_gate.h), over the harness's reset reason and millis().
+auth = tree("baseLogger/Helpers/auth_gate.h")
+cur["auth_window"] = (line(auth, "static const uint32_t AUTH_RESET_WINDOW_MS = ", "baseLogger/Helpers/auth_gate.h")
+                      + block(auth, "static bool authResetWindowOpen() {", "baseLogger/Helpers/auth_gate.h"))
+lead_in = logger[:recovered].splitlines()
+while lead_in and lead_in[-1].lstrip().startswith("//"):
+    lead_in.pop()
+gap = logger[recovered + len(cur["weak_recovered"]):find(logger, WEAK_EXPIRY, what=PATHS["logger"])].splitlines()
+if (logger.count(WEAK_RECOVERED) != 1 or not lead_in or lead_in[-1] != "#if ENABLE_IO36_RAIL" or not gap
+        or gap[0] != "#endif" or any(not l.lstrip().startswith("//") for l in gap[1:])):
+    sys.exit("FAIL: the weak-rail recovery block must be the only one, under #if ENABLE_IO36_RAIL, directly ahead of "
+             "the weak-rail window expiry (only #endif and comments between)")
+# loop()'s poll condition, from the tree for both sides too: the adapter counts a poll as reaching the car only when it
+# holds (sm_poll_reaches_car), so "a poll ran on a weak-rail wake" tests the firmware's own veto (#104), not a copy.
+# A plain && chain whose terms include the veto, guarding the lazy init and the bus read; see also the checks below.
+poll_if = line(logger, POLL_IF, PATHS["logger"])
+poll_match = re.fullmatch(r"    if \((.*)\) \{\n", poll_if)
+if not poll_match or "||" in poll_match.group(1):
+    sys.exit(f"FAIL: loop()'s poll condition must be one line, `if (a && b && ...) {{`, a plain && chain: {poll_if!r}")
+if POLL_VETO not in [term.strip() for term in poll_match.group(1).split("&&")]:
+    sys.exit(f"FAIL: loop()'s poll condition has no `{POLL_VETO}` term: a weak-rail cold boot would poll the car "
+             f"during its BLE window (#104): {poll_if.strip()!r}")
+poll_block = block(logger, poll_if, PATHS["logger"])
+for call in ("obd.initialize();", "current_frame = obd.readPIDs(PRINT);"):
+    if call not in poll_block:
+        sys.exit(f"FAIL: loop()'s poll condition must guard {call!r} (#104): the veto would not cover it")
+cur["poll_condition"] = poll_match.group(1)
 cur["modem_override"] = line(sleep, "  if (g_weak_rail_cold_boot) modem_on = false;", PATHS["sleep"])
 if "  if (g_ota_active || g_logdump_active) return;\n" + cur["modem_override"] not in sleep:
     sys.exit("FAIL: enterDeepSleep's weak-rail modem override must directly follow the OTA/dump guard, ahead of every "
@@ -372,6 +428,39 @@ extracted = len(re.findall(DRIVE_CALL, code_only("".join(v for k, v in cur.items
 if calls != extracted:
     sys.exit(f"FAIL: {calls} drive_state.h calls in the firmware but {extracted} in the extracted blocks; "
              "a call outside them is not compared against SM_PIN - extract its block")
+
+# The weak-rail cold boot's veto (#104) covers every bus read in logger.ino, not only the one the harness runs: each
+# obd.readPIDs( sits inside an `if (` block whose && terms include it (the poll condition above, and the
+# OBD_ALARM_GATE=0 branch config.h does not build). GNSS is not powered on that wake either: every sys.gpsBegin() is
+# behind the veto, or in dcPromotePoke(), which only a sample poke reaches (a cold boot is never one), or FILE_TEST.
+def vetoed_blocks(text):
+    """(start, end) of every brace block whose single-line `if (...) {` opener has the veto as an && term."""
+    spans = []
+    for m in re.finditer(r"^ *if \(([^\n]*)\) \{ *$", text, re.M):  # a trailing comment is blanked to spaces
+        if "||" not in m.group(1) and POLL_VETO in [t.strip() for t in m.group(1).split("&&")]:
+            spans.append((m.start(), m.start() + len(block(text[m.start():], m.group(0)))))
+    return spans
+
+
+logger_code = code_only(logger)
+promote = block(logger_code, "void dcPromotePoke() {", PATHS["logger"])
+promote_at = logger_code.index(promote)
+file_test = [(m.start(), logger_code.index("#endif", m.start())) for m in re.finditer(r"^#if FILE_TEST\n", logger_code, re.M)]
+for call, exempt in (("obd.readPIDs(", []), ("sys.gpsBegin()", [(promote_at, promote_at + len(promote))] + file_test)):
+    for m in re.finditer(re.escape(call), logger_code):
+        if not any(a <= m.start() < b for a, b in vetoed_blocks(logger_code) + exempt):
+            number = logger_code.count("\n", 0, m.start()) + 1
+            sys.exit(f"FAIL: {PATHS['logger']}:{number} calls {call} outside an `if (... && {POLL_VETO} ...)` block: "
+                     "a weak-rail cold boot must not reach the bus or power GNSS (#104)")
+# Nor does it ask the never-powered modem for the clock: setup()'s one boot resync is this exact line (#104), with no
+# other clockResync call in setup() (comments stripped; code_only would blank the "boot" literal).
+setup_code = re.sub(r"//[^\n]*", "", block(logger, "void setup() {", PATHS["logger"]))
+if setup_code.count("clockResync(") != 1 or "\n" + BOOT_RESYNC + "\n" not in setup_code:
+    sys.exit(f"FAIL: setup() must call clockResync exactly once, as {BOOT_RESYNC.strip()!r}: a weak-rail cold boot "
+             "must not send AT+CCLK? to a modem it never powered (#104)")
+if "if (!g_sample_poke || !g_dc_confirmed || !dcMotionRecent()) return;" not in promote:
+    sys.exit("FAIL: dcPromotePoke() must return unless g_sample_poke: its sys.gpsBegin() is exempt from the weak-rail "
+             "veto only because a cold boot is never a sample poke (#104)")
 
 # Two wires the adapter bypasses (it sets the inputs directly): the sampled motion windows must reach the
 # accumulator, and an OBD answer must stamp the car-on evidence.

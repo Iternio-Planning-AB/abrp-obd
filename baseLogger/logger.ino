@@ -190,9 +190,22 @@ bool g_sample_poke = false;
   bleInitForWake() denied all of it for the full parked cadence. Measured: rail 10.95 against an 11.00
   threshold, BLE never came up, 30 minutes of silence, on a bench supply sitting 50 mV under the line.
 
-  What this does NOT relax: should_poll stays false, so no OBD request is made and the modem is never
-  powered. That is where the battery actually goes; BLE advertising is small change beside it. The window is
+  What this does NOT relax: no OBD request is made, GNSS is not powered and the modem is never powered.
+  That is where the battery actually goes; BLE advertising is small change beside it. The window is
   bounded so a weak battery is never held awake indefinitely - see WEAK_RAIL_COLD_BOOT_AWAKE_MS.
+
+  should_poll is a local in the gate, so on its own it kept nothing off the bus: loop() polled the car at the
+  ACTIVE cadence for the whole window, after the boot restore had run the profile's init and GNSS was up
+  (#104). This flag is therefore a veto every bus or GNSS site checks itself: loop()'s poll condition (so the
+  window's cycles run as gate-denied ones, and the expiry below the poll still runs), the boot profile restore
+  and a BLE profile push (both defer obd.initialize() via g_obd_needs_init), and the GNSS power-up in setup()
+  and its per-cycle retry, and setup()'s clock resync (AT+CCLK? to a modem never powered). Local reads stay: the
+  IO36 rail ADC and the co-processor's ATRV.
+
+  The veto never lifts within the wake, so the wake ends one of two ways, both in loop()'s poll block after the
+  poll: the window expires with nobody connected (parked cadence), or a cycle's rail reaches RAIL_AWAKE_VOLTS,
+  the car switched on (WEAK_RAIL_RECOVERED_WAKE_MINUTES, so the normal wake follows), which a connected phone
+  holds off only inside the key-reset window.
 */
 bool g_weak_rail_cold_boot = false;
 // Must outlive the key-reset window itself (AUTH_RESET_WINDOW_MS, timed from this same boot) plus the
@@ -758,8 +771,9 @@ void setup() {
   // a person-present wake (the same !g_sample_poke guard GPS uses) - see the bleInitForWake() call below GPS.
 
   // NOTE: GNSS is NO LONGER powered here. It's powered after the gate, ONLY on a wake that needs a live fix
-  // (a drive, or a cold boot) - see the ENABLE_GPS block below. A stationary/charging wake reuses the frozen
-  // last-driving fix (Feature 4), so we don't waste power on a GNSS that can't re-lock in time anyway.
+  // (a drive, or a cold boot other than the weak-rail one) - see the ENABLE_GPS block below. A
+  // stationary/charging wake reuses the frozen last-driving fix (Feature 4), so we don't waste power on a
+  // GNSS that can't re-lock in time anyway.
 
 #if ENABLE_MEMS
 #if ENABLE_SLEEP
@@ -945,9 +959,10 @@ void setup() {
     // the whole parked cadence, which is where the log-dump, the update and the connection-key reset all
     // live - the reset especially, since it is only accepted within seconds of this very boot.
     //
-    // The poll is still refused (should_poll is false and stays false), so no OBD request is made and the
-    // modem is never powered on this path (the loop's offline reconnect skips it too, or an unanswering modem
-    // would be powered on). Only the radio comes up, for a bounded window.
+    // The poll is still refused: should_poll is false, and because loop() never reads it, every bus and GNSS
+    // site checks g_weak_rail_cold_boot itself (see its definition; #104). So no OBD request is made, GNSS
+    // stays off and the modem is never powered on this path (the loop's offline reconnect skips it too, or an
+    // unanswering modem would be powered on). Only the radio comes up, for a bounded window.
     if (!should_poll && weak_rail && wake_cause == ESP_SLEEP_WAKEUP_UNDEFINED) {
       g_weak_rail_cold_boot = true;
 #if ENABLE_LOGGING
@@ -1091,7 +1106,9 @@ void setup() {
   // free-ran on the RC oscillator at ~30 s/hour, forever, unless a GPS fix happened to correct it.
   // See CLOCK_RESYNC_SECONDS and the note on last_clock_sync_epoch for the measurements.
   // The modem is only up here on a wake that polls and uploads, so with no valid clock at all NTP may follow.
-  if (clockNeedsSync() && !clockResync("boot")) clockNtpNoClock();
+  // Not on a weak-rail cold boot: NET init never powered the modem, so AT+CCLK? would only wait out its
+  // timeout on the weak battery and log a failed resync (#104).
+  if (!g_weak_rail_cold_boot && clockNeedsSync() && !clockResync("boot")) clockNtpNoClock();
   network.set_api_page(TLM_V2_PATH); // uploads use the v2 tlm endpoint (logNetwork -> sendBulk)
 #endif
 #endif
@@ -1141,7 +1158,9 @@ void setup() {
   // Power GNSS ONLY on a wake that needs a live position: a drive or a cold boot. A stationary sample
   // (charging/heartbeat = g_sample_poke) reuses the frozen last-driving fix (Feature 4), so we don't power
   // the GNSS at all - it couldn't re-lock in the few seconds we're awake, and the frozen fix is the truth.
-  if (!g_sample_poke) {
+  // Nor on a weak-rail cold boot: that wake polls nothing, so a fix would serve no frame, and GNSS is load on
+  // the battery the lockout exists to protect (#104).
+  if (!g_sample_poke && !g_weak_rail_cold_boot) {
     // The FLAG MUST FOLLOW THE RESULT. gpsBegin() gives the GNSS ~1.4s to emit a sentence and, on
     // failure, powers it back DOWN and clears FLAG_GNSS_USE_LINK - so setting g_gps_powered = true
     // regardless was a lie with two consequences. gpsGetData() then took the dead direct-UART branch
@@ -1311,12 +1330,23 @@ void loop() {
       // clears the flag.
       if (profile_dump != last_applied_profile) {
         obd.setVehicleCommands(config);
-        obd.initialize();
-        g_obd_needs_init = false;
-        last_applied_profile = profile_dump;
+        // A weak-rail cold boot sends nothing to the bus (#104): take the profile, but leave its init to the
+        // poll site's lazy init, which this wake's veto keeps from running. It runs on the next boot that is
+        // not a weak-rail cold boot, which restores this profile from flash (persisted below as on any push).
+        if (g_weak_rail_cold_boot) {
+          g_obd_needs_init = true;
 #if ENABLE_LOGGING
-        logEvent("CONFIG applied from BLE push (%d bytes, on loop task)", (int)profile_dump.size());
+          logEvent("CONFIG applied from BLE push (%d bytes) - OBD init deferred (weak-rail cold boot)",
+            (int)profile_dump.size());
 #endif
+        } else {
+          obd.initialize();
+          g_obd_needs_init = false;
+#if ENABLE_LOGGING
+          logEvent("CONFIG applied from BLE push (%d bytes, on loop task)", (int)profile_dump.size());
+#endif
+        }
+        last_applied_profile = profile_dump;
       } else {
 #if ENABLE_LOGGING
         logEvent("CONFIG push identical to running profile - re-init skipped");
@@ -1504,8 +1534,9 @@ void loop() {
     // cycle until it takes. Without this a single quiet gpsBegin() failure at wake cost the whole
     // wake - and on an alarm-flagged car the driving permit needs a fresh fix to exist at all, so
     // it cost the whole drive (Appendix J root cause 3). Skipped on a sample poke, which never
-    // powers GNSS by design, and stops the moment it succeeds.
-    if (!g_gps_powered && !g_sample_poke) {
+    // powers GNSS by design, and on a weak-rail cold boot, which never powers it either (#104),
+    // and stops the moment it succeeds.
+    if (!g_gps_powered && !g_sample_poke && !g_weak_rail_cold_boot) {
       if (sys.gpsBegin()) {
         g_gps_powered = true;
         pollGpsData();
@@ -1517,9 +1548,12 @@ void loop() {
     }
 #endif
 
+    // A weak-rail cold boot (g_weak_rail_cold_boot) is a veto outside the alarm gate (#23's layering): its
+    // cycles run exactly as gate-denied ones, with no readPIDs and no deferred init, so the window's expiry
+    // further down still runs. Ahead of alarmGateAllowsPoll(), so a flagged car logs no DENY for it (#104).
     OBDVector current_frame{};
     bool obd_read_attempted = false;
-    if (!g_no_profile && alarmGateAllowsPoll()) {
+    if (!g_no_profile && !g_weak_rail_cold_boot && alarmGateAllowsPoll()) {
       if (g_obd_needs_init) {
         obd.initialize();
         g_obd_needs_init = false;
@@ -1534,11 +1568,16 @@ void loop() {
       obd_read_attempted = true;
     }
 #else
+    // No alarm gate, but the weak-rail cold boot's veto still holds (#104): its cycles ask the car nothing.
+    OBDVector current_frame{};
+    bool obd_read_attempted = false;
+    if (!g_weak_rail_cold_boot) {
 #if ENABLE_LOGGING
-    obd.fail_known = obd.pids_hash == obd_fail_profile ? obd_fail_logged : 0;  // #85: only new failures kept
+      obd.fail_known = obd.pids_hash == obd_fail_profile ? obd_fail_logged : 0;  // #85: only new failures kept
 #endif
-    auto current_frame = obd.readPIDs(PRINT); // pass PRINT so raw SENDING/RECEIVING CAN buffers are shown while debugging
-    bool obd_read_attempted = true;
+      current_frame = obd.readPIDs(PRINT); // pass PRINT so raw SENDING/RECEIVING CAN buffers are shown while debugging
+      obd_read_attempted = true;
+    }
 #endif
 #endif
     int obd_count = (int)current_frame.size(); // PIDs returned this reading (0 = car asleep / no answer)
@@ -2355,6 +2394,24 @@ void loop() {
     last_poll = millis();
 
 #if ATRV_GATE_ENFORCE && ENABLE_SLEEP && ENABLE_MEMS
+#if ENABLE_IO36_RAIL
+    // Weak-rail cold boot, and the car has since been switched on: this cycle's rail (read at the top of the cycle)
+    // says the DC-DC is charging the 12V, so the lockout protects nothing, but the veto would keep every cycle off
+    // the car for as long as a phone holds the window open (#104). End the wake and let the next one take the
+    // normal path: gate, modem, GNSS and profile init. A connected phone holds it off only inside the key-reset
+    // window (authResetWindowOpen): the reset needs a power-on boot, so sleeping under a phone mid-reset would
+    // refuse it for good (see the static_assert on WEAK_RAIL_COLD_BOOT_AWAKE_MS); after the window a phone cannot
+    // block it. RAIL_AWAKE_VOLTS, not IO36_LOCKOUT_HIGH: a bench supply sitting around 11 V is exactly the wake the
+    // BLE window exists for, and must not end it.
+    if (g_weak_rail_cold_boot && !maintenance_mode && g_last_io36 >= RAIL_AWAKE_VOLTS && !(bleConnected() && authResetWindowOpen())) {
+#if ENABLE_LOGGING
+      logEvent("WEAK-RAIL cold boot ended: rail=%.2f (car awake) -> deep sleep %dmin", g_last_io36,
+        WEAK_RAIL_RECOVERED_WAKE_MINUTES);
+#endif
+      g_next_wake_minutes = WEAK_RAIL_RECOVERED_WAKE_MINUTES;
+      enterDeepSleep(false, "weak-rail-recovered"); // modem was never powered this wake - never returns
+    }
+#endif
     // Parked-poke fast-path: this wake was a deliberate HEARTBEAT poke of an asleep car (not a drive/charge).
     // We've now taken the one reading; before sleeping, run the Test C before/after experiment: did the poll
     // wake the car? Wait a few seconds for any ECU power-up, re-read the true rail, and log it beside the

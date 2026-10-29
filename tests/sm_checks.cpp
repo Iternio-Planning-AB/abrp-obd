@@ -699,16 +699,54 @@ void scenarios() {
   sm_cur::powerOn(t.back());
   check(difference(sm_old::save(), sm_cur::save()).empty() && !sm_asleep && !sm_gate_open && g_weak_rail_cold_boot &&
         countLog("ATRVGATE weak-rail COLD BOOT (rail=10.00)") == 1, "a weak cold boot stays up", t);
+  // Its cycles ask the car nothing (#104), even one the car would answer with a charge.
   until([&] { return sm_asleep; }, [&] {
     check(sm_now <= WEAK_RAIL_COLD_BOOT_AWAKE_MS + 10000, "the window lasts WEAK_RAIL_COLD_BOOT_AWAKE_MS", t);
     play(Advance(10000), t);
-    play(Silent(), t);
+    play(sm_now < 30000 ? Charge(-50, 380) : Silent(), t);
   }, "the window's expiry");
+  check(sm_polls == 0 && g_last_obd_answer_ms == 0 && !recently_charging,
+        "no poll cycle of a weak cold boot's window reaches the car", t);
   check(sm_now > WEAK_RAIL_COLD_BOOT_AWAKE_MS && !sm_sleep_modem && g_next_wake_minutes == WAKE_PARKED_MINUTES &&
         countLog("WEAK-RAIL cold-boot BLE window expired") == 1, "then the next poll cycle sleeps, modem off", t);
   wakeAt(Wake(SM_TIMER, 10.0f));
   check(!sm_gate_open && sm_asleep && !g_weak_rail_cold_boot &&
         countLog("ATRVGATE skip -> deep sleep (WEAK RAIL, modem never powered)") == 1, "a weak timer wake skips", t);
+
+  // The car switched on (a cycle's rail at RAIL_AWAKE_VOLTS) ends a weak cold boot, modem off and still unpolled, and
+  // the next wake takes the normal path (#104). With no phone it ends at once, key-reset window or not.
+  t.clear();
+  t.push_back(Wake(SM_COLD, 10.0f));
+  sm_old::powerOn(t.back());
+  sm_cur::powerOn(t.back());
+  play(Advance(10000), t);
+  play(Charge(-50, 380, 0, RAIL_AWAKE_VOLTS), t);
+  check(sm_asleep && sm_sleep_reason == "weak-rail-recovered" && !sm_sleep_modem && sm_polls == 0,
+        "with no phone the car switched on ends a weak cold boot inside the key-reset window too", t);
+  // A connected phone holds it while the key-reset window is open (sleeping would refuse a reset in progress for
+  // good), and holds the window open past its length; after the key-reset window it cannot hold the recovery.
+  t.clear();
+  t.push_back(Wake(SM_COLD, 10.0f));
+  sm_old::powerOn(t.back());
+  sm_cur::powerOn(t.back());
+  sm_old::sm_ble_connected = sm_cur::sm_ble_connected = true;
+  play(Advance(10000), t);
+  play(Charge(-50, 380, 0, RAIL_AWAKE_VOLTS), t);
+  check(sm_now < AUTH_RESET_WINDOW_MS && !sm_asleep && g_weak_rail_cold_boot && sm_polls == 0 &&
+        countLog("WEAK-RAIL cold boot ended") == 0,
+        "a connected phone holds the recovery inside the key-reset window, still unpolled", t);
+  play(Advance(WEAK_RAIL_COLD_BOOT_AWAKE_MS), t);
+  play(Silent(12.6), t);
+  check(!sm_asleep && g_weak_rail_cold_boot, "a connected phone holds the window open at a parked rail", t);
+  play(Advance(10000), t);
+  play(Charge(-50, 380, 0, RAIL_AWAKE_VOLTS), t);
+  check(sm_asleep && !sm_sleep_modem && sm_sleep_reason == "weak-rail-recovered" &&
+        sm_armed_minutes == WEAK_RAIL_RECOVERED_WAKE_MINUTES && sm_polls == 0 &&
+        countLog("WEAK-RAIL cold boot ended: rail=13.30 (car awake)") == 1 &&
+        countLog("WEAK-RAIL cold-boot BLE window expired") == 0,
+        "the car switched on ends a phone-held weak cold boot, modem off, unpolled", t);
+  wakeAt(Wake(SM_TIMER, 13.5f));
+  check(sm_gate_open && !g_weak_rail_cold_boot && !sm_asleep, "and the next wake opens the gate as usual", t);
 
   // The counters and since_poll across wakes, and an enforced alarm flag suppressing a stationary poke.
   start(t);

@@ -1,7 +1,8 @@
 """Host checks for the BLE profile push hand-off: what reaches /vehicle_profile.json, and what a reset does to a push
 still waiting for the loop, and what a key reset forgets. Compiles the real push stash (configCallback), config-apply
 block (logger.ino), loadPersistedProfile (ble.h) and forgetProfile (auth_gate.h) against an in-memory LittleFS and fake OBD/BLE
-objects. The BLE task, NVS and the reboot itself are not exercised;
+objects, including a weak-rail cold boot's deferred OBD init on the restore and on a push (#104). The BLE task, NVS
+and the reboot itself are not exercised;
 the pre-reset drops, the wrapper's hand-over and the key-reset calls are checked for position only."""
 import os
 import re
