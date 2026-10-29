@@ -448,10 +448,17 @@ void logEvent(const char* fmt, ...);           // Helpers/logging.h
 bool queueUploadFrame(std::vector<OBDVector>& frames, const OBDVector& frame);
 #if ENABLE_NETWORK
 bool uploadBuffered(bool drain);               // Helpers/network_upload.h
+bool uploadQueued();                           // Helpers/network_upload.h
 #if ENABLE_LOGGING
 bool saveUploadBacklog();                      // Helpers/network_upload.h
 void gzipLogWakeSummary();                     // Helpers/gzip_body.h
 bool uploadBacklogPending();                   // Helpers/network_upload.h
+bool uploadBacklogUnread();                    // Helpers/network_upload.h
+void loadUploadBacklog();                      // Helpers/network_upload.h
+#else
+inline bool uploadBacklogPending() { return false; } // no backlog file without the log filesystem
+inline bool uploadBacklogUnread() { return false; }
+inline void loadUploadBacklog() {}
 #endif
 #endif
 void bleDeinitForSleep();                      // Helpers/ble.h (no-op stub when BLE is disabled)
@@ -667,6 +674,10 @@ void setup() {
   // failures could be logged later; survives across the deep-sleep reboots above.
   datalogger.onNewSegment(logFwBuild); // every segment names the build, so rotation never loses it
   datalogger.begin(LOG_HEADER);
+#if ENABLE_NETWORK
+  // A file here is an earlier wake's: it is read only once the modem registers, and a sleep before that appends.
+  g_backlog_unread = uploadBacklogPending();
+#endif
 #endif
 
   // Capture the return value + devType. Both were discarded, which made a co-processor that failed to answer
@@ -1187,13 +1198,6 @@ void setup() {
 #endif
   }
   config_initialized = true;
-
-#if ENABLE_NETWORK && ENABLE_LOGGING
-  // Restore telemetry that couldn't be uploaded before the last sleep (wedged bearer / dead spot). Only
-  // reachable on a polling wake - gate skips slept long before this - and the modem is freshly booted here,
-  // so the normal upload path drains these with their original (correct) utc stamps.
-  loadUploadBacklog();
-#endif
 }
 
 /*
@@ -1282,9 +1286,11 @@ void loop() {
       // with this one.
       if (pushed_token != tlm_push_token) {
 #if ENABLE_NETWORK && ENABLE_LOGGING
-        if (!obd_result_vector.empty() || !g_upload_held.empty())
-          logEvent("UPLOAD discarded n=%lu reason=token", obd_result_vector.size() + g_upload_held.size());
+        const bool filed = uploadBacklogPending();
+        if (!obd_result_vector.empty() || !g_upload_held.empty() || filed)
+          logEvent("UPLOAD discarded n=%lu reason=token file=%d", obd_result_vector.size() + g_upload_held.size(), filed);
         LittleFS.remove(UPLOAD_BACKLOG_PATH); // a save left there is the old vehicle's too
+        g_backlog_unread = false;              // never read, even if the remove failed: the next save replaces it
 #endif
 #if ENABLE_NETWORK
         g_upload_held.clear(); // held frames are under the old token too, and the next save writes them first
@@ -1729,7 +1735,9 @@ void loop() {
     const double poll_utc = uploadSendUtc();
     seedGeoQueued(poll_utc);
     GeoMarks poll_geo = obd_result_vector.empty() ? g_geo_accepted : g_geo_queued;
-    bool frame_has_data = v2HasTelemetry(current_frame, poll_utc, &poll_geo);
+    // The frozen fix is the same every parked wake, so an unread backlog may hold it: judged without geo until read.
+    const bool geo_filed = uploadBacklogUnread() && !strcmp(gpsLocationSource(), "frozen");
+    bool frame_has_data = v2HasTelemetry(current_frame, geo_filed ? 0 : poll_utc, &poll_geo);
 #else
     bool frame_has_data = !current_frame.empty();
 #endif
@@ -2208,7 +2216,7 @@ void loop() {
       // No token, no upload. Belt-and-braces since an unpaired dongle also never polls, so the buffer
       // should be empty anyway - but the alternative is powering the modem for a POST the API can only
       // answer 401, and this is the one condition where that is knowable in advance.
-      if (!bleRelaying() && !g_ota_active && !ble_upload_grace && !g_logdump_active && !obd_result_vector.empty() &&
+      if (!bleRelaying() && !g_ota_active && !ble_upload_grace && !g_logdump_active && uploadQueued() &&
           !tlm_push_token.empty() &&
           (ble_handoff_fire || dc_first_upload || ( millis() - last_broadcast ) > upload_delay)) {
         // Awake-aware backoff. The fail cap exists to stop the modem thrashing a SLEEPING car's 12V when
@@ -2219,6 +2227,8 @@ void loop() {
         bool car_awake = (obd_count > 0) || !is_currently_parked;
         bool backed_off = !car_awake && (upload_fail_count >= MAX_UPLOAD_FAILS_PER_WAKE);
         if (!backed_off && network.connected()) {
+          // Registered: the backlog can go now. Before connect(), whose session-reuse idle check a parse would outlast.
+          if (uploadBacklogUnread()) loadUploadBacklog();
           // Split the socket-open (connect) check out of the outer gate. BUG: when connect() returned false
           // (modem registered but the SH/TLS session failed to open - common under car electrical load), the
           // OLD single condition `&& network.connect()` skipped the ENTIRE block - no failure counted,

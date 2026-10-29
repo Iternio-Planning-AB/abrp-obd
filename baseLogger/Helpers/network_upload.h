@@ -384,6 +384,10 @@ static unsigned dropAgedFrames(double send_utc) {
   return n;
 }
 
+// Frames waiting for cellular: in RAM, or in a backlog file this wake has not read.
+bool uploadBacklogUnread();
+bool uploadQueued() { return !obd_result_vector.empty() || uploadBacklogUnread(); }
+
 // Upload the RAM buffer in bounded batches (<= MAX_FRAMES_PER_POST per POST) so a backlog can't build a
 // giant, timeout-prone payload. Sent frames are erased on success. Assumes the link is already connected
 // (caller does network.connect()/disconnect()). Stops on the first failed POST (never hammers a dead link).
@@ -494,6 +498,9 @@ bool uploadBuffered(bool drain) {
   polling wake, where the freshly-booted modem drains them through the normal upload path.
 */
 static const char* UPLOAD_BACKLOG_PATH = "/upload_backlog.jsonl";
+// The file holds only earlier wakes' frames, none of RAM's: set in setup(), cleared once RAM holds them.
+bool g_backlog_unread = false;
+void loadUploadBacklog();
 
 // At the count cap the oldest frame still goes. Count-cap and heap drops are aggregated until an accepted upload or
 // backlog save.
@@ -509,42 +516,85 @@ void logUploadCapped() {
   }
 }
 
-// Called from enterDeepSleep AFTER the flush attempt, and before an OTA reboot. Overwrite semantics are correct:
-// the RAM buffer already contains any previously-loaded backlog (the file is deleted at load).
+bool uploadBacklogPending() { return LittleFS.exists(UPLOAD_BACKLOG_PATH); }
+// The file holds frames no RAM copy does, waiting for the modem to register.
+bool uploadBacklogUnread() { return g_backlog_unread && uploadBacklogPending(); }
+
+// Called from enterDeepSleep AFTER the flush attempt, and before an OTA reboot. An unread file holds only older
+// frames, so this wake's are appended: a wake without coverage neither reads nor rewrites it. Past BACKLOG_MAX_BYTES
+// or the flash budget the file is compacted instead (read, then rewritten). A file RAM already holds (loaded, or
+// written by this wake) is overwritten.
 // The file takes at most what LittleFS has free above BACKLOG_FS_RESERVE (a file being overwritten still counts as
-// used: littlefs keeps its blocks until the new one is synced). Past that the oldest frames are not saved
-// (reason=fs), so the newest, the trip-end marker among them, are the ones kept. A write that fails ends the save,
-// and the file's size is checked after close, since File buffers and a failed final flush is not reported. Lost
-// frames re-arm the marker debt if the marker is among them.
+// used: littlefs keeps its blocks until the new one is synced), and a rewrite at most BACKLOG_COMPACT_BYTES. Past that
+// the oldest frames are not saved (reason=fs, or reason=size), so the newest, the trip-end marker among them, are the
+// ones kept. A write that fails ends the save, and the file's size is checked after close, since File buffers and a
+// failed final flush is not reported. Lost frames re-arm the marker debt if the marker is among them.
 bool saveUploadBacklog() {
   logUploadCapped();
+  if (g_upload_held.empty() && obd_result_vector.empty()) {
+    if (!g_backlog_unread) LittleFS.remove(UPLOAD_BACKLOG_PATH); // a copy RAM held (loaded, or discarded), now sent
+    return true; // an unread file is left as it is
+  }
+  const unsigned long t0 = millis();
+  auto freeBytes = [] {
+    const size_t total = LittleFS.totalBytes(), used = LittleFS.usedBytes();
+    return total > used ? total - used : 0;
+  };
+  auto fsBudget = [](size_t free_bytes) { return free_bytes > BACKLOG_FS_RESERVE ? free_bytes - BACKLOG_FS_RESERVE : 0; };
+  auto lineBytes = [](const OBDVector& frame) { return encodeUploadFrame(frame).dump().size() + 2; }; // println's CR LF
+  bool append = false, torn = false;
+  size_t base = 0; // where this save's lines start: the old size, plus the newline ending a torn last line
+  if (uploadBacklogUnread()) {
+    if (File tail = LittleFS.open(UPLOAD_BACKLOG_PATH, "r")) {
+      base = tail.size();
+      torn = base && tail.seek(base - 1) && tail.read() != '\n'; // a cut line must not swallow the next frame
+      tail.close();
+    }
+    size_t bytes = torn ? 1 : 0;
+    for (const auto* frames : { &g_upload_held, &obd_result_vector })
+      for (const auto& frame : *frames) bytes += lineBytes(frame);
+    append = base && base + bytes <= BACKLOG_MAX_BYTES && bytes <= fsBudget(freeBytes());
+    if (!append) {
+      logEvent("BACKLOG compacted reason=%s on_flash=%u add=%u", base + bytes > BACKLOG_MAX_BYTES ? "max" : "fs",
+        (unsigned)base, (unsigned)bytes);
+      obd_result_vector.insert(obd_result_vector.begin(), g_upload_held.begin(), g_upload_held.end()); // file, held, RAM
+      std::vector<OBDVector>().swap(g_upload_held);
+      loadUploadBacklog();
+      logUploadCapped();
+      base = 0;
+    }
+  }
   const size_t held_count = g_upload_held.size();
   const size_t frame_count = held_count + obd_result_vector.size();
-  if (!frame_count) return true; // everything uploaded (or nothing polled) - leave no stale file
   auto frameAt = [&](size_t i) -> const OBDVector& {
     return i < held_count ? g_upload_held[i] : obd_result_vector[i - held_count];
   };
-  auto lineBytes = [&](size_t i) { return encodeUploadFrame(frameAt(i)).dump().size() + 2; }; // println's CR LF
-  const size_t total = LittleFS.totalBytes(), used = LittleFS.usedBytes();
-  const size_t free_bytes = total > used ? total - used : 0;
-  const size_t budget = free_bytes > BACKLOG_FS_RESERVE ? free_bytes - BACKLOG_FS_RESERVE : 0;
-  size_t first = frame_count, bytes = 0;
-  while (first) {
-    const size_t line = lineBytes(first - 1);
-    if (bytes + line > budget) break;
-    bytes += line;
-    --first;
-  }
   auto lost = [&](size_t from, size_t to) {
     for (size_t i = from; i < to; ++i) uploadFrameLost(frameAt(i));
   };
-  if (first) {
-    lost(0, first);
-    logEvent("UPLOAD discarded n=%u reason=fs free=%u", (unsigned)first, (unsigned)free_bytes);
+  size_t first = 0;
+  if (!append) {
+    const size_t free_bytes = freeBytes(), fs_budget = fsBudget(free_bytes);
+    const size_t budget = fs_budget < BACKLOG_COMPACT_BYTES ? fs_budget : BACKLOG_COMPACT_BYTES;
+    size_t bytes = 0;
+    first = frame_count;
+    while (first) {
+      const size_t line = lineBytes(frameAt(first - 1));
+      if (bytes + line > budget) break;
+      bytes += line;
+      --first;
+    }
+    if (first) {
+      lost(0, first);
+      logEvent("UPLOAD discarded n=%u reason=%s free=%u", (unsigned)first, budget < fs_budget ? "size" : "fs",
+        (unsigned)free_bytes);
+    }
+    if (first == frame_count) return true;
   }
-  if (first == frame_count) return true;
-  File f = LittleFS.open(UPLOAD_BACKLOG_PATH, "w");
+  File f = LittleFS.open(UPLOAD_BACKLOG_PATH, append ? "a" : "w");
   if (!f) { Serial.printf("Backlog: open for write failed\n"); return false; }
+  if (!append) g_backlog_unread = false;
+  if (append && torn && f.print("\n")) ++base;
   size_t written = first;
   for (; written < frame_count; ++written)
     if (!f.println(encodeUploadFrame(frameAt(written)).dump().c_str())) break;
@@ -552,26 +602,33 @@ bool saveUploadBacklog() {
   size_t on_flash = 0;
   if (File check = LittleFS.open(UPLOAD_BACKLOG_PATH, "r")) { on_flash = check.size(); check.close(); }
   size_t kept = first;
-  for (size_t at = 0; kept < written && at + lineBytes(kept) <= on_flash; ++kept) at += lineBytes(kept);
+  for (size_t at = base; kept < written && at + lineBytes(frameAt(kept)) <= on_flash; ++kept) at += lineBytes(frameAt(kept));
   if (kept < frame_count) {
     lost(kept, frame_count);
     logEvent("BACKLOG write failed at %u of %u", (unsigned)(kept - first), (unsigned)(frame_count - first));
   }
   Serial.printf("Backlog: %d unsent frame(s) persisted to flash\n", (int)(kept - first));
-  logEvent("BACKLOG saved %d unsent frame(s)", (int)(kept - first));
+  if (append) {
+    logEvent("BACKLOG appended %u bytes=%u ms=%lu", (unsigned)kept, (unsigned)on_flash, millis() - t0);
+    // On flash now, behind the older frames: a second save must not append them again.
+    std::vector<OBDVector>().swap(g_upload_held);
+    std::vector<OBDVector>().swap(obd_result_vector);
+  } else {
+    logEvent("BACKLOG saved %d unsent frame(s) ms=%lu", (int)(kept - first), millis() - t0);
+  }
   return true;
 }
 
-bool uploadBacklogPending() { return LittleFS.exists(UPLOAD_BACKLOG_PATH); }
-
-// Called at the end of setup() on polling wakes only (gate skips sleep before this, leaving the file for the
-// next real wake). The file's frames are older than the RAM buffer's, so they go in front; queueUploadFrame drops
-// the oldest past MAX_UPLOAD_BUFFER (counted in upload_capped). Then the file is deleted - from here the frames
-// are RAM-owned and re-persisted at the next sleep if still unsent.
+// Called once the modem has registered, just before a cellular upload (the loop's, or the pre-sleep flush), and by a
+// compacting save; a wake that never registers leaves the file unread. The file's frames are older than the RAM
+// buffer's, so they go in front; queueUploadFrame drops the oldest past MAX_UPLOAD_BUFFER (counted in upload_capped).
+// Then the file is deleted - from here the frames are RAM-owned and re-persisted at the next sleep if still unsent.
 void loadUploadBacklog() {
   if (!LittleFS.exists(UPLOAD_BACKLOG_PATH)) return;
+  g_backlog_unread = false; // read now, or unreadable: not read again this wake, even if the remove below fails
   File f = LittleFS.open(UPLOAD_BACKLOG_PATH, "r");
   if (!f) return;
+  const unsigned long t0 = millis();
   g_upload_held.clear();
   std::vector<OBDVector> pending;
   pending.swap(obd_result_vector);
@@ -600,7 +657,7 @@ void loadUploadBacklog() {
   g_geo_queued_seeded = false;
   if (restored) {
     Serial.printf("Backlog: restored %d frame(s) from flash for upload\n", (int)restored);
-    logEvent("BACKLOG restored %d frame(s) from flash", (int)restored);
+    logEvent("BACKLOG restored %d frame(s) from flash ms=%lu", (int)restored, millis() - t0);
   }
 }
 #endif

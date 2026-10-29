@@ -43,6 +43,8 @@ struct File {
   }
   size_t print(const char* value) { *data += value; return std::strlen(value); }
   String readString() { String result{data->substr(offset)}; offset = data->size(); return result; }
+  bool seek(size_t pos) { if (!data || pos > data->size()) return false; offset = pos; return true; }
+  int read() { return data && offset < data->size() ? (unsigned char)(*data)[offset++] : -1; }
   size_t size() const { return data ? data->size() : 0; }
   void close() {}
 };

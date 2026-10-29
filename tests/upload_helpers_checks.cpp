@@ -151,6 +151,9 @@ bool park_marker_owed = false;
 #include "tlm_signature.h"
 #include "drive_marker_restored.inc"
 #include "network_upload.h"
+#if !ENABLE_LOGGING
+bool uploadBacklogUnread() { return false; } // logger.ino's stub: no backlog file without the log filesystem
+#endif
 
 #include "support/upload_heap_fixture.h"
 void pushToken(json newConfig) {
@@ -184,6 +187,7 @@ void reset() {
     g_geo_accepted = g_geo_queued = {}; reset_reason = ESP_RST_POWERON;
 #if ENABLE_LOGGING
     g_upload_request_id = 0;
+    g_backlog_unread = false;
 #endif
 }
 void sha256(const std::string& bytes, unsigned char digest[32]) {
@@ -638,6 +642,13 @@ void bleHandover() {
           "a new token drops what was polled under the old one, held or saved, and the backlog file");
 #if ENABLE_LOGGING
     check(events("UPLOAD discarded n=3 reason=token").size() == 1, "and says how much");
+    reset();
+    LittleFS.seed(encodeUploadFrame(frame(0)).dump() + "\r\n");
+    g_backlog_unread = true;
+    LittleFS.fail_remove = "/upload_backlog.jsonl";
+    pushToken({{"tlm_push_token", "third-vehicle"}});
+    LittleFS.fail_remove.clear();
+    check(!uploadBacklogUnread(), "an old vehicle's file the token change could not remove is never read or appended to");
 #endif
     tlm_push_token = token;
 }
@@ -1319,6 +1330,113 @@ void gzipFallback() {
     }
 }
 
+#if ENABLE_LOGGING
+// A wake that cannot upload appends to the earlier wakes' file instead of reading and rewriting it (#92).
+void backlogAppend() {
+    auto fileUtcs = [] {
+        std::vector<double> u;
+        std::istringstream rows(LittleFS.contents());
+        for (std::string row; std::getline(rows, row);)
+            try { u.push_back(json::parse(row)["utc"].get<double>()); } catch (const json::exception&) {}
+        return u;
+    };
+    auto restoredUtcs = [] {
+        std::vector<double> u;
+        for (const auto& f : obd_result_vector) for (const auto& kv : f) if (kv.first == "utc") u.push_back(kv.second);
+        return u;
+    };
+    auto newWake = [] { obd_result_vector.clear(); g_upload_held.clear(); g_backlog_unread = uploadBacklogPending(); };
+    const OBDVector marker{{"is_parked", 1.0}, {"utc", 1791112099}};
+
+    reset();
+    obd_result_vector = {frame(0), frame(1)};
+    saveUploadBacklog();
+    const std::string earlier = LittleFS.contents();
+    newWake();
+    check(uploadQueued(), "a file this wake has not read is queued for cellular");
+    obd_result_vector = {frame(2), marker};
+    LittleFS.read_observer = countBacklogRead;
+    backlog_reads = 0;
+    check(saveUploadBacklog() && LittleFS.contents().compare(0, earlier.size(), earlier) == 0 && backlog_reads == 0,
+          "an unread file is appended to, its bytes unchanged and never read");
+    LittleFS.read_observer = nullptr;
+    check(events("BACKLOG appended 2").size() == 1, "and the append is logged");
+    check(saveUploadBacklog() && fileUtcs() == std::vector<double>{1791112000, 1791112001, 1791112002, 1791112099},
+          "a second save in the wake appends nothing twice");
+    obd_result_vector.clear();
+    loadUploadBacklog();
+    check(restoredUtcs() == std::vector<double>{1791112000, 1791112001, 1791112002, 1791112099},
+          "the next load restores every frame in order, the marker last");
+
+    // An append that loses its last line, the marker, re-arms it; held frames go first, as in a rewrite.
+    reset();
+    obd_result_vector = {frame(0)};
+    saveUploadBacklog();
+    newWake();
+    g_upload_held = {frame(1)};
+    obd_result_vector = {marker};
+    LittleFS.keep_lines = 1;
+    check(saveUploadBacklog() && park_marker_owed && events("BACKLOG write failed at 1 of 2").size() == 1,
+          "an append that loses the marker re-arms it");
+    // An append never takes the flash reserve: past the budget the file is compacted.
+    reset();
+    obd_result_vector = {frame(0)};
+    saveUploadBacklog();
+    newWake();
+    obd_result_vector = {frame(1)};
+    LittleFS.other_used = LittleFS.capacity - LittleFS.usedBytes() - BACKLOG_FS_RESERVE - 10;
+    check(saveUploadBacklog() && events("BACKLOG compacted reason=fs").size() == 1,
+          "an append past the flash budget is not made");
+    // A load whose remove fails leaves RAM holding the file: it is neither read again nor appended to.
+    reset();
+    obd_result_vector = {frame(0)};
+    saveUploadBacklog();
+    newWake();
+    LittleFS.fail_remove = "/upload_backlog.jsonl";
+    loadUploadBacklog();
+    check(!uploadBacklogUnread() && obd_result_vector.size() == 1, "a file RAM holds is not read again");
+    obd_result_vector.push_back(frame(1));
+    saveUploadBacklog();
+    LittleFS.fail_remove.clear();
+    check(fileUtcs() == std::vector<double>{1791112000, 1791112001}, "and the save overwrites it");
+    obd_result_vector.clear();
+    check(saveUploadBacklog() && !uploadBacklogPending(), "a copy RAM held and has sent is removed");
+
+    // A torn last line stays its own skipped line: the first appended frame is not glued onto it.
+    reset();
+    LittleFS.seed(encodeUploadFrame(frame(0)).dump() + "\r\n{\"utc\":17911");
+    newWake();
+    obd_result_vector = {frame(1)};
+    saveUploadBacklog();
+    obd_result_vector.clear();
+    loadUploadBacklog();
+    check(restoredUtcs() == std::vector<double>{1791112000, 1791112001}, "an append after a torn line keeps its frame");
+
+    // Past BACKLOG_MAX_BYTES the save rewrites the newest frames, file then held then RAM, within BACKLOG_COMPACT_BYTES.
+    auto big = [](unsigned i) {
+        OBDVector f{{"utc", 1791112000.0 + i}};
+        for (unsigned k = 0; k < 100; ++k) f.emplace_back("pid_" + std::to_string(k), i + k / 8.0);
+        return f;
+    };
+    reset();
+    std::string rows;
+    unsigned n = 0;
+    for (std::string line; rows.size() + (line = encodeUploadFrame(big(n)).dump() + "\r\n").size() <= BACKLOG_MAX_BYTES - 64; ++n)
+        rows += line;
+    LittleFS.seed(rows);
+    newWake();
+    g_upload_held = {big(n)};
+    obd_result_vector = {big(n + 1), marker};
+    check(saveUploadBacklog() && LittleFS.contents().size() <= BACKLOG_COMPACT_BYTES, "over the bound the file is rewritten smaller");
+    const auto kept = fileUtcs();
+    check(kept.size() > 3 && kept.size() < n && std::is_sorted(kept.begin(), kept.end() - 1) &&
+          kept[kept.size() - 3] == 1791112000.0 + n && kept[kept.size() - 2] == 1791112000.0 + n + 1 &&
+          kept.back() == 1791112099 && !park_marker_owed,
+          "it keeps the newest frames in order: file, held, RAM, the marker last");
+    check(events("BACKLOG compacted reason=max").size() == 1, "and logs the compaction");
+}
+#endif
+
 int main(int argc, char** argv) {
     const std::string group = argc > 1 ? argv[1] : "all";
 #if ENABLE_LOGGING
@@ -1326,6 +1444,9 @@ int main(int argc, char** argv) {
     if (group == "all" || group == "errors") safeErrors();
 #endif
     if (group == "all" || group == "queue") { queue(); bleHandover(); frameAge(); }
+#if ENABLE_LOGGING
+    if (group == "all" || group == "backlog-append") backlogAppend();
+#endif
     if (group == "all" || group == "geo-expiry") { geoExpiry(); geoClockQuality(); geoExplicitClock(); geoBoundaries(); }
     if (group == "all" || group == "geo-retry" || group == "geo-sizing") geoPublicClockReads();
     if (group == "all" || group == "geo-retry") geoTrustRetry();

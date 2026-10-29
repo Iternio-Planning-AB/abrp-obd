@@ -568,7 +568,7 @@ down. They stay in PSRAM for the whole session (an earlier version spilled them 
 internal heap and cost about 6 s of flash writes; #91 removed it). Cellular stands down while the phone relays;
 when relaying ends the loop's upload drains them oldest first, at most `UPLOAD_MAX_BATCHES_PER_CYCLE` x
 `MAX_FRAMES_PER_POST` per cycle, and a sleep in the session flushes them over cellular first and saves what is
-left (an overwrite of the backlog file). A backlog file over the cap restores only the newest frames. A frame the phone relayed in a v0 session, or that a v1 app acked, never goes over cellular, including the dongle's own fix (BLE trims
+left (appended to a backlog file the wake has not read, otherwise an overwrite). A backlog file over the cap restores only the newest frames. A frame the phone relayed in a v0 session, or that a v1 app acked, never goes over cellular, including the dongle's own fix (BLE trims
 `lat`/`lon`/`heading`; the phone supplies its own). A profile push with a different (or, after an unreadable
 profile, an unknown) `tlm_push_token` discards the queue and the backlog file (`UPLOAD discarded n=…
 reason=token`): those frames may be another vehicle's history. The cap drops the oldest frame past
@@ -590,12 +590,26 @@ first (`UPLOAD discarded n=… reason=heap free= maxblock= psram=`). Bench (a ON
 below both reserves): 600 frames with long keys, 512 kept, no internal heap used, every frame read back exact; with
 PSRAM ballasted to ~80 KB above the reserve, 300 frames settle at ~50 kept, the newest, and the reserve holds.
 
-The backlog file shares LittleFS with the flash log, whose rotation keeps ~384 KB free. `saveUploadBacklog` writes
-at most what is free above `BACKLOG_FS_RESERVE`; past that the oldest frames are left out (`UPLOAD discarded n=…
-reason=fs`), so the trip-end marker, queued last, is kept. A write that still fails ends the save (`BACKLOG write
-failed at`), and since `File` buffers, the file's size is checked after close to catch a failed final flush; lost
-frames re-arm the marker debt if the marker was among them. A full queue's file is ~260 KB: ~5.7 s to write at
-sleep and ~7.3 s to read at the next polling wake, which a parked offline car pays on every polling wake.
+The backlog file shares LittleFS with the flash log, whose rotation keeps ~384 KB free. `saveUploadBacklog` writes at
+most what is free above `BACKLOG_FS_RESERVE`, and a rewrite at most `BACKLOG_COMPACT_BYTES`; past that the oldest
+frames are left out (`UPLOAD discarded n=… reason=fs`, or `reason=size`), so the trip-end marker, queued last, is
+kept. A write that still fails ends the save (`BACKLOG write failed at`), and since `File` buffers, the file's size is
+checked after close to catch a failed final flush; lost frames re-arm the marker debt if the marker was among them. A
+full queue's file is ~260 KB: ~5.7 s to write at sleep and ~7.3 s to read, measured on the bench.
+
+**The backlog is read only when it can be sent** (#92). `setup()` notes a file from an earlier wake
+(`g_backlog_unread`, cleared once RAM holds it) and leaves it; `loadUploadBacklog()` runs once the modem has
+registered, just before the loop's cellular upload or the pre-sleep flush, and before `connect()`, whose session-reuse
+idle check a parse would outlast. Both upload gates count the unread file (`uploadQueued()`). A wake that never
+registers appends its frames at sleep (`BACKLOG appended n bytes= ms=`; a torn last line is terminated first) and
+moves them out of RAM, so a second save cannot append them twice. Past `BACKLOG_MAX_BYTES` or the flash budget it
+compacts instead (`BACKLOG compacted`: a read and a rewrite of at most `BACKLOG_COMPACT_BYTES`, newest kept). A wake
+whose RAM already holds the file overwrites it. While the file is unread, a poll carrying the frozen parked
+fix is judged without its location, since the file may already hold it (it is the same every parked wake); a live fix,
+and any poll with other data, is judged as before. So only an asleep car's intermediate frozen relocations go
+unqueued, and the newest goes up after the load. Not fixed: a wake that registers but cannot open a session still
+reads and rewrites the file. The file stays on flash through an offline stretch, so the flash log keeps about one
+segment less history meanwhile.
 
 **A frame older than 6 days is dropped from the queue** (#67). Parked history that old is worth little next to the
 frames queued behind it, and the server answers 400 for the whole POST if any point in it is older than 30 days, so
@@ -1054,7 +1068,8 @@ internals removed; see the note at its top).
    must survive a crash goes in `RTC_NOINIT_ATTR`, which is garbage after a power-on and may hold another
    image's bytes after a rollback, so it needs a check that rejects both (`wdt_streak.h`: a magic and an
    inverted copy). That store holds the crash-loop streak, the "modem may be on" flag and a copy of the
-   park-marker debt that is cleared only once the marker is sent, since the backlog is deleted when it loads.
+   park-marker debt that is cleared only once the marker is sent, since the backlog is deleted when it loads (once
+   the modem registers, #92).
 10. **UNCONFIRMED is parked to every reader except the frame's `is_parked`, `addGpsData` and the marker.** `drive_unconfirmed` (written only by `drive_state.h`, like
    the latch) withholds the frame's `is_parked`, switches `addGpsData` to the live fix and owes no marker; everything
    else keeps reading `is_currently_parked`. A new parked-gated guard needs no change; one that must tell the states

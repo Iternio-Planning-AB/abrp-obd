@@ -189,6 +189,7 @@ void resetFixture() {
   frozen_geo_lat = frozen_geo_lon = 0;
   g_geo_accepted = g_geo_queued = {};
   g_geo_queued_seeded = true;
+  g_backlog_unread = false;
   last_active = g_last_speed_ms = 0;
   gps = HostGPS{};
   gpsData = last_gd = GPS_DATA{};
@@ -1319,6 +1320,20 @@ void geoDowngrade() {
   obd_result_vector.clear();
   loadUploadBacklog();
   check(obd_result_vector.empty(), "old successful upload cannot restore already drained geo");
+  // An appended backlog (#92) is still one frame per line to the old loader.
+  obd_result_vector = {original[0], original[1]};
+  saveUploadBacklog();
+  obd_result_vector = {original[2]};
+  g_backlog_unread = true;
+  saveUploadBacklog();
+  g_backlog_unread = false;
+  historical::obd_result_vector.clear();
+  historical::loadUploadBacklog();
+  check(historical::obd_result_vector.size() == 3 &&
+        json::parse(historical::bulkStringV2(historical::obd_result_vector))[2]["soc"]["time"] == v2Time(1791500002),
+        "the eacc loader restores an appended backlog in order");
+  historical::obd_result_vector.clear();
+  LittleFS.files.clear();
   json legacy = json::object();
   for (const auto& res : original[0]) if (!isGeoMetaKey(res.first)) legacy[res.first] = res.second;
   const auto encoded = encodeUploadFrame(original[0]).dump();
@@ -1663,6 +1678,33 @@ void uploadGate() {
   setClock(CLK_HTTP, T);
   bufferPoll(frozen);
   check(obd_result_vector.size() == 1, "a fix restored under an untrusted clock is not buffered again once it is trusted");
+
+  // An unread backlog (#92): the frozen fix it holds is not buffered again; a frame with data and a live fix are.
+  resetFixture();
+  setClock(CLK_HTTP, T);
+  park_marker_owed = false;
+  parkedFixture();
+  OBDVector filed{{"utc", T}, {"soc", 50}};
+  addGpsData(filed);
+  obd_result_vector = {filed};
+  saveUploadBacklog();
+  obd_result_vector.clear();
+  g_backlog_unread = uploadBacklogPending();
+  OBDVector frozen_only{{"utc", T}};
+  addGpsData(frozen_only);
+  bufferPoll(frozen_only);
+  check(obd_result_vector.empty(), "a frozen fix behind an unread backlog is not buffered again");
+  OBDVector parked_soc{{"utc", T}, {"soc", 51}};
+  addGpsData(parked_soc);
+  bufferPoll(parked_soc);
+  check(obd_result_vector.size() == 1 && json::parse(bulkStringV2({obd_result_vector.back()}, T))[0].contains("location"),
+        "a parked poll with data behind an unread backlog is buffered with its location");
+  check(linkHeading("9000") == 90, "seed a moving fix");
+  OBDVector live{{"utc", T + 30}};
+  addGpsData(live);
+  bufferPoll(live);
+  check(obd_result_vector.size() == 2 && std::string(gpsLocationSource()) == "gnss",
+        "a live fix behind an unread backlog is buffered");
 
   // A phone taking the transport (#58): what is queued for cellular stays queued, and what it relays is not.
   resetFixture();

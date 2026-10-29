@@ -680,6 +680,13 @@
 // free) and the vehicle profile (~3 KB): room for the profile, a push and LittleFS's own metadata. A full queue is
 // ~260 KB of file; past the budget the oldest frames are not saved (saveUploadBacklog).
 #define BACKLOG_FS_RESERVE 65536UL
+// A wake that cannot upload appends its frames to the backlog file: reading and rewriting a full one costs ~14 s awake
+// and ~260 KB of flash writes, every parked offline wake (#92). Past BACKLOG_MAX_BYTES the save rewrites it instead, and
+// every rewrite keeps at most BACKLOG_COMPACT_BYTES of the newest frames, so the next 64 KB append again: a car with
+// large frames compacts once per 64 KB, not every wake. A full queue of typical frames (~260 KB) fits in one rewrite.
+// The file stays on flash through an offline stretch, so the flash log keeps about one segment less history then.
+#define BACKLOG_MAX_BYTES 360448UL
+#define BACKLOG_COMPACT_BYTES 294912UL
 #define UPLOAD_MIN_FREE_HEAP 32768UL
 #define UPLOAD_MIN_MAX_BLOCK 16384UL
 
