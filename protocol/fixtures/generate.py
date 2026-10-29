@@ -198,6 +198,37 @@ FIXTURES["v1/fw-0-1_app-0-1-give-up.json"] = fixture(
         check(transport="phone", queued=[], uploaded=[2, 3, 4]),
     ], 1, True)
 
+# The app's give-up stop: it writes a stop as soon as it gives up on seq 2, so cellular sends 2 at once rather than
+# after RELAY_ACK_TIMEOUT_MS, and a resume once the state shows 2 gone. The same v1 wire messages as the file above,
+# which stays as it was (v1 is released). Firmware only: no step says a post failed.
+FIXTURES["v1/fw-0-1_app-0-1-give-up-stop.json"] = fixture(
+    "v1 firmware [0,1] x negotiating app [0,1]: after a failed post the app stops the relay until that frame is sent",
+    [0, 1], [0, 1], ["firmware"], [
+        nonce([0, 1]),
+        proof(1),
+        ok(1),
+        subscribe("ABD9"),
+        subscribe("ABD1"),
+        poll(1, 1),
+        abd9_write({"relay_ack": 1}),
+        dict(poll(2, 2), note="the app's post of seq 2 fails: it gives up on 2"),
+        abd9_write({"relay": "stop"}, "a give-up hands over at once"),
+        event("lapsed", "stop"),
+        state("lapsed", 2, 2, why="stop", note="seq 2 is still queued: no resume, no ack"),
+        check(transport="cellular", queued=[2], uploaded=[]),
+        dict(poll(3, 3), note="the app posts 3 but does not ack it"),
+        check(queued=[], uploaded=[2, 3]),
+        {"wait": 1000, "note": "the dongle's next loop pass rebuilds the state"},
+        state("lapsed", 3, 0, why="stop", note="sent >= 2 and oldest 0: seq 2 went over cellular, the app resumes"),
+        abd9_write({"relay": "resume"}),
+        event("live"),
+        state("live", 3, 0),
+        poll(4, 4),
+        abd9_write({"relay_ack": 4}),
+        state("live", 4, 0),
+        check(transport="phone", queued=[], uploaded=[2, 3]),
+    ], 1, True)
+
 # The second bound: the app's ABD1 subscription died with the link and the grant alive. Firmware only: the app does not
 # unsubscribe on purpose.
 FIXTURES["v1/fw-0-1_app-0-1-unsubscribed.json"] = fixture(

@@ -18,7 +18,8 @@
     and is queued as a plain cellular frame.
     ABD9 is the session channel (write with response; notify; a readable state):
       app    -> {"relay_ack":n}       every frame up to seq n was posted (cumulative); its frames come off the queue
-      app    -> {"relay":"stop"}      the app cannot post (offline, logged out, 401/403): cellular takes over at once
+      app    -> {"relay":"stop"}      the app cannot post (offline, logged out, 401/403) or gave up on a frame:
+                                      cellular takes over at once
       app    -> {"relay":"resume"}    it can again; the only thing that ends a stop
       dongle -> {"relay":"lapsed","why":"timeout"|"stop"|"unsubscribed"} / {"relay":"live"}   on each transition
       state     {"relay":"live"|"lapsed"[,"why":..],"sent":s,"oldest":o} (readable; {} outside v1)
@@ -27,7 +28,9 @@
     or above N: until then a cumulative ack past N would take N off the queue unposted. sent >= N proves the state was
     rebuilt after N was queued (the state is rebuilt at the top of every loop pass; N is notified and queued later in
     one pass). A frame held for the next wake keeps oldest at or below its seq for the rest of the wake, so that app
-    acks nothing more this wake: duplicates over cellular, never a lost point.
+    acks nothing more this wake: duplicates over cellular, never a lost point. The app also writes a stop as soon as
+    it gives up on N, so cellular sends N now rather than after RELAY_ACK_TIMEOUT_MS, and a resume once the state
+    shows N gone; an app that only stops acking still drains through the timeout.
     The timeout is the safety net for what the app cannot report (iOS suspending it): once tagged frames have waited
     RELAY_ACK_TIMEOUT_MS with no ack moving forward, cellular takes over with every frame still queued, and the next
     forward ack or a resume hands the transport back. Nothing outstanding, an update or a log dump holds the clock.
