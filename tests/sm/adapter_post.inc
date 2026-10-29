@@ -23,18 +23,21 @@ struct Snap {
 #undef SM_FIELD
   float gps_speed;
   std::vector<OBDVector> frames;
-  std::vector<std::string> log, serial;
+  // The logs only grow between a snapshot and its restore (only powerOn clears them, and never between the two), so
+  // a snapshot keeps their lengths and a restore cuts them back.
+  size_t log_n, serial_n;
 };
 
-Snap save() {
+// frames=false skips the copy of the buffered frames, for a snapshot only compared, never restored.
+Snap save(bool frames = true) {
   Snap s;
 #define SM_SAVE(T, name, value) s.name = name;
   SM_RAM(SM_SAVE) SM_RTC(SM_SAVE) SM_STUB(SM_SAVE) SM_LOCAL(SM_SAVE)
 #undef SM_SAVE
   s.gps_speed = sm_gps.speed;
-  s.frames = obd_result_vector;
-  s.log = sm_log;
-  s.serial = sm_serial;
+  if (frames) s.frames = obd_result_vector;
+  s.log_n = sm_log.size();
+  s.serial_n = sm_serial.size();
   return s;
 }
 
@@ -44,8 +47,12 @@ void restore(const Snap& s) {
 #undef SM_LOAD
   sm_gps.speed = s.gps_speed;
   obd_result_vector = s.frames;
-  sm_log = s.log;
-  sm_serial = s.serial;
+  if (sm_log.size() < s.log_n || sm_serial.size() < s.serial_n) {
+    fprintf(stderr, "harness: a log shrank between a snapshot and its restore\n");
+    abort();
+  }
+  sm_log.resize(s.log_n);
+  sm_serial.resize(s.serial_n);
 }
 
 #define SM_RESET(T, name, value) name = value;
@@ -240,7 +247,7 @@ const char* propertyBroken(const Snap& pre, const SmEvent& e) {
   if (crashed && (pre.park_marker_owed || marker_buffered) && !park_marker_owed)
     return "a crash lost the trip-end marker debt";
   size_t unlatch_lines = 0;
-  for (size_t i = pre.log.size(); i < sm_log.size(); ++i) {
+  for (size_t i = pre.log_n; i < sm_log.size(); ++i) {
     if (sm_log[i].size() > 119) return "a logEvent line is longer than the 119 characters logEvent keeps";
     unlatch_lines += sm_log[i].compare(0, 13, "LEASH driving") == 0;
   }

@@ -208,22 +208,24 @@ std::string firstLineDiff(const char* what, const std::vector<std::string>& a, c
   return {};
 }
 
-// The first output where OLD and CUR differ, or empty.
+// The first output where OLD and CUR differ, or empty: the scalars from the two snapshots, the buffered frames and the
+// logs live.
 std::string difference(const sm_old::Snap& a, const sm_cur::Snap& b) {
+  const auto& fa = sm_old::obd_result_vector;
+  const auto& fb = sm_cur::obd_result_vector;
 #define SM_CMP(T, name, value) if (!same(a.name, b.name)) return #name ": OLD " + text(a.name) + " | CUR " + text(b.name);
   SM_RAM(SM_CMP) SM_RTC(SM_CMP) SM_STUB(SM_CMP)
 #undef SM_CMP
   if (a.gps_speed != b.gps_speed) return "gps speed";
-  bool frames = a.frames.size() == b.frames.size();
-  for (size_t i = 0; frames && i < a.frames.size(); ++i) {
-    frames = a.frames[i].size() == b.frames[i].size();
-    for (size_t j = 0; frames && j < a.frames[i].size(); ++j)
-      frames = a.frames[i][j].first == b.frames[i][j].first && same(a.frames[i][j].second, b.frames[i][j].second);
+  bool frames = fa.size() == fb.size();
+  for (size_t i = 0; frames && i < fa.size(); ++i) {
+    frames = fa[i].size() == fb[i].size();
+    for (size_t j = 0; frames && j < fa[i].size(); ++j)
+      frames = fa[i][j].first == fb[i][j].first && same(fa[i][j].second, fb[i][j].second);
   }
-  if (!frames) return "buffered frames: OLD " + std::to_string(a.frames.size()) + " | CUR " +
-                                   std::to_string(b.frames.size());
-  if (a.log != b.log) return firstLineDiff("logEvent", a.log, b.log);
-  if (a.serial != b.serial) return firstLineDiff("Serial", a.serial, b.serial);
+  if (!frames) return "buffered frames: OLD " + std::to_string(fa.size()) + " | CUR " + std::to_string(fb.size());
+  if (sm_old::sm_log != sm_cur::sm_log) return firstLineDiff("logEvent", sm_old::sm_log, sm_cur::sm_log);
+  if (sm_old::sm_serial != sm_cur::sm_serial) return firstLineDiff("Serial", sm_old::sm_serial, sm_cur::sm_serial);
   return {};
 }
 
@@ -237,7 +239,7 @@ void play(const SmEvent& e, std::vector<SmEvent>& trace, const sm_old::Snap& old
   events++;
   if (const char* broken = sm_old::propertyBroken(old_pre, e)) fail(std::string("OLD property: ") + broken, trace);
   if (const char* broken = sm_cur::propertyBroken(cur_pre, e)) fail(std::string("CUR property: ") + broken, trace);
-  const std::string diff = difference(sm_old::save(), sm_cur::save());
+  const std::string diff = difference(sm_old::save(false), sm_cur::save(false));
   if (!diff.empty()) fail("OLD and CUR differ at " + diff, trace);
 }
 void play(const SmEvent& e, std::vector<SmEvent>& trace) { play(e, trace, sm_old::save(), sm_cur::save()); }
@@ -248,7 +250,7 @@ void start(std::vector<SmEvent>& trace) {
   trace.push_back(boot);
   sm_old::powerOn(boot);
   sm_cur::powerOn(boot);
-  const std::string diff = difference(sm_old::save(), sm_cur::save());
+  const std::string diff = difference(sm_old::save(false), sm_cur::save(false));
   if (!diff.empty()) fail("OLD and CUR differ at power-on: " + diff, trace);
 }
 
@@ -697,7 +699,7 @@ void scenarios() {
   t.push_back(Wake(SM_COLD, 10.0f));
   sm_old::powerOn(t.back());
   sm_cur::powerOn(t.back());
-  check(difference(sm_old::save(), sm_cur::save()).empty() && !sm_asleep && !sm_gate_open && g_weak_rail_cold_boot &&
+  check(difference(sm_old::save(false), sm_cur::save(false)).empty() && !sm_asleep && !sm_gate_open && g_weak_rail_cold_boot &&
         countLog("ATRVGATE weak-rail COLD BOOT (rail=10.00)") == 1, "a weak cold boot stays up", t);
   // Its cycles ask the car nothing (#104), even one the car would answer with a charge.
   until([&] { return sm_asleep; }, [&] {
