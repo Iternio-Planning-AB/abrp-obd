@@ -30,8 +30,14 @@ after the cycle's rail and GNSS refresh. On an enforced car a poll asks
 the car (obd.tx_count moves) exactly when an oracle kept from the trace's inputs permits it: the setup window with an
 authenticated phone or within ALARM_PERMIT_BLE_GRACE_MS of one, or the rail awake and a moving fix no older than ALARM_GNSS_MAX_AGE_MS or a speed note within
 ALARM_SPEED_HOLD_MS, a sustained rail collapse voiding the note. Every DENY line carries tx=, which never moves
-between two of them; only the gated branch moves the counter here, so that checks the transition logging. Groups:
-enumerate (exhaustive over a drive, an energy and a wake alphabet, --depth, default 5), random (fixed seeds), scenarios (named field and charge cases), crash (CUR alone: a panic,
+between two of them; only the gated branch moves the counter here, so that checks the transition logging.
+The regions compose (#83): every poll's drive rules read the charge latch the last energy block or the wake gate left,
+in the firmware's order (a rules poll can assert one instead), and a composed alphabet (drive and charge polls,
+sustained motion after its own 20 s, the stream-trust delay, latched taper-band and give-up wakes, a plain and an
+alarm-enforced motion wake, a fix past the alarm's age bound, a sleep) is enumerated beside the others. This runner
+fails unless the drive block comes before the energy block in loop() and only the energy block and the wake gate assign
+the latch. Groups:
+enumerate (exhaustive over a drive, an energy, a wake and a composed alphabet, --depth, default 5), random (fixed seeds), scenarios (named field and charge cases), crash (CUR alone: a panic,
 also inside the pre-sleep flush, never loses the marker debt; an absolute property, not a comparison), rules
 (CUR alone: absolute checks of the #6 driving rules), or all. A Charge or Silent poll keeps the wake's rail and
 motion; any answered poll stamps the last OBD answer. A wake carries the rail, the ATRV read, the alarm flag and an
@@ -63,8 +69,8 @@ OBD init and a missing profile (g_no_profile stays false); the loop's own phone-
 the setup permit's grace runs from the last permit read that saw the phone; bleRelaying(), which the pin asked and a
 phone with no relay session cannot tell from bleAuthenticated(); since_poll at the target's 32-bit width; GNSS power (a
 poll's GNSS input is the event's, also on a weak-rail cold boot, whose GNSS the firmware never powers: that is checked
-by position only), the boot profile restore and a profile push (tests/run_profile_checks.py). The multi-region layer
-is #83.
+by position only), the boot profile restore and a profile push (tests/run_profile_checks.py). The awake ladder stays
+shared context, so the DC hold (dcAwakeHeld) keeping CHARGING from STANDBY is not compared.
 """
 
 import os
@@ -450,6 +456,17 @@ if (terms[-1] != "alarmGateAllowsPoll()" or len(reads) != 2 or len(outside) != 1
     sys.exit("FAIL: loop() must ask the car (readPIDs and the deferred obd.initialize) only inside its poll condition, "
              "with alarmGateAllowsPoll() its last term, directly under #if OBD_ALARM_GATE in FAKE_DATA's #else, "
              "after the cycle's rail and GNSS refresh; the one other readPIDs is the gate's #else")
+
+# The composition (#83): the drive rules read the latch the previous energy block or the wake gate left, so the drive
+# block runs first and nothing else assigns it.
+latch_writes = [m.start() for m in re.finditer(r"(?<!bool )\brecently_charging\s*=(?!=)", code)]  # not its definition
+# Positions from the source, which code_only keeps (it blanks comments, whose anchors these are, in place).
+spans = [(find(logger, start, what=PATHS["logger"]), find(logger, start, what=PATHS["logger"]) + len(text))
+         for start, text in ((WAKE_GATE, cur["wake_gate"]), (ENERGY_START, cur["energy"]))]
+if (not find(logger, DRIVE_START, what=PATHS["logger"]) < find(logger, ENERGY_START, what=PATHS["logger"])
+        or not latch_writes or any(not any(a <= w < b for a, b in spans) for w in latch_writes)):
+    sys.exit("FAIL: loop()'s drive block must come before its energy block, and only the energy block and the wake gate "
+             "may assign recently_charging")
 
 # Step 1 (#24), extended by #6 to drive_unconfirmed and the refusal-streak flag: drive_state.h is the only code that assigns the park/drive storage. An assignment here is
 # =, a compound assignment, ++/--, taking the address or binding a reference (an alias could assign), or

@@ -260,6 +260,14 @@ of the transition logging: only the gated branch moves the counter here). Scenar
 moving fix, a tunnel on the speed hold, a stale fix, a short dip and a switch-off, and the wizard's setup permit with
 the phone leaving, each boundary to the millisecond; random
 adds 500 sequences on an enforced car with fix ages around the bound. The per-PID guard inside `readPIDs` is not covered.
+The regions also compose: every poll's drive rules read the charge latch the previous energy block or the wake gate
+left, in the firmware's order (a rules poll can assert one instead), and the runner fails unless the drive block comes
+first and only those two assign the latch. A composed alphabet (15 symbols, about 760 k sequences at depth 5: drive and
+charge polls, sustained motion after its own 20 s, the stream-trust delay, latched taper-band and give-up wakes, a plain
+and an alarm-enforced motion wake, a fix past the alarm's age bound, a sleep) is enumerated beside the other three, and a
+scenario shows a real latch dropping UNCONFIRMED to PARKED and refusing sustained motion and a moving fix until its
+release. The awake ladder stays shared context, so the DC hold
+keeping CHARGING from STANDBY is not compared.
 
 ## Diagnostic host checks
 

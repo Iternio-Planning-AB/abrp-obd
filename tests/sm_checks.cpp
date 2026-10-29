@@ -54,8 +54,9 @@ struct SmEvent {
   bool alarm = false;  // WAKE: the OBD-alarm gate is enforced for this car
   bool dump = false;  // HOLD: the log dump rather than an OTA update
   bool on = false;    // MAINT: the console's maintenance_mode
-  // POLL inputs to the driving rules (#6). The defaults make CUR agree with OLD: car on, motion this poll, no
-  // sustained motion, no power, no charge latch. Charge and Silent polls keep the wake's rail and motion instead.
+  // POLL inputs to the driving rules (#6): car on, motion this poll, no sustained motion, no power, and the charge
+  // latch the energy block left unless charge_block asserts one (#83). Charge and Silent polls keep the wake's rail
+  // and motion instead.
   int car = SM_CAR_RAIL;
   int motion = SM_MOVE_NOW;
   bool sustained = false;  // the accumulator holds 20 s of motion
@@ -66,6 +67,7 @@ struct SmEvent {
   double power = NAN, current = NAN, voltage = NAN, dcfc = NAN;
   double poll_rail = NAN;  // the rail this cycle read; NaN keeps the last
   unsigned long fix_age_ms = 0;  // POLL: how old the GNSS fix is
+  unsigned long lead_ms = 0;  // POLL: the clock moves this much first
 };
 
 SmEvent Poll(int key, double speed, bool gnss = false, double kmh = 0, bool has_data = true, double speed2 = 0) {
@@ -168,6 +170,12 @@ SmEvent Atrv(SmEvent e, double atrv) {
 SmEvent Alarmed(SmEvent e) {
   e.alarm = true;
   return named(e, ",alarm");
+}
+// A poll that comes after its own 20 s of sustained motion.
+SmEvent Sustained(SmEvent e) {
+  e = Rules(e, SM_CAR_RAIL, SM_MOVE_NOW, true, e.power);
+  e.lead_ms = 20000;
+  return named(e, ",after=20s");
 }
 // A poll whose GNSS fix is ms old.
 SmEvent Aged(SmEvent e, unsigned long ms) {
@@ -329,6 +337,18 @@ const std::vector<SmEvent> WAKE_ALPHABET = {
   Atrv(Wake(SM_MOTION, 12.6f), 7.99), Wake(SM_COLD, 10.0f), Alarmed(Wake(SM_TIMER, 13.6f)),
   Alarmed(Wake(SM_MOTION, 13.6f)), Charge(-50, 380, 0.5),
   Silent(), Sleep(), Advance(CONFIRM_MS),
+};
+
+// The composed alphabet (#83): drive and charge in the same polls, the drive rules on the real charge latch. A speed
+// poll, a moving fix, sustained motion with and without a discharge, charge polls that latch and release, silence on
+// a high and a low rail, the stream-trust delay, latched wakes in the taper band and below it, a motion wake plain
+// and alarm-enforced, a fix past the alarm's age bound, and a sleep.
+const std::vector<SmEvent> COMPOSED_ALPHABET = {
+  Poll(SM_SPEED, 12.35), Poll(SM_NONE, 0, true, 7.25), Sustained(Poll(SM_NONE, 0)),
+  Sustained(Rules(Poll(SM_NONE, 0), SM_CAR_RAIL, SM_MOVE_NOW, false, 12.5)), Charge(-50, 380, 0.5),
+  Charge(0.479), Silent(13.6), Silent(12.6), Advance(CONFIRM_MS),
+  Wake(SM_TIMER, 12.5f, true, true), Wake(SM_TIMER, 12.0f, true, true), Wake(SM_MOTION, 13.6f),
+  Alarmed(Wake(SM_MOTION, 13.6f)), Aged(Poll(SM_NONE, 0, true, 60), ALARM_GNSS_MAX_AGE_MS + 1), Sleep(),
 };
 
 unsigned long leaves = 0;
@@ -937,6 +957,34 @@ void scenarios() {
   at(sm_setup_ms);
   play(parked, t);
   check(sm_tx == 3 * SM_POLL_COMMANDS, "until ALARM_SETUP_PERMIT_MINUTES", t);
+
+  // Drive and charge composed (#83): the charge latch the energy block sets keeps sustained motion and a moving fix
+  // out of DRIVE and drops UNCONFIRMED to PARKED; its release lets them through.
+  auto plugged = [](SmEvent e) {  // a charging car's answer: its current and voltage
+    e.current = -50, e.voltage = 380;
+    return named(e, ",a=-50");
+  };
+  const SmEvent moving = Sustained(Poll(SM_NONE, 0)), fix = Poll(SM_NONE, 0, true, 40);
+  const SmEvent charging = Charge(-50, 380, 0.5), released = Charge(0.479);
+  start(t);
+  play(Advance(CONFIRM_MS), t);
+  play(moving, t);
+  check(drive_unconfirmed && !recently_charging, "sustained motion on a car that is on, not charging: UNCONFIRMED", t);
+  play(charging, t);
+  check(drive_unconfirmed && recently_charging, "a trusted charging sample latches the charge", t);
+  play(plugged(moving), t);
+  check(is_currently_parked && !drive_unconfirmed && countLog("LEASH unconfirmed charging -> parked") == 1,
+        "the latch drops UNCONFIRMED to PARKED", t);
+  play(plugged(moving), t);
+  play(plugged(fix), t);
+  check(is_currently_parked && !drive_unconfirmed && countLog("LEASH gnss=40.0km/h refused reason=charging") == 1,
+        "and keeps sustained motion and a moving fix out of DRIVE", t);
+  play(released, t);
+  play(released, t);
+  check(!recently_charging, "two positive samples release it", t);
+  play(moving, t);
+  play(fix, t);
+  check(!is_currently_parked && countLog("LEASH driving gnss=40.0km/h") == 1, "then they drive", t);
 }
 
 
@@ -1227,15 +1275,19 @@ int main(int argc, char** argv) {
     start(trace);
     enumerate(depth, trace, WAKE_ALPHABET);
     const unsigned long wake_leaves = leaves - drive_leaves - energy_leaves;
+    start(trace);
+    enumerate(depth, trace, COMPOSED_ALPHABET);
+    const unsigned long composed_leaves = leaves - drive_leaves - energy_leaves - wake_leaves;
     for (int kind : {SEED_NEAR_CAP, SEED_NEAR_STALE, SEED_LATCHED_STALE}) {
       startSeeded(trace, kind);
       enumerate(depth - 1, trace, SEEDED_ALPHABET);
     }
     const double s = std::chrono::duration<double>(clock::now() - t0).count();
     std::cout << "PASS: enumerate depth " << depth << " over " << ALPHABET.size() << " drive, " << ENERGY_ALPHABET.size()
-              << " energy and " << WAKE_ALPHABET.size() << " wake symbols, " << drive_leaves << " + " << energy_leaves
-              << " + " << wake_leaves << " sequences, and the energy symbols at depth " << depth - 1
-              << " with an odd advance, from near the cap, near stale and latched near stale (" << leaves - drive_leaves - energy_leaves - wake_leaves
+              << " energy, " << WAKE_ALPHABET.size() << " wake and " << COMPOSED_ALPHABET.size() << " composed symbols, "
+              << drive_leaves << " + " << energy_leaves << " + " << wake_leaves << " + " << composed_leaves
+              << " sequences, and the energy symbols at depth " << depth - 1
+              << " with an odd advance, from near the cap, near stale and latched near stale (" << leaves - drive_leaves - energy_leaves - wake_leaves - composed_leaves
               << "), in " << s << "s\n";
   }
   if (group == "all" || group == "crash") {

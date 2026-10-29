@@ -228,6 +228,7 @@ OBDVector carFrame(const SmEvent& e) {
 }
 
 void poll(const SmEvent& e) {
+  sm_now += e.lead_ms;  // a poll that comes after its own interval (a sustained window's 20 s)
   // The rail the top of the cycle reads: the event's; else for a drive poll the rules' car-on input, and for a
   // charge poll the last one read. Then the GNSS fix, and loop()'s own poll condition (from the tree, for both sides):
   // the weak-rail veto (#104) and the alarm permit. A vetoed or denied cycle reads nothing and runs on as one the car
@@ -255,10 +256,16 @@ void poll(const SmEvent& e) {
   if (e.motion == SM_MOVE_NOW) g_last_motion_ms = sm_now;
   else if (e.motion == SM_MOVE_NONE) g_last_motion_ms = 0;
   sm_motion_inputs(e);
-  const bool latch = recently_charging;
-  recently_charging = e.charge_block;
-  sm_drive_poll(current_frame);
-  recently_charging = latch;
+  // The drive rules read the charge latch as the last energy block or the wake gate left it, in the firmware's order
+  // (#83); a rules poll can assert one instead.
+  if (e.charge_block) {
+    const bool latch = recently_charging;
+    recently_charging = true;
+    sm_drive_poll(current_frame);
+    recently_charging = latch;
+  } else {
+    sm_drive_poll(current_frame);
+  }
   sm_emplace(current_frame);
   sm_published = -1;
   for (const auto& res : current_frame) if (res.first == "is_parked") sm_published = res.second;
