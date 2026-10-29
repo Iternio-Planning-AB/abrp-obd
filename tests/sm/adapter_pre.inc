@@ -37,7 +37,12 @@
   X(bool, g_dc_refused_logged, false) \
   X(unsigned long, g_last_motion_ms, 0) \
   X(float, g_last_voltage, 0.0f) \
-  X(bool, g_weak_rail_cold_boot, false)
+  X(bool, g_weak_rail_cold_boot, false) \
+  X(unsigned long, g_alarm_setup_permit_until, 0) \
+  X(unsigned long, g_alarm_ble_seen_ms, 0) \
+  X(unsigned long, g_alarm_speed_hold_until, 0) \
+  X(unsigned long, g_alarm_rail_low_since, 0) \
+  X(bool, g_no_profile, false)
 #define SM_RTC(X) \
   X(bool, park_marker_owed, false) \
   X(bool, recently_charging, false) \
@@ -104,12 +109,29 @@ enum SmReset { ESP_RST_POWERON = 1, ESP_RST_PANIC = 4, ESP_RST_TASK_WDT = 6, ESP
   X(bool, sm_run_on, false) \
   X(unsigned long, sm_run_ms, 0) \
   X(uint32_t, sm_run_budget, 0) \
-  X(const char*, sm_budget_broken, nullptr)
+  X(const char*, sm_budget_broken, nullptr) \
+  X(const char*, sm_alarm_broken, nullptr) \
+  X(unsigned long, sm_fix_age, 0)
+// Harness state for one wake, reset by every boot as RAM is: the car's command counter (obd.tx_count), an
+// authenticated phone, and the alarm permit's oracle, kept from the trace's inputs rather than the gate's state.
+#define SM_WAKE(X) \
+  X(unsigned long, sm_tx, 0) \
+  X(bool, sm_ble_auth, false) \
+  X(bool, sm_note_on, false) \
+  X(unsigned long, sm_note_ms, 0) \
+  X(bool, sm_low_on, false) \
+  X(unsigned long, sm_low_ms, 0) \
+  X(bool, sm_setup_on, false) \
+  X(unsigned long, sm_setup_ms, 0) \
+  X(bool, sm_seen_on, false) \
+  X(unsigned long, sm_seen_ms, 0) \
+  X(long, sm_deny_tx, -1)
 
 #define SM_DEFINE(T, name, value) T name = value;
 SM_RAM(SM_DEFINE)
 SM_RTC(SM_DEFINE)
 SM_STUB(SM_DEFINE)
+SM_WAKE(SM_DEFINE)
 #undef SM_DEFINE
 
 struct SmGps { float speed = 0; } sm_gps;  // knots, as GPS_DATA
@@ -128,7 +150,10 @@ struct SmHeap {
 // Function-local statics in the extracted blocks, hoisted by run_sm_checks.py so that each boot resets them, as
 // a deep-sleep wake does.
 #define SM_LOCAL(X) \
-  X(int, logged_dcfc, -1)
+  X(int, logged_dcfc, -1) \
+  X(bool, logged_this_wake, false) \
+  X(bool, last_permit, false) \
+  X(unsigned long, last_deny_log_ms, 0)
 #define SM_DEFINE(T, name, value) T name = value;
 SM_LOCAL(SM_DEFINE)
 #undef SM_DEFINE
@@ -163,9 +188,10 @@ struct {
   }
 } Serial;
 
+// A moving fix sm_fix_age old: fresh for any bound at least that.
 bool gpsMovingFresh(unsigned long max_age_ms) {
   sm_gnss_age = max_age_ms;  // compared across sides: the age bound is part of the decision
-  return sm_gnss_fresh;
+  return sm_gnss_fresh && sm_fix_age <= max_age_ms;
 }
 // Into the logEvent stream, so the order of the freeze against the LEASH lines is compared too.
 void freezeParkedLocation() {
@@ -173,21 +199,30 @@ void freezeParkedLocation() {
   sm_now += SM_IO_MS;
   logEvent("PARKED_LOC (harness)");
 }
-void alarmNoteSpeed(double kmh) { sm_alarm_calls++; sm_alarm_last = kmh; }
-// The OBD-alarm flag, per wake: the gate's ALARMGATE branch and the energy vetoes read it. The loop's per-cycle
-// permit is not modelled: an enforced car's polls still reach the car here.
+// The speed note runs alarm_gate.h's own body, after the adapter has recorded it.
+void alarmNoteSpeedBody(double kmh);
+void alarmNoteSpeed(double kmh) {
+  sm_alarm_calls++;
+  sm_alarm_last = kmh;
+  if (kmh >= (double)ALARM_SPEED_HOLD_KMH) sm_note_on = true, sm_note_ms = sm_now;
+  alarmNoteSpeedBody(kmh);
+}
+// The OBD-alarm flag, per wake: the gate's ALARMGATE branch, the loop's permit and the energy vetoes read it.
 bool alarmEnforced() { return g_alarm_flag == 1; }
-// No phone in this harness, except where a scenario connects one (sm_ble_connected, reset at power-on): the extracted
-// blocks see a phone only through bleConnected().
+// No phone holds the ladder in this harness, except where a scenario connects one (sm_ble_connected, reset at
+// power-on): the extracted blocks see it only through bleConnected(). An authenticated one is the setup permit's
+// "human still here"; the pin asked bleRelaying(), which a phone with no relay session cannot tell apart from it.
 bool bleConnected() { return sm_ble_connected; }
+bool bleAuthenticated() { return sm_ble_auth; }
+bool bleRelaying() { return sm_ble_auth; }
 // The wake cause setup() reads, as the ESP-IDF values.
 enum SmWakeCause { ESP_SLEEP_WAKEUP_UNDEFINED = 0, ESP_SLEEP_WAKEUP_EXT0 = 2, ESP_SLEEP_WAKEUP_TIMER = 4 };
-// loop()'s poll condition (sm_poll_reaches_car) reads these beside the weak-rail flag: a profile is always loaded here,
-// and the per-cycle alarm permit is not modelled (run_sm_checks.py's header), so both pass.
-const bool g_no_profile = false;
-bool alarmGateAllowsPoll() { return true; }
 // ATRV, the co-processor's pin-16 read: the event's.
-struct { float getVoltage() const { return sm_atrv; } } obd;
+// Every co-processor command a poll sends counts in tx_count; ATRV is not one.
+struct {
+  float getVoltage() const { return sm_atrv; }
+  unsigned long& tx_count = sm_tx;
+} obd;
 // The RTC microsecond clock runs on through deep sleep and every reset but a power loss: the time of earlier
 // wakes and sleeps (sm_rtc_ms) plus this wake's millis().
 uint64_t esp_rtc_get_time_us() { return (uint64_t)(sm_rtc_ms + sm_now) * 1000ULL; }

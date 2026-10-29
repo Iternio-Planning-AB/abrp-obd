@@ -22,7 +22,15 @@ every event: the latch, the leash and hold times, the marker debt and its crash 
 buffered frames, alarm speed notes, freezes, every energy and gate RTC field and RAM output, the next-wake
 minutes, and the exact logEvent and Serial sequences; the gate's poll or skip shows in its counters. It also checks
 the weak-rail gate, the weak-rail cold boot's modem-off sleep, the max-awake backstop and the fast-cadence budget
-(#83) as properties. Groups:
+(#83) as properties.
+The OBD-alarm permit (#83) is alarm_gate.h from the setup grant through alarmGateAllowsPoll(), pinned for OLD; it is
+the last term of loop()'s poll condition (from the tree, after the weak-rail veto), and this runner fails unless loop()
+asks the car (readPIDs and the deferred obd.initialize) only inside that condition, compiled in the default build,
+after the cycle's rail and GNSS refresh. On an enforced car a poll asks
+the car (obd.tx_count moves) exactly when an oracle kept from the trace's inputs permits it: the setup window with an
+authenticated phone or within ALARM_PERMIT_BLE_GRACE_MS of one, or the rail awake and a moving fix no older than ALARM_GNSS_MAX_AGE_MS or a speed note within
+ALARM_SPEED_HOLD_MS, a sustained rail collapse voiding the note. Every DENY line carries tx=, which never moves
+between two of them; only the gated branch moves the counter here, so that checks the transition logging. Groups:
 enumerate (exhaustive over a drive, an energy and a wake alphabet, --depth, default 5), random (fixed seeds), scenarios (named field and charge cases), crash (CUR alone: a panic,
 also inside the pre-sleep flush, never loses the marker debt; an absolute property, not a comparison), rules
 (CUR alone: absolute checks of the #6 driving rules), or all. A Charge or Silent poll keeps the wake's rail and
@@ -50,10 +58,13 @@ outside the extracted blocks (the rest of handleActivityState, dcPromotePoke and
 SAMPLE_POLL line, the modem, detectMovement timing, RTC retention, hardware); the wdt-streak sleeps before and after
 the gate; resets other than a deep-sleep wake, a power loss, a panic and a WDT (a brownout or software reset reloads
 RTC as those do, so the sanitize cannot show); the heartbeat (ENABLE_PARKED_HEARTBEAT 0, so the branch and
-heartbeat_asleep_streak are not compiled); the loop's per-cycle alarm permit (an enforced car's polls reach the car
-here); since_poll at the target's 32-bit width; GNSS power (a poll's GNSS input is the event's, also on a weak-rail
-cold boot, whose GNSS the firmware never powers: that is checked by position only), the boot profile restore and a
-profile push (tests/run_profile_checks.py). The energy properties and the multi-region layer are #83.
+heartbeat_asleep_streak are not compiled); the per-PID alarm guard inside readPIDs (alarmPollGuard), the deferred
+OBD init and a missing profile (g_no_profile stays false); the loop's own phone-presence stamp (alarmGateService), so
+the setup permit's grace runs from the last permit read that saw the phone; bleRelaying(), which the pin asked and a
+phone with no relay session cannot tell from bleAuthenticated(); since_poll at the target's 32-bit width; GNSS power (a
+poll's GNSS input is the event's, also on a weak-rail cold boot, whose GNSS the firmware never powers: that is checked
+by position only), the boot profile restore and a profile push (tests/run_profile_checks.py). The multi-region layer
+is #83.
 """
 
 import os
@@ -92,7 +103,8 @@ def line(text, prefix, what):
 PATHS = {"logger": "baseLogger/logger.ino", "machine": "baseLogger/Helpers/state_machine.h",
          "sleep": "baseLogger/Helpers/sleep_power.h", "upload": "baseLogger/Helpers/network_upload.h",
          "logging": "baseLogger/Helpers/logging.h", "drive_state": "baseLogger/Helpers/drive_state.h",
-         "motion_stats": "baseLogger/Helpers/motion_stats.h", "config": "baseLogger/config.h"}
+         "motion_stats": "baseLogger/Helpers/motion_stats.h", "config": "baseLogger/config.h",
+         "alarm": "baseLogger/Helpers/alarm_gate.h"}
 
 
 # Code anchors only (never comment text), each failing with its own text when the code it names has moved.
@@ -116,6 +128,13 @@ BOOT_RESYNC = '  if (!g_weak_rail_cold_boot && clockNeedsSync() && !clockResync(
 POLL_IF = "    if (!g_no_profile && "
 POLL_VETO = "!g_weak_rail_cold_boot"
 POKE_SLEEP = "    if (g_sample_poke && !maintenance_mode && !dcAwakeHeld(current_state)) {"
+# The OBD-alarm permit (#83): alarm_gate.h from the setup grant through alarmGateAllowsPoll(), its function-local
+# statics hoisted (adapter_pre.inc SM_LOCAL) and the speed note renamed, so the adapter's stub can count it first.
+ALARM_START = "void alarmGrantSetupPermit() {"
+ALARM_END = "\n/* Loop-task service:"
+ALARM_STATICS = ("  static bool logged_this_wake = false;\n  static bool last_permit = false;\n"
+                 "  static unsigned long last_deny_log_ms = 0;\n")
+ALARM_NOTE = "void alarmNoteSpeed(double kmh) {"
 
 
 def recipe(src, side):
@@ -138,7 +157,12 @@ def recipe(src, side):
     for header in ("motion_stats", "drive_state"):
         if src[header].count("#pragma once\n") != 1 or '#include "' in src[header]:
             sys.exit(f"FAIL: {where[header]} must be one #pragma once and no project include, to inline it")
+    alarm_start = find(src["alarm"], ALARM_START, what=where["alarm"])
+    alarm = src["alarm"][alarm_start:find(src["alarm"], ALARM_END, alarm_start, where["alarm"]) + 1]
+    if alarm.count(ALARM_STATICS) != 1 or alarm.count(ALARM_NOTE) != 1:
+        sys.exit(f"FAIL: expected alarmGateAllowsPoll's three statics together and one alarmNoteSpeed in {where['alarm']}")
     return {
+        "alarm": alarm.replace(ALARM_STATICS, "").replace(ALARM_NOTE, "void alarmNoteSpeedBody(double kmh) {"),
         # Inlined, never #included: #pragma once would hand OLD the tree's copy.
         "drive_state": src["drive_state"].replace("#pragma once\n", ""),
         "motion_stats": src["motion_stats"].replace("#pragma once\n", ""),
@@ -174,6 +198,7 @@ SIDE = """{enum}
 {buffer_cap}
 {weak_awake_ms}
 #include "adapter_pre.inc"
+{alarm}
 {motion_stats}
 {drive_state}
 {motion_inputs}
@@ -331,7 +356,10 @@ ENERGY_BLOCKS = ("energy_rail", "energy", "energy_helpers")
 # Step 0b-2 (#82) adds the setup() wake: the RTC sanitize and the whole gate block, with its skip path. The ladder's
 # post-drive window, the poke's sleep, the last-poll stamp and the weak-rail window stay shared context.
 WAKE_BLOCKS = ("sanitize", "wake_gate")
-PIN_BLOCKS = DRIVE_BLOCKS + ENERGY_BLOCKS + WAKE_BLOCKS
+# Step 0b-3 (#83) adds the OBD-alarm permit the loop asks before every poll. The poll site itself is the adapter's,
+# pinned below by position.
+ALARM_BLOCKS = ("alarm",)
+PIN_BLOCKS = DRIVE_BLOCKS + ENERGY_BLOCKS + WAKE_BLOCKS + ALARM_BLOCKS
 old = dict(cur)
 for name in PIN_BLOCKS:
     old[name] = pin[name]
@@ -377,9 +405,9 @@ for region, prefix in (("SM_RAM", ""), ("SM_RTC", "RTC_DATA_ATTR ")):
         for label, src in (("SM_PIN", old_src), ("tree", cur_src)):
             if label == "SM_PIN" and name == "maintenance_mode":
                 continue
-            if not re.search(pattern, src["logger"] + src["sleep"], re.M):
-                sys.exit(f"FAIL: {region} {name} = {value} does not match its definition in logger.ino or "
-                         f"sleep_power.h ({label})")
+            if not re.search(pattern, src["logger"] + src["sleep"] + src["alarm"], re.M):
+                sys.exit(f"FAIL: {region} {name} = {value} does not match its definition in logger.ino, "
+                         f"sleep_power.h or alarm_gate.h ({label})")
 
 
 
@@ -388,6 +416,40 @@ def code_only(text):
     return re.sub(r'"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|//[^\n]*|/\*.*?\*/',
                   lambda m: re.sub(r"[^\n]", " ", m.group(0)), text, flags=re.S)
 
+
+# The poll site (#83), modelled by the adapter: the car is asked (readPIDs, and the deferred OBD init) only inside the
+# permit, compiled in the default build, after the cycle's rail and GNSS refresh (the permit's own inputs); the only
+# other read is the build without the gate.
+def open_directives(text, pos):
+    """The #if blocks open at pos, each as its opening line and whether pos is past its #else."""
+    stack = []
+    for l in text[:pos].splitlines():
+        t = l.strip()
+        if re.match(r"#\s*if", t):
+            stack.append((t, False))
+        elif re.match(r"#\s*el", t):
+            stack[-1] = (stack[-1][0], True)
+        elif re.match(r"#\s*endif", t):
+            stack.pop()
+    return stack
+
+
+code = code_only(logger)
+gate_at = find(code, poll_if, what=PATHS["logger"])
+gated = block(code, poll_if)
+terms = [term.strip() for term in cur["poll_condition"].split("&&")]
+reads = [m.start() for m in re.finditer(r"obd\.readPIDs\(", code)]
+inits = [m.start() for m in re.finditer(r"obd\.initialize\(\);", code)]
+outside = [r for r in reads if not gate_at <= r < gate_at + len(gated)]
+if (terms[-1] != "alarmGateAllowsPoll()" or len(reads) != 2 or len(outside) != 1 or "current_frame = obd.readPIDs(PRINT);" not in gated
+        or len(inits) != 2 or "obd.initialize();" not in gated
+        or open_directives(code, gate_at) != [("#if FAKE_DATA", True), ("#if OBD_ALARM_GATE", False)]
+        or open_directives(code, outside[0]) != [("#if FAKE_DATA", True), ("#if OBD_ALARM_GATE", True)]
+        or "#define FAKE_DATA 0\n" not in cur_src["config"]
+        or not code.index(ENERGY_RAIL.split("\n")[0]) < code.index("      pollGpsData();\n      parkAccumSample();") < gate_at):
+    sys.exit("FAIL: loop() must ask the car (readPIDs and the deferred obd.initialize) only inside its poll condition, "
+             "with alarmGateAllowsPoll() its last term, directly under #if OBD_ALARM_GATE in FAKE_DATA's #else, "
+             "after the cycle's rail and GNSS refresh; the one other readPIDs is the gate's #else")
 
 # Step 1 (#24), extended by #6 to drive_unconfirmed and the refusal-streak flag: drive_state.h is the only code that assigns the park/drive storage. An assignment here is
 # =, a compound assignment, ++/--, taking the address or binding a reference (an alias could assign), or

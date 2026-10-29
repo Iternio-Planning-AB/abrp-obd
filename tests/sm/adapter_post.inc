@@ -19,7 +19,7 @@ void enterDeepSleep(bool modem_on, const char* reason) {
 
 struct Snap {
 #define SM_FIELD(T, name, value) T name;
-  SM_RAM(SM_FIELD) SM_RTC(SM_FIELD) SM_STUB(SM_FIELD) SM_LOCAL(SM_FIELD)
+  SM_RAM(SM_FIELD) SM_RTC(SM_FIELD) SM_STUB(SM_FIELD) SM_WAKE(SM_FIELD) SM_LOCAL(SM_FIELD)
 #undef SM_FIELD
   float gps_speed;
   std::vector<OBDVector> frames;
@@ -32,7 +32,7 @@ struct Snap {
 Snap save(bool frames = true) {
   Snap s;
 #define SM_SAVE(T, name, value) s.name = name;
-  SM_RAM(SM_SAVE) SM_RTC(SM_SAVE) SM_STUB(SM_SAVE) SM_LOCAL(SM_SAVE)
+  SM_RAM(SM_SAVE) SM_RTC(SM_SAVE) SM_STUB(SM_SAVE) SM_WAKE(SM_SAVE) SM_LOCAL(SM_SAVE)
 #undef SM_SAVE
   s.gps_speed = sm_gps.speed;
   if (frames) s.frames = obd_result_vector;
@@ -43,7 +43,7 @@ Snap save(bool frames = true) {
 
 void restore(const Snap& s) {
 #define SM_LOAD(T, name, value) name = s.name;
-  SM_RAM(SM_LOAD) SM_RTC(SM_LOAD) SM_STUB(SM_LOAD) SM_LOCAL(SM_LOAD)
+  SM_RAM(SM_LOAD) SM_RTC(SM_LOAD) SM_STUB(SM_LOAD) SM_WAKE(SM_LOAD) SM_LOCAL(SM_LOAD)
 #undef SM_LOAD
   sm_gps.speed = s.gps_speed;
   obd_result_vector = s.frames;
@@ -99,6 +99,41 @@ void budgetCheck(const BudgetBefore& b, unsigned long energy_ms) {
     sm_budget_broken = "a streaming charge's budget does not follow its time on the fast cadence";
 }
 
+// The OBD-alarm permit (#83), from the trace's inputs as alarm_gate.h's header states it: on an enforced car, the
+// setup window while a phone is authenticated or within ALARM_PERMIT_BLE_GRACE_MS of the last read inside the window
+// that saw one (the loop's own presence stamp is not modelled), or the rail awake and either a moving fix no older than
+// ALARM_GNSS_MAX_AGE_MS or a speed note at or above ALARM_SPEED_HOLD_KMH within ALARM_SPEED_HOLD_MS. A rail low for
+// ALARM_RAIL_COLLAPSE_MS, at the permit's reads, voids the note.
+const unsigned long SM_POLL_COMMANDS = 4;  // a poll's PID requests, answered or not
+bool alarmOracle() {
+  if (g_alarm_flag != 1) return true;
+  const bool awake = g_last_io36 >= RAIL_AWAKE_VOLTS;
+  if (awake) sm_low_on = false;
+  else if (!sm_low_on) sm_low_on = true, sm_low_ms = sm_now;
+  if (sm_low_on && sm_now - sm_low_ms >= ALARM_RAIL_COLLAPSE_MS) sm_note_on = false;
+  const bool window = sm_setup_on && sm_now < sm_setup_ms;
+  if (window && sm_ble_auth) sm_seen_on = true, sm_seen_ms = sm_now;
+  if (window && sm_seen_on && sm_now - sm_seen_ms <= ALARM_PERMIT_BLE_GRACE_MS) return true;
+  const bool moving = sm_gnss_fresh && sm_fix_age <= ALARM_GNSS_MAX_AGE_MS;
+  return awake && (moving || (sm_note_on && sm_now - sm_note_ms < ALARM_SPEED_HOLD_MS));
+}
+// The car asked exactly when the oracle permits, and the audit trail's shape: every DENY line carries tx=, which never
+// moves between two of them. Only the gated branch moves the counter here, so this checks the transition logging.
+void alarmCheck(unsigned long tx, bool oracle, size_t log_n) {
+  if ((sm_tx != tx) != oracle)
+    sm_alarm_broken = oracle ? "a permitted poll did not ask the car" : "a poll asked the car without the permit";
+  for (size_t i = log_n; i < sm_log.size(); ++i) {
+    const std::string& l = sm_log[i];
+    if (l.compare(0, 16, "ALARMGATE PERMIT") == 0) sm_deny_tx = -1;
+    if (l.compare(0, 14, "ALARMGATE DENY") != 0) continue;
+    const size_t at = l.rfind(" tx=");
+    if (at == std::string::npos) { sm_alarm_broken = "a DENY line without tx="; return; }
+    const long logged = std::stol(l.substr(at + 4));
+    if (sm_deny_tx >= 0 && logged != sm_deny_tx) sm_alarm_broken = "tx= moved between two DENY lines";
+    sm_deny_tx = logged;
+  }
+}
+
 #define SM_RESET(T, name, value) name = value;
 // A boot: RAM back to its initialisers, the RTC sanitize and the debt restore, then the setup() gate. A cold boot
 // zeroes the clock, as setup() does, until a poll sets it.
@@ -106,6 +141,7 @@ void boot(const SmEvent& e, SmReset reset) {
   sm_rtc_ms += sm_now;
   SM_RAM(SM_RESET)
   upload_capped = upload_heap_dropped = 0;
+  SM_WAKE(SM_RESET)
   SM_LOCAL(SM_RESET)
   sm_now = 0;
   sm_asleep = false;
@@ -192,22 +228,28 @@ OBDVector carFrame(const SmEvent& e) {
 }
 
 void poll(const SmEvent& e) {
-  // Whether the cycle asks the car is loop()'s own poll condition (from the tree, for both sides). A vetoed cycle (a
-  // weak-rail cold boot, #104) reads nothing and runs on as one the car did not answer, as a gate-denied one does.
+  // The rail the top of the cycle reads: the event's; else for a drive poll the rules' car-on input, and for a
+  // charge poll the last one read. Then the GNSS fix, and loop()'s own poll condition (from the tree, for both sides):
+  // the weak-rail veto (#104) and the alarm permit. A vetoed or denied cycle reads nothing and runs on as one the car
+  // did not answer. An answered poll stamps the last OBD answer, as loop() does. Then the motion stamp and the rolling
+  // accumulator.
+  if (!std::isnan(e.poll_rail)) g_last_io36 = (float)e.poll_rail;
+  else if (e.car != SM_CAR_KEEP) g_last_io36 = e.car == SM_CAR_RAIL ? 13.5f : 12.0f;
+  sm_energy_rail();
+  sm_gnss_fresh = e.gnss;
+  sm_fix_age = e.fix_age_ms;
+  const unsigned long tx = sm_tx;
+  const size_t log_n = sm_log.size();
+  const bool oracle = !g_no_profile && !g_weak_rail_cold_boot && alarmOracle();  // the veto comes first: no gate read
   OBDVector current_frame;
   if (sm_poll_reaches_car()) {
     sm_polls++;
+    sm_tx += SM_POLL_COMMANDS;
     current_frame = carFrame(e);
   }
+  alarmCheck(tx, oracle, log_n);
   const int obd_count = (int)current_frame.size();
-  // The rail the top of the cycle reads: the event's; else for a drive poll the rules' car-on input, and for a
-  // charge poll the last one read. An answered poll stamps the last OBD answer, as loop() does. Then the motion
-  // stamp and the rolling accumulator.
-  if (!std::isnan(e.poll_rail)) g_last_io36 = (float)e.poll_rail;
-  else if (e.car != SM_CAR_KEEP) g_last_io36 = e.car == SM_CAR_RAIL ? 13.5f : 12.0f;
   if (obd_count > 0) g_last_obd_answer_ms = sm_now;
-  sm_energy_rail();
-  sm_gnss_fresh = e.gnss;
   sm_gps.speed = (float)(e.gnss_kmh / 1.852);
   sm_clock_ok = e.clock_ok;
   if (e.motion == SM_MOVE_NOW) g_last_motion_ms = sm_now;
@@ -257,6 +299,13 @@ void step(const SmEvent& e) {
   switch (e.k) {
   case SmKind::POLL: poll(e); break;
   case SmKind::MAINT: maintenance_mode = e.on; break;
+  case SmKind::SETUP:  // a completed full profile push from an authenticated phone, or (off) the phone leaving
+    sm_ble_auth = e.on;
+    if (!e.on) break;
+    sm_setup_on = true;
+    sm_setup_ms = sm_now + (unsigned long)ALARM_SETUP_PERMIT_MINUTES * 60000UL;
+    alarmGrantSetupPermit();
+    break;
   case SmKind::LADDER: case SmKind::HOLD: ladder(e); break;
   case SmKind::SLEEP:
     sm_clock_ok = e.clock_ok;
@@ -279,6 +328,7 @@ void step(const SmEvent& e) {
 // Properties of one side after event e, against its state before it. Null when they hold.
 const char* propertyBroken(const Snap& pre, const SmEvent& e) {
   if (sm_budget_broken) return sm_budget_broken;
+  if (sm_alarm_broken) return sm_alarm_broken;
   if (e.k == SmKind::WAKE && sm_gate_weak && sm_gate_open) return "the gate opened on a weak rail";
   // A weak-rail cold boot stays up for BLE, but its loop's poll condition vetoes every cycle (#104), so no wake on a
   // weak rail asks the car anything.
