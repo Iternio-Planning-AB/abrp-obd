@@ -45,14 +45,17 @@ Every build checks its linker map and fails unless the C/C++ runtime came from t
 multilib (`tools/pio_psram_libs.py`, #64): this ESP32 rev 1 can lose stores to PSRAM, where mallocs over 4 KB
 land.
 
-**CI runs the host checks only.** `.github/workflows/host-tests.yml` runs every `tests/run_*.py` on each
-pull request and on `main`, normally and with `CXX='clang++ -DNDEBUG'`. Apart from the one job below, nothing in CI builds
-the firmware or touches a device, so a green PR proves the host checks and nothing more. Merging needs its `ci` job,
+**CI runs the host checks and a firmware build, never a device.** `.github/workflows/host-tests.yml` runs every
+`tests/run_*.py` on each pull request and on `main`, normally and with `CXX='clang++ -DNDEBUG'`. Apart from the one job
+below, nothing in CI builds the firmware, and nothing touches a device, so a green PR proves the host checks and that
+the firmware builds, and nothing more. Merging needs its `ci` job,
 the one check the `main` ruleset requires: a new job goes in that job's `needs`. See *Testing* below,
 because that gap is the single biggest difference from a normal repo.
 
-The `variants` job compiles the non-default `config.h` variants with `sh tools/check_variants.sh` from `baseLogger/`;
-it never builds the default image. `ENABLE_LOGGING 0`, `ENABLE_BLE 0` and `ENABLE_NETWORK 0` (as `ENABLE_CELL 0`) are built and linked.
+The `variants` job first builds and links the default image (`pio run -e esp32dev` from `baseLogger/`, with its PSRAM
+linker-map check), then the non-default `config.h` variants with `sh tools/check_variants.sh`. A linked image is not a
+flashed one: no OBD, power gate, modem or GPS behaviour is exercised.
+`ENABLE_LOGGING 0`, `ENABLE_BLE 0` and `ENABLE_NETWORK 0` (as `ENABLE_CELL 0`) are built and linked.
 `ENABLE_WIFI 1` (with `ENABLE_CELL 0`) only compiles, as it overflows IRAM, and its TLS is unverified: bench only.
 
 ## The rules that bite first

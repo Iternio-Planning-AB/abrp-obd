@@ -1,6 +1,6 @@
 # Every host runner (tests/run_*.py) on each pull request and on main, normally and with NDEBUG. Host checks
-# only: clang++ and Python, no hardware, no secrets. The `variants` job below builds the non-default firmware
-# configs. See AGENTS.md (Testing).
+# only: clang++ and Python, no hardware, no secrets. The `variants` job below builds the default firmware and the
+# non-default configs. See AGENTS.md (Testing).
 name: Host tests
 
 on:
@@ -70,9 +70,10 @@ jobs:
             exit 1
           fi
 
-  # The non-default config.h variants (tools/check_variants.sh); the host runners never see the firmware build. The
-  # toolchain comes in exactly as release.yml installs it (hash-pinned tools, esptool dependencies from wheels, no
-  # index afterwards), and no cache: a pull request must not read or poison one the release build could trust.
+  # The default firmware, linked with its PSRAM linker-map check, then the non-default config.h variants
+  # (tools/check_variants.sh); the host runners never see the firmware build. A build, not hardware: nothing is flashed
+  # or run. The toolchain comes in exactly as release.yml installs it (hash-pinned tools, esptool dependencies from
+  # wheels, no index afterwards), and no cache: a pull request must not read or poison one the release build could trust.
   variants:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -115,6 +116,10 @@ jobs:
 
       - name: Check esptool dependencies
         run: python3 baseLogger/tools/check_esptool_deps.py --wheels "$RUNNER_TEMP/wheels"
+
+      - name: Build default firmware
+        working-directory: baseLogger
+        run: pio run -e esp32dev
 
       - name: Build the variants
         run: sh baseLogger/tools/check_variants.sh
