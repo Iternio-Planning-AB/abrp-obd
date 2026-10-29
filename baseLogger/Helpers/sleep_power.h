@@ -118,16 +118,17 @@ void enterDeepSleep(bool modem_on, const char* reason = nullptr) {
   // (WiFi associated). In a dead spot - e.g. an underground garage - connected() is false, so we skip it
   // entirely instead of stalling for tens of seconds and draining the battery; the frames are safe in
   // LittleFS and go up on the next connected wake. (The POST itself is also bounded by the wrapper timeout.)
-  if (!obd_result_vector.empty() && upload_fail_count < MAX_UPLOAD_FAILS_PER_WAKE) {
+  if (uploadQueued() && upload_fail_count < MAX_UPLOAD_FAILS_PER_WAKE) {
     // up= is seconds since NET init=up, sampled before connect(): parked flushes ~25 s in failed while ~50 s
     // succeeded. The open trace (see HTTPClientSIM::open) says which step failed and whether the bearer was up.
     if (!network.connected()) {
       Serial.printf("Pre-sleep flush skipped: not registered - %d frame(s) kept in flash\n",
         obd_result_vector.size());
 #if ENABLE_LOGGING
-      logEvent("FLUSH skipped: not registered - %d kept", (int)obd_result_vector.size());
+      logEvent("FLUSH skipped: not registered - %d kept file=%d", (int)obd_result_vector.size(), uploadBacklogUnread());
 #endif
     } else {
+      if (uploadBacklogUnread()) loadUploadBacklog(); // registered: its last chance this wake. Before connect(), as in loop()
       int up_s = (int)(network.upForMs() / 1000);
       if (!network.connect()) {
         std::string why = network.lastOpenTrace();
@@ -150,18 +151,18 @@ void enterDeepSleep(bool modem_on, const char* reason = nullptr) {
         network.disconnect();
       }
     }
-  } else if (!obd_result_vector.empty()) {
+  } else if (uploadQueued()) {
     Serial.printf("Pre-sleep flush skipped: upload backed off - %d frame(s) kept in flash\n",
       obd_result_vector.size());
 #if ENABLE_LOGGING
-    logEvent("FLUSH skipped: backed off - %d frame(s) kept", (int)obd_result_vector.size());
+    logEvent("FLUSH skipped: backed off - %d frame(s) kept file=%d", (int)obd_result_vector.size(), uploadBacklogUnread());
 #endif
   }
   } // if (modem_on)
 
 #if ENABLE_LOGGING
   // Persist whatever the flush could NOT send (dead bearer / no coverage) before RAM is wiped - previously
-  // those frames were silently lost. Restored + uploaded on the next polling wake (see loadUploadBacklog).
+  // those frames were silently lost. Uploaded once a later wake registers (see loadUploadBacklog).
   gzipLogWakeSummary();
   saveUploadBacklog();
 #endif

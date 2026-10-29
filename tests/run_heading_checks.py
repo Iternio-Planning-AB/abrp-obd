@@ -57,6 +57,21 @@ with tempfile.TemporaryDirectory(prefix="obd-heading-checks-") as temporary:
     if not 0 <= ota_commit.find("saveUploadBacklog();") < ota_commit.index("esp_restart();"):
         raise RuntimeError("the OTA reboot must save the upload backlog kept through the session (#58)")
     sleep = (root / "baseLogger/Helpers/sleep_power.h").read_text()
+    # #92: the backlog is read only on the way to a cellular upload (registered, before connect(): a parse there
+    # would outlast a reused session's idle check), and the gates see a file RAM does not hold.
+    setup = logger[logger.index("void setup() {"):logger.index("\nvoid loop() {")]
+    if "loadUploadBacklog();" in setup or not 0 <= setup.find("datalogger.begin(") < setup.find("g_backlog_unread = uploadBacklogPending();"):
+        raise RuntimeError("setup() must not read the backlog, only note an earlier wake's file once the FS is mounted (#92)")
+    upload_gate = logger[logger.index("      if (!bleRelaying() && !g_ota_active && !ble_upload_grace"):]
+    registered = upload_gate.index("if (!backed_off && network.connected()) {")
+    if "uploadQueued()" not in upload_gate[:upload_gate.index("{")] or \
+            not registered < upload_gate.find("if (uploadBacklogUnread()) loadUploadBacklog();", registered) < upload_gate.index("network.connect()", registered):
+        raise RuntimeError("the loop upload must count an unread backlog and load it once registered, before connect() (#92)")
+    flush = sleep[sleep.index("void enterDeepSleep("):]
+    flush_open = flush.index("if (!network.connected()) {")
+    if not flush.find("uploadQueued() && upload_fail_count") < flush_open or \
+            not flush_open < flush.find("if (uploadBacklogUnread()) loadUploadBacklog();", flush_open) < flush.index("network.connect()", flush_open):
+        raise RuntimeError("the pre-sleep flush must count an unread backlog and load it once registered, before connect() (#92)")
     marker_start = sleep.index("  if (rtc.getEpoch() > 1e9 && is_currently_parked")
     marker_end = sleep.index("\n  }\n", marker_start) + len("\n  }\n")
     (build / "park_marker.inc").write_text(sleep[marker_start:marker_end])

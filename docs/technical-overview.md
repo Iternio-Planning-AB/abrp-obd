@@ -220,6 +220,7 @@ intended production values. The upload count ceiling is `MAX_UPLOAD_BUFFER` in `
 | `UPLOAD_MIN_FREE_PSRAM` | 131072 B | Free PSRAM a queued frame must leave, for gzip's state and bodies; below it the oldest frames go. |
 | `UPLOAD_MIN_FREE_HEAP` / `UPLOAD_MIN_MAX_BLOCK` | 32768 / 16384 B | The same for internal heap, on a board without PSRAM. |
 | `BACKLOG_FS_RESERVE` | 65536 B | Flash the upload backlog file leaves free; past it the oldest frames are not saved. |
+| `BACKLOG_MAX_BYTES` / `BACKLOG_COMPACT_BYTES` | 360448 / 294912 B | A wake that cannot upload appends to the backlog file; past the first it is rewritten with at most the second, the newest frames kept. |
 | `GEO_MAX_SEND_AGE_SECONDS` | 29 days | A location or heading older than this is left out of the upload; the server refuses anything past 30 days. |
 
 `cellwrapper.cpp` also sets the modem to GSM+LTE (`CNMP=51`) with LTE-M only on the LTE side

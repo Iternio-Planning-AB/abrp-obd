@@ -103,6 +103,8 @@ size_t indexOf(const std::string& prefix) {
 }
 
 #include "backlog_path.inc"
+bool uploadBacklogPending() { return LittleFS.exists(UPLOAD_BACKLOG_PATH); }
+bool g_backlog_unread = false;
 #include "config_callback.inc"
 #include "persisted_profile.inc"
 #include "forget_profile.inc"

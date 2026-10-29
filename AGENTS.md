@@ -357,7 +357,7 @@ A location or heading goes up once per new GPS observation; the design is in `DO
 Upload group `geo-dedup` covers repeats within a batch, accepted/failed/unanswered outcomes, new times or
 coordinates, multi-batch partial failure, sizing against the mark, boot clearing and untrusted clocks; the
 heading `upload-gate` group covers a geo-only poll buffered once while unaccepted, never again after, and
-not again behind a restored backlog. RTC retention across deep sleep and what the backend shows between
+not again behind a restored or an unread backlog. RTC retention across deep sleep and what the backend shows between
 sends need a parked night.
 
 Run `python3 tests/run_clock_range_checks.py` normally and with `CXX='clang++ -DNDEBUG'` for extracted
@@ -515,6 +515,17 @@ threshold), independently of the estimator. `queue` covers the #75 field heap (2
 free: the queue fills to the cap with no internal heap at any step), short PSRAM, no PSRAM with long keys, and the
 backlog's flash budget and a failing write. It does not emulate ESP32 fragmentation or prove that unrelated
 allocations succeed; the PSRAM allocation itself only runs on a device.
+
+Upload group `backlog-append` (#92) covers a wake that cannot upload: an unread file counts as queued, its save
+appends to the earlier wakes' file without reading it or changing its bytes, a second save appends nothing twice, an
+append that loses the marker re-arms it (held frames first), an append past the flash budget compacts instead, a load
+whose remove fails is not read again, is overwritten and once sent removed, a token change's file is never read, a
+torn last line keeps the appended frame, and past `BACKLOG_MAX_BYTES` the file is compacted to the newest frames
+within `BACKLOG_COMPACT_BYTES` (file, held, RAM, marker last). The heading runner checks by position that `setup()` no
+longer reads the backlog and that both cellular uploads load it once registered, before `connect()`; `upload-gate`
+covers a frozen fix not buffered again behind an unread file while a live fix and a poll with data are, and
+`geo-downgrade` the `eacc642` loader on an appended file. Real LittleFS append time and a parked offline night remain
+hardware gates.
 
 `python3 tests/run_sm_checks.py` keeps the extracted queue helper on the CUR side under high heap and compares
 the drive/marker behavior with the pinned side. It does not prove low-heap admission, LittleFS behavior or
