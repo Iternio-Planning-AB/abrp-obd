@@ -35,7 +35,9 @@
   X(const char*, g_cadence_reason, nullptr) \
   X(bool, g_dc_logged, false) \
   X(bool, g_dc_refused_logged, false) \
-  X(unsigned long, g_last_motion_ms, 0)
+  X(unsigned long, g_last_motion_ms, 0) \
+  X(float, g_last_voltage, 0.0f) \
+  X(bool, g_weak_rail_cold_boot, false)
 #define SM_RTC(X) \
   X(bool, park_marker_owed, false) \
   X(bool, recently_charging, false) \
@@ -59,11 +61,14 @@
   X(uint8_t, pdw_open, 0) \
   X(uint64_t, pdw_open_us, 0) \
   X(uint8_t, pdw_polls, 0) \
-  X(uint64_t, charge_last_evidence_us, 0)
+  X(uint64_t, charge_last_evidence_us, 0) \
+  X(uint32_t, skips_count, 0) \
+  X(uint32_t, polls_count, 0) \
+  X(time_t, last_poll_epoch, 0)
 // Harness-only state: the trace's inputs and what the stubs recorded. Not firmware globals, so not checked.
 // sm_store_marker is the RTC_NOINIT debt copy (wdt_streak.h; its own semantics are the energy wdt-streak
-// group's). The buffer stands for RAM and the upload backlog together, except on a gate skip, which sleeps
-// before the backlog loads: there it is the file (sm_backlog_file) and RAM is empty.
+// group's). The buffer stands for RAM and the upload backlog together, except during the gate, which runs before
+// the backlog loads: there it is the file (sm_backlog_file) and RAM is empty.
 enum SmReset { ESP_RST_POWERON = 1, ESP_RST_PANIC = 4, ESP_RST_TASK_WDT = 6, ESP_RST_DEEPSLEEP = 8 };
 #define SM_STUB(X) \
   X(SmReset, sm_reset, ESP_RST_POWERON) \
@@ -90,7 +95,11 @@ enum SmReset { ESP_RST_POWERON = 1, ESP_RST_PANIC = 4, ESP_RST_TASK_WDT = 6, ESP
   X(bool, sm_gate_weak, false) \
   X(double, sm_published, -1) \
   X(unsigned, sm_sleeps, 0) \
-  X(std::string, sm_sleep_reason, "")
+  X(std::string, sm_sleep_reason, "") \
+  X(bool, sm_sleep_modem, false) \
+  X(float, sm_atrv, 13.5f) \
+  X(int, g_alarm_flag, -1) \
+  X(bool, sm_cold_boot, false)
 
 #define SM_DEFINE(T, name, value) T name = value;
 SM_RAM(SM_DEFINE)
@@ -123,7 +132,10 @@ unsigned long millis() { return sm_now; }
 // Logging and the freeze take real time on the device (UART, flash), so each moves the clock: a reordering of
 // a clock read against a log line shows up as a different timestamp.
 const unsigned long SM_IO_MS = 1;
-struct { uint32_t getEpoch() const { return sm_clock_ok ? 1791500000u : 0u; } } rtc;
+// The RTC epoch runs with the RTC clock (esp_rtc_get_time_us below) while it is set.
+unsigned long sm_rtc_s();
+struct { uint32_t getEpoch() const { return sm_clock_ok ? 1791500000u + (uint32_t)sm_rtc_s() : 0u; } } rtc;
+bool clockValid() { return sm_clock_ok; }
 
 void logEvent(const char* fmt, ...) {
   char text[512];
@@ -157,12 +169,19 @@ void freezeParkedLocation() {
   logEvent("PARKED_LOC (harness)");
 }
 void alarmNoteSpeed(double kmh) { sm_alarm_calls++; sm_alarm_last = kmh; }
-// No alarm-flagged car here: the gate's ALARMGATE branch and pdwOpenWindow's veto stay shut on both sides.
-int g_alarm_flag = -1;
-bool alarmEnforced() { return false; }
+// The OBD-alarm flag, per wake: the gate's ALARMGATE branch and the energy vetoes read it. The loop's per-cycle
+// permit is not modelled: an enforced car's polls still reach the car here.
+bool alarmEnforced() { return g_alarm_flag == 1; }
+// No phone in this harness.
+bool bleConnected() { return false; }
+// The wake cause setup() reads, as the ESP-IDF values.
+enum SmWakeCause { ESP_SLEEP_WAKEUP_UNDEFINED = 0, ESP_SLEEP_WAKEUP_EXT0 = 2, ESP_SLEEP_WAKEUP_TIMER = 4 };
+// ATRV, the co-processor's pin-16 read: the event's.
+struct { float getVoltage() const { return sm_atrv; } } obd;
 // The RTC microsecond clock runs on through deep sleep and every reset but a power loss: the time of earlier
 // wakes and sleeps (sm_rtc_ms) plus this wake's millis().
 uint64_t esp_rtc_get_time_us() { return (uint64_t)(sm_rtc_ms + sm_now) * 1000ULL; }
+unsigned long sm_rtc_s() { return (sm_rtc_ms + sm_now) / 1000UL; }
 float readIO36Rail() { return g_last_io36; }
 // The motion window's peaks only fill log lines; the motion stamp itself is a poll input.
 float motion_window_peak = 0, motion_window_axmax = 0;

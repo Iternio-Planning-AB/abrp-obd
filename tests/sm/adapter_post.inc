@@ -4,6 +4,8 @@
 // change, as handleActivityState().
 
 void enterDeepSleep(bool modem_on, const char* reason) {
+  sm_modem_override(modem_on);
+  sm_sleep_modem = modem_on;
   if (modem_on) sm_marker();
   if (modem_on && sm_flush_ok) obd_result_vector.clear();  // the pre-sleep flush sent everything
   sm_flush_ok = false;
@@ -46,7 +48,8 @@ void restore(const Snap& s) {
 }
 
 #define SM_RESET(T, name, value) name = value;
-// A boot: RAM back to its initialisers, the RTC sanitize and the debt restore, then the setup() gate.
+// A boot: RAM back to its initialisers, the RTC sanitize and the debt restore, then the setup() gate. A cold boot
+// zeroes the clock, as setup() does, until a poll sets it.
 void boot(const SmEvent& e, SmReset reset) {
   sm_rtc_ms += sm_now;
   SM_RAM(SM_RESET)
@@ -56,23 +59,29 @@ void boot(const SmEvent& e, SmReset reset) {
   sm_asleep = false;
   sm_reset = reset;
   if (reset == ESP_RST_DEEPSLEEP) g_wake_reason = e.cause == SM_MOTION ? "MOTION" : "TIMER";
+  if (e.cause == SM_COLD) sm_clock_ok = false;
   chargeWakeStateSanitize(reset == ESP_RST_DEEPSLEEP);
   sm_restore();
   // A charge latch the trace asserts (a charge some earlier, unmodelled poll saw); otherwise the energy block's own.
   if (e.charge_latched) recently_charging = true;
   g_last_io36 = e.rail;
+  sm_atrv = std::isnan(e.atrv) ? (e.awake ? 13.5f : 5.3f) : (float)e.atrv;
+  g_alarm_flag = e.alarm ? 1 : -1;
+  sm_cold_boot = e.cause == SM_COLD;
   sm_gate_weak = e.rail >= IO36_LOCKOUT_LOW && e.rail < IO36_LOCKOUT_HIGH;
-  sm_gate_open = sm_gate(e.rail, e.cause == SM_COLD, e.cause == SM_MOTION, e.awake, false);
-  if (!sm_gate_open) {
-    std::vector<OBDVector> backlog;
-    backlog.swap(obd_result_vector);
-    sm_backlog_file = !backlog.empty();
-    sm_skip();
-    enterDeepSleep(false, "gate");  // the skip path never powers the modem
-    backlog.swap(obd_result_vector);
-    sm_backlog_file = false;
-    return;
-  }
+  // The gate runs before the backlog loads: the frames are in the file, RAM is empty. The gate decided to poll
+  // when it counted a poll; its skip path sleeps from inside it.
+  std::vector<OBDVector> backlog;
+  backlog.swap(obd_result_vector);
+  sm_backlog_file = !backlog.empty();
+  const uint32_t polls = polls_count;
+  sm_wake_gate(e.cause == SM_COLD ? ESP_SLEEP_WAKEUP_UNDEFINED : e.cause == SM_MOTION ? ESP_SLEEP_WAKEUP_EXT0
+                                                                                       : ESP_SLEEP_WAKEUP_TIMER);
+  sm_gate_open = polls_count != polls;
+  backlog.swap(obd_result_vector);
+  sm_backlog_file = false;
+  if (sm_asleep) return;
+  sm_stamp();  // after the network bring-up, which a skip never reaches
   changeState(ACTIVE);
 }
 
@@ -96,8 +105,9 @@ void powerOn(const SmEvent& e) {
 
 // A panic or WDT reset: the bootloader reloads .rtc.data, the unsent frames in RAM are lost (the worst case:
 // the backlog was already loaded), the clock is zeroed until a later poll syncs it (run_sm_checks.py pins that
-// line), the debt store is kept. A cold boot.
+// line), the debt store is kept. A cold boot, at the rail the wake had.
 void crash(SmEvent e, SmReset reset = ESP_RST_PANIC) {
+  e.rail = g_last_io36;
   SM_RTC(SM_RESET)
   obd_result_vector.clear();
   sm_clock_ok = false;
@@ -151,6 +161,8 @@ void poll(const SmEvent& e) {
   sm_energy(current_frame, obd_count);
   sm_buffer(current_frame, e.has_data);
   sm_marker_set();
+  sm_weak_expiry();
+  if (sm_asleep) return;
   if (sm_poke_sleeps()) enterDeepSleep(true);  // a poke the DC hold does not keep sleeps after its one poll
 }
 
@@ -183,7 +195,9 @@ void step(const SmEvent& e) {
   case SmKind::SLEEP:
     sm_clock_ok = e.clock_ok;
     if (e.crash) {  // a panic in the pre-sleep flush, after the marker block (#30's field crashes)
-      if (e.modem_on) sm_marker();
+      bool modem_on = e.modem_on;
+      sm_modem_override(modem_on);
+      if (modem_on) sm_marker();
       crash(e, ESP_RST_TASK_WDT);  // a hung upload
       break;
     }
@@ -199,7 +213,11 @@ void step(const SmEvent& e) {
 // Properties of one side after event e, against its state before it. Null when they hold.
 const char* propertyBroken(const Snap& pre, const SmEvent& e) {
   if (e.k == SmKind::WAKE && sm_gate_weak && sm_gate_open) return "the gate opened on a weak rail";
-  if (sm_gate_weak && sm_polls != pre.sm_polls) return "a poll ran on a weak-rail wake";
+  // A weak-rail cold boot stays up for BLE, and its loop still polls the car (#104): this holds for the rest.
+  if (sm_gate_weak && !sm_cold_boot && sm_polls != pre.sm_polls) return "a poll ran on a weak-rail wake";
+  if (g_weak_rail_cold_boot && !sm_cold_boot) return "the weak-rail BLE window opened on a deep-sleep wake";
+  if (!pre.sm_asleep && sm_asleep && pre.g_weak_rail_cold_boot && sm_sleep_modem)
+    return "a weak-rail cold boot slept with the modem on (marker, flush)";
   // The backstop runs at the top of a ladder tick, so the state it judges is the one before the tick.
   if (e.k == SmKind::LADDER && !pre.sm_asleep && pre.is_currently_parked && !pre.maintenance_mode &&
       pre.current_state != UNINITIALIZED && sm_now > (unsigned long)MAX_AWAKE_MINUTES * 60UL * 1000UL &&

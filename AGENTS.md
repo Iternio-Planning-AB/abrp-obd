@@ -179,8 +179,8 @@ Run `python3 tests/run_sm_checks.py` (groups `scenarios`, `random`, `enumerate`,
 the park/drive decision. The differential covers the drive region; shared context comes from the working
 tree. The blocks that write drive state (the poll-time unlatch and re-latch, the `is_parked` publish, the
 OTA/dump hold, `changeState`, the buffer block and the pre-sleep marker) come from the pinned `main` commit
-(`SM_PIN`, via `git show`) for OLD and from the working tree for CUR; the context around them (the wake
-gate, the backstop) comes from the working tree for both, so a deliberate change there does not fail it. Each
+(`SM_PIN`, via `git show`) for OLD and from the working tree for CUR; the context around them (the
+backstop, the delays) comes from the working tree for both, so a deliberate change there does not fail it. Each
 side compiles into its own namespace around one harness (`tests/sm/`), and identical event sequences run
 through both: every sequence of 5 events over a
 15-symbol alphabet (about 760 k, a few seconds; `--depth 6` runs about 11 M in under a minute), 5000
@@ -189,7 +189,7 @@ OTA and log-dump holds, a console session, both speed keys and a NaN speed, trip
 no-speed-PID drives). The fake clock advances inside every log line and freeze, as the device's does.
 After every event the latch, leash, hold time, marker debt, published `is_parked`, buffered frames,
 freezes, the GNSS age bound asked for, and the exact `logEvent` and Serial sequences must be equal; the
-weak-rail gate and the max-awake backstop are checked as properties, on the working tree's code. The `crash`
+weak-rail gate, the weak-rail cold boot's modem-off sleep and the max-awake backstop are checked as properties. The `crash`
 group (#49) runs CUR alone, because what it checks is absolute: a panic mid-drive, in the pre-sleep flush and
 after a backlog load, plus every 5-event sequence over the alphabet with a crash, a flush crash and a sent flush added, must never lose the debt or an unsent marker.
 On the differential's boots the restore is a no-op, so a restore that fires there fails it. Since step 1 (#24) the CUR side is the
@@ -209,8 +209,21 @@ compared; a sample poke the DC hold does not keep sleeps after its one poll. An 
 group mixes charge polls in, and named scenarios cover an AC charge and its release, DC by power through a taper and
 the car's `is_dcfc=0`, the silent hold and parked-held, the stale reset after `CHARGE_STALE_RESET_MINUTES` (held, on
 an answered poke and on a skip wake), the post-drive window's polls and expiry, the stream-trust delay, the fast-budget cap,
-corroboration, and a DC session released silent on a streaming wake. The setup() sanitize, the gate with its skip
-path, the post-drive window at the ladder end and the poke's sleep stay shared context until #82.
+corroboration, and a DC session released silent on a streaming wake. The post-drive window at the ladder end and the
+poke's sleep stay shared context.
+
+Since 0b-2 (#82) it also covers the `setup()` wake: the whole ATRV gate block (the ATRV
+read, the taper bridge and its give-up, the charge-end read, the follow-up, the poll decision, the alarm suppression,
+the poll and skip counters, `since_poll`, every gate log line, the weak-rail cold boot and the skip path), from `SM_PIN`
+for OLD, over multi-wake sequences in which the RTC state carries across sleeps and RAM resets. `chargeWakeStateSanitize`
+is pinned too, though no modelled reset can show it: every reset but a deep-sleep wake reloads RTC. A wake carries the
+rail, the ATRV read, the alarm flag and an optional charge latch; the RTC epoch runs through sleeps and a cold boot
+zeroes the clock. A wake alphabet (17 symbols, about 1.4 M sequences at depth 5: each gate threshold, latched wakes in
+every give-up band, the ATRV threshold, a weak cold boot, an alarm-enforced poke) is enumerated beside the other two,
+and named scenarios cover the taper budget to its give-up, the charge-end read once per latch, a weak cold boot's BLE
+window and its modem-off expiry, and the counters and `since_poll` across wakes. setup()'s last-poll stamp, the weak-rail
+window's expiry and the sleep's modem override for it are shared context. A weak cold boot still polls the car during
+its window, as the firmware does (#104).
 
 ## Diagnostic host checks
 

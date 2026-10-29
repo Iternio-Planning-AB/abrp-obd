@@ -1,27 +1,31 @@
-"""Differential checks for the park/drive decision and the poll-side energy block (state machine #23, steps 0a
-#28 and 0b-1 #81).
+"""Differential checks for the park/drive decision, the poll-side energy block and the setup() wake gate (state
+machine #23, steps 0a #28, 0b-1 #81 and 0b-2 #82).
 
-Two regions are compared. The drive region is drive_state.h and the blocks that call it: the speed loop, the
+Three regions are compared. The drive region is drive_state.h and the blocks that call it: the speed loop, the
 GNSS branch and the time re-latch, the is_parked publish, the OTA/dump hold, changeState, the frame_has_data
 buffer block with the queue helper, the pre-sleep marker and the setup() marker restore. The energy region is
 the poll's rail refresh and the contiguous block in loop() from the is_charging verdict through dcAwakeTrack():
 the release latch and silent hold, the taper stall count, the DC session, the next-wake cadence, the fast budget
 and cap, corroboration and the stale guard, with the helpers it calls (resetChargeCorroboration, pdwActive,
-chargeStateStale, the dcAwake* functions). Both are extracted with the same anchors from two places: OLD from the
-pinned commit (git show), CUR from the working tree. The context around them (the setup() sanitize and wake gate
-with its skip path, the post-drive window at the ladder end, a sample poke's sleep after its poll, the backstop,
-the delays) comes from the working tree for both sides, so a deliberate change there cannot fail the differential; a property checks that the shared
+chargeStateStale, the dcAwake* functions). The wake region is setup()'s RTC sanitize and the whole ATRV gate block:
+the ATRV read, the taper bridge and its give-up, the charge-end read, the follow-up, the poll decision, the alarm
+suppression, the counters and log lines, the weak-rail cold boot and the skip path. All are extracted with the same
+anchors from two places: OLD from the pinned commit (git show), CUR from the working tree. The context around them
+(the post-drive window at the ladder end, a sample poke's sleep after its poll, setup()'s last-poll stamp, the
+weak-rail window's expiry and every sleep's modem override for it, the backstop, the delays) comes from the working
+tree for both sides, so a deliberate change there cannot fail the differential; a property checks that the shared
 backstop never sleeps a driving car.
 tests/sm_checks.cpp compiles each side into its own namespace around the same harness
 (tests/sm/adapter_*.inc) and runs identical event sequences through both, asserting equal outputs after
 every event: the latch, the leash and hold times, the marker debt and its crash copy, published is_parked,
-buffered frames, alarm speed notes, freezes, every energy RTC field and RAM output, the next-wake minutes, and
-the exact logEvent and Serial sequences. It also checks the weak-rail gate and the max-awake backstop properties,
-on the working tree's gate and backstop. Groups: enumerate (exhaustive over a drive and an energy alphabet,
---depth, default 5), random (fixed seeds), scenarios (named field and charge cases), crash (CUR alone: a panic,
+buffered frames, alarm speed notes, freezes, every energy and gate RTC field and RAM output, the next-wake
+minutes, and the exact logEvent and Serial sequences; the gate's poll or skip shows in its counters. It also checks
+the weak-rail gate, the weak-rail cold boot's modem-off sleep and the max-awake backstop as properties. Groups:
+enumerate (exhaustive over a drive, an energy and a wake alphabet, --depth, default 5), random (fixed seeds), scenarios (named field and charge cases), crash (CUR alone: a panic,
 also inside the pre-sleep flush, never loses the marker debt; an absolute property, not a comparison), rules
 (CUR alone: absolute checks of the #6 driving rules), or all. A Charge or Silent poll keeps the wake's rail and
-motion; any answered poll stamps the last OBD answer.
+motion; any answered poll stamps the last OBD answer. A wake carries the rail, the ATRV read, the alarm flag and an
+optional charge latch; the RTC clock and epoch run through sleeps, and a cold boot zeroes the clock until a poll.
 Before compiling, it checks that only drive_state.h assigns the park/drive storage, that alarm_gate.h names no
 drive state, and that every drive call is in an extracted block.
 
@@ -33,8 +37,12 @@ never a skip.
 What it cannot prove: 32-bit millis() wrap (the host unsigned long is 64-bit); any feature-flag set other
 than the config.h defaults with PRINT 0 (lines under #if PRINT and other branches are not compiled); code
 outside the extracted blocks (the rest of handleActivityState, dcPromotePoke and motion inside a wake, the
-SAMPLE_POLL line, the modem, detectMovement timing, RTC retention, hardware). The setup() wake gate as a compared region is #82; the
-energy properties and the multi-region layer are #83.
+SAMPLE_POLL line, the modem, detectMovement timing, RTC retention, hardware); the wdt-streak sleeps before and after
+the gate; resets other than a deep-sleep wake, a power loss, a panic and a WDT (a brownout or software reset reloads
+RTC as those do, so the sanitize cannot show); the heartbeat (ENABLE_PARKED_HEARTBEAT 0, so the branch and
+heartbeat_asleep_streak are not compiled); the loop's per-cycle alarm permit (an enforced car's polls reach the car
+here); since_poll at the target's 32-bit width. A weak-rail cold boot's polls still reach the car, as the firmware's do
+(#104). The energy properties and the multi-region layer are #83.
 """
 
 import os
@@ -50,7 +58,7 @@ SM_PIN = "d146449b7b6a7790dfa964a0966673349766aa98"
 
 root = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(root / "tests/support"))
-from extract import block, find, wake_gate  # noqa: E402
+from extract import block, find  # noqa: E402
 if subprocess.run(["git", "merge-base", "--is-ancestor", SM_PIN, "HEAD"], cwd=root).returncode != 0:
     sys.exit(f"FAIL: SM_PIN {SM_PIN} is not an ancestor of HEAD: fetch main, or re-pin (see this file's header)")
 
@@ -86,9 +94,10 @@ ENERGY_START = "    // Feature A - is_charging"
 ENERGY_END = "\n#if ENABLE_BLE\n    const uint16_t ble_mtu"
 ENERGY_RAIL = "    g_last_io36 = readIO36Rail();\n    // A poke held by a DC charge"
 LOGGED_DCFC = "        static int logged_dcfc = -1;"
-GATE_THROUGH = "    if (g_sample_poke) g_rail_before_poke = rail;"
-GATE_SKIP_START = "      g_next_wake_minutes = WAKE_PARKED_MINUTES; // skip = parked"
-GATE_SKIP_END = "      enterDeepSleep(false);"
+# The setup() wake gate (#82): the ATRV read, the taper bridge and its give-up, the charge-end read, the poll decision,
+# the counters and log lines, the weak-rail cold boot and the skip path, as one brace-matched block.
+WAKE_GATE = "  {\n    g_last_voltage = obd.getVoltage();\n"
+WEAK_EXPIRY = "    if (g_weak_rail_cold_boot && !maintenance_mode && !bleConnected() &&"
 POKE_SLEEP = "    if (g_sample_poke && !maintenance_mode && !dcAwakeHeld(current_state)) {"
 
 
@@ -105,7 +114,10 @@ def recipe(src, side):
         sys.exit(f"FAIL: expected one {LOGGED_DCFC.strip()!r} in the energy block ({side})")
     rail = find(logger, ENERGY_RAIL, what=where["logger"])
     dc_start = find(machine, "bool dcMotionRecent() {", what=where["machine"])
-    skip = find(logger, GATE_SKIP_START, what=where["logger"])
+    gate = find(logger, WAKE_GATE, what=where["logger"])
+    under = logger.rfind("#if ENABLE_ATRV_GATE\n", 0, gate)
+    if logger.count(WAKE_GATE) != 1 or under < 0 or re.search(r"^\s*#", logger[under + 1:gate], re.M):
+        sys.exit(f"FAIL: expected one wake gate block, under #if ENABLE_ATRV_GATE with no directive between ({side})")
     for header in ("motion_stats", "drive_state"):
         if src[header].count("#pragma once\n") != 1 or '#include "' in src[header]:
             sys.exit(f"FAIL: {where[header]} must be one #pragma once and no project include, to inline it")
@@ -125,7 +137,8 @@ def recipe(src, side):
         "marker": block(src["sleep"], "  if (rtc.getEpoch() > 1e9 && is_currently_parked", where["sleep"]),
         "session": block(machine, "if (g_ota_active || g_logdump_active) {", where["machine"]),
         "backstop": block(machine, "if (!maintenance_mode && !g_ota_active && !g_logdump_active", where["machine"]),
-        "gate": wake_gate(logger, where["logger"], through=GATE_THROUGH),
+        "wake_gate": block(logger, WAKE_GATE, where["logger"]),
+        "weak_awake_ms": line(logger, "static const uint32_t WEAK_RAIL_COLD_BOOT_AWAKE_MS = ", where["logger"]),
         "queue_helper": src["upload"][upload_start:upload_end],
         "energy_rail": logger[rail:find(logger, "\n#endif", rail, where["logger"]) + 1],
         "energy": energy.replace(LOGGED_DCFC, ""),
@@ -135,7 +148,6 @@ def recipe(src, side):
                           block(logger, "bool chargeStateStale(uint64_t now_us) {", where["logger"]) +
                           machine[dc_start:find(machine, "\n// Open the post-drive window", dc_start, where["machine"]) + 1],
         "sanitize": block(logger, "void chargeWakeStateSanitize(bool deep_sleep) {", where["logger"]),
-        "skip": logger[skip:find(logger, GATE_SKIP_END, skip, where["logger"])],
         "ladder_end": machine[find(machine, "bool pdwOpenWindow() {", what=where["machine"]):
                               find(machine, "\n/*\n  Use movement and BLE", what=where["machine"]) + 1],
     }
@@ -143,6 +155,7 @@ def recipe(src, side):
 
 SIDE = """{enum}
 {buffer_cap}
+{weak_awake_ms}
 #include "adapter_pre.inc"
 {motion_stats}
 {drive_state}
@@ -162,8 +175,17 @@ void sm_energy_rail() {{
 {energy_rail}}}
 void sm_energy(OBDVector& current_frame, int obd_count) {{
 {energy}}}
-void sm_skip() {{
-{skip}}}
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wsign-compare"  // the gate's `now > 1000000000UL` on the host's signed time_t
+void sm_wake_gate(SmWakeCause wake_cause) {{
+{wake_gate}}}
+#pragma GCC diagnostic pop
+void sm_stamp() {{
+{stamp}}}
+void sm_weak_expiry() {{
+{weak_expiry}}}
+void sm_modem_override(bool& modem_on) {{
+{modem_override}}}
 bool sm_poke_sleeps() {{ return {poke_sleep}; }}
 void sm_buffer(OBDVector& current_frame, bool frame_has_data) {{
   int g_geo_queued = 0, poll_geo = 0;
@@ -185,9 +207,6 @@ void sm_marker_set() {{
 {marker_set}}}
 void sm_marker_clear() {{
 {marker_clear}}}
-bool sm_gate(float rail, bool is_cold, bool is_motion, bool awake, bool heartbeat_due) {{
-{gate}  return should_poll;
-}}
 #include "adapter_post.inc"
 """
 
@@ -217,6 +236,17 @@ if advance + cur["restore"] not in logger:
     sys.exit("FAIL: the marker restore must directly follow the streak advance in setup(), ahead of every sleep")
 cur["poke_sleep"] = line(logger, POKE_SLEEP, PATHS["logger"]).strip()[len("if ("):-len(") {")]
 cur["marker_set"] = line(logger, "    if (park_marker_owed) wdtStreakMarker(true);", PATHS["logger"])
+# Around the gate, from the tree for both sides: setup()'s last-poll stamp once the network is up, the weak-rail cold
+# boot's window expiry (inside the poll block, after the poll and before the poke's sleep) and every sleep's modem
+# override for that wake.
+cur["stamp"] = line(logger, "  if (clockValid()) last_poll_epoch = rtc.getEpoch();", PATHS["logger"])
+cur["weak_expiry"] = block(logger, WEAK_EXPIRY, PATHS["logger"])
+if not logger.index(cur["marker_set"]) < find(logger, WEAK_EXPIRY, what=PATHS["logger"]) < logger.index(POKE_SLEEP):
+    sys.exit("FAIL: the weak-rail window expiry must follow the poll's buffer and marker set, before the poke's sleep")
+cur["modem_override"] = line(sleep, "  if (g_weak_rail_cold_boot) modem_on = false;", PATHS["sleep"])
+if "  if (g_ota_active || g_logdump_active) return;\n" + cur["modem_override"] not in sleep:
+    sys.exit("FAIL: enterDeepSleep's weak-rail modem override must directly follow the OTA/dump guard, ahead of every "
+             "use of modem_on")
 buffered = find(logger, "    if (frame_has_data) {", what=PATHS["logger"])
 buffered += len(block(logger, "    if (frame_has_data) {"))
 if not re.fullmatch(r"(?:#if PRINT\n(?:.*\n)*?#endif\n)?", logger[buffered:logger.index(cur["marker_set"])]):
@@ -232,20 +262,26 @@ if not saved < start < sleep.index("  bleDeinitForSleep();") or any(not l.lstrip
 # overwriting the backlog that boot never loaded.
 line(logger, "  if (wake_cause == ESP_SLEEP_WAKEUP_UNDEFINED) rtc.setTime(0);", PATHS["logger"])
 
-# The differential covers the drive region only. OLD takes the blocks that write drive state from SM_PIN - the
+# Step 0a (#28) covers the drive region. OLD takes the blocks that write drive state from SM_PIN - the
 # speed loop, the GNSS branch and the time re-latch, the is_parked publish, the OTA/dump hold, changeState, the
-# frame_has_data buffer block and the pre-sleep marker - and the rest (the wake gate, the backstop, the
-# delays) from the working tree, as CUR does. A deliberate change to that shared context is then identical
+# frame_has_data buffer block and the pre-sleep marker - and the rest (the backstop, the delays) from the
+# working tree, as CUR does. A deliberate change to that shared context is then identical
 # on both sides and cannot fail the differential.
 DRIVE_BLOCKS = ("motion_stats", "drive_state", "drive", "emplace", "session", "marker", "change_state", "buffer", "queue_helper", "restore")
 # Step 0b-1 (#81) adds the poll-side energy region the same way: the rail refresh, the energy block and the
-# helpers it calls come from SM_PIN for OLD. What setup() and the ladder do to energy state (the sanitize, the
-# gate and its skip path, the post-drive window) is shared context until #82.
+# helpers it calls come from SM_PIN for OLD.
 ENERGY_BLOCKS = ("energy_rail", "energy", "energy_helpers")
-PIN_BLOCKS = DRIVE_BLOCKS + ENERGY_BLOCKS
+# Step 0b-2 (#82) adds the setup() wake: the RTC sanitize and the whole gate block, with its skip path. The ladder's
+# post-drive window, the poke's sleep, the last-poll stamp and the weak-rail window stay shared context.
+WAKE_BLOCKS = ("sanitize", "wake_gate")
+PIN_BLOCKS = DRIVE_BLOCKS + ENERGY_BLOCKS + WAKE_BLOCKS
 old = dict(cur)
 for name in PIN_BLOCKS:
     old[name] = pin[name]
+
+# A C++ constant, out of the macro check's reach: the pinned gate runs with the tree's value, so they must be equal.
+if pin["weak_awake_ms"] != cur["weak_awake_ms"]:
+    sys.exit("FAIL: WEAK_RAIL_COLD_BOOT_AWAKE_MS differs between SM_PIN and the tree; the OLD gate would run with the new value")
 
 # OLD must never pull a project header into its namespace: #pragma once would hand it CUR's copy.
 for name in PIN_BLOCKS:
@@ -280,12 +316,13 @@ adapter = tree("tests/sm/adapter_pre.inc")
 for region, prefix in (("SM_RAM", ""), ("SM_RTC", "RTC_DATA_ATTR ")):
     body = re.search(rf"^#define {region}\(X\) \\\n((?:.*\\\n)*.*)", adapter, re.M).group(1)
     for type_, name, value in re.findall(r"X\(([\w ]+), (\w+), ([^)]+)\)", body):
-        pattern = rf"^{prefix}(?:volatile )?{re.escape(type_)} {name} = {re.escape(value)};"
+        pattern = rf"^{prefix}(?:static )?(?:volatile )?{re.escape(type_)} {name} = {re.escape(value)};"
         for label, src in (("SM_PIN", old_src), ("tree", cur_src)):
             if label == "SM_PIN" and name == "maintenance_mode":
                 continue
-            if not re.search(pattern, src["logger"], re.M):
-                sys.exit(f"FAIL: {region} {name} = {value} does not match its definition in logger.ino ({label})")
+            if not re.search(pattern, src["logger"] + src["sleep"], re.M):
+                sys.exit(f"FAIL: {region} {name} = {value} does not match its definition in logger.ino or "
+                         f"sleep_power.h ({label})")
 
 
 

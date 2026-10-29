@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <chrono>
 #include <iostream>
 #include <limits>
@@ -49,6 +50,8 @@ struct SmEvent {
   float rail = 12.6f;
   bool awake = true;
   bool charge_latched = false;
+  double atrv = NAN;   // WAKE: the ATRV read; NaN: 13.5 awake, 5.3 asleep
+  bool alarm = false;  // WAKE: the OBD-alarm gate is enforced for this car
   bool dump = false;  // HOLD: the log dump rather than an OTA update
   bool on = false;    // MAINT: the console's maintenance_mode
   // POLL inputs to the driving rules (#6). The defaults make CUR agree with OLD: car on, motion this poll, no
@@ -151,6 +154,19 @@ SmEvent Wake(int cause, float rail, bool awake = true, bool charge_latched = fal
   SmEvent e{SmKind::WAKE, name.str()};
   e.cause = cause, e.rail = rail, e.awake = awake, e.charge_latched = charge_latched;
   return e;
+}
+// A wake with an exact ATRV read, or with the OBD-alarm gate enforced.
+SmEvent named(SmEvent e, const std::string& suffix) {
+  e.name.insert(e.name.size() - 1, suffix);
+  return e;
+}
+SmEvent Atrv(SmEvent e, double atrv) {
+  e.atrv = atrv;
+  return named(e, ",atrv=" + std::to_string(atrv).substr(0, 4));
+}
+SmEvent Alarmed(SmEvent e) {
+  e.alarm = true;
+  return named(e, ",alarm");
 }
 
 namespace sm_old {
@@ -256,6 +272,19 @@ const std::vector<SmEvent> ENERGY_ALPHABET = {
   Sleep(),
 };
 
+// The wake alphabet (#82): timer wakes on each gate threshold (RAIL_AWAKE, the taper floor, the charge-end floor,
+// the lockout's top), latched wakes in the taper band, the charge-end band, below it and on a weak rail, a latched
+// motion wake, motion at the ATRV threshold and just under it, a weak cold boot, and an alarm-enforced poke and
+// motion wake.
+const std::vector<SmEvent> WAKE_ALPHABET = {
+  Wake(SM_TIMER, 13.3f), Wake(SM_TIMER, 13.0f), Wake(SM_TIMER, 12.2f), Wake(SM_TIMER, 11.0f),
+  Wake(SM_TIMER, 13.1f, true, true), Wake(SM_TIMER, 12.5f, true, true), Wake(SM_TIMER, 12.0f, true, true),
+  Wake(SM_TIMER, 10.0f, true, true), Wake(SM_MOTION, 12.6f, true, true), Atrv(Wake(SM_MOTION, 12.6f), 8.0),
+  Atrv(Wake(SM_MOTION, 12.6f), 7.99), Wake(SM_COLD, 10.0f), Alarmed(Wake(SM_TIMER, 13.6f)),
+  Alarmed(Wake(SM_MOTION, 13.6f)), Charge(-50, 380, 0.5),
+  Silent(), Sleep(), Advance(CONFIRM_MS),
+};
+
 unsigned long leaves = 0;
 void enumerate(int depth, std::vector<SmEvent>& trace, const std::vector<SmEvent>& alphabet) {
   if (depth == 0) { leaves++; return; }
@@ -298,8 +327,12 @@ SmEvent randomEvent(std::mt19937& rng) {
   case 7: return Sleep(pick({0, 1, 1}) != 0, pick({0, 1, 1}) != 0);
   default: {
     const int cause = (int)pick({SM_TIMER, SM_MOTION, SM_COLD});
-    const float rail = (float)pick({5.9, 7.99, 8.0, 9.5, 10.99, 11.0, 12.6, 13.0, 13.29, 13.3, 14.8});
-    return Wake(cause, rail, pick({0, 1, 1}) != 0, pick({0, 0, 1}) != 0);
+    const float rail = (float)pick({5.9, 7.99, 8.0, 9.5, 10.99, 11.0, 12.0, 12.19, 12.2, 12.5, 12.6, 12.99, 13.0,
+                                    13.1, 13.29, 13.3, 14.8});
+    SmEvent e = Wake(cause, rail, pick({0, 1, 1}) != 0, pick({0, 0, 1}) != 0);
+    if (pick({0, 0, 0, 1}) != 0) e = Atrv(e, pick({0, 5.3, 7.99, 8.0, 13.5}));
+    if (pick({0, 0, 0, 0, 0, 1}) != 0) e = Alarmed(e);
+    return e;
   }
   }
 }
@@ -320,9 +353,9 @@ struct Sample { unsigned long ms; double current; };
 
 // ---- named field scenarios: equality throughout, plus what each one is about, asserted on CUR ----
 
-size_t countLog(const char* prefix) {
+size_t countLog(const std::string& prefix) {
   size_t n = 0;
-  for (const auto& line : sm_cur::sm_log) n += line.compare(0, strlen(prefix), prefix) == 0;
+  for (const auto& line : sm_cur::sm_log) n += line.compare(0, prefix.size(), prefix) == 0;
   return n;
 }
 
@@ -609,6 +642,96 @@ void scenarios() {
   poke(Charge(-50, NAN, 0.5));
   check(g_next_wake_minutes == WAKE_CHARGING_MINUTES && charge_uncorroborated_s == 0 &&
         countLog("CHARGE corroborated") == 1, "a soc rise restores it", t);
+
+  // ---- the setup() wake gate (#82): what depth 5 cannot reach, each asserted on CUR ----
+  auto wakeAt = [&](const SmEvent& wake) { play(Sleep(), t); play(wake, t); };
+
+  // The taper bridge: TAPER_CONFIRM_MAX_WAKES SoC-stalled confirm-polls in the taper band, then the give-up: the
+  // latch clears, the follow-up is armed and the wake skips.
+  start(t);
+  poke(Charge(-50, 380, 0.5));
+  for (int i = 0; i < TAPER_CONFIRM_MAX_WAKES; ++i) {
+    wakeAt(Wake(SM_TIMER, 13.1f));
+    check(sm_gate_open && g_sample_poke && g_taper_confirm && recently_charging, "a taper-band wake confirm-polls", t);
+    check(countLog("ATRVGATE atrv=13.50 rail=13.10 AWAKE poll(taper-confirm)") == (size_t)i + 1 &&
+          countLog("TAPER_CONFIRM attempt=" + std::to_string(i) + "/") == 1, "each confirm-poll is logged", t);
+    play(Charge(-50, 380, 0), t);
+    check(taper_confirm_wakes == (uint32_t)i + 1, "a confirm-poll with no SoC gain spends the budget", t);
+  }
+  wakeAt(Wake(SM_TIMER, 13.1f));
+  check(!sm_gate_open && sm_asleep && !recently_charging && taper_confirm_wakes == 0 && charge_followup == 1 &&
+        countLog("FOLLOWUP armed (latch cleared at rail=13.10)") == 1, "a spent budget gives up and skips", t);
+
+  // The charge-end read: one final poll per latch when the rail falls below the taper floor, none below
+  // CHARGE_END_POLL_FLOOR; a rail-awake wake re-arms it.
+  start(t);
+  wakeAt(Wake(SM_TIMER, 12.5f, true, true));
+  check(sm_gate_open && g_sample_poke && charge_end_polled && !recently_charging && charge_followup == 1 &&
+        countLog("CHARGE_END rail=12.50 < taper floor 13.00 -> final poll, latch cleared") == 1, "the charge-end read", t);
+  wakeAt(Wake(SM_TIMER, 12.5f, true, true));
+  check(!sm_gate_open && !recently_charging && countLog("CHARGE_END") == 1, "only once per latch", t);
+  wakeAt(Wake(SM_TIMER, 13.6f));
+  check(!charge_end_polled, "a rail-awake wake re-arms it", t);
+  wakeAt(Wake(SM_TIMER, 12.5f, true, true));
+  check(sm_gate_open && countLog("CHARGE_END") == 2, "and the next latch reads again", t);
+  wakeAt(Wake(SM_TIMER, 13.6f));
+  wakeAt(Wake(SM_TIMER, 12.19f, true, true));
+  check(!sm_gate_open && !recently_charging && countLog("CHARGE_END") == 2, "below the floor: cleared, no read", t);
+  wakeAt(Wake(SM_MOTION, 12.6f));
+  check(charge_followup == 0 && countLog("FOLLOWUP cleared reason=motion") == 1, "motion clears the follow-up", t);
+  // A give-up on a stale charge starts the next charge's corroboration from nothing; short of stale it keeps it.
+  start(t);
+  for (int i = 0; i < 3; ++i) poke(Charge(-50, 380, 0.5));
+  poke(Charge(0.479));
+  poke(Charge(0.479));
+  play(Sleep(), t);
+  while (esp_rtc_get_time_us() + 2ULL * WAKE_PARKED_MINUTES * 60000000ULL - charge_last_evidence_us < STALE_US)
+    play(Wake(SM_TIMER, 12.6f), t);
+  play(Wake(SM_TIMER, 12.6f), t);
+  check(charge_uncorroborated_s > 0 && !chargeStateStale(esp_rtc_get_time_us()), "a skip short of stale keeps it", t);
+  play(Wake(SM_TIMER, 12.5f, true, true), t);
+  check(sm_gate_open && charge_uncorroborated_s == 0 && charge_corr_soc_hw < 0, "the stale give-up resets it", t);
+
+  // A weak-rail cold boot stays up for BLE with the modem off, and its window's expiry sleeps it parked, modem off.
+  t.clear();
+  t.push_back(Wake(SM_COLD, 10.0f));
+  sm_old::powerOn(t.back());
+  sm_cur::powerOn(t.back());
+  check(difference(sm_old::save(), sm_cur::save()).empty() && !sm_asleep && !sm_gate_open && g_weak_rail_cold_boot &&
+        countLog("ATRVGATE weak-rail COLD BOOT (rail=10.00)") == 1, "a weak cold boot stays up", t);
+  until([&] { return sm_asleep; }, [&] {
+    check(sm_now <= WEAK_RAIL_COLD_BOOT_AWAKE_MS + 10000, "the window lasts WEAK_RAIL_COLD_BOOT_AWAKE_MS", t);
+    play(Advance(10000), t);
+    play(Silent(), t);
+  }, "the window's expiry");
+  check(sm_now > WEAK_RAIL_COLD_BOOT_AWAKE_MS && !sm_sleep_modem && g_next_wake_minutes == WAKE_PARKED_MINUTES &&
+        countLog("WEAK-RAIL cold-boot BLE window expired") == 1, "then the next poll cycle sleeps, modem off", t);
+  wakeAt(Wake(SM_TIMER, 10.0f));
+  check(!sm_gate_open && sm_asleep && !g_weak_rail_cold_boot &&
+        countLog("ATRVGATE skip -> deep sleep (WEAK RAIL, modem never powered)") == 1, "a weak timer wake skips", t);
+
+  // The counters and since_poll across wakes, and an enforced alarm flag suppressing a stationary poke.
+  start(t);
+  play(Poll(SM_NONE, 0), t);  // the poll that sets the clock; a cold boot zeroed it before the stamp
+  check(polls_count == 1 && last_poll_epoch == 0, "a cold boot with no clock yet counts its poll but stamps none", t);
+  wakeAt(Wake(SM_TIMER, 12.6f));
+  check(skips_count == 1 && countLog("ATRVGATE atrv=13.50 rail=12.60 AWAKE skip since_poll=-1s skips=1 polls=1") == 1,
+        "no stamp, no since_poll", t);
+  wakeAt(Wake(SM_TIMER, 13.6f));
+  const time_t stamped = last_poll_epoch;
+  check(polls_count == 2 && std::labs((long)(rtc.getEpoch() - stamped)) <= 1, "a poke stamps the last poll", t);
+  wakeAt(Wake(SM_TIMER, 12.6f));
+  const std::string skip = "ATRVGATE atrv=13.50 rail=12.60 AWAKE skip since_poll=";
+  long since = -1;
+  for (const auto& line : sm_log)
+    if (line.compare(0, skip.size(), skip) == 0) since = std::atol(line.c_str() + skip.size());
+  check(since > 0 && std::labs(since - (long)(rtc.getEpoch() - stamped)) <= 1 &&
+        countLog(skip + std::to_string(since) + "s skips=2 polls=2") == 1, "since_poll runs from the stamp", t);
+  wakeAt(Alarmed(Wake(SM_TIMER, 13.6f)));
+  check(!sm_gate_open && sm_asleep && countLog("ALARMGATE stationary poke suppressed (flag=1 rail=13.60)") == 1,
+        "an enforced alarm flag suppresses a stationary poke", t);
+  wakeAt(Alarmed(Wake(SM_MOTION, 13.6f)));
+  check(sm_gate_open && !sm_asleep, "but not a motion wake", t);
 }
 
 
@@ -895,10 +1018,13 @@ int main(int argc, char** argv) {
     const unsigned long drive_leaves = leaves;
     start(trace);
     enumerate(depth, trace, ENERGY_ALPHABET);
+    const unsigned long energy_leaves = leaves - drive_leaves;
+    start(trace);
+    enumerate(depth, trace, WAKE_ALPHABET);
     const double s = std::chrono::duration<double>(clock::now() - t0).count();
-    std::cout << "PASS: enumerate depth " << depth << " over " << ALPHABET.size() << " drive and "
-              << ENERGY_ALPHABET.size() << " energy symbols, " << drive_leaves << " + " << leaves - drive_leaves
-              << " sequences in " << s << "s\n";
+    std::cout << "PASS: enumerate depth " << depth << " over " << ALPHABET.size() << " drive, " << ENERGY_ALPHABET.size()
+              << " energy and " << WAKE_ALPHABET.size() << " wake symbols, " << drive_leaves << " + " << energy_leaves
+              << " + " << leaves - drive_leaves - energy_leaves << " sequences in " << s << "s\n";
   }
   if (group == "all" || group == "crash") {
     crashes(depth);
