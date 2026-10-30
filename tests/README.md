@@ -122,6 +122,32 @@ moving fix, a tunnel on the speed hold, a stale fix, a short dip and a switch-of
 the phone leaving, each boundary to the millisecond; random
 adds 500 sequences on an enforced car with fix ages around the bound. The per-PID guard inside `readPIDs` is not covered.
 
+Run `python3 tests/run_sm_checks.py composition` for #83's composed drive/energy sequences (also included in
+the default run). This group runs CUR only: #6 intentionally changed the drive rules relative to `SM_PIN`,
+which remains unchanged. Before each event, `playComposed` resolves the adapter's `charge_block` input from
+the real energy latch, making its temporary substitution a no-op. Drive therefore reads the previous poll's
+energy state; energy reads this poll's drive state. The runner checks the production blocks' order.
+Existing isolated `rules` tests and historical differential groups retain their scripted input semantics.
+
+Named scenarios cover GNSS and accelerometer starts on the poll after charge release (a NaN speed cannot
+override the latch); both speed-PID keys overriding a real charge latch while energy rejects regen as charging,
+and subsequent GNSS continuing that drive despite the residual release latch;
+a poll re-latching PARK and accepting trusted charge immediately; the streaming trust prerequisite;
+UNCONFIRMED accepting charge and returning to PARK on the next poll, without a freeze or marker;
+silent hold and release, with marker debt beginning only after a driving frame is buffered; and a high-rail
+motion wake retaining energy RTC state, resetting drive RAM, and actually polling with the retained charge block.
+The latter models deep sleep and the real wake gate, not physical RTC retention.
+
+Five fixed seeds each run 100 mixed 40-event sequences over charge, GNSS, acceleration, speed, silence,
+time, ladder/session holds, sleep/wake and alarm/setup events. Each poll gets a 20-second clock advance for
+the fixture's sustained-motion window. Independent properties check prior-latch start blocking, speed
+precedence, no charge acquisition from denied/unanswered polls, and no charging verdict in a newly buffered
+driving frame. Existing budget, alarm, marker and backstop properties also run. Reachability counters require
+the generated traces to exercise answered charge-blocked motion, speed overriding charge, and parking followed
+by a newly buffered charging frame.
+These are bounded generated tests, not exhaustive combined-state coverage or a second implementation of the
+energy controller. Transport, actual motion sampling, firmware-width clocks and hardware remain outside this group.
+
 ## Diagnostic host checks
 
 Run `python3 tests/run_log_diagnostics_checks.py` for actual DataLogger, CSV, and GPS-selection checks.

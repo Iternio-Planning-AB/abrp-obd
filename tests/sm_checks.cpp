@@ -1193,6 +1193,179 @@ void rules() {
   check(obd_result_vector.size() == 1, "a parked heartbeat after UNCONFIRMED queues no marker", t);
 }
 
+void playComposed(SmEvent e, std::vector<SmEvent>& trace) {
+  using namespace sm_cur;
+  const Snap pre = save(false);
+  const size_t frames = obd_result_vector.size();
+  e.charge_block = pre.recently_charging;
+  playCur(e, trace);
+  if (e.k != SmKind::POLL || pre.sm_asleep) return;
+  const bool speed = sm_polls != pre.sm_polls && !e.silent &&
+    ((e.key != SM_NONE && e.speed > 0) || (e.key == SM_BOTH && e.speed2 > 0));
+  if (pre.is_currently_parked && pre.recently_charging && !speed)
+    check(is_currently_parked && !drive_unconfirmed,
+          "composition: the previous charge latch blocks non-speed starts, including UNCONFIRMED", trace);
+  if (speed)
+    check(!is_currently_parked && !drive_unconfirmed && sm_published == 0,
+          "composition: an answered positive speed PID wins over the charge latch", trace);
+  if (!pre.recently_charging && (sm_polls == pre.sm_polls || e.silent))
+    check(!recently_charging, "composition: a denied or unanswered poll cannot establish a charge", trace);
+  if (!is_currently_parked && obd_result_vector.size() > frames)
+    for (const auto& kv : obd_result_vector.back())
+      if (kv.first == "is_charging")
+        check(kv.second == 0, "composition: a driving frame never reports charging (regen)", trace);
+}
+
+void composition() {
+  using namespace sm_cur;
+  std::vector<SmEvent> t;
+  auto begin = [&] { startCur(t); playComposed(Advance(CONFIRM_MS), t); };
+  auto has = [&](const char* key, double value) {
+    if (obd_result_vector.empty()) return false;
+    for (const auto& kv : obd_result_vector.back()) if (kv.first == key) return kv.second == value;
+    return false;
+  };
+  const SmEvent charge = Charge(-50, 380, 0.5, 13.5);
+  auto charged = [&] {
+    begin();
+    playComposed(charge, t);
+    check(recently_charging && has("is_charging", 1) && g_next_wake_minutes == WAKE_CHARGING_MINUTES,
+          "composition: trusted AC evidence establishes the real latch", t);
+  };
+  SmEvent gnss = Poll(SM_NONE, 0, true, 20);
+  gnss.current = 30;
+  gnss.voltage = 400;
+  SmEvent accel = Rules(Poll(SM_NONE, 0), SM_CAR_RAIL, SM_MOVE_NOW, true, 12);
+  accel.current = 30;
+  accel.voltage = 400;
+
+  for (bool use_accel : {false, true}) {
+    charged();
+    SmEvent move = use_accel ? accel : gnss;
+    move.key = SM_SPEED;
+    move.speed = NAN;
+    for (unsigned i = 1; i <= CHARGE_RELEASE_POLLS; ++i) {
+      playComposed(move, t);
+      check(is_currently_parked && !drive_unconfirmed && sm_published == 1 && !park_marker_owed &&
+            recently_charging == (i < CHARGE_RELEASE_POLLS),
+            "composition: release is visible to energy now, but to drive only next poll", t);
+    }
+    playComposed(move, t);
+    check(!is_currently_parked && sm_published == 0 && park_marker_owed && has("is_charging", 0),
+          "composition: released charge permits the next GNSS/accel start", t);
+  }
+  for (int key : {SM_SPEED, SM_VRS}) {
+    charged();
+    SmEvent speed = Poll(key, 25);
+    speed.current = -50;
+    speed.voltage = 380;
+    playComposed(speed, t);
+    check(!is_currently_parked && recently_charging && charge_release_polls == 1 &&
+          has("is_charging", 0) && park_marker_owed,
+          "composition: speed wins immediately, energy sees DRIVE and starts its release", t);
+    const auto hold = g_last_speed_ms;
+    playComposed(Advance(AT + 1), t);
+    playComposed(gnss, t);
+    check(!is_currently_parked && g_last_speed_ms > hold && sm_freezes == 0 && sm_published == 0,
+          "composition: the residual charge latch cannot block GNSS continuing an established drive", t);
+  }
+
+  startCur(t);
+  playComposed(charge, t);
+  check(!recently_charging && !has("is_charging", 1), "composition: an untrusted stream cannot latch charge", t);
+  begin();
+  playComposed(Poll(SM_SPEED, 25), t);
+  playComposed(charge, t);
+  check(!is_currently_parked && !recently_charging && has("is_charging", 0),
+        "composition: negative current while driving is regen", t);
+  playComposed(Advance(AT + 1), t);
+  playComposed(charge, t);
+  check(is_currently_parked && recently_charging && has("is_charging", 1) && sm_freezes == 1 &&
+        sm_published == 1 && g_next_wake_minutes == WAKE_CHARGING_MINUTES,
+        "composition: energy sees this poll's re-latch to PARK", t);
+
+  begin();
+  SmEvent uncertain = Rules(charge, SM_CAR_RAIL, SM_MOVE_NOW, true);
+  playComposed(uncertain, t);
+  check(drive_unconfirmed && recently_charging && sm_published == -1 && has("is_charging", 1) &&
+        !park_marker_owed && sm_freezes == 0,
+        "composition: energy can latch charge while drive is still UNCONFIRMED", t);
+  playComposed(uncertain, t);
+  check(is_currently_parked && !drive_unconfirmed && recently_charging && sm_published == 1 &&
+        !park_marker_owed && sm_freezes == 0 && logged("LEASH unconfirmed charging -> parked"),
+        "composition: that charge clears UNCONFIRMED on the next poll without a marker or freeze", t);
+
+  charged();
+  SmEvent silent = Silent(13.5);
+  silent.gnss = true;
+  silent.gnss_kmh = 20;
+  silent.motion = SM_MOVE_NOW;
+  for (unsigned i = 0; i < CHARGE_SILENT_HOLD_POLLS; ++i) {
+    playComposed(silent, t);
+    check(recently_charging && charge_release_polls == 0 && is_currently_parked,
+          "composition: silent hold retains the real charge block", t);
+  }
+  for (unsigned i = 1; i <= CHARGE_RELEASE_POLLS; ++i) {
+    playComposed(silent, t);
+    check(is_currently_parked && recently_charging == (i < CHARGE_RELEASE_POLLS),
+          "composition: silence past the hold releases only after hysteresis", t);
+  }
+  playComposed(silent, t);
+  check(!is_currently_parked && !park_marker_owed,
+        "composition: GNSS may drive after the silent release, but no buffered frame means no marker debt", t);
+  playComposed(gnss, t);
+  check(!is_currently_parked && park_marker_owed && has("is_parked", 0),
+        "composition: the first buffered driving frame owes the marker", t);
+
+  charged();
+  playComposed(Poll(SM_SPEED, 25), t);
+  check(!is_currently_parked && recently_charging, "composition: drive and release-hold coexist before sleep", t);
+  playComposed(Sleep(), t);
+  const auto retained = save(false);
+  playComposed(Wake(SM_MOTION, 13.6f), t);
+  check(!sm_asleep && sm_gate_open && !g_sample_poke && is_currently_parked && !drive_unconfirmed &&
+        recently_charging && charge_release_polls == retained.charge_release_polls &&
+        charging_fast_minutes == retained.charging_fast_minutes,
+        "composition: deep sleep resets drive RAM and preserves energy RTC through the wake gate", t);
+  const unsigned polls = sm_polls;
+  playComposed(Advance(CONFIRM_MS), t);
+  SmEvent moving_charge = charge;
+  moving_charge.gnss = true;
+  moving_charge.gnss_kmh = 20;
+  moving_charge.motion = SM_MOVE_NOW;
+  playComposed(moving_charge, t);
+  check(sm_polls == polls + 1 && is_currently_parked && recently_charging && sm_published == 1,
+        "composition: the retained charge blocks an actual post-wake GNSS poll", t);
+
+  const std::vector<SmEvent> alphabet = {
+    charge, gnss, accel, uncertain, Poll(SM_SPEED, 25), silent, Advance(AT + 1), Sleep(),
+    Wake(SM_MOTION, 13.6f), Wake(SM_TIMER, 12.6f), Ladder(SmTo::CHARGING), Hold(false),
+    Alarmed(Wake(SM_MOTION, 13.6f)), Setup(), Leave()
+  };
+  unsigned blocked = 0, speed_override = 0, parked_charge = 0;
+  for (uint32_t seed : {83u, 831u, 832u, 833u, 834u}) {
+    std::mt19937 rng(seed);
+    for (unsigned sequence = 0; sequence < 100; ++sequence) {
+      charged();
+      for (unsigned i = 0; i < 40; ++i) {
+        const SmEvent& e = alphabet[std::uniform_int_distribution<size_t>(0, alphabet.size() - 1)(rng)];
+        if (e.k == SmKind::POLL) playComposed(Advance(20000), t);
+        const auto pre = save(false);
+        const size_t frames = obd_result_vector.size();
+        playComposed(e, t);
+        if (e.k != SmKind::POLL || pre.sm_asleep) continue;
+        blocked += sm_polls != pre.sm_polls && !e.silent &&
+                   pre.is_currently_parked && pre.recently_charging && is_currently_parked &&
+                   (e.gnss || e.sustained);
+        speed_override += pre.recently_charging && e.key == SM_SPEED && sm_polls != pre.sm_polls;
+        parked_charge += !pre.is_currently_parked && is_currently_parked &&
+                         obd_result_vector.size() > frames && has("is_charging", 1);
+      }
+    }
+  }
+  check(blocked && speed_override && parked_charge, "composition: generated traces reach both feedback directions", t);
+}
+
 int main(int argc, char** argv) {
   std::string group = "all";
   int depth = 5;  // caught every harness mutant that depth 6 did, in ~3 s; --depth 6 runs the 11 M sequences
@@ -1202,8 +1375,8 @@ int main(int argc, char** argv) {
     else group = arg;
   }
   if (group != "all" && group != "enumerate" && group != "random" && group != "scenarios" && group != "crash" &&
-      group != "rules") {
-    std::cerr << "unknown group " << group << " (all, enumerate, random, scenarios, crash, rules)\n";
+      group != "rules" && group != "composition") {
+    std::cerr << "unknown group " << group << " (all, enumerate, random, scenarios, crash, rules, composition)\n";
     return 2;
   }
   using clock = std::chrono::steady_clock;
@@ -1246,6 +1419,10 @@ int main(int argc, char** argv) {
   if (group == "all" || group == "rules") {
     rules();
     std::cout << "PASS: rules (CUR only: the #6 driving-rule scenarios)\n";
+  }
+  if (group == "all" || group == "composition") {
+    composition();
+    std::cout << "PASS: composition (CUR only: real drive/energy feedback, named transitions and 5 seeds x 100 x 40)\n";
   }
   std::cout << "events compared: " << events << '\n';
 }
