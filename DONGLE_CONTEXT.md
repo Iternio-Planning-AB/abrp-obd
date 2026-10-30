@@ -160,6 +160,11 @@ Check the rail before powering peripherals or issuing bus traffic.
   (11 V up to `RAIL_AWAKE_VOLTS`) within the window of the last motion opens the post-drive window from
   then and sleeps `POST_DRIVE_RECHECK_MINUTES` once (`reason=pdw-recheck`); that wake takes the unchanged
   gate. Never on a weak rail; equal to `WAKE_PARKED_MINUTES` turns it off.
+- The RTC charge latch also blocks speed-less drive starts; this poll's discharge overrides it there, and only with
+  a discharging current in the frame (#95; cars without a current PID keep the latch; vetoes in `drive_state.h`).
+  Risk: plugged-in preconditioning or V2L while the car is moved reads as a drive, which forces `is_charging` to 0
+  (the latch releases, the CHARGING exit and DC hold are lost, the parked-only backstop is off), and GNSS drift can
+  hold it past `ACTIVE_TIMER`. The car-on requirement for a DRIVING GNSS hold should land before or with this.
 - Bring BLE up before slow modem initialization. Suppress cellular only while `bleRelaying()` says
   the phone is the transport—not merely connected or, in v1, authenticated.
 - Normal sleep flushes/saves uploads, deinitializes BLE, powers down peripherals and arms wake sources.
@@ -207,7 +212,8 @@ must re-arm its debt. Changing to a different or unknown token discards the old 
 **Drive and geo:** `drive_state.h` owns PARKED/DRIVING/UNCONFIRMED. GNSS needs car/motion evidence and
 no charge latch to start driving; sustained motion without sufficient driving evidence can be
 UNCONFIRMED. That state omits the frame's `is_parked`, uses live location and owes no PARK marker,
-but remains parked to other readers. The alarm gate is independent.
+but remains parked to other readers. A discharge in the poll's own frame overrides the charge latch (§6).
+The alarm gate is independent.
 Location and heading retain their observation times and are sent once per accepted observation.
 Only HTTP 200 advances accepted marks; failed sends do not. Frozen positions are not periodically
 re-uploaded merely to keep a backend map entry alive.

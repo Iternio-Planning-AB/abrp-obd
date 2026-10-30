@@ -20,13 +20,13 @@
     moment        from                  condition                                       to           effects
     speed         any                   a speed key > 0.0                               DRIVING      hold, leash; LEASH line if it was parked
     gnss          PARKED, UNCONFIRMED   gpsMovingFresh, car on, motion within           DRIVING      hold, leash, LEASH line
-                                        DRIVE_MOTION_RECENT_MS, no charge latch
+                                        DRIVE_MOTION_RECENT_MS, no charge latch*
     gnss          PARKED, UNCONFIRMED   gpsMovingFresh, any of those missing            same         one LEASH refused line per streak
     gnss          DRIVING               gpsMovingFresh                                  DRIVING      hold, leash (no new gate)
-    accel         PARKED                car on, sustained motion, no charge latch       UNCONFIRMED  hold = now, LEASH line
+    accel         PARKED                car on, sustained motion, no charge latch*      UNCONFIRMED  hold = now, LEASH line
     accel         PARKED, UNCONFIRMED   ... and discharge > DRIVE_DISCHARGE_KW          DRIVING      hold, LEASH line
-    accel         DRIVING               car on, sustained motion, no charge latch       DRIVING      hold (continuation, no log)
-    accel         UNCONFIRMED           charge latch set                                PARKED       LEASH line, no freeze
+    accel         DRIVING               car on, sustained motion, no charge latch*      DRIVING      hold (continuation, no log)
+    accel         UNCONFIRMED           charge latch* set                               PARKED       LEASH line, no freeze
     poll end      UNCONFIRMED           hold = last motion; now - hold > ACTIVE_TIMER   PARKED       LEASH line, no freeze
     poll end      DRIVING               now - last hold > ACTIVE_TIMER                  PARKED       freeze, LEASH re-latch line
     idle          DRIVING               activity state -> CHARGING or STANDBY           PARKED       freeze
@@ -35,6 +35,15 @@
     buffered      DRIVING               a frame entered the upload buffer               DRIVING      owe the PARK marker
     marker        any                   the pre-sleep PARK marker was queued            -            debt paid
     restored      any                   a reset but deep sleep; the crash copy owes     -            debt owed (#49)
+
+  * The charge latch is recently_charging, overridden by this frame's discharge over DRIVE_DISCHARGE_KW (#95): a
+    charge and that discharge cannot both be true, so a stale latch from before an unplug cannot hold back a drive.
+    Two things veto the override, and neither creates a latch: the car's own is_charging or is_dcfc in the frame
+    (the profile's; loop() appends its derived ones later) at any value but 0, a garbled one included, and a
+    current below CHARGING_CURRENT_THRESHOLD, the sign the latch is set from. Without a veto, a plugged-in car
+    drawing that much (preconditioning, V2L) while it is moved reads as a drive, and that is not bounded by
+    ACTIVE_TIMER: once DRIVING, every gpsMovingFresh fix refreshes the hold, car on or off, so GNSS drift can keep it
+    DRIVING with the parked-only backstop off. Requiring car_on for that GNSS hold is a separate follow-up.
 
   Still elsewhere: the awake ladder and its last_active leash (state_machine.h, #29), the charge latch
   (#25), the wake gates and RTC boot (#26).
@@ -55,7 +64,7 @@ struct DriveEvidence {
   bool motion_recent;     // a detectMovement hit within DRIVE_MOTION_RECENT_MS
   bool motion_sustained;  // the rolling window shows motion on enough of its sampled time
   bool discharge;         // the battery is discharging above DRIVE_DISCHARGE_KW
-  bool charge_latched;    // the charge latch (recently_charging) is set
+  bool charge_latched;    // the charge latch (recently_charging) is set, and this frame does not override it (#95)
 };
 // Why a fresh moving GNSS fix may not start a drive, or nullptr when it may. A drive already under way just
 // continues on it: no new gate.
@@ -149,18 +158,26 @@ inline DriveSample driveSample(const OBDVector* frame) {
 #if ENABLE_MEMS
   s.evidence.motion_sustained = motionSustained(g_drive_motion, now, &s.act_pct);
 #endif
-  s.evidence.charge_latched = recently_charging;
   double amps = 0, volts = 0;
-  bool known = false;
+  bool known = false, has_amps = false, car_flag = false;
   if (frame) {
+    has_amps = driveFrameValue(*frame, "current", -2000.0, 2000.0, &amps);
     known = driveFrameValue(*frame, "power", -1000.0, 1000.0, &s.kw);
-    if (!known && driveFrameValue(*frame, "current", -2000.0, 2000.0, &amps) &&
-        driveFrameValue(*frame, "voltage", 0.0, 1000.0, &volts)) {
+    if (!known && has_amps && driveFrameValue(*frame, "voltage", 0.0, 1000.0, &volts)) {
       s.kw = amps * volts / 1000.0;
       known = true;
     }
+    // Before loop() appends its own is_charging/is_dcfc, either key here is the profile's: the car's own word. Any
+    // value but exactly 0 counts, NaN and infinities included: a garbled flag fails closed, keeping the latch.
+    for (const auto& res : *frame)
+      if (res.first == "is_charging" || res.first == "is_dcfc") car_flag = car_flag || !(res.second == 0);
   }
   s.evidence.discharge = known && s.kw > (double)DRIVE_DISCHARGE_KW;
+  // #95: a charge and a discharge over DRIVE_DISCHARGE_KW cannot both be true, so this frame's discharge outranks the
+  // latch's older charge evidence - but only with proof from the latch's own signal, a current that is not charging
+  // by its sign (a power key may use another sign convention, and with no current there is no proof), and no car flag.
+  const bool overridden = s.evidence.discharge && has_amps && amps >= CHARGING_CURRENT_THRESHOLD && !car_flag;
+  s.evidence.charge_latched = recently_charging && !overridden;
   return s;
 }
 
@@ -176,9 +193,10 @@ inline void driveSpeed(double kmh) {
   driveStore(driveOnMoving(driveRegion(), millis()));
 }
 
-// gpsMovingFresh() this poll; kmh is the GNSS speed, for the log lines only. Starting a drive needs the evidence.
-inline void driveGnss(double kmh) {
-  if (const char* refused = driveGnssRefusal(driveRegion(), driveSample(nullptr).evidence)) {
+// gpsMovingFresh() this poll; kmh is the GNSS speed, for the log lines only. Starting a drive needs the evidence,
+// read from this poll's frame as driveAccel's is.
+inline void driveGnss(double kmh, const OBDVector& frame) {
+  if (const char* refused = driveGnssRefusal(driveRegion(), driveSample(&frame).evidence)) {
     if (!g_drive_gnss_refused) {
       g_drive_gnss_refused = true;
 #if ENABLE_LOGGING
