@@ -222,6 +222,7 @@ OBDVector carFrame(const SmEvent& e) {
   if (!std::isnan(e.voltage)) frame.emplace_back("voltage", e.voltage);
   if (!std::isnan(e.current)) frame.emplace_back("current", e.current);
   if (!std::isnan(e.dcfc)) frame.emplace_back("is_dcfc", e.dcfc);
+  frame.insert(frame.end(), e.extra.begin(), e.extra.end());
   if (!std::isnan(e.kwh_step)) { sm_kwh += e.kwh_step; frame.emplace_back("kwh_charged", sm_kwh); }
   if (!std::isnan(e.soe_step)) { sm_soe += e.soe_step; frame.emplace_back("soe", sm_soe); }
   return frame;
