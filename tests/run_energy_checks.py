@@ -43,6 +43,7 @@ WORST_EVENT_ARGS = {
     "DC_AWAKE off reason=%s": ("parked-uncorroborated", 15.99),
     "DC_AWAKE refused ": ("motion", 15.99),
     "DC_AWAKE poke promoted": (1, 1),
+    "POSTDRIVE window %s": ("recheck", "WIFI_RECOVERY", 15.99, 4294967295),
 }
 event_sources = logger + state_machine + sleep
 # The host stand-in for the streak store keeps its bytes across boots, as RTC_NOINIT_ATTR does and

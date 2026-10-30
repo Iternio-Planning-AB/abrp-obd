@@ -32,6 +32,7 @@
   X(uint8_t, g_dc_inferred_polls, 0) \
   X(unsigned long, g_dc_silent_since_ms, 0) \
   X(bool, g_pdw_ladder_done, false) \
+  X(bool, g_pdw_recheck, false) \
   X(const char*, g_cadence_reason, nullptr) \
   X(bool, g_dc_logged, false) \
   X(bool, g_dc_refused_logged, false) \

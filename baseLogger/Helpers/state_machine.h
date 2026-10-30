@@ -164,9 +164,11 @@ void dcAwakeTrack() {
 
 // Open the post-drive window (POST_DRIVE_WINDOW_MINUTES) if the rail is high now, once per wake. Only after an
 // awake period on the parked cadence: a latched, capped or recovery cadence was chosen for a reason.
+// At a healthy but low rail within the window of the last motion, open it from now for the re-check (#22).
 bool pdwOpenWindow() {
   if (g_pdw_ladder_done) return false;
   g_pdw_ladder_done = true;
+  g_pdw_recheck = false;
 #if OBD_ALARM_GATE
   if (alarmEnforced()) return false;
 #endif
@@ -184,17 +186,28 @@ bool pdwOpenWindow() {
   pdw_polls = 0;
   pdw_open = rail >= RAIL_AWAKE_VOLTS;
   if (!pdwActive(now_us)) pdw_open = 0;
+#if ENABLE_IO36_RAIL && ENABLE_SLEEP && ENABLE_MEMS
+  // The DC-DC already off at park: a plug-in after the sleep shows no rail rise to WOM. Only a real reading in the
+  // healthy band (never a weak 12 V), and only near motion: not after the max-awake backstop or a long BLE session.
+  if (POST_DRIVE_RECHECK_MINUTES < WAKE_PARKED_MINUTES && rail >= IO36_LOCKOUT_HIGH && rail < RAIL_AWAKE_VOLTS &&
+      idle_us < POST_DRIVE_WINDOW_US) {
+    pdw_open_us = now_us;
+    pdw_open = 1;
+    g_pdw_recheck = true;
+  }
+#endif
 #if ENABLE_LOGGING
-  logEvent("POSTDRIVE window %s wake=%s rail=%.2f idle=%lus", pdw_open ? "opened" : "closed", g_wake_reason, rail,
+  logEvent("POSTDRIVE window %s wake=%s rail=%.2f idle=%lus",
+    g_pdw_recheck ? "recheck" : pdw_open ? "opened" : "closed", g_wake_reason, rail,
     (unsigned long)(idle_us / 1000000ULL));
 #endif
   return pdw_open;
 }
-// End of the awake ladder: an open window comes back on the charging cadence.
+// End of the awake ladder: an open window comes back on the charging cadence, a re-check's once a little later.
 void pdwArmAtLadderEnd() {
   if (!pdwOpenWindow()) return;
-  g_next_wake_minutes = WAKE_CHARGING_MINUTES;
-  g_cadence_reason = "pdw";
+  g_next_wake_minutes = g_pdw_recheck ? POST_DRIVE_RECHECK_MINUTES : WAKE_CHARGING_MINUTES;
+  g_cadence_reason = g_pdw_recheck ? "pdw-recheck" : "pdw";
 }
 
 /*

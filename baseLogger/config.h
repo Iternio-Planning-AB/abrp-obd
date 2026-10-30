@@ -592,9 +592,10 @@
 #define DC_CHARGING_MIN_KW         40
 #define WAKE_PARKED_MINUTES        30    // FIELD: parked voltage-watch. Each wake is a cheap ~5s rail check
                                          // (no modem, no poll, no BLE on a skip) ~ a few mAh/day. 30 min
-                                         // bounds how late we catch a SCHEDULED charge start (no motion, only
-                                         // the rail rise shows it); plugging in by hand is caught instantly
-                                         // via WOM. Test value was 8.
+                                         // bounds how late we catch a charge start with no awake dongle: a
+                                         // SCHEDULED one, or a plug-in, which need not trip WOM (#22: one came
+                                         // ~31 min late). POST_DRIVE_RECHECK_MINUTES shortens the first wake
+                                         // after parking. Test value was 8.
 #define WAKE_CHARGING_MAX_MINUTES  720    // backstop: after this much cumulative fast-cadence, force long
 // Fast cadence held by the current sign alone must be confirmed by the car's counters: if the frame has
 // soc or kwh_charged and neither rose (CHARGE_PROGRESS_*) within this many fast-cadence minutes, drop to
@@ -608,6 +609,19 @@
 // awake-ladder end with a fresh high rail, never from OBD; the ladder spends about five minutes of it.
 #define POST_DRIVE_WINDOW_MINUTES  15
 #define POST_DRIVE_MAX_POLLS       5
+// Post-drive re-check (#22): FIELD (Scenic, 8-day log) the car had shut its DC-DC down before the ladder ended
+// (rail 12.42 V), the charge plugged in after it went unseen for ~31 min (~10.7 kWh) and no WOM wake came. So a
+// ladder ending at a healthy but low rail (IO36_LOCKOUT_HIGH up to RAIL_AWAKE_VOLTS) less than
+// POST_DRIVE_WINDOW_MINUTES after the last motion opens the window timed from now and comes back this soon, once.
+// The ladder spends ~5 min after the last motion, so it looks ~15 min after parking. The re-check wake takes the
+// unchanged gate: a high rail polls, and a silent car gets the window's retries; a low rail is one ~5 s skip.
+// That skip is the cost: one per awake period that ended within the window of motion, door and BLE wakes too.
+// A weak rail never gets it. Equal to WAKE_PARKED_MINUTES disables it (the cadence and log are as before).
+#define POST_DRIVE_RECHECK_MINUTES 10
+static_assert(0 < POST_DRIVE_RECHECK_MINUTES && POST_DRIVE_RECHECK_MINUTES <= WAKE_PARKED_MINUTES,
+              "the re-check comes sooner than the parked cadence, or is off at equal");
+static_assert(POST_DRIVE_RECHECK_MINUTES < POST_DRIVE_WINDOW_MINUTES ||
+              POST_DRIVE_RECHECK_MINUTES == WAKE_PARKED_MINUTES, "an enabled re-check wake must land inside its window");
 
 // ---- Charge-taper bridging (recently-charging confirm-poll latch) ----
 // PROBLEM proven in the field: during a charge taper (CV phase) the DC-DC backs off and the rail drops to

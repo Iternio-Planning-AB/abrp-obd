@@ -357,7 +357,8 @@ RTC_DATA_ATTR uint8_t charge_silent_polls = 0;
 // spent by the first silent high-rail sample poke, cleared by motion or a cold boot. 0/1 only.
 RTC_DATA_ATTR uint8_t charge_followup = 0;
 // Post-drive window (POST_DRIVE_WINDOW_MINUTES), opened at the awake-ladder end with the rail high and timed
-// on the RTC microsecond clock from the last motion, never the wall clock: it may be untrusted.
+// on the RTC microsecond clock from the last motion, never the wall clock: it may be untrusted. The low-rail
+// re-check (POST_DRIVE_RECHECK_MINUTES) times it from the ladder end instead.
 RTC_DATA_ATTR uint8_t pdw_open = 0;
 RTC_DATA_ATTR uint64_t pdw_open_us = 0;
 RTC_DATA_ATTR uint8_t pdw_polls = 0;
@@ -365,6 +366,7 @@ RTC_DATA_ATTR uint8_t pdw_polls = 0;
 // budget, cap and corroboration until this is CHARGE_STALE_RESET_MINUTES old.
 RTC_DATA_ATTR uint64_t charge_last_evidence_us = 0;
 bool g_pdw_ladder_done = false;          // pdwOpenWindow() decides once per wake
+bool g_pdw_recheck = false;              // its window is the low-rail re-check's (POST_DRIVE_RECHECK_MINUTES)
 const char* g_cadence_reason = nullptr;  // names an ambiguous cadence for SLEEP enter; null = derive from minutes
 static const uint64_t POST_DRIVE_WINDOW_US = (uint64_t)POST_DRIVE_WINDOW_MINUTES * 60000000ULL;
 bool pdwActive(uint64_t now_us) {
