@@ -4,15 +4,13 @@ import hashlib
 import importlib.util
 import io
 import json
-import os
 from pathlib import Path
 import re
-import shlex
 import subprocess
 import tempfile
+from support.host_build import compile_cpp, runtime_environment
 
 root = Path(__file__).resolve().parents[1]
-compiler = shlex.split(os.environ.get("CXX", "clang++"))
 parser = argparse.ArgumentParser()
 parser.add_argument("group", nargs="?", default="all", choices=["all", "schema", "logging", "schema-failures", "ble-write", "motion", "fw-build", "dump-since", "loop-gap", "stat-widths"])
 parser.add_argument("--capture-helper", type=Path)
@@ -179,19 +177,12 @@ with tempfile.TemporaryDirectory(prefix="obd-log-diagnostics-") as temporary:
         stat_formats += f'static const char* const {prefix}_FORMAT = "{found[0] if found else ""}";\n'
     (build / "stat_formats.inc").write_text(stat_formats)
     executable = build / "log_diagnostics_checks"
-    subprocess.run([
-        *compiler, "-std=c++17", "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
-        "-Wall", "-Wextra", "-Wno-unused-function", "-Wno-unused-parameter", "-I", str(root / "tests/support"),
-        "-I", str(root / "libraries/DataLogger"),
-        "-I", str(root / "libraries/FreematicsPlus"),
-        "-I", str(root / "libraries/nlohmann"),
-        "-I", str(root / "libraries/BLEWrapper"),
-        "-I", str(root / "baseLogger/Helpers"), "-I", str(build),
-        str(root / "tests/log_diagnostics_checks.cpp"),
-        str(root / "libraries/FreematicsPlus/FreematicsGPS.cpp"), "-o", str(executable),
-    ], check=True)
-    environment = dict(os.environ)
-    environment["UBSAN_OPTIONS"] = environment.get("UBSAN_OPTIONS", "") + ":halt_on_error=1"
+    compile_cpp(executable,
+                [root / "tests/log_diagnostics_checks.cpp", root / "libraries/FreematicsPlus/FreematicsGPS.cpp"],
+                includes=[root / "tests/support", root / "libraries/DataLogger", root / "libraries/FreematicsPlus",
+                          root / "libraries/nlohmann", root / "libraries/BLEWrapper", root / "baseLogger/Helpers", build],
+                flags=["-Wno-unused-function", "-Wno-unused-parameter"])
+    environment = runtime_environment()
     subprocess.run([str(executable), arguments.group], env=environment, check=True)
     if arguments.since_helper:
         since_differential(arguments.since_helper, executable, environment, build)

@@ -1,10 +1,9 @@
-import os
 import re
 from pathlib import Path
-import shlex
 import subprocess
 import sys
 import tempfile
+from support.host_build import compile_cpp, cxx, runtime_environment
 
 root = Path(__file__).resolve().parents[1]
 source = (root / "libraries/FreematicsPlus/FreematicsPlus.cpp").read_text()
@@ -23,8 +22,7 @@ moving_age = next(line for line in config.splitlines() if line.startswith("#defi
 clock = (root / "baseLogger/Helpers/clock_sync.h").read_text()
 clock_start = clock.index("time_t utcToEpoch(")
 clock_end = clock.index("\n}", clock_start) + 2
-compiler = shlex.split(os.environ.get("CXX", "clang++"))
-print(subprocess.check_output([*compiler, "--version"], text=True).splitlines()[0], flush=True)
+print(subprocess.check_output([*cxx(), "--version"], text=True).splitlines()[0], flush=True)
 with tempfile.TemporaryDirectory(prefix="obd-heading-checks-") as temporary:
     build = Path(temporary)
     (build / "gps_get_data.inc").write_text(source[start:end])
@@ -94,15 +92,11 @@ with tempfile.TemporaryDirectory(prefix="obd-heading-checks-") as temporary:
     (build / "historical_backlog.inc").write_text(historical_upload[historical_start:historical_end])
     (build / "historical_format.inc").write_text(historical_format)
     executable = build / "heading_checks"
-    subprocess.run([
-        *compiler, "-std=c++17", "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
-        "-Wall", "-Wextra", "-Wno-unused-parameter", "-Wno-unused-variable", "-Wno-unused-function",
-        "-I", str(root / "tests/support"), "-I", str(root / "libraries/FreematicsPlus"),
-        "-I", str(root / "libraries/nlohmann"), "-I", str(root / "baseLogger/Helpers"),
-        "-I", str(build), str(root / "tests/heading_checks.cpp"),
-        str(root / "libraries/FreematicsPlus/FreematicsGPS.cpp"), "-o", str(executable),
-    ], check=True)
-    environment = dict(os.environ)
-    environment["UBSAN_OPTIONS"] = environment.get("UBSAN_OPTIONS", "") + ":halt_on_error=1"
+    compile_cpp(executable,
+                [root / "tests/heading_checks.cpp", root / "libraries/FreematicsPlus/FreematicsGPS.cpp"],
+                includes=[root / "tests/support", root / "libraries/FreematicsPlus",
+                          root / "libraries/nlohmann", root / "baseLogger/Helpers", build],
+                flags=["-Wno-unused-parameter", "-Wno-unused-variable", "-Wno-unused-function"])
+    environment = runtime_environment()
     result = subprocess.run([str(executable), *sys.argv[1:]], env=environment)
     sys.exit(result.returncode)

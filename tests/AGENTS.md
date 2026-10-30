@@ -64,6 +64,9 @@ is unreachable; `--require-live` makes that a failure. Do not mistake a skip for
 - Share small, repeated harness utilities only when needed; do not introduce a framework just to
   reduce runner count. Generated sequences, historical comparisons and absolute safety properties
   are complementary, not automatically duplicates.
+- Energy, diagnostics and heading share `support/host_build.py` for C++17/ASan/UBSan compilation
+  and the runtime environment. Sources, ordered include paths, extra flags and test execution stay
+  in each runner. Preserve compiler commands and process counts when migrating another runner.
 
 - Extract/include production code rather than reimplementing it in the harness. Extraction
   anchors can include comments: comment-only changes still need relevant runner checks.
