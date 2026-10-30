@@ -101,6 +101,7 @@ struct FakeNetwork {
 #include "gzip_fake.h"
 GzipOutcome gzipBody(const std::string&, std::string&) { return GZIP_UNAVAILABLE; }
 int logging_errors = 0, g_last_http = 0, g_http0_streak = 0;
+int g_upload_posts = 0, g_upload_accepted = 0, g_upload_frames_ok = 0; // logger.ino's FLUSHSTAT counters (#110)
 unsigned long g_last_post_ms = 0;
 std::string g_last_status, tlm_push_token = "test-token", api_key = "test-key";
 std::vector<OBDVector> obd_result_vector;

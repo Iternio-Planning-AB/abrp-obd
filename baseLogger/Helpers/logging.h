@@ -197,12 +197,13 @@ void profileSigSelfTest();
 void gzipBenchTest(const char* args); // gzip_body.h, included after this file
 
 // Non-blocking-ish serial console for retrieving the flash log: DUMP (stream all; DUMP n = newest n segments;
-// DUMP SINCE <utc> = from that time), STAT (usage), CLEAR.
-void handleLogCommands() {
-  if (!Serial.available()) return;
+// DUMP SINCE <utc> = from that time), STAT (usage), CLEAR. True when it read a command: loop() re-seeds the loop gap
+// (WAKESTAT, #110) after one, so a DUMP's minutes are never mistaken for a stall.
+bool handleLogCommands() {
+  if (!Serial.available()) return false;
   String cmd = Serial.readStringUntil('\n');
   cmd.trim();
-  if (!cmd.length()) return;
+  if (!cmd.length()) return false;
 
   // Any console interaction pins the device awake and pulls it out of a low-power state, so a USB dump
   // can't be cut off by the deep-sleep state machine (which over USB looks like a "restart" + lost WiFi).
@@ -230,7 +231,7 @@ void handleLogCommands() {
        cmd.substring(0, 2).equalsIgnoreCase("AT"))) {
     Serial.printf("BUSY: %s in progress - %s refused (try again when it finishes)\n",
       g_ota_active ? "firmware update" : "BLE log dump", cmd.c_str());
-    return;
+    return true;
   }
 
   if (is_dump) {
@@ -238,7 +239,7 @@ void handleLogCommands() {
     bool by_time;
     uint32_t since = 0;
     // The host capture script keys on "usage: DUMP" to fall back from SINCE to DUMP n on older firmware.
-    if (!parseDumpArgs(cmd.c_str() + 4, newest, by_time, since)) { Serial.printf("usage: DUMP [n>=1 | SINCE <utc>]\n"); return; }
+    if (!parseDumpArgs(cmd.c_str() + 4, newest, by_time, since)) { Serial.printf("usage: DUMP [n>=1 | SINCE <utc>]\n"); return true; }
     // Streaming a full log at 115200 baud can exceed WEDGE_WDT_TIMEOUT_S - unsubscribe for the (bench-only,
     // human-attended) dump so the wedge guard can't reset mid-transfer, then re-arm.
     esp_task_wdt_delete(NULL);
@@ -311,7 +312,7 @@ void handleLogCommands() {
     ble.set_authenticated(false); // the open session proved against the wiped secret: it re-pairs like any other
     if (!forgetProfile("authclear")) {
       Serial.printf("AUTHCLEAR FAILED: the log, profile or backlog could not be erased - secret kept, try again\n");
-      return;
+      return true;
     }
     ble.clearAuthSecrets();
     // Say what this actually DOES: the next phone to connect provisions a brand-new secret and every
@@ -340,5 +341,6 @@ void handleLogCommands() {
     if (!hang) abort();
     for (;;) delay(1000);
   }
+  return true;
 }
 #endif

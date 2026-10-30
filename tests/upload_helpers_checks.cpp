@@ -142,6 +142,7 @@ struct FakeNetwork : NetworkWrapper {
 #endif
 } network;
 int logging_errors = 0, g_last_http = 0, g_http0_streak = 0;
+int g_upload_posts = 0, g_upload_accepted = 0, g_upload_frames_ok = 0;
 unsigned long g_last_post_ms = 0;
 std::string g_last_status, tlm_push_token = "test-token-actual", api_key = "test-key-actual";
 std::vector<OBDVector> obd_result_vector;
@@ -179,6 +180,7 @@ void reset() {
     gzip_noted_failures = 0;
     std::vector<OBDVector>().swap(g_upload_held);
     logging_errors = g_last_http = g_http0_streak = 0; g_last_status.clear();
+    g_upload_posts = g_upload_accepted = g_upload_frames_ok = 0;
     std::vector<OBDVector>().swap(obd_result_vector);
     upload_capped = upload_heap_dropped = 0;
     park_marker_owed = false;
@@ -696,6 +698,36 @@ void frameAge() {
     check(restored.size() == 2 && uploadBuffered(true) && network.sent == std::vector<std::string>{bulkStringV2({restored[1]}, now)},
         "a backlog restored from flash is judged at send like the RAM queue");
 #endif
+}
+// The batch counters FLUSHSTAT reports (#110): attempts and acceptances where uploadBuffered makes them, and only the
+// frames an accepted batch erased. Oversized and held frames leave the queue too, but were never accepted.
+std::string counters() {
+    return "posts=" + std::to_string(g_upload_posts) + " accepted=" + std::to_string(g_upload_accepted) +
+           " frames_ok=" + std::to_string(g_upload_frames_ok) + " sent=" + std::to_string(network.sent.size());
+}
+void uploadCounters() {
+    reset();
+    for (unsigned i = 0; i < 120; ++i) obd_result_vector.push_back(frame(i));
+    const auto original = obd_result_vector;
+    check(uploadBuffered(true) && obd_result_vector.empty() && network.sent.size() > 1 &&
+          g_upload_posts == (int)network.sent.size() && g_upload_accepted == g_upload_posts && g_upload_frames_ok == 120,
+          "a multi-batch drain counts every batch tried and accepted, and every frame sent: " + counters());
+
+    reset();
+    obd_result_vector = original;
+    network.codes = {200, 503};
+    const bool ok = uploadBuffered(true);
+    const size_t left = obd_result_vector.size();
+    check(!ok && left > 0 && left < original.size() && g_upload_posts == 2 && g_upload_accepted == 1 &&
+          g_upload_frames_ok == (int)(original.size() - left),
+          "a failed second POST is tried, not accepted, and its frames are not counted: " + counters());
+
+    reset(); gzip_enabled = true; force_oversized = true; obd_result_vector = {frame(0)};
+    check(uploadBuffered(true) && obd_result_vector.empty() && g_upload_posts == 0 && g_upload_accepted == 0 &&
+          g_upload_frames_ok == 0, "an oversized frame dropped is neither tried nor accepted: " + counters());
+    reset(); gzip_outcome = GZIP_OFF; obd_result_vector = {oversizedFrame(), frame(1)};
+    check(uploadBuffered(true) && obd_result_vector.empty() && g_upload_held.size() == 1 && g_upload_posts == 1 &&
+          g_upload_accepted == 1 && g_upload_frames_ok == 1, "a frame held for the next wake is not an accepted frame: " + counters());
 }
 void geoExpiry() {
     reset();
@@ -1443,7 +1475,7 @@ int main(int argc, char** argv) {
     if (group == "all" || group == "fingerprint") fingerprint();
     if (group == "all" || group == "errors") safeErrors();
 #endif
-    if (group == "all" || group == "queue") { queue(); bleHandover(); frameAge(); }
+    if (group == "all" || group == "queue") { queue(); bleHandover(); frameAge(); uploadCounters(); }
 #if ENABLE_LOGGING
     if (group == "all" || group == "backlog-append") backlogAppend();
 #endif

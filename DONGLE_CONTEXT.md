@@ -953,6 +953,20 @@ order and decline detection → Appendix A §7b; OTA → Appendix B §4, Appendi
   windows cover: a blocking upload between windows stretches a "minute". Rail and time are on the EVT prefix.
   Diagnostic only, gathered to judge accelerometer drive detection for cars with no OBD speed PID; nothing decides
   on it, and OTA/log-dump windows (which bypass `detectMovement`) are not counted.
+- **`FLUSHSTAT open=<ms> drain=<ms> posts=<ok>/<tried> frames=<ok>/<queued>`** (#110) follows a connected pre-sleep
+  `FLUSH` line, which is unchanged: `open` is the flush's `connect()` alone (the backlog load is before it), `drain`
+  is `uploadBuffered(true)`, `posts` counts batches accepted and tried (one per `UPLOAD try`), and `frames` the frames
+  accepted batches erased, against those queued at the drain's start. Aged, oversized and held frames log their own
+  lines and are not counted. An open failure adds nothing (its `FLUSH skipped: open failed` lines say it).
+- **`WAKESTAT prep=<ms> loopmax=<ms> at=<millis> loops=<n>`** (#110), once per wake that reaches `enterDeepSleep`,
+  beside the last `MOTION` line: `prep` runs from just past the OTA/dump guard through the park marker, the flush and
+  the backlog save to just before the BLE teardown (not "time to sleep": the power-down follows it). `loopmax` is the
+  longest gap between two visits to the top of `loop()` this wake and `at` the millis it ended, to match against the
+  `UPLOAD`/`OBD` lines; its floor is the 500 ms `detectMovement` window, and a serial console command re-seeds it, so
+  a `DUMP` never reads as a stall. When `loop()` ran, the sleep's entry is one more visit: a sleep from inside the loop
+  body (`net-recover` after a modem stall) still closes the gap before it, and `loops` is the loop visits plus that
+  one. `loops=0` (an ATRV skip, which sleeps from `setup()`) leaves `loopmax`/`at` 0. The
+  crash-streak timer sleep, the OTA reboot and `ESP.restart()` skip it. A scheduler-gap proxy, not BLE latency.
 - **`SLEEP enter ... reason=<r>`** names why the dongle slept. `dc-charge`, `charging` and `parked` are the
   cadence tiers, read back from the armed timer (1, 3, 30 min). `net-recover` is the modem-recovery
   reboot (1 min), `wdt-streak` the WDT-streak escalation (below), `backstop` the parked MAX_AWAKE ceiling. Charge
