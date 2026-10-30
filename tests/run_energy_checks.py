@@ -1,11 +1,10 @@
 import argparse
-import os
 from pathlib import Path
 import re
-import shlex
 import subprocess
 import sys
 import tempfile
+from support.host_build import compile_cpp, runtime_environment
 
 
 def line(text, prefix):
@@ -35,7 +34,6 @@ ota = (root / "baseLogger/Helpers/ota_update.h").read_text()
 
 
 
-compiler = shlex.split(os.environ.get("CXX", "clang++"))
 # logEvent() formats into char msg[120]: a longer line loses its tail, which is where fields get added.
 WORST_EVENT_ARGS = {
     "SAMPLE_POLL ": (99, 1, 1, 255, 1, 99, 15.99, 15.99, 1, 255, 1, 15),
@@ -182,17 +180,14 @@ with tempfile.TemporaryDirectory(prefix="obd-energy-checks-") as temporary:
     end = logger.index(") {\n", start)
     (build / "poke_sleeps.inc").write_text(f"bool sleeps() {{ return {logger[start:end]}; }}\n")
     executable = build / "energy_checks"
-    subprocess.run([
-        *compiler, "-std=c++17", "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
-        "-Wall", "-Wextra", "-Wno-unused-parameter", "-Wno-unused-variable", "-Wno-unused-function",
-        "-I", str(root / "tests/support"), "-I", str(root / "libraries/FreematicsPlus"),
-        "-I", str(root / "libraries/nlohmann"), "-I", str(root / "libraries/mathparser"),
-        "-I", str(root / "baseLogger/Helpers"), "-I", str(build),
-        str(root / "tests/energy_checks.cpp"), str(root / "libraries/mathparser/parser.cpp"),
-        str(root / "libraries/mathparser/expression_tree.cpp"), "-o", str(executable),
-    ], check=True)
-    environment = dict(os.environ)
-    environment["UBSAN_OPTIONS"] = environment.get("UBSAN_OPTIONS", "") + ":halt_on_error=1"
+    compile_cpp(executable,
+                [root / "tests/energy_checks.cpp", root / "libraries/mathparser/parser.cpp",
+                 root / "libraries/mathparser/expression_tree.cpp"],
+                includes=[root / "tests/support", root / "libraries/FreematicsPlus",
+                          root / "libraries/nlohmann", root / "libraries/mathparser",
+                          root / "baseLogger/Helpers", build],
+                flags=["-Wno-unused-parameter", "-Wno-unused-variable", "-Wno-unused-function"])
+    environment = runtime_environment()
     command = [str(executable), args.group]
     if args.profiles:
         command.append(str(args.profiles.resolve()))
