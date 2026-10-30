@@ -74,7 +74,6 @@ bool WiFiWrapper::connect() {
     static const char* collect[] = { "Date" };
     https.collectHeaders(collect, 1);
   }
-  // Serial.printf("Connection to %s %s\n", url.c_str(), success ? "succeeded" : "refused");
   return success;
 }
 
@@ -86,7 +85,6 @@ bool WiFiWrapper::set_headers(HeaderVector headers) {
   // addHeader() accumulates until https.end(), and connect() reuses a connected session: call https.end()
   // per POST before re-enabling this lane, or every request carries every earlier request's signature.
   for (auto header : headers) {
-    // Serial.printf("Adding header %s, %s\n", header.first.c_str(), header.second.c_str());
     https.addHeader(header.first.c_str(), header.second.c_str());
   }
   return true;

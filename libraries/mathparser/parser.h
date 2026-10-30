@@ -36,10 +36,6 @@ struct Token {
   Token(std::string expr, TYPE type, int pre) : expr{ expr }, type{ type }, precedence{ pre } { };
   Token(std::string expr, TYPE type, int pre, ASSOCIATIVITY ass) : expr{ expr }, type{ type }, precedence{ pre }, associativity{ ass } { };
 
-  // std::string get_expr(){
-  //   return expr;
-  // }
-
   std::string expr;
   TYPE type;
   int precedence{ 0 };
@@ -54,21 +50,18 @@ public:
   // Parses the expression and returns an expression tree
   NodePtr parse(const std::string& expression);
 
-  // Parses the expression and returns an expression tree
   NodePtr parse(const std::string& expression, const std::vector<int>& variables);
 
   // As above, with VAL{name} taken from values (the last entry of that name). A name it lacks throws.
   NodePtr parse(const std::string& expression, const std::vector<int>& variables, const ParserValues* values);
 
 private:
-  // Splits the expression into tokens
   std::vector<Token> tokenize(const std::string& expression, const std::vector<int>& variables,
                               const ParserValues* values);
 
   //Creates outputStack in RPN according to shunting yard algorithm
   std::vector<Token> buildStack(const std::vector<Token>& tokens);
 
-  // Creates an expression tree from tokens
   NodePtr buildTree(const std::vector<Token>& tokens);
 };
 

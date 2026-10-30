@@ -1,20 +1,11 @@
 #pragma once
 /*
-  BLE helpers - everything for the phone/app link (BLEWrapper session management).
-  Contains: the config-push callback + pending-config hand-off to the loop task
-  (configCallback), the BLEWrapper instance, the connection probe (bleConnected), the
-  cross-task BLE event log queue writer (bleLogCb), per-wake bring-up/teardown
-  (bleInitForWake / bleDeinitForSleep, with no-op stubs when BLE is disabled), and the
-  persisted BLE-pushed vehicle profile loader (loadPersistedProfile).
+  BLE lifecycle, cross-task config/event hand-off, and persisted vehicle profiles.
 
-  Extracted verbatim from logger.ino (definitions moved, logic unchanged). This file is
-  #included by logger.ino into the single sketch translation unit - it is NOT a standalone
-  compilation unit - so it shares logger.ino's globals and the config.h feature flags.
+  Included into logger.ino's single translation unit; shares its globals and config.h flags.
 */
 
-// Helpers/alarm_gate.h is included AFTER this file in the sketch translation unit (it needs
-// gps_location.h). Forward-declare the three names this file uses; same pattern as the
-// otaBenchReset/profileSigSelfTest declarations in logging.h.
+// alarm_gate.h follows gps_location.h, so these declarations must precede its definitions.
 void alarmFlagHook(int v);
 bool alarmFlagged();
 bool alarmEnforced();
@@ -25,10 +16,6 @@ bool forgetProfile(const char* why);   // Helpers/auth_gate.h (after network_upl
 bool bleProtoPhoneIsTransport();       // Helpers/ble_protocol.h (after ble_relay.h)
 void relaySessionWrite(const uint8_t* d, size_t n); // Helpers/ble_relay.h: the ABD9 session-channel stash
 size_t relaySessionRead(uint8_t* out, size_t size); // Helpers/ble_relay.h: ABD9's readable state
-
-/*
-  Callbackfunction for BLEWrapper. To be called when config has been completely transferred over BLE
-*/
 
 #if ENABLE_BLE
 // Hand-off from the Bluedroid task to the loop task. The BLE stack invokes configCallback on ITS OWN task;
@@ -64,8 +51,6 @@ bool configCallback(json newConfig) {
   }
 }
 
-// Initialization of BLEWrapper, handles all BLE communication with ABRP app
-
 BLEWrapper ble{
   configCallback,
   preferences, // Persistent storage
@@ -74,10 +59,6 @@ BLEWrapper ble{
 
 #endif
 
-/*
-  Returns true only when BLE is enabled and a device is connected.
-  Lets the activity state machine compile and behave correctly when BLE is disabled (e.g. WiFi-only).
-*/
 bool bleConnected() {
 #if ENABLE_BLE
   return ble.connected();
@@ -86,7 +67,7 @@ bool bleConnected() {
 #endif
 }
 
-// TRUE only when a connected phone has ALSO completed the AUTH handshake on ABD2. With the GATT table
+// TRUE only when a connected phone has ALSO completed the AUTH handshake on ABD8. With the GATT table
 // encryption-gated, a phone that DECLINED the pairing dialog (or any stranger) stays connected but can read
 // nothing - and keying cellular off mere presence made the dongle buffer silently while such a phone camped
 // (data flowed NOWHERE live; field-found). authenticated is session-scoped: set by AUTH OK, cleared on
@@ -279,4 +260,3 @@ bool loadPersistedProfile() {
 #elif ENABLE_BLE
 void dropUnsavedPush(const char*) { ble.invalidateHash(); } // nothing on flash to remove
 #endif
-

@@ -1,18 +1,8 @@
 #pragma once
 /*
-  Telemetry payload formatting - serializers from OBDVector frames to the wire formats.
-  Contains: logString (single-frame {"tlm":...} for the API), bleTlmFrame/bleTlmString (the
-  BLE ABD1 frame, fitted to the notify size), bulkString (the legacy v1 /1/tlm/bulk body) and
-  bulkStringV2 (the v2 /2/app/tlm InputPointList, which is what actually goes out - see
-  TLM_V2_PATH in config.h).
+  OBDVector serializers for BLE ABD1 and the cloud API (v2 selected by TLM_V2_PATH).
 
-  Extracted verbatim from logger.ino (definitions moved, logic unchanged). This file is
-  #included by logger.ino into the single sketch translation unit - it is NOT a standalone
-  compilation unit - so it shares logger.ino's globals and the config.h feature flags.
-*/
-
-/*
-  Convert vector of PID results to suitable form for iternio telemetry API
+  Included into logger.ino's single translation unit; shares its globals and config.h flags.
 */
 
 #include <algorithm>

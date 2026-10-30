@@ -249,4 +249,4 @@ for that car.
 
 - [Technical overview](technical-overview.md): how it works inside, the code layout, the settings
   and the serial console commands.
-- [`DONGLE_CONTEXT.md`](../DONGLE_CONTEXT.md): the full design history and field findings.
+- [Dongle context](../DONGLE_CONTEXT.md): architecture and constraints, with links to design history and field findings.

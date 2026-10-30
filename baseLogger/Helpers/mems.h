@@ -1,19 +1,8 @@
 #pragma once
 /*
-  MEMS helpers - ICM-42627 motion sensor (accelerometer/IMU).
-  Contains: the Point3D/memData containers and the sensor handle, bias filtering
-  (calculateBias), the per-cycle read/motion computation (processMEMS), the boot-time
-  calibration (calibrateMEMS), the boot soft-reset that clears WOM config persisted across
-  deep sleep (softResetMEMS), and the movement detector the activity state machine polls
-  (detectMovement).
+  ICM-42627 sampling, calibration, motion detection, and reset of retained WOM configuration.
 
-  Extracted verbatim from logger.ino (definitions moved, logic unchanged). This file is
-  #included by logger.ino into the single sketch translation unit - it is NOT a standalone
-  compilation unit - so it shares logger.ino's globals and the config.h feature flags.
-*/
-
-/*
-  Initialize values for motionsensors.
+  Included into logger.ino's single translation unit; shares its globals and config.h flags.
 */
 
 #if ENABLE_MEMS
@@ -40,10 +29,6 @@ struct memData {
 MEMS_I2C* mems = 0;
 #endif
 
-/*
-  Read data from motionsensor
-*/
-
 #if ENABLE_MEMS
 
 // High pass filter, averages 10 latest acceleration values
@@ -67,8 +52,6 @@ void calculateBias(Point3D new_acc) {
   mem_data.accBias = accBias;
 }
 
-//update mem_data
-
 // false when the read failed and mem_data still holds the previous sample
 bool processMEMS() {
   float temp;
@@ -90,7 +73,6 @@ bool processMEMS() {
     Serial.printf("[ACC] %.2f/%.2f/%.2f\n", mem_data.acc[0], mem_data.acc[1], mem_data.acc[2]);
     Serial.printf("[GYR] %.2f/%.2f/%.2f\n", mem_data.gyr[0], mem_data.gyr[1], mem_data.gyr[2]);
 #endif
-    // calculate motion
     mem_data.motion = 0;
     for (byte i = 0; i < 3; i++) {
       mem_data.motion += mem_data.acc[i] * mem_data.acc[i];
@@ -105,8 +87,6 @@ bool processMEMS() {
   mem_data.accCount = 0;
   return true;
 }
-
-//Initial calibration
 
 void calibrateMEMS() {
   Point3D accBias = { 0.0f };

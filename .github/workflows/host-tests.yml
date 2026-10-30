@@ -1,6 +1,6 @@
 # Every host runner (tests/run_*.py) on each pull request and on main, normally and with NDEBUG. Host checks
 # only: clang++ and Python, no hardware, no secrets. The `variants` job below builds the default firmware and the
-# non-default configs. See AGENTS.md (Testing).
+# non-default configs. See tests/AGENTS.md and tests/README.md.
 name: Host tests
 
 on:

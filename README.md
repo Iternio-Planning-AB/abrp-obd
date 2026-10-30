@@ -62,8 +62,8 @@ worked, and what to do if it doesn't.
 
 - [Getting started guide](docs/getting-started.md): the full setup, step by step
 - [Technical overview](docs/technical-overview.md): how it works, the code layout and the settings
-- [`DONGLE_CONTEXT.md`](DONGLE_CONTEXT.md): everything else, from design history to protocols and
-  field findings. Long; best read with an AI assistant
+- [Dongle context](DONGLE_CONTEXT.md): architecture, protocol constraints and links to detailed
+  field findings and design history
 - [`RELEASING.md`](RELEASING.md): how firmware releases are made
 - [`CONTRIBUTING.md`](CONTRIBUTING.md): building, testing and sending changes
 - [`SECURITY.md`](SECURITY.md): report security problems privately, never in a public issue

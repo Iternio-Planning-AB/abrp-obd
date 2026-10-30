@@ -1,14 +1,9 @@
 #pragma once
 /*
-  Power management / deep-sleep helpers.
-  Contains: the WOM wake pin + RTC-persisted wake/sleep counters, the true-12V-rail reader
-  (readIO36Rail), the reset-reason decoder (resetReasonStr), and enterDeepSleep() - the full
-  power-down path (pre-sleep upload flush + backlog save, BLE teardown, modem/GPS power-off,
-  Wake-on-Motion arming, adaptive wake timer). softResetMEMS lives in Helpers/mems.h.
+  Rail voltage, wake/reset diagnostics, and deep sleep: flush, persist, power down, arm wake sources.
+  The MEMS reset lives in Helpers/mems.h.
 
-  Extracted verbatim from logger.ino (definitions moved, logic unchanged). This file is
-  #included by logger.ino into the single sketch translation unit - it is NOT a standalone
-  compilation unit - so it shares logger.ino's globals and the config.h feature flags.
+  Included into logger.ino's single translation unit; shares its globals and config.h flags.
 */
 
 /*
