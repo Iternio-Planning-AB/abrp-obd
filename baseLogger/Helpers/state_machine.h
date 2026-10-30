@@ -1,14 +1,9 @@
 #pragma once
 /*
-  Activity state machine helpers (BLE / ACTIVE / CHARGING / STANDBY / UNINITIALIZED).
-  Contains: the per-state upload + poll cadences (getTransmissionDelay / getPollingDelay),
-  the state transition handler (changeState), and the movement/BLE-driven state selector
-  incl. the max-awake backstop and deep-sleep hand-off (handleActivityState). The
-  ActivityState enum itself stays in logger.ino (globals section).
+  Activity transitions, poll/upload cadences, and sleep decisions.
+  ActivityState is declared in logger.ino.
 
-  Extracted verbatim from logger.ino (definitions moved, logic unchanged). This file is
-  #included by logger.ino into the single sketch translation unit - it is NOT a standalone
-  compilation unit - so it shares logger.ino's globals and the config.h feature flags.
+  Included into logger.ino's single translation unit; shares its globals and config.h flags.
 */
 
 // Upload cadence (ms between transmissions) for each activity state.

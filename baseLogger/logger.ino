@@ -2226,62 +2226,34 @@ void loop() {
       }
 #endif
 #if ENABLE_NETWORK
-      // Skip cellular entirely while a phone is RELAYING over BLE: BLE is the transport (the phone relays to
-      // the ABRP cloud), and a TLS POST here competes with the BLE link for CPU + contiguous heap and can
-      // hiccup it -> the app sees the drop and reconnects (the 0x13 churn). Buffered frames flush over
-      // cellular once relaying ends or the device sleeps.
-      // bleRelaying (connected AND authenticated), NOT bleConnected: with the gated GATT table a phone that
-      // declined pairing stays connected but takes nothing, and suppressing on mere presence made the dongle
-      // buffer silently while such a phone camped - data flowed nowhere live (field-found). Cost of the swap:
-      // in the few seconds between CONNECT and AUTH OK a POST may now overlap the connect/pairing handshake;
-      // accepted - it is rare (needs the batching timer to expire inside that window), a hiccup there only
-      // delays pairing/setup by one retry, and the alternative recreates the buffering hole.
-      // Ride through the phone's connect/disconnect flap: after a BLE drop, hold cellular off for the grace
-      // window so a POST can't collide with the reconnect handshake on the shared modem UART (the http=0
-      // regression). g_ble_disconnect_ms==0 => no RELAYING session has ended this wake => no hold-off, which
-      // covers both the no-phone case and a peer that connected but never authorized (see
-      // g_ble_session_relayed - changeState only stamps this for a session that actually held the transport).
+      // TLS competes with BLE for CPU/contiguous heap and caused 0x13 reconnect churn. Suppress it only
+      // while bleRelaying(): gating on mere connection stranded data behind phones that declined pairing.
+      // A POST may overlap initial pairing; an occasional retry is preferable to that buffering hole.
+      // After a relay disconnect, the grace avoids the reconnect/POST overlap that caused http=0.
+      // changeState stamps g_ble_disconnect_ms only for sessions that held the transport; zero means no grace.
       bool ble_upload_grace = (g_ble_disconnect_ms != 0) && (( millis() - g_ble_disconnect_ms ) < BLE_UPLOAD_GRACE_MS);
-      // Fast handoff: the first upload after a BLE session ends skips the batching timer and fires the moment
-      // the grace clears - the user watching the app/cloud sees the transport switch within seconds. Later
-      // uploads batch on transmission_delay as normal.
+      // The first upload after relay ends bypasses batching once the grace clears.
       bool ble_handoff_fire = g_ble_handoff_pending && !ble_upload_grace;
-      // The BLE state sets transmission_delay = 0 (see getTransmissionDelay), which is only safe while that
-      // state implies RELAYING - the upload is suppressed anyway, so the zero never fires. It is not safe
-      // for a phone that is connected but has not passed the ABD8 proof: nothing suppresses those uploads
-      // (correctly - see bleRelaying below) and with a zero cadence nothing rate-limits them either, so the
-      // dongle POSTs on EVERY loop iteration, each one opening and tearing down an SH/TLS session with the
-      // whole BLE stack resident. That is the http=0 thrash, and it delivers less than doing nothing would.
-      // A connection must not change the cellular cadence before it has earned the transport, so fall back
-      // to the ACTIVE cadence until AUTH lands. Computed here rather than in getTransmissionDelay because
-      // transmission_delay is a snapshot taken at changeState() and AUTH arrives seconds AFTER the
-      // ACTIVE -> BLE transition, so a value fixed at transition time could never track it.
+      // BLE's zero upload delay caused per-loop TLS/http=0 thrashing before authentication. Use ACTIVE's
+      // cadence whenever the phone is not relaying. Recompute here: changeState's snapshot predates AUTH
+      // and cannot track later changes in relay status.
       const unsigned long upload_delay = (current_state == BLE && !bleRelaying())
         ? getTransmissionDelay(ACTIVE) : dcAwakeDelay(current_state, transmission_delay);
       // A held DC charge's first frame goes now, as the 1-minute wake's pre-sleep flush would have sent it.
       const bool dc_first_upload = dcAwakeHeld(current_state) && last_broadcast == 0;
-      // No token, no upload. Belt-and-braces since an unpaired dongle also never polls, so the buffer
-      // should be empty anyway - but the alternative is powering the modem for a POST the API can only
-      // answer 401, and this is the one condition where that is knowable in advance.
+      // Refuse a missing token before spending modem power on a guaranteed 401.
       if (!bleRelaying() && !g_ota_active && !ble_upload_grace && !g_logdump_active && uploadQueued() &&
           !tlm_push_token.empty() &&
           (ble_handoff_fire || dc_first_upload || ( millis() - last_broadcast ) > upload_delay)) {
-        // Awake-aware backoff. The fail cap exists to stop the modem thrashing a SLEEPING car's 12V when
-        // uploads keep failing (the overnight drain). But when the car is AWAKE/driving (OBD answering or
-        // we're moving) there's no battery concern and the live telemetry matters most, so keep retrying
-        // regardless of the count. Only an asleep, repeatedly-failing car goes quiet. (A mid-drive cell
-        // hiccup used to trip the cap and silence the whole rest of the drive - this is the fix.)
+        // Cap failures only while parked and silent to prevent overnight 12V drain. Applying the cap
+        // while awake let a mid-drive cellular hiccup silence the rest of the drive.
         bool car_awake = (obd_count > 0) || !is_currently_parked;
         bool backed_off = !car_awake && (upload_fail_count >= MAX_UPLOAD_FAILS_PER_WAKE);
         if (!backed_off && network.connected()) {
           // Registered: the backlog can go now. Before connect(), whose session-reuse idle check a parse would outlast.
           if (uploadBacklogUnread()) loadUploadBacklog();
-          // Split the socket-open (connect) check out of the outer gate. BUG: when connect() returned false
-          // (modem registered but the SH/TLS session failed to open - common under car electrical load), the
-          // OLD single condition `&& network.connect()` skipped the ENTIRE block - no failure counted,
-          // g_http0_streak never advanced, no cleanup, and the recovery ladder never fired - so the loop
-          // silently stalled (field-confirmed: ~2 min of zero upload attempts after a single http=0). Now an
-          // open failure is handled in the else below so recovery still engages.
+          // Keep connect() inside this block so open failures count toward recovery and get cleanup.
+          // The old outer-gate check bypassed both, causing ~2-minute stalls after http=0 under car load.
 #if ENABLE_LOGGING
           // Signal + modem-voltage snapshot right before the POST, so each upload outcome below can be
           // attributed to RF (low csq), power (sagging vbat), or session (both healthy but still http=0).
@@ -2354,10 +2326,8 @@ void loop() {
 #endif
             network.disconnect();
           }
-          // Stale-bearer recovery: repeated http=0 means the modem's data context died (e.g. after a long BLE
-          // session left cellular idle). Reopening the HTTP session can't revive a dead PDP context; a full
-          // re-init (restart -> begin/checkSIM/APN/CNCFG) does. Bounded, and only reachable with NO phone
-          // connected (cellular is BLE-gated), so it can't stall a live BLE stream.
+          // Repeated http=0 can mean a dead PDP context after a long BLE session. Reopening HTTP cannot
+          // revive it; restart re-runs begin/checkSIM/APN/CNCFG. The relay gate keeps this off a live BLE stream.
           if (g_http0_streak >= HTTP0_RESTART_THRESHOLD) {
 #if ENABLE_LOGGING
             logEvent("NET recover: %dx http=0 -> modem restart (stale bearer)", g_http0_streak);

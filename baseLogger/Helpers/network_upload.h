@@ -1,14 +1,8 @@
 #pragma once
 /*
-  Network upload helpers (ENABLE_NETWORK) - the cloud upload pipeline.
-  Contains: the bulk POST + response handling (logNetwork), the batched drain of the RAM
-  frame buffer with the cellular byte-size cap (uploadBuffered), and the store-and-forward
-  backlog that persists unsent frames across deep sleep (saveUploadBacklog /
-  loadUploadBacklog).
+  Batched cloud uploads and a persistent backlog for unsent frames (ENABLE_NETWORK).
 
-  Extracted verbatim from logger.ino (definitions moved, logic unchanged). This file is
-  #included by logger.ino into the single sketch translation unit - it is NOT a standalone
-  compilation unit - so it shares logger.ino's globals and the config.h feature flags.
+  Included into logger.ino's single translation unit; shares its globals and config.h flags.
 */
 
 #include <new>

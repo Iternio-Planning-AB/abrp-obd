@@ -1,14 +1,8 @@
 #pragma once
 /*
-  Miscellaneous helpers - small utilities that don't belong to a bigger category.
-  Contains: the full NVS chip reset (resetChip, bench-only), the serial file-injection test
-  harness (file_test, FILE_TEST builds), the persisted WiFi credential loader
-  (loadPreferences, ENABLE_WIFI builds), and the passive CAN-bus sniff diagnostic
-  (sniffCanBus, ENABLE_CAN_SNIFF builds).
+  Bench diagnostics, serial test injection, and persisted WiFi credentials.
 
-  Extracted verbatim from logger.ino (definitions moved, logic unchanged). This file is
-  #included by logger.ino into the single sketch translation unit - it is NOT a standalone
-  compilation unit - so it shares logger.ino's globals and the config.h feature flags.
+  Included into logger.ino's single translation unit; shares its globals and config.h flags.
 */
 
 /*
@@ -27,36 +21,28 @@ void resetChip() {
 
 #if FILE_TEST
 void file_test() {
-  // Check if data is available
   if (Serial.available() > 0) {
     OBDVector test_vector{};
-    // Read a line from the serial buffer
-    char buffer[64]; // Buffer to hold incoming data
+    char buffer[64];
     uint8_t idx = 0;
     char c;
 
-    // Read until newline or buffer size is reached
     while (Serial.available() > 0 && idx < sizeof(buffer) - 1) {
       c = Serial.read();
       if (c == '\n' || c == '\r') {
-        buffer[idx] = '\0'; // Null-terminate the string
+        buffer[idx] = '\0';
         break;
       }
       buffer[idx++] = c;
     }
 
-    // Convert comma-separated values directly
     uint32_t utc;
     float lat, lon;
 
-    // Parse the received data
     if (sscanf(buffer, "%u,%f,%f", &utc, &lat, &lon) == 3) {
       gd->time = utc;
       gd->lat = lat;
       gd->lng = lon;
-      // Serial.println(utc);
-      // Serial.println(lat, 6); // Print latitude with 6 decimal places
-      // Serial.println(lon, 6); // Print longitude with 6 decimal places
     } else {
       Serial.println("Error parsing input");
     }

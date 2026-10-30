@@ -1,576 +1,77 @@
-# AGENTS.md
+# Repository guidance
 
-Guidance for AI coding agents working in this repo. `CLAUDE.md` is a symlink to this file.
+An ESP32 OBD logger on Freematics ONE+ hardware, uploading to ABRP over its own LTE-M modem.
+A phone is an occasional privileged client, not the data path. A client that can write to the
+dongle can write to the car, and nobody may be nearby to notice a flattened 12 V battery.
+The closed STM32 co-processor owns CAN, K-line and pin-16 voltage; we cannot reflash it.
 
-This is the **short** entry point: how to build, and the handful of mechanical rules that will bite you
-before you get near the domain. The domain itself lives in [`DONGLE_CONTEXT.md`](DONGLE_CONTEXT.md) —
-over 4000 lines of it — which is deliberately *not* auto-loaded. Read §0 there first (thirty seconds), then
-the section you need. There is a map at the bottom of this file.
+Read §0 of [DONGLE_CONTEXT.md](DONGLE_CONTEXT.md), then only the relevant section. Code is
+authoritative; historical design documents may describe superseded behaviour.
 
-## What this is
+## Working rules
 
-An ESP32 OBD logger that polls the car and uploads to ABRP over its **own LTE-M modem**, so a parked
-car keeps reporting with no phone nearby. A phone is an occasional privileged client, not the data
-path. Two consequences drive nearly every design decision in here: a client that can write to the
-dongle can write to the **car**, and nobody is standing next to a car whose 12 V battery is being
-flattened.
+- Branch from `main`. Put worktrees in `.worktrees/` at the project root.
+- Do not commit, push or open PRs unless asked. Follow the Conventional Commit rules in
+  [CONTRIBUTING.md](CONTRIBUTING.md); commit types control release notes and version bumps.
+- Check `git remote -v` before using a forge CLI.
+- Preserve safety invariants, hardware constraints and field history in comments. Trim obvious
+  narration and repetition, not the reasons a workaround exists.
+- Fix the general case, not behaviour keyed to one car's make or model.
+- Firmware changes must run on a device before committing. A bench test does not verify power
+  gates, real PIDs or GPS; report hardware and drive verification separately from host checks.
+- Protocol changes must land with the matching closed-source ABRP app change. Describe that
+  app-side dependency in the PR; a firmware-only wire-format change breaks the pair.
+- Keep the supported-car and settings tables in the user docs current.
+- Never publish dongle logs, DUMP output or tokens; see [SECURITY.md](SECURITY.md).
 
-Hardware is a Freematics ONE+: our ESP32 alongside an **STM32 co-processor we cannot reflash** (closed
-vendor blob; it owns CAN, K-line and pin-16 voltage, and we drive it with ELM327-style AT commands).
-
-## Build
+## Build and test
 
 ```sh
 cd baseLogger && pio run -e esp32dev
 ```
 
-`pio` may not be on `PATH` in a non-login shell — check before concluding the toolchain is missing.
-If it is unavailable, this isolated invocation has been verified from `baseLogger/` and does not
-install Python packages globally:
+`pio` may be absent from a non-login shell's PATH. If unavailable, run from `baseLogger/`:
 
 ```sh
 uv run --no-project --with platformio==6.1.18 pio run -e esp32dev
 ```
 
-Flash and watch with `pio run -e esp32dev -t upload -t monitor` (115200 baud).
+Host checks use Python 3 and `clang++` (or `CXX`), from the repository root:
 
-`OTA_FW_VERSION` and `FW_BUILD_TAG` are injected by `tools/pio_version.py` from the newest `vX.Y.Z` tag
-(fetch tags from the GitHub remote), never edited by hand. Releases are cut by the manual *Release* workflow; see
-`RELEASING.md`.
+```sh
+python3 tests/run_heading_checks.py
+CXX='clang++ -DNDEBUG' python3 tests/run_heading_checks.py
+```
 
-A clean build prints two pre-existing `"PRINT" redefined` warnings, from `FreematicsOBD.cpp` and
-`mathparser/parser.cpp`. They are not yours; anything else probably is.
+Choose runners using [tests/AGENTS.md](tests/AGENTS.md); detailed coverage is in
+[tests/README.md](tests/README.md). **CI proves host checks and firmware builds, not device behaviour.**
+The required `ci` job in `.github/workflows/host-tests.yml` aggregates checks; add new jobs to its `needs`.
 
-Every build checks its linker map and fails unless the C/C++ runtime came from the toolchain's PSRAM-safe
-multilib (`tools/pio_psram_libs.py`, #64): this ESP32 rev 1 can lose stores to PSRAM, where mallocs over 4 KB
-land.
+## Scoped guidance
 
-**CI runs the host checks and a firmware build, never a device.** `.github/workflows/host-tests.yml` runs every
-`tests/run_*.py` on each pull request and on `main`, normally and with `CXX='clang++ -DNDEBUG'`. Apart from the one job
-below, nothing in CI builds the firmware, and nothing touches a device, so a green PR proves the host checks and that
-the firmware builds, and nothing more. Merging needs its `ci` job,
-the one check the `main` ruleset requires: a new job goes in that job's `needs`. See *Testing* below,
-because that gap is the single biggest difference from a normal repo.
+Nested instructions supplement this file. Each `CLAUDE.md` is a relative symlink to its sibling
+`AGENTS.md`; edit the target, not a second copy.
 
-The `variants` job first builds and links the default image (`pio run -e esp32dev` from `baseLogger/`, with its PSRAM
-linker-map check), then the non-default `config.h` variants with `sh tools/check_variants.sh`. A linked image is not a
-flashed one: no OBD, power gate, modem or GPS behaviour is exercised.
-`ENABLE_LOGGING 0`, `ENABLE_BLE 0` and `ENABLE_NETWORK 0` (as `ENABLE_CELL 0`) are built and linked.
-`ENABLE_WIFI 1` (with `ENABLE_CELL 0`) only compiles, as it overflows IRAM, and its TLS is unverified: bench only.
-
-## The rules that bite first
-
-**`baseLogger/Helpers/*.h` are not translation units.** They are `#include`d into `logger.ino` to form
-one sketch, and they share its globals and `config.h` flags. Every one says so in its header comment.
-Do not add include guards that assume separate compilation, do not add `static` where a global is
-expected, and do not expect a symbol to be visible before its `#include` line.
-
-**Include order in `logger.ino` is load-bearing.** The list around line 320 is ordered by dependency,
-not alphabetically — a helper that calls `logEvent` must come after `logging.h`, one that calls
-`gzipBody` after `gzip_body.h`. Insert deliberately.
-
-**`build_src_filter` excludes Freematics reference sources** (`stanleyhuangyc*`, `*telelogger*`,
-`*libraries-FreematicsPlus*`). None are tracked, but a local copy dropped into `baseLogger/` to read
-must never compile — the reference FreematicsPlus would collide with the real one in `libraries/`.
-
-**Deep sleep is a reboot, not a resume.** RAM is wiped and `setup()` runs again from the top. Anything
-that must survive is `RTC_DATA_ATTR` (wake/sleep counters, the charging budget, the taper latch, the
-frozen parked fix) or LittleFS (the vehicle profile, the upload backlog). A plain global reset to its
-initialiser on every wake is the most common way to get this wrong. At crash streak 3, an early exception
-takes timer-only deep sleep before peripheral initialisation; it deliberately leaves already-powered
-peripherals on and does not arm WOM for that sleep. `RTC_DATA_ATTR` survives deep sleep only: a panic, WDT
-or software reset reloads it too (`DONGLE_CONTEXT.md` §11).
-
-**BLE callbacks run on the Bluedroid task and must only copy bytes and set a flag.** All NVS, crypto
-and OBD work happens on the loop task, in the matching `*Service()` function. This is stated as
-load-bearing in `auth_gate.h` and holds equally for OTA, the log dump and the profile push. Two handlers parse small
-JSON there: ABD2's (`StartupCallbacks::onWrite`) and ABD9's (`relaySessionWrite`, at most 64 B, into a mailbox under a
-lock); neither does NVS, crypto or OBD work, and ABD9's also never logs or calls `ble` (pinned by
-`run_relay_checks.py`).
-
-**Tunables live in `config.h`**, each with the reasoning above it. Change the constant, and update the
-comment when the reasoning changes — several of them encode a measured field result, not a preference.
-Two are hard external limits rather than choices: the SIM7070 refuses a request body over
-`SHCONF BODYLEN=1024`, and the key-reset window is timed from the dongle's own power-on.
-
-**Comments here carry field history.** Many explain a failure that took a drive or a 71-hour log to
-find. Do not delete one unless you are deleting the code it describes.
-
-## Testing
-
-Run `python3 tests/run_heading_checks.py` from the repo root for the heading/GPS regression checks
-(Python standard library and `clang++`, or set `CXX`). The runner extracts the complete current
-`gpsGetData()` method and the GNSS-unlatch block from `logger.ino` on every run, reads the production
-movement-age limit, includes the real GPS types and location/telemetry/upload helpers, and compiles
-the real TinyGPS implementation with ASan/UBSan. Serial and HTTP transports are fakes; co-processor
-replies are synthetic and host `millis()` is controlled. Host date writes emulate the ESP32's 32-bit
-`unsigned long`. Checks remain enabled regardless of `NDEBUG`.
-
-Parser checks cover rejected/truncated replies preserving the accepted record, malformed and
-32-bit-overflowing required integers, coordinate rejection/recovery and optional heading handling.
-Selected GNSS integration checks follow the real sampling/frame/unlatch order: the first moving fix
-emits live coordinates while still PARK, the next distinct moving fix unlatches DRIVE, replayed or
-rejected replies do not create fresh movement, fresh zero-speed fixes still use the frozen parked
-position, and `gps-relocate` moves that position only once `PARK_ACC_MIN` fresh stationary fixes average
-beyond `PARK_RELOCATE_MIN_M`, and `gps-jump` covers the link-path jump filter (time-aware bound, re-anchor
-after three consistent fresh fixes, replays and sparse fixes never re-anchor; an altitude bound refuses a
-horizontally plausible fix far off vertically; a wake's first fix is held until a second fresh fix agrees). Each group starts from a reset fixture. These are not full state-machine,
-OBD-profile, power-gate or GNSS-hardware tests. The synthetic in-memory queue test verifies all 120 points arrive
-once, in order, with battery data intact; it does not exercise LittleFS restoration or the cellular
-modem.
-
-Pass a group name (`link-range`, `link-failures`, `link-truncated`, `link-required`, `link-atomic`,
-`link-valid`, `gps-replay`, `gps-rejected`, `gps-stationary`, `gps-relocate`, `gps-jump`, `direct-missing`,
-`direct-range`, or `queue`) to run just that group.
-
-Run `python3 tests/run_release_checks.py` for the release tooling: version naming and selection, build-tag
-resolution, signing through a fake `aws` with throwaway keys, the workflow's safety properties, and the
-linker-map check of `tools/psram_libs.py` (`PsramRuntimeLink`). The release-notes group needs `git-cliff` (or
-set `GIT_CLIFF`); without it, it is skipped, and with `CI` set it fails.
-
-Hardware verification still requires a real dongle, and the loop is:
-
-1. Build.
-2. Flash, and reproduce on hardware — a bench supply (and a fake car, an internal tool not in this repo)
-   covers the transport, but never the OBD profile, the power gates or anything GPS.
-3. Read the flash log (`DUMP 3` over serial for the newest three segments, `DUMP` for all of it, or the
-   in-app log dump over ABD7). `logEvent` lines are the
-   ground truth; `Serial.printf` is lost the moment the cable is out.
-4. **Only then commit.** Firmware changes stay in the working tree until they have run on a device.
-
-A change that only a drive can exercise — power gating, upload cadence, unit conversions on real PIDs —
-is not verified by a bench test, and saying so is part of reporting it.
-
-## Where to look
-
-| Question | Section of `DONGLE_CONTEXT.md` |
+| Scope | Guidance |
 | --- | --- |
-| What is built, what is enabled | §1 |
-| BLE service/characteristic layout (ABD0–ABD8) | §2 |
-| Auth, pairing, what a client may do | §3, Appendix A |
-| OTA firmware update | §4, Appendices B and C |
-| Log retrieval | §5 |
-| Sleep, wake gates, battery protection | §6 |
-| Cloud upload, profiles, where they come from | §6a |
-| Co-processor command limits, cars it can't read (BMW i3 …) | §6b |
-| The OBD-alarm gate (per vehicle) | §7 |
-| App-side obligations, `abrpobd` vs `obdble` | §8 |
-| Diagnosing a dongle that went quiet | §9 |
-| Invariants to check before changing something | §11 |
+| Sketch, helpers, configuration and firmware tooling | [baseLogger/AGENTS.md](baseLogger/AGENTS.md) |
+| Wrappers, drivers and vendored dependencies | [libraries/AGENTS.md](libraries/AGENTS.md) |
+| Host harnesses and verification | [tests/AGENTS.md](tests/AGENTS.md) |
 
-In the source, the entry points are `logger.ino` (`setup()` is the wake ladder, `loop()` is the poll
-and upload cycle), `Helpers/state_machine.h` (activity states and cadences), `Helpers/sleep_power.h`
-(the normal `enterDeepSleep` primitive; setup's timer-only crash-loop emergency is an explicit exception)
-and `Helpers/auth_gate.h` (ABD8).
+Keep these files short and actionable. Detailed coverage and field narratives belong in the
+linked references, not in automatically loaded instructions.
 
-## Etiquette
+## Reference map
 
-- Do not commit, push or open PRs unless asked. Branch work off `main`.
-- Commit messages generate the release notes: follow *Commits* in `CONTRIBUTING.md` (Conventional
-  Commits, and which types reach the notes).
-- User docs: `README.md` (what it is, what you need, supported cars), `docs/getting-started.md`
-  (setup, step by step) and `docs/technical-overview.md` (code layout, settings, console). Keep the
-  car table and the settings tables current when the code changes.
-- Check `git remote -v` before reaching for a forge CLI: `gh` only works if the remote is GitHub.
-- The app is the closed-source ABRP app, in its own repository. Protocol changes
-  touch both repos and land together; a firmware change that moves a wire format without the app is a broken pair.
-  From outside, describe the app-side change a PR needs in its description.
-
-## State-machine differential harness
-
-Run `python3 tests/run_sm_checks.py` (groups `scenarios`, `random`, `enumerate`, `crash`, `rules`; `--depth N`, default 5) for
-the park/drive decision. The differential covers the drive region; shared context comes from the working
-tree. The blocks that write drive state (the poll-time unlatch and re-latch, the `is_parked` publish, the
-OTA/dump hold, `changeState`, the buffer block and the pre-sleep marker) come from the pinned `main` commit
-(`SM_PIN`, via `git show`) for OLD and from the working tree for CUR; the context around them (the
-backstop, the delays) comes from the working tree for both, so a deliberate change there does not fail it. Each
-side compiles into its own namespace around one harness (`tests/sm/`), and identical event sequences run
-through both: every sequence of 5 events over a
-15-symbol alphabet (about 760 k, a few seconds; `--depth 6` runs about 11 M in under a minute), 5000
-fixed-seed sequences of 30, and named field cases (garage latch, smooth-road leash, re-latch boundary,
-OTA and log-dump holds, a console session, both speed keys and a NaN speed, trip-end marker, the two
-no-speed-PID drives). The fake clock advances inside every log line and freeze, as the device's does.
-After every event the latch, leash, hold time, marker debt, published `is_parked`, buffered frames,
-freezes, the GNSS age bound asked for, and the exact `logEvent` and Serial sequences must be equal; the
-weak-rail gate, the weak-rail cold boot's modem-off sleep and the max-awake backstop are checked as properties. The `crash`
-group (#49) runs CUR alone, because what it checks is absolute: a panic mid-drive, in the pre-sleep flush and
-after a backlog load, plus every 5-event sequence over the alphabet with a crash, a flush crash and a sent flush added, must never lose the debt or an unsent marker.
-On the differential's boots the restore is a no-op, so a restore that fires there fails it. Since step 1 (#24) the CUR side is the
-drive region in `Helpers/drive_state.h`, and the runner fails if anything outside that header assigns
-`is_currently_parked`, `g_last_speed_ms`, `park_marker_owed`, `drive_unconfirmed` or `g_drive_gnss_refused`, if `alarm_gate.h` names drive state, or if
-a call into the drive region sits outside the blocks it extracts. The pin rule and what the harness
-cannot prove (32-bit `millis()` wrap, other flag sets, code outside the extracted blocks) are in the
-runner's header. The `rules` group (#6) also runs CUR alone, as absolute checks: the named driving-rule scenarios (desk drift, late-fix drive, discharge, charge block, UNCONFIRMED exit) over Poll inputs for the car, motion, sustained motion, power and charge latch, whose defaults make CUR agree with OLD.
-
-Since 0b-1 (#81) the differential also covers the poll-side energy block: the rail refresh and `loop()`'s block from
-the `is_charging` verdict through `dcAwakeTrack()` (release latch and silent hold, taper stall count, DC session,
-next-wake cadence, fast budget and cap, corroboration, the stale guard) with the helpers it calls, from `SM_PIN`
-for OLD. Polls carry a scripted car answer (current, voltage, soc/kwh/soe steps, `is_dcfc`, the rail, or silence),
-the RTC microsecond clock runs through sleeps, and every energy RTC field, RAM output and the next-wake minutes are
-compared; a sample poke the DC hold does not keep sleeps after its one poll. An energy alphabet (16 symbols, about
-1 M sequences at depth 5, soc-less kwh and soe profiles among them) is enumerated beside the drive one, the random
-group mixes charge polls in, and named scenarios cover an AC charge and its release, DC by power through a taper and
-the car's `is_dcfc=0`, the silent hold and parked-held, the stale reset after `CHARGE_STALE_RESET_MINUTES` (held, on
-an answered poke and on a skip wake), the post-drive window's polls and expiry, the stream-trust delay, the fast-budget cap,
-corroboration, and a DC session released silent on a streaming wake. The post-drive window at the ladder end and the
-poke's sleep stay shared context.
-
-Since 0b-2 (#82) it also covers the `setup()` wake: the whole ATRV gate block (the ATRV
-read, the taper bridge and its give-up, the charge-end read, the follow-up, the poll decision, the alarm suppression,
-the poll and skip counters, `since_poll`, every gate log line, the weak-rail cold boot and the skip path), from `SM_PIN`
-for OLD, over multi-wake sequences in which the RTC state carries across sleeps and RAM resets. `chargeWakeStateSanitize`
-is pinned too, though no modelled reset can show it: every reset but a deep-sleep wake reloads RTC. A wake carries the
-rail, the ATRV read, the alarm flag and an optional charge latch; the RTC epoch runs through sleeps and a cold boot
-zeroes the clock. A wake alphabet (17 symbols, about 1.4 M sequences at depth 5: each gate threshold, latched wakes in
-every give-up band, the ATRV threshold, a weak cold boot, an alarm-enforced poke) is enumerated beside the other two,
-and named scenarios cover the taper budget to its give-up, the charge-end read once per latch, a weak cold boot's BLE
-window and its modem-off expiry, and the counters and `since_poll` across wakes. setup()'s last-poll stamp, the weak-rail
-window's expiry and the sleep's modem override for it are shared context. So is `loop()`'s poll condition (#104): a
-poll reaches the car only when it holds, so the property "a poll ran on a weak-rail wake" holds a weak cold boot to the
-firmware's own veto (`!g_weak_rail_cold_boot`), and the named scenario checks that its window's cycles ask the car
-nothing. The veto never lifts within the wake, which ends when the window expires with no phone connected or when a
-cycle's rail reaches `RAIL_AWAKE_VOLTS` (the car switched on), sleeping `WEAK_RAIL_RECOVERED_WAKE_MINUTES` with the
-modem off; a connected phone holds that recovery off only inside the key-reset window (`authResetWindowOpen()`,
-extracted from `auth_gate.h` as shared context with the recovery block). A named scenario covers it with no phone, and
-with a connected phone (`sm_ble_connected`, the harness's only phone) inside the key-reset window, holding the BLE
-window open past its length, and after the key-reset window, when the rail ends it. The
-runner fails if the condition loses that term or stops guarding the lazy init and `readPIDs()`, if any
-`obd.readPIDs(` or `sys.gpsBegin()` in `logger.ino` sits outside a block vetoed on it (`dcPromotePoke()`, which needs
-a sample poke, and `FILE_TEST` excepted), if setup()'s boot clock resync loses its `!g_weak_rail_cold_boot` guard, or
-if the recovery block leaves its place directly ahead of the expiry. GNSS power itself is not modelled: a poll's GNSS
-input is the event's.
-
-Since #83 the fast-cadence budget is checked as properties on both sides, against the adapter's own record: a poll on
-the charging branch (a fast tier, no cadence reason) never comes with the budget already at `WAKE_CHARGING_MAX_MINUTES`;
-a sample poke, and a streaming wake's first charging poll, add exactly the tier they arm, and the polls after it the
-whole minutes since; a streaming release, and a stale charge on a release, the silent hold or a skip wake, reset the
-budget, and nothing else does (a sample poke's release keeps it until stale). Staleness is judged as loosely as the
-firmware's read inside the block allows, either way. The follow-up and post-drive looks arm the charging cadence past
-the cap by design (once per charge; `POST_DRIVE_*`), named in a scenario. The cap and the stale reset are out of
-depth-5 reach from a cold start, so enumerate (energy symbols and an odd advance, at depth 4) and random also start
-from a charge one poke short of the cap and a charge one parked wake short of stale, released or still latched.
-It also runs the OBD-alarm permit: `alarm_gate.h` from the setup grant through `alarmGateAllowsPoll()`, pinned for OLD,
-as the last term of `loop()`'s poll condition, after the weak-rail veto, and pinned by position (the car is asked,
-`readPIDs` and the deferred `obd.initialize`, only inside that condition, compiled in the default build, after the rail
-and GNSS refresh). On an enforced car a poll asks the car
-exactly when an oracle kept from the trace's inputs permits it (the setup window with an authenticated phone or within its BLE grace, or the
-rail awake and a moving fix no older than `ALARM_GNSS_MAX_AGE_MS` or a speed note within `ALARM_SPEED_HOLD_MS`, a
-sustained collapse voiding the note), and every DENY line carries a `tx=` that never moves between two of them (a check
-of the transition logging: only the gated branch moves the counter here). Scenarios cover a parked car, a
-moving fix, a tunnel on the speed hold, a stale fix, a short dip and a switch-off, and the wizard's setup permit with
-the phone leaving, each boundary to the millisecond; random
-adds 500 sequences on an enforced car with fix ages around the bound. The per-PID guard inside `readPIDs` is not covered.
-
-## Diagnostic host checks
-
-Run `python3 tests/run_log_diagnostics_checks.py` for actual DataLogger, CSV, and GPS-selection checks.
-The filesystem is in memory; tests cover schema rotation, failed opens, partial headers, serial dump,
-BLE byte-stream reading, cached GPS fields, native millis wrap, and that BLE write logging (`ble-write`)
-records keys, never values, and (`motion`) the per-minute `MOTION` line aggregation: percentages, peak/mean,
-one line per minute, the partial-minute flush at sleep and uncounted OTA/log-dump windows. `fw-build` covers the `FW build=` line: top of every new segment (first boot, schema
-rotation, size rotation inside `logEvent` with the segment size still exact, `CLEAR`), again on a
-non-deep-sleep boot, never on a continued segment, and the `eacc642` loader not rotating on it. `dump-since` covers `DUMP SINCE`: clockless boots
-taking their boot's first epoch across a segment boundary, a never-clocked boot taking the epoch before it, a
-millis-drop boot boundary, context lines under their own segment headers, a since older than everything (byte-equal
-to `DUMP`) and newer than everything (header and end marker), that segments ending before since are never opened,
-that logging resumes, and the console parse. `loop-gap` (#110) covers the `WAKESTAT` loop gap on the real helper: a
-seed-only first visit, the longest gap and when it ended, a gap across the 32-bit `millis()` wrap, a console command
-re-seeding it, and that `loop()` notes it before the activity ladder and re-seeds after `handleLogCommands()`.
-`stat-widths` renders the `FLUSHSTAT` and `WAKESTAT` literals from `sleep_power.h` through the real `logEvent` at
-their widest (107 and 78 characters). `run_modem_checks.py` pins both calls whole (arguments, stamps, the sleep entry's
-closing loop-gap visit) at their positions in `enterDeepSleep`; the upload `queue` group checks the batch counters
-behind `FLUSHSTAT`. No runner compiles the flush with logging on, so
-the lines themselves need a bench flush. `--since-helper <absolute path to capture2.py>` (optional; internal
-tool) runs 300 random synthetic logs against its `SinceFilter`. `--capture-helper <absolute-script-path>` (optional; the helper is an internal tool,
-not in this repo) also verifies a synthetic dump through it, including actual historical
-`eacc642` logger-begin and CSV-builder code simulating a firmware rollback; this does not open a device.
-`CXX="clang++ -DNDEBUG"` keeps assertions checked.
-
-Run `python3 tests/run_upload_checks.py` for real SIM7070 send/AT parsing and upload-helper checks with
-ASan/UBSan and NDEBUG. UART is fake. Python hashlib/hmac/base64 independently verify the logged
-fingerprint and every signature, so the host mbedTLS shims are never their own oracle.
-Its `session` group (also part of `tls-ca`) runs the real `CellWrapper::connect()` on the real SH
-open/close/send: the production driving cadence plus one poll must not exceed `SESSION_IDLE_MAX_MS`, and the
-limit plus the measured connect-to-POST time must stay under the 61.3 s idle at which reused sessions failed
-in the field. Idle exactly the limit reuses (logged `reused idle=Ns`), 1 ms more reopens (`idle=Ns <trace>`,
-kept when that reopen fails), and a silent POST is http=0 with `p/a/r=1/1/255` and the retry opens fresh.
-Run `python3 tests/run_gzip_container_checks.py` for the real `gzip_body.h` linked with the vendored
-zlib. What it covers:
-- the `libraries/zlib` SHA256SUMS drift check;
-- independent Python decompression and CRC/ISIZE checks;
-- an absolute ratio floor, 9 synthetic points under `CELL_MAX_POST_BYTES` for every seed;
-- the pinned `library.json`;
-- verify failures, each with its own cause, from tampering with the block type, a stored block, the CRC
-  and the ISIZE;
-- the failure budget;
-- the crash breadcrumb;
-- the PSRAM allocation and verify-memory failures, and the per-wake summary;
-- the refused member's header bytes in the verify-fail line, an OTA self-test body past the 4 KB malloc
-  threshold that refuses the field fault (header byte 9 zeroed), and the `GZTEST` console loop (counts by
-  cause, no failure budget spent, argument caps, any key stops it).
-
-zlib is compiled with `CC` (default `clang`), which takes `-DNDEBUG` from `CXX`. PSRAM allocation, RTC
-memory and the clock are shims. The checks do not prove what the server or the modem accepts.
-Upload group `gzip-fallback` checks that a gzip failure never sends an over-cap body or drops a frame, and
-that the sized body is the sent body.
-
-GPS CSV `gps_read=ok` means parsing accepted a reply, including replies with zero coordinates.
-`gps_fix` still means cached nonzero coordinates. Date/time and speed are the cached accepted record,
-not fields from a rejected reply. `gps_field` is 0=date, 1=time, 2=latitude, 3=longitude,
-4=altitude, 5=speed; -1 is not applicable. On `gps_read=coord`, 4 means the jump filter refused the altitude. `gps_read=unconfirmed` is a wake's first fix, held until a second fresh fix agrees. `gps_time_age_ms` measures elapsed time since
-receiver date/time changed, not proven position-observation age; blank means unknown. Reply bytes
-count only co-processor bytes, not direct UART bytes. `gps_source` records the GPS helper's actual
-coordinate selection (gnss/frozen/omitted), not final wire eligibility. The freshness serializer can
-subsequently omit selected coordinates when their observation time is unknown or invalid. Source
-selection does not itself establish that a location was uploaded.
-The log has no raw-fix columns: `lat`/`lon` (3 decimals) hold the position `gps_source` selected, which
-is the receiver fix itself when `gnss`, and `PARKED_LOC` events log the frozen average. Both are written
-before send-time freshness, so they include positions the uploader later omits; treat flash logs as
-private. Segments from older firmware keep their `gps_lat`/`gps_lon` until rotated out. GPS columns are an optional
-tail after the exact legacy CSV prefix. Rollback rows require the current capture helper, which reports
-legacy-shaped rows and leaves absent diagnostics blank rather than guessing their origin or values.
-
-Upload request IDs reset each wake. The 12-hex SHA256 is a truncated final-wire-payload fingerprint,
-not an authentication or exactly-once guarantee. `src` counts source frames, `pts` serialized points,
-and `sutc` spans source frame UTCs, including frames omitted by serialization. `loc`/`ldup` count locations sent
-and omitted as already sent, appended only when both fit whole. `p/a/r` is the observed
-prompt/body-ACK/POST result; `rx` is declared/SHREAD/captured response length. `w=?` explicitly means
-UART-written length is unknown. `cut=-1` means response completeness is unknown, 0 measured complete,
-and 1 measured incomplete. Raw server bodies are not recorded: only fixed categories and length/
-truncation metadata. The body-ACK outcome remains diagnostic; POST acceptance and retries are unchanged.
-
-## Combined freshness verification and rollout
-
-The combined heading/GPS runner now has 32 groups; `upload-gate` covers which polls are buffered for upload. Run it normally and with `CXX='clang++ -DNDEBUG'`.
-It covers accepted-record observation UTC, strict calendars, independent location/heading times,
-frozen-average contributor times, and valid GPS clock seeding before a coordinate fix. The backlog
-oracle compiles the historical `eacc642` loader/serializer/resave path; it verifies numeric battery
-FIFO preservation and prevents old firmware from restamping protected geo. A successful historical
-battery upload deliberately discards protected geo history. Queue power-loss atomicity is unchanged.
-
-`__geo_` is reserved, scrubbed from profile results and public serializers, and stored as numeric
-shadow metadata only in the private backlog. Legacy/invalid geo provenance drops geo, not otherwise
-eligible battery/state. Actual RTC retention, cross-image resets, on-device gzip and modem behavior remain
-hardware gates. Sender-side geo eligibility does not depend on any server-side change; the backend's existing
-clock-skew normalization is unchanged.
-
-## Send-time geo expiry verification
-
-Upload groups `geo-expiry`, `geo-retry`, and `geo-sizing` exercise the real public upload path,
-including in-memory LittleFS save/restore and failed-send resaves. The runner uses production
-`config.h` constants, including the 1000-byte cap and `GEO_MAX_SEND_AGE_SECONDS` (29 * 24 * 60 * 60
-seconds, inclusive). The one-day margin under the server's 30-day window mitigates clock/transport
-error; it does not guarantee safety for a bad but apparently recently synchronized clock. Expiry,
-clock-quality retry, and sizing checks also run with logging disabled. Compiling RED assertions
-cover unknown clocks with valid fresh geo/SOC, unsynced retained RTC, the former 30-day boundary,
-invalid explicit formatter time, and raw-RTC retry/sizing policy regressions.
-
-`logNetwork(frames)` has no freshness-bypass parameter. Its internal `uploadSendUtc()` captures the
-uint32 RTC once and validates that snapshot through the real `clockNeedsSync(now)` predicate. The
-snapshot must be > 1e9 and at most `CLOCK_MAX_EPOCH`, the smaller of UINT32_MAX and the native
-`time_t` positive maximum. `last_clock_sync_epoch` must also be valid, nonzero, not future, and at most
-`CLOCK_RESYNC_SECONDS` (900) seconds old. Never-synced, stale, inconsistent, unrepresentable, and unknown
-clocks omit geo, not eligible battery/driving/charging data. Snapshot-aware `uint64_t` overloads of
-`clockValid`, `clockStale`, and `clockNeedsSync` validate raw uint32 epochs without signed narrowing;
-the existing no-argument acquisition APIs remain. The retained `RTC_DATA_ATTR time_t` sync field and
-its layout are unchanged.
-
-Buffered uploads take one trust-aware UTC snapshot per attempted batch and use that exact eligible
-policy for both sizing and final serialization, even if clock quality changes during compression.
-Each retry and subsequent batch takes a new snapshot. The internal `logNetworkAt(frames, send_utc)`
-is not a new public sender entry point. The shared `bulkStringV2(frames, send_utc = 0)` formatter
-fails closed on missing, invalid, fractional, nonfinite, or out-of-native-calendar send times. Location
-and heading observation UTCs must also fit the same native-calendar bound before their `time_t` casts.
-An explicit valid formatter time represents caller-validated clock trust; offline mapping tests use
-fixed explicit trusted times, never frame UTC as the actual send clock. Historical numeric backlog
-provenance/calendar acceptance is not narrowed by this wire-only eligibility bound.
-
-Eligible location and heading retain their independent original observation UTC. Filtering never
-rewrites source frames or failed-send backlog provenance. Eligible battery/state retain original
-frame UTC; on a trusted send clock `uploadBuffered` drops a frame whose own UTC is more than
-`BACKLOG_MAX_SEND_AGE_SECONDS` (6 days, inclusive) old before sizing (upload group `queue`). Geo-only
-omitted batches keep the successful no-POST rule. Future-relative-to-corrected-send-clock normalization remains the backend's existing
-policy. Both host runners extract the production clock-quality predicates instead of faking them;
-UART, clocks, compression, and filesystems remain fakes. Real RTC retention, clock acquisition,
-modem timing, on-device gzip and hardware remain unverified; no device was flashed by these checks.
-
-## Send-once geo verification
-
-A location or heading goes up once per new GPS observation; the design is in `DONGLE_CONTEXT.md` §6a.
-Upload group `geo-dedup` covers repeats within a batch, accepted/failed/unanswered outcomes, new times or
-coordinates, multi-batch partial failure, sizing against the mark, boot clearing and untrusted clocks; the
-heading `upload-gate` group covers a geo-only poll buffered once while unaccepted, never again after, and
-not again behind a restored or an unread backlog. RTC retention across deep sleep and what the backend shows between
-sends need a parked night.
-
-Run `python3 tests/run_clock_range_checks.py` normally and with `CXX='clang++ -DNDEBUG'` for extracted
-production predicates, sender snapshots, and formatter checks under both host-native `time_t` and a
-signed32 target alias. Add `--target-cxx /path/to/xtensa-esp32-elf-g++` to compile native type/bound and
-unchanged RTC-sync ABI probes using the actual target compiler. Host calendar bridging emulates signed32
-writes but is not ESP32 runtime verification. The current ESP32 toolchain has signed32 `time_t`:
-INT32_MAX (2038-01-19T03:14:07Z) is inclusive; INT32_MAX+1 and UINT32_MAX are untrusted. Native time64
-hosts retain the uint32 ceiling. This patch does not upgrade existing time-source/GPS conversion or
-battery/calendar formatting for dates after 2038; that broader firmware limitation remains unsupported.
-
-Clock groups `drift`, `resync`, `bounds` and `modem` drive the real `clock_sync.h` (compensation, `setClock`,
-the drift learner, `clockResync`, both NTP triggers, the parsers, NVS) against a fake microsecond clock, `millis()`
-and a scripted modem; `modem` runs the real `CellWrapper::syncNtp`/`readClock` against a scripted UART. They also
-compile logger.ino's two NTP call sites against their globals, check every log line fits logEvent's buffer (at
-most 119 chars), and check that a post-OTA trial boot zeroes the clock. The source policy is in DONGLE_CONTEXT.md
-§6a. Still needing a dongle and a parked night: the real RC rate, RTC retention, NVS across a re-plug, what
-`AT+CNTP` mode 1 does, NTP right after a POST, and real NITZ quality (look for `CLOCK drift ... src=` and
-`CLOCK ntp=` in the dump).
-
-## Energy and temperature host checks
-
-Run `python3 tests/run_energy_checks.py` for charge progress/corroboration, the `is_charging` verdict
-and release latch (`signal`, `release`; replays field current sequences, no location data), the `setup()`
-wake gate (taper and charge-end reads), the `SLEEP enter` reason labels (`sleep-reason`), the crash-loop
-streak (`wdt-streak`: the real `wdt_streak.h` store across simulated resets, brownouts counting with
-crashes, garbage and foreign stores, the escalation's threshold and cadence, the OTA commit ending it, the
-retained "modem may be on" flag every sleep acts on, the park-marker debt copy, and the weak-rail cold boot
-never reconnecting the modem, plus the extracted startup slice verifying the threshold-3 timer-only sleep
-before `sys.begin()`; RTC retention and actual peripheral power remain hardware gates), the DC fast-charge hold
-(`dc-awake`: entry on the car's `is_dcfc` or inferred power, the per-charge DC latch through the taper, the
-time-based silent hold (a seeded hour of 60 % silence) and the backstop sleep, budget by elapsed time on motion wakes, the 30 s cadence outside BLE, the CHARGING hold and the sample-poke stay, the
-live rail/alarm/motion vetoes, motion promoting a held poke, every exit and its sleep tier, a new AC charge not
-latched, and the cadence kept under `SESSION_IDLE_MAX_MS`), the ABD1 frame fitted to MTU−3 (`ble-frame`: compact 2 dp numbers, key filtering, priority trimming, MTU 23, and the `BLE tlm` log cadence), telemetry serialization, CSV columns, and schema-rotation checks under
-ASan/UBSan. Add `--profiles /path/to/profiles` to exercise actual Scenic/iX3 production/developer
-equations with the firmware parser (optional: the ABRP backend profiles are not public). The runner extracts the current charging and logging code;
-filesystem and hardware are fakes, not on-device verification.
-
-## OBD reply checks
-
-Run `python3 tests/run_obd_reply_checks.py` for the real `genericProtocol()` on protocol-6 `22xxxx`
-replies, extracted from `obdwrapper.cpp`: a clean reply decodes to fixed bytes, stray, blank and short lines
-ahead of a single or first frame are dropped, a re-segmented reply under a foreign header and a wrong DID
-are refused, non-`22xxxx` requests are left to the plain parser, and truncated replies decode their partial
-bytes. `header` covers the expected reply ID (the #45 splice, another ECU's answer to the same DID, foreign
-frames inside, after or instead of our consecutive frames, a lost frame, negative responses and non-frames,
-each with its refusal reason and the ID seen), `expected` the ID derived from the profile's filter commands,
-and `retry` the real `readPIDs()` against a scripted co-processor link: one resend of the command after a
-refused reply, none after a negative response, an unfinished reply or a closed alarm gate, none again after
-a failed retry until the command decodes, the 220105 capture keeping the first reply, and polling a profile
-that threw part-way through being applied. `failures` covers what `readPIDs()` keeps for the `OBDFAIL` log (#85): a
-refused AT filter, no data, a refusal, an out-of-range value and a reply too short for its equation, each with the
-command's index and reply, cleared each poll. It also covers `loop()`'s logging block, compiled from `logger.ino`:
-once per command, 4 a poll, only on a poll the car answered, the 8 slots kept for commands not yet logged, again
-after a new profile. `profile` runs the reference MEB SoC cases (11 replies including the missing-reply fallbacks)
-through the real `readPIDs()` and expects the app's numbers: virtual `VAL{}` keys in any order with min/max
-clamping, multi-command keys, missing bytes as NaN, the multi-frame index digit, `==` and refused `!=`, and the
-parser refusing a function it has no node for. Fixtures are scrubbed co-processor replies (the MEB ones shared
-with the app, with their line breaks put back); the co-processor itself is not exercised.
-
-## Profile push checks
-
-Run `python3 tests/run_profile_checks.py` for the BLE profile hand-off: the real `configCallback` stash, config-apply
-block from `loop()`, `loadPersistedProfile()` and `forgetProfile()` against an in-memory LittleFS. A push's hash is
-committed only after its file is written; a push landing during the apply stays pending and is not the one persisted;
-a key reset forgets file, hash, token, queue and pending push, and ends a running log dump and update, drops queued BLE
-events and erases the log before it clears the rest, so its reason is the first line of the fresh log; a log that
-cannot all be erased fails the forget with everything kept, and a profile or backlog file that stays fails it with the
-token and queue kept; an empty log still erases. `completeSetup`, the per-connect `new_hash` reset and
-both key-reset call sites are checked by position. A full push writes `/vehicle_profile.json` even when
-the profile is unchanged (a token-only re-push survives a reboot, with the re-init still skipped), and a failed
-write, or a push that does not apply, invalidates the hash and removes the file, so the next boot cannot restore an
-older token. On a weak-rail cold boot (#104) the restore and a push take the profile and token, persist and commit as
-usual, and leave `obd.initialize()` deferred (`g_obd_needs_init`); the next wake's restore runs it. The runner also
-checks that `otaFinalize` and `bleDeinitForSleep` drop a push still pending, after the boot-partition commit and after
-`ble.deinit()`, by position only. The BLE task, NVS and the reset itself are not exercised.
-
-## BLE protocol and relay-session checks (#90)
-
-Run `python3 tests/run_relay_checks.py` (groups `old-app`, `acking`, `stall`, `never-ack`, `resume`, `disconnect`,
-`presence`, `hold`, `sessions`, `persistence`, `negotiation`, `grant`, `nonce`, `stop-resume`, `mailbox`, `state`,
-`subscribed-seq`, `seq-frame`, `dump-cellular`, `unsubscribed`, `fixtures`, `enumerate` with `--depth N`, default 4; and
-`no-protocol`)
-for the protocol version a session negotiates and whether a connected phone is the transport. It compiles the real
-`Helpers/ble_relay.h` (the session state machine and the ABD9 session channel), `ble_protocol.h` (negotiation and the
-per-version tables), auth_gate.h's `authSendNonce`, ble.h's predicates, the ABD1 frame builder, the upload queue, v2
-body and backlog encoder, and from `loop()` the ABD1 send, the queue block, the modem reconnect gate and the upload
-gate with its grace and handoff; BLE, HTTP, the clock and `esp_random` are fakes. A second build with
-`-DBLE_PROTO_MIN=1` runs `no-protocol` and its fixture row; it is compiled only when no group or one of those two is
-named, and a group name that neither build has fails the run. Covered: the negotiation matrix (absent, 0, 1, 7, the
-malformed values, MTU < 96), the version bound to the grant (a repeat proof keeps it, a reconnect between two loop
-passes selects the new grant's), the nonce frame (70 B, 80 B with `"reset":1`), the no-protocol session (setup refused
-before the grant, nothing relayed, everything uploaded). The eight #90 acceptance scenarios run as negotiated v1
-sessions: a v0 app reads frames byte-identical to the pinned pre-#90 builder and keeps the transport however long it
-stays (its ABD9 writes logged once by key and ignored); in v1 frames carry `seq` beside `tlm` only while the app is
-subscribed to ABD1, relayed frames are queued until acked on ABD9, the transport lapses exactly `RELAY_ACK_TIMEOUT_MS`
-after the first outstanding frame or the last ack that moved forward, cellular then sends every unacked frame once, in
-order, and a forward ack or a resume hands it back; an app unsubscribed from ABD1 with untagged frames queued lapses
-`RELAY_UNSUBSCRIBED_MAX_MS` after the first one, and subscribing again ends that; an empty frame takes no seq; a stop
-lapses at once and only a resume ends it; a burst of ABD9
-writes collapses (ack first, then the verb), and an entry from an ended grant is discarded; the readable state (at
-most 93 B, `sent` and `oldest`: the lowest seq still queued for cellular, held frames included, 0 for none) follows
-every transition and a notify never replaces it, and an app that gave up on seq N can tell when N has left the queue
-(the give-up drain: `sent >= N` and `oldest` 0 or above N); a log dump keeps every cellular gate closed; a
-seq never reaches a body or the backlog. `enumerate` runs every 4-event sequence over 15 events from three starting
-points (about 152 k sequences, ~50 s under ASan with the compile) against the session invariants: no frame counted as relayed without
-being queued, no seq while unsubscribed, no tagged frame from an ended session, no frame dropped that its own session
-did not ack, the version fixed for the grant, a new v1 session starts live, only a resume ends a stop, no unsubscribed
-v1 session holds cellular off with untagged frames queued past `RELAY_UNSUBSCRIBED_MAX_MS` (a wait exactly the ack timeout passes it only, a long one both bounds),
-and the ack timeout both ways: tagged frames unacked past `RELAY_ACK_TIMEOUT_MS` (not held) lapse the transport, and a
-live, subscribed session keeps it until then (a wait 2 s short of the timeout; a session idle with everything acked
-must not lapse on its next frame). The model keeps each grant's ack clock (session start, forward ack, a resume or
-resubscribe ending a lapse, every pass with nothing outstanding or a log dump running); a failure names its sequence. `fixtures`
-replays every file under `protocol/fixtures/` the firmware owns (see its README) and checks the main-firmware nonce
-frames against `authSendNonce` from the pinned main commit. Checked by position: the ABD2 handler (its `PROTO` gate
-right after `NOAUTH`, no `relay_ack` case left), a connection starting with no grant (`onConnect` clears it), the GATT table (ABD1-ABD8 as on the pinned main commit, ABD9/ABDA
-with notify and an encrypted CCCD, 30 of 32 handles, the ABD1/ABD8/ABD9 CCCDs cleared on disconnect, the boot handle
-log), auth_gate.h around `bleProtoAccept` (after the HMAC check, the only grant, its reply notified straight after), version numbers outside
-`ble_protocol.h`, which gates key on `bleAuthenticated()`, and the ABD5 info JSON's worst-case length. A phone, the
-app, the GATT stack and the modem are not exercised: the bench procedure is a local document next to the design.
-
-Run `python3 tests/run_protocol_fixture_checks.py` (no compiler) for `protocol/fixtures/`: `SHA256SUMS` lists every
-file and nothing else, every file is what `generate.py` writes, follows the README's schema, and every proof is
-recomputed with hashlib. The app copies the directory with its sums; `v0/` is frozen, `v1/` freezes when v1 ships.
-
-## Config macro checks
-
-Run `python3 tests/run_config_checks.py`: preprocesses `config.h` for the default build and every flag set `tools/check_variants.sh` builds,
-and fails if `ENABLE_NETWORK` does not behave as one value inside an `#if` (`ENABLE_NETWORK && X`, `!ENABLE_NETWORK`).
-
-## Cellular TLS trust checks
-
-Run `python3 tests/run_server_roots_checks.py` (add `--require-live` to fail rather than skip when
-`api.iternio.com` is unreachable) and `python3 tests/run_upload_checks.py tls-ca`. Neither proves what
-the modem accepts; that needs `TLSCHECK` on a dongle.
-
-`python3 tests/run_upload_checks.py signing` covers the signed upload: the shared RFC 9421 vector byte for
-byte, every signed POST recomputed by the runner from the captured wire bytes with Python's
-hashlib/hmac (gzip on and off), no `X-TLM-TOKEN`, and the real `setHeaders()` AT output (quote escaping,
-refused values, the header budget, abort on a refused `AT+SHAHEAD`) and the best-effort User-Agent.
-
-## Cellular registration host checks
-
-Run `python3 tests/run_modem_checks.py` normally and with `CXX='clang++ -DNDEBUG'`.
-It exercises production cellular startup, registration/recovery and sleep against fake UART/time/hardware.
-Host checks do not verify real attachment timing, electrical sleep behavior or vehicle power/GPS.
-
-## Adaptive upload-queue checks (#75)
-
-Run `python3 tests/run_upload_checks.py queue` and `logging-off`, and `python3 tests/run_heading_checks.py upload-gate`,
-`geo-backlog-rows` and `geo-downgrade`, normally and with `CXX='clang++ -DNDEBUG'`, for the real queue helper, the poll
-buffer, the PARK marker, held-frame save and the bounded backlog restore. The upload runner compiles with
-logger.ino's `MAX_UPLOAD_BUFFER`. `tests/support/upload_heap_fixture.h` measures the queue's real storage and places it
-as the firmware does (pairs and long keys in PSRAM while there is PSRAM, the outer array there from the 4 KB malloc
-threshold), independently of the estimator. `queue` covers the #75 field heap (2292 B largest internal block, PSRAM
-free: the queue fills to the cap with no internal heap at any step), short PSRAM, no PSRAM with long keys, and the
-backlog's flash budget and a failing write. It does not emulate ESP32 fragmentation or prove that unrelated
-allocations succeed; the PSRAM allocation itself only runs on a device.
-
-Upload group `backlog-append` (#92) covers a wake that cannot upload: an unread file counts as queued, its save
-appends to the earlier wakes' file without reading it or changing its bytes, a second save appends nothing twice, an
-append that loses the marker re-arms it (held frames first), an append past the flash budget compacts instead, a load
-whose remove fails is not read again, is overwritten and once sent removed, a token change's file is never read, a
-torn last line keeps the appended frame, and past `BACKLOG_MAX_BYTES` the file is compacted to the newest frames
-within `BACKLOG_COMPACT_BYTES` (file, held, RAM, marker last). The heading runner checks by position that `setup()` no
-longer reads the backlog and that both cellular uploads load it once registered, before `connect()`; `upload-gate`
-covers a frozen fix not buffered again behind an unread file while a live fix and a poll with data are, and
-`geo-downgrade` the `eacc642` loader on an appended file. Real LittleFS append time and a parked offline night remain
-hardware gates.
-
-`python3 tests/run_sm_checks.py` keeps the extracted queue helper on the CUR side under high heap and compares
-the drive/marker behavior with the pinned side. It does not prove low-heap admission, LittleFS behavior or
-hardware heap characteristics.
+| Question | Reference |
+| --- | --- |
+| Product, hardware and supported cars | [README.md](README.md) |
+| Setup and flashing | [docs/getting-started.md](docs/getting-started.md) |
+| Code layout, settings and console | [docs/technical-overview.md](docs/technical-overview.md) |
+| Release process and signing | [RELEASING.md](RELEASING.md) |
+| Enabled features / BLE layout / auth | DONGLE_CONTEXT §1 / §2 / §3, Appendix A |
+| OTA / log retrieval | DONGLE_CONTEXT §4, Appendices B–C / §5 |
+| Sleep, wake gates and battery protection | DONGLE_CONTEXT §6 |
+| Cloud uploads and profiles / co-processor limits | DONGLE_CONTEXT §6a / §6b |
+| OBD-alarm gate / app obligations | DONGLE_CONTEXT §7 / §8 |
+| Diagnostics / invariants | DONGLE_CONTEXT §9 / §11 |

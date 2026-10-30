@@ -241,7 +241,6 @@ void BLEWrapper::init() {
   pSessionCharacteristic->setCallbacks(new SessionCallbacks(this));
 
   // https://www.bluetooth.com/specifications/gatt/viewer?attributeXmlFile=org.bluetooth.descriptor.gatt.client_characteristic_configuration.xml
-  // Create a BLE Descriptor
   pTelemetryCccd = new BLE2902();
   pTelemetryCharacteristic->addDescriptor(pTelemetryCccd);
   BLE2902* pStartupCccd = new BLE2902();
@@ -282,7 +281,6 @@ void BLEWrapper::init() {
     pReservedBCccd->setAccessPermissions(enc_cccd);
   }
 
-  // Start the service
   pService->start();
   // Every characteristic's value handle, now that start() has registered them. They follow heap-address order, not
   // creation order (see the FROZEN TABLE note in blewrapper.h), and a bonded phone's cached table is only right while
@@ -292,7 +290,6 @@ void BLEWrapper::init() {
     pOtaControlCharacteristic->getHandle(), pOtaDataCharacteristic->getHandle(), pLogDumpCharacteristic->getHandle(),
     pAuthCharacteristic->getHandle(), pSessionCharacteristic->getHandle(), pReservedBCharacteristic->getHandle());
 
-  // Start advertising
   BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
   pAdvertising->addServiceUUID(SERVICE_UUID);
   // Put the device NAME + TX-power in the SCAN RESPONSE, not the primary advertisement packet.

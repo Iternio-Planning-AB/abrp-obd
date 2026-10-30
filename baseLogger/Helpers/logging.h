@@ -1,13 +1,8 @@
 #pragma once
 /*
-  Flash logging + serial console helpers (ENABLE_LOGGING).
-  Contains: the CSV schema (LOG_HEADER) and row builder (buildLogLine + stateName/fcol),
-  the EVT event marker writer (logEvent), and the serial console (handleLogCommands:
-  DUMP/STAT/CLEAR/RESUME, raw AT passthrough and the RADIO modem-config dump).
+  Flash CSV/event logging and serial diagnostics (ENABLE_LOGGING).
 
-  Extracted verbatim from logger.ino (definitions moved, logic unchanged). This file is
-  #included by logger.ino into the single sketch translation unit - it is NOT a standalone
-  compilation unit - so it shares logger.ino's globals and the config.h feature flags.
+  Included into logger.ino's single translation unit; shares its globals and config.h flags.
 */
 
 static unsigned long gpsFixAgeMs();

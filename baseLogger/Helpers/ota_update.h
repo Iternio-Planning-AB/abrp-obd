@@ -65,7 +65,7 @@
 
 // Control opcodes: uint16 little-endian in bytes [0..1] of an ABD5 write.
 //   START: [0..1]=0x0001 [2..5]=image_size [6..9]=version [10..41]=sha256 (optional) [42..105]=signature
-//          (reserved for the phase-2 ECDSA check; parsed and ignored today).
+//          Signature is ECDSA-P256 r||s; required when OTA_REQUIRE_SIGNATURE is enabled.
 #define OTA_CMD_START 0x0001
 #define OTA_CMD_END   0x0002
 #define OTA_CMD_ABORT 0x0003

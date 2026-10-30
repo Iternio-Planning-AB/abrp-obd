@@ -132,7 +132,7 @@ panic, watchdog or software reset reloads it.
 ### `baseLogger/Helpers/` — one concern per header
 
 These are **not separate translation units**: they are `#include`d into `logger.ino` in dependency
-order and share its globals. See [`AGENTS.md`](../AGENTS.md) before adding one.
+order and share its globals. See [`baseLogger/AGENTS.md`](../baseLogger/AGENTS.md) before adding one.
 
 | File | What it does |
 |---|---|
@@ -190,7 +190,8 @@ order and share its globals. See [`AGENTS.md`](../AGENTS.md) before adding one.
 
 Host-compiled checks for GPS parsing, telemetry, upload/AT parsing, gzip, clock range, log
 diagnostics and the release tooling. They use the real firmware sources with fake transports; they
-do not replace a run on a real dongle. How to run each is in [`AGENTS.md`](../AGENTS.md#testing).
+do not replace a run on a real dongle. Commands are in [`tests/AGENTS.md`](../tests/AGENTS.md);
+detailed coverage and limitations are in [`tests/README.md`](../tests/README.md).
 
 ## Building
 

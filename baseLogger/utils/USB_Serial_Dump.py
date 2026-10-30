@@ -16,19 +16,17 @@ TIMEOUT_S    = 300            # safety cap (a full ~3.3MB dump @115200 takes ~5 
 def main():
     print(f"[+] Opening {PORT} @ {BAUD}")
     
-    # 1. Initialize the port object WITHOUT opening it immediately
+    # Configure DTR/RTS before opening: toggling them can reset or hold the ESP32.
     ser = serial.Serial()
     ser.port = PORT
     ser.baudrate = BAUD
     ser.timeout = 1
     
-    # 2. Force hardware flow control off BEFORE the OS can toggle pins
-    # This prevents the Mac from rebooting the ESP32 or holding it in a dead state
     ser.dtr = False
     ser.rts = False
     
     try:
-        ser.open() # Now open it safely
+        ser.open()
     except Exception as e:
         print(f"[-] Failed to open port: {e}", file=sys.stderr)
         sys.exit(1)
@@ -59,7 +57,6 @@ def main():
             
             line = raw.decode('utf-8', 'ignore').rstrip('\r\n')
 
-            # Look for the absolute end of the transmission
             if line.strip() == END_MARKER:
                 print('[+] Empty log' if not capturing else '[+] Done compiling logs.')
                 break
@@ -81,7 +78,6 @@ def main():
                     continue
                 header_written = True
             
-            # Write the clean data row to the file and print it
             f.write(line + '\n')
             print(line)
             

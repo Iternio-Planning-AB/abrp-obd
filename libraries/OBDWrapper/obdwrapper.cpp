@@ -366,7 +366,6 @@ bool OBDWrapper::readBuffer(std::string pid_string, char* buffer, int bufsize = 
 void OBDWrapper::testPIDs() {
   std::vector<std::string> responses{};
   for (auto pid_string : pids) {
-    // auto pid = std::stol(pid_string, 0, 16);
     char buffer[512]{};   // match readPIDs so a capture shows the whole reply
     if (pid_string.size() > sizeof(buffer) - 2) continue;
     snprintf(buffer, sizeof(buffer), "%04s\r", pid_string.c_str());   // same format as readPIDs

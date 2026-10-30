@@ -1,13 +1,8 @@
 #pragma once
 /*
-  GPS/GNSS helpers - position + GNSS time handling.
-  Contains: the GNSS->RTC clock seed (setClockFromGps), the parked-location freeze that
-  captures the last good driving fix (freezeParkedLocation), and addGpsData() which attaches
-  position/heading to a telemetry frame (frozen fix when parked, live fix when driving).
+  GNSS clock seeding and telemetry location/heading selection, including the frozen parked fix.
 
-  Extracted verbatim from logger.ino (definitions moved, logic unchanged). This file is
-  #included by logger.ino into the single sketch translation unit - it is NOT a standalone
-  compilation unit - so it shares logger.ino's globals and the config.h feature flags.
+  Included into logger.ino's single translation unit; shares its globals and config.h flags.
 */
 #include "FreematicsGPS.h"   // TinyGPS::distance_between
 
