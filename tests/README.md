@@ -151,6 +151,9 @@ energy controller. Transport, actual motion sampling, firmware-width clocks and 
 ## Diagnostic host checks
 
 Run `python3 tests/run_log_diagnostics_checks.py` for actual DataLogger, CSV, and GPS-selection checks.
+The `schema` group also owns the energy suite's former production-header migration case: old energy
+rows are preserved, the new segment uses `LOG_HEADER`, subsequent wakes reuse it, and empty segments
+are reused. Use this runner instead of the former `run_energy_checks.py schema` command.
 The filesystem is in memory; tests cover schema rotation, failed opens, partial headers, serial dump,
 BLE byte-stream reading, cached GPS fields, native millis wrap, and that BLE write logging (`ble-write`)
 records keys, never values, and (`motion`) the per-minute `MOTION` line aggregation: percentages, peak/mean,
@@ -325,10 +328,10 @@ before `sys.begin()`; RTC retention and actual peripheral power remain hardware 
 (`dc-awake`: entry on the car's `is_dcfc` or inferred power, the per-charge DC latch through the taper, the
 time-based silent hold (a seeded hour of 60 % silence) and the backstop sleep, budget by elapsed time on motion wakes, the 30 s cadence outside BLE, the CHARGING hold and the sample-poke stay, the
 live rail/alarm/motion vetoes, motion promoting a held poke, every exit and its sleep tier, a new AC charge not
-latched, and the cadence kept under `SESSION_IDLE_MAX_MS`), the ABD1 frame fitted to MTU−3 (`ble-frame`: compact 2 dp numbers, key filtering, priority trimming, MTU 23, and the `BLE tlm` log cadence), telemetry serialization, CSV columns, and schema-rotation checks under
+latched, and the cadence kept under `SESSION_IDLE_MAX_MS`), the ABD1 frame fitted to MTU−3 (`ble-frame`: compact 2 dp numbers, key filtering, priority trimming, MTU 23, and the `BLE tlm` log cadence), telemetry serialization and energy/temperature CSV columns under
 ASan/UBSan. Add `--profiles /path/to/profiles` to exercise actual Scenic/iX3 production/developer
 equations with the firmware parser (optional: the ABRP backend profiles are not public). The runner extracts the current charging and logging code;
-filesystem and hardware are fakes, not on-device verification.
+hardware is fake, not on-device verification. DataLogger schema rotation is owned by the diagnostics runner.
 
 ## OBD reply checks
 

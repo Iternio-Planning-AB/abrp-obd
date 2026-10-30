@@ -286,6 +286,26 @@ void loggingChecks() {
 }
 
 void schemaChecks() {
+  {
+    const std::string old = "soc,kwh_charged\n49.24,42.230\n";
+    LittleFS = Filesystem{};
+    LittleFS.files["/log0000.csv"] = old;
+    DataLogger updated;
+    check(updated.begin(LOG_HEADER), "updated logger mounts");
+    check(LittleFS.files.size() == 2, "CSV schema change rotates rather than appending beneath an old header");
+    check(LittleFS.files.at("/log0000.csv") == old, "schema migration preserves existing log rows");
+    check(LittleFS.files.at("/log0001.csv") == LOG_HEADER + "\n", "new segment starts with the new schema");
+    updated.end();
+    DataLogger wake;
+    check(wake.begin(LOG_HEADER), "next wake mounts");
+    check(LittleFS.files.size() == 2, "unchanged schema reuses the existing segment");
+    wake.end();
+    LittleFS = Filesystem{};
+    LittleFS.files["/log0000.csv"] = "";
+    DataLogger empty;
+    check(empty.begin(LOG_HEADER) && LittleFS.files.size() == 1, "empty segment needs a header, not another segment");
+    empty.end();
+  }
   const std::string old = "soc,lat,lon\n50,1,2\n";
   const std::string header = "soc,lat,lon,gps_read";
   LittleFS = Filesystem{};
