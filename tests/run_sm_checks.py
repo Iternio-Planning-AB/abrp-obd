@@ -403,14 +403,18 @@ for macro in sorted(used):
         sys.exit(f"FAIL: config.h {macro} differs between SM_PIN and the tree; the OLD side would run with the new value")
 
 # The harness resets each firmware global to a literal; that literal must be the firmware's initialiser: in
-# the tree for all of them, and at SM_PIN too except maintenance_mode, which only the shared context reads.
+# the tree for all of them, and at SM_PIN too except those only the shared context reads: maintenance_mode, and
+# g_pdw_recheck (#22, the ladder end's re-check), which is newer than SM_PIN and must stay out of every pinned block.
+SHARED_ONLY = ("maintenance_mode", "g_pdw_recheck")
+if any(re.search(r"\bg_pdw_recheck\b", pin[block_name]) for block_name in PIN_BLOCKS):
+    sys.exit("FAIL: g_pdw_recheck appears in a pinned block; define it at SM_PIN and check its initialiser there")
 adapter = tree("tests/sm/adapter_pre.inc")
 for region, prefix in (("SM_RAM", ""), ("SM_RTC", "RTC_DATA_ATTR ")):
     body = re.search(rf"^#define {region}\(X\) \\\n((?:.*\\\n)*.*)", adapter, re.M).group(1)
     for type_, name, value in re.findall(r"X\(([\w ]+), (\w+), ([^)]+)\)", body):
         pattern = rf"^{prefix}(?:static )?(?:volatile )?{re.escape(type_)} {name} = {re.escape(value)};"
         for label, src in (("SM_PIN", old_src), ("tree", cur_src)):
-            if label == "SM_PIN" and name == "maintenance_mode":
+            if label == "SM_PIN" and name in SHARED_ONLY:
                 continue
             if not re.search(pattern, src["logger"] + src["sleep"] + src["alarm"], re.M):
                 sys.exit(f"FAIL: {region} {name} = {value} does not match its definition in logger.ino, "

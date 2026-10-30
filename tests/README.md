@@ -74,7 +74,11 @@ group mixes charge polls in, and named scenarios cover an AC charge and its rele
 the car's `is_dcfc=0`, the silent hold and parked-held, the stale reset after `CHARGE_STALE_RESET_MINUTES` (held, on
 an answered poke and on a skip wake), the post-drive window's polls and expiry, the stream-trust delay, the fast-budget cap,
 corroboration, and a DC session released silent on a streaming wake. The post-drive window at the ladder end and the
-poke's sleep stay shared context.
+poke's sleep stay shared context. A CUR-asserted scenario (#22) parks with the rail healthy but low (12.42 V) and checks
+the one `POST_DRIVE_RECHECK_MINUTES` sleep (`pdw-recheck`), then each re-check wake: a low rail skips to the parked
+cadence with no second re-check, a high rail with a charging answer takes the charging cadence, and a silent one gets
+the window's bounded 3-minute retries, then parked. Its RAM flag `g_pdw_recheck` is newer than `SM_PIN`, so like
+`maintenance_mode` its initialiser is checked in the tree only, and the runner fails if a pinned block names it.
 
 Since 0b-2 (#82) it also covers the `setup()` wake: the whole ATRV gate block (the ATRV
 read, the taper bridge and its give-up, the charge-end read, the follow-up, the poll decision, the alarm suppression,
@@ -319,7 +323,11 @@ most 119 chars), and check that a post-OTA trial boot zeroes the clock. The sour
 
 Run `python3 tests/run_energy_checks.py` for charge progress/corroboration, the `is_charging` verdict
 and release latch (`signal`, `release`; replays field current sequences, no location data), the `setup()`
-wake gate (taper and charge-end reads), the `SLEEP enter` reason labels (`sleep-reason`), the crash-loop
+wake gate (taper and charge-end reads; with the real `pdwOpenWindow`/`pdwArmAtLadderEnd`, the post-drive window and
+its #22 low-rail re-check: the band from `IO36_LOCKOUT_HIGH` to `RAIL_AWAKE_VOLTS` only, a window timed from the
+ladder end, none on a weak or unread rail, a build without the ladder's rail read, motion a window old, a latched,
+capped, sampled, alarm-enforced or non-parked wake, and the real NET-recovery reboot keeping its 1 minute), the
+`SLEEP enter` reason labels (`sleep-reason`), the crash-loop
 streak (`wdt-streak`: the real `wdt_streak.h` store across simulated resets, brownouts counting with
 crashes, garbage and foreign stores, the escalation's threshold and cadence, the OTA commit ending it, the
 retained "modem may be on" flag every sleep acts on, the park-marker debt copy, and the weak-rail cold boot

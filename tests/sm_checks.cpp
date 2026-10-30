@@ -671,6 +671,52 @@ void scenarios() {
   check(pdw_expected >= 2 && g_next_wake_minutes == WAKE_PARKED_MINUTES &&
         countLog("POSTDRIVE window closed reason=expired") == 1, "the window expires, logged once", t);
 
+  // #22: a drive that parks with the DC-DC already off ends the ladder at a healthy but low rail. It comes back in
+  // POST_DRIVE_RECHECK_MINUTES once, inside a window timed from the ladder end, then the unchanged gate decides.
+  uint64_t recheck_us = 0;
+  auto parkLow = [&] {
+    start(t);
+    play(Poll(SM_SPEED, 50), t);
+    play(Advance(60000), t);
+    play(Poll(SM_SPEED, 0), t);
+    play(Silent(12.42), t);  // the car shut its DC-DC down as it parked (FIELD, #22: 12.42 V)
+    play(Advance(AT + 1), t);
+    play(Ladder(SmTo::CHARGING), t);
+    play(Advance(AT + 1), t);
+    play(Ladder(SmTo::STANDBY), t);
+    play(Sleep(), t);
+    check(sm_asleep && is_currently_parked && sm_armed_minutes == POST_DRIVE_RECHECK_MINUTES && g_cadence_reason &&
+          std::string(g_cadence_reason) == "pdw-recheck" && pdw_open &&
+          countLog("POSTDRIVE window recheck wake=POWERON rail=12.42") == 1,
+          "a ladder ending at a healthy low rail re-checks in POST_DRIVE_RECHECK_MINUTES", t);
+    recheck_us = esp_rtc_get_time_us();
+  };
+  parkLow();
+  play(Wake(SM_TIMER, 12.42f), t);
+  check(sm_rtc_ms * 1000ULL - recheck_us == (uint64_t)POST_DRIVE_RECHECK_MINUTES * 60000000ULL &&
+        sm_asleep && !sm_gate_open && sm_armed_minutes == WAKE_PARKED_MINUTES, "a low-rail re-check wake skips to parked", t);
+  play(Wake(SM_TIMER, 12.42f), t);
+  check(sm_asleep && !sm_gate_open && sm_armed_minutes == WAKE_PARKED_MINUTES && countLog("POSTDRIVE window recheck") == 1,
+        "and there is no second re-check", t);
+  // Plugged in after parking: the re-check wake finds the rail up and the car answering a charge.
+  parkLow();
+  poke(Charge(-50, 380, 0.5));
+  check(recently_charging && sm_asleep && sm_armed_minutes == WAKE_CHARGING_MINUTES && !pdw_open,
+        "a re-check wake that finds a charge takes the charging cadence", t);
+  // The rail up but the car silent (OBD not up yet): the window's bounded WAKE_CHARGING_MINUTES retries, then parked.
+  parkLow();
+  unsigned recheck_polls = 0;
+  until([&] { return !pdw_open; }, [&] {
+    poke(Silent());
+    if (pdw_open) {
+      check(sm_armed_minutes == WAKE_CHARGING_MINUTES && pdw_polls == ++recheck_polls && std::string(g_cadence_reason) == "pdw" &&
+            esp_rtc_get_time_us() - recheck_us < (uint64_t)POST_DRIVE_WINDOW_MINUTES * 60000000ULL,
+            "a silent high-rail re-check wake retries inside the window", t);
+    }
+  }, "the re-check window's end");
+  check(recheck_polls >= 1 && recheck_polls <= POST_DRIVE_MAX_POLLS && sm_armed_minutes == WAKE_PARKED_MINUTES &&
+        countLog("POSTDRIVE window closed reason=expired") == 1, "bounded retries, then the parked cadence", t);
+
   // A streaming wake trusts a charging sample only CHARGE_STREAM_CONFIRM_SECONDS after the last discharge one.
   start(t);
   play(Charge(-50), t);

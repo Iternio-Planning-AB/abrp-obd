@@ -1342,7 +1342,7 @@ struct Dongle : ChargePoll {
   int g_alarm_flag = 0, next = WAKE_PARKED_MINUTES;
   float ladder_rail = 0;
   const char* g_wake_reason = "TIMER";
-  bool g_pdw_ladder_done = false;
+  bool g_pdw_ladder_done = false, g_pdw_recheck = false;
   int fast_pokes = 0, low_rail_polls = 0;
   float readIO36Rail() const { return ladder_rail; }
   bool ble_up = false;
@@ -1353,6 +1353,15 @@ struct Dongle : ChargePoll {
 #include "pdw_ladder.inc"
 #undef ENABLE_SLEEP
 #undef ENABLE_MEMS
+  // The NET-recovery reboot (logger.ino), whole: it opens the window, then takes its own 1-minute sleep.
+  int g_recovers_since_ok = 2;
+  unsigned long net_reboot_count = 0;
+  std::vector<OBDVector> obd_result_vector;
+  const char* slept_reason = nullptr;
+  void enterDeepSleep(bool, const char* reason) { slept_reason = reason; }
+  void netRecover() {
+#include "net_recover_sleep.inc"
+  }
   bool gate(float rail, bool is_cold, bool is_motion, bool awake = true, bool heartbeat_due = false) {
 #include "wake_gate.inc"
     charge_end = charge_end_poll;
@@ -1360,7 +1369,7 @@ struct Dongle : ChargePoll {
   }
   // Fresh RAM, as every wake is a reboot.
   void boot() {
-    g_sample_poke = g_taper_confirm = g_pdw_ladder_done = false;
+    g_sample_poke = g_taper_confirm = g_pdw_ladder_done = g_pdw_recheck = false;
     g_rail_before_poke = 0;
     g_next_wake_minutes = WAKE_PARKED_MINUTES;
     g_cadence_reason = nullptr;
@@ -1413,6 +1422,11 @@ struct Dongle : ChargePoll {
     next = g_next_wake_minutes;
     return dcAwakeHeld(current_state);
   }
+};
+
+// The ladder end of a build that cannot read the rail there (the #else branch): it reads 0 V, whatever the rail.
+struct NoRailDongle : Dongle {
+#include "pdw_ladder.inc"
 };
 
 const OBDVector SILENT = {};
@@ -1488,6 +1502,8 @@ void postDriveChecks() {
   Dongle fast;
   check(fast.awake(14.2f, false) == WAKE_CHARGING_MINUTES && fast.pdw_open, "a drive ending at a high rail opens the window");
   const unsigned long last_motion = fast.last_active;
+  check(fast.reason("pdw") && fast.pdw_open_us == (uint64_t)last_motion * 1000ULL,
+        "a high-rail window is timed from the last motion, reason pdw");
   int pokes = 0;
   while (fast.next == WAKE_CHARGING_MINUTES && pokes < 20) {
     fast.wake(14.9f);
@@ -1513,8 +1529,61 @@ void postDriveChecks() {
   check(reboot.pdwOpenWindow() && reboot.g_next_wake_minutes == WAKE_PARKED_MINUTES,
         "opening the window leaves the cadence to its caller (the NET-recovery reboot keeps its 1 min)");
 
+  // #22: parked with the DC-DC already off, a healthy but low rail. One look soon, in a window timed from now.
+  Dongle parked;
+  check(parked.awake(13.5f, false, SILENT, 12.42f) == POST_DRIVE_RECHECK_MINUTES && parked.reason("pdw-recheck"),
+        "a healthy low rail at the ladder end re-checks in POST_DRIVE_RECHECK_MINUTES");
+  check(parked.pdw_open && parked.pdw_polls == 0 && parked.pdw_open_us == (uint64_t)parked.now * 1000ULL,
+        "the re-check's window is timed from the ladder end, not the last motion");
+  check(parked.wake(12.42f) == WAKE_PARKED_MINUTES && !parked.polled, "a re-check wake at a low rail skips to parked");
+  check(parked.wake(12.42f) == WAKE_PARKED_MINUTES && !parked.polled, "and there is no second re-check");
+  Dongle edge;
+  check(edge.awake(13.5f, false, SILENT, IO36_LOCKOUT_HIGH) == POST_DRIVE_RECHECK_MINUTES,
+        "the re-check band starts at IO36_LOCKOUT_HIGH");
+
+  // A weak rail, or no rail reading, gets no extra wake.
+  for (float weak : {IO36_LOCKOUT_HIGH - 0.01f, IO36_LOCKOUT_LOW, 0.0f}) {
+    Dongle sagging;
+    check(sagging.awake(13.5f, false, SILENT, weak) == WAKE_PARKED_MINUTES && !sagging.pdw_open && !sagging.g_cadence_reason,
+          "a weak or unread rail at the ladder end re-checks nothing");
+  }
+  NoRailDongle unread;
+  unread.boot();
+  unread.now = 60UL * 60000UL;
+  unread.last_active = unread.now - 5UL * 60000UL;
+  unread.ladder_rail = 12.42f;
+  unread.pdwArmAtLadderEnd();
+  check(!unread.pdw_open && unread.g_next_wake_minutes == WAKE_PARKED_MINUTES && !unread.g_cadence_reason,
+        "a build that cannot read the rail at the ladder end re-checks nothing");
+
+  // The last motion older than the window (the max-awake backstop, a long BLE session): no re-check.
+  for (unsigned long idle : {(unsigned long)POST_DRIVE_WINDOW_MINUTES, 2UL * MAX_AWAKE_MINUTES}) {
+    Dongle late;
+    late.boot();
+    late.now = 3UL * MAX_AWAKE_MINUTES * 60000UL;
+    late.last_active = late.now - idle * 60000UL;
+    late.ladder_rail = 12.42f;
+    late.pdwArmAtLadderEnd();
+    check(!late.pdw_open && late.g_next_wake_minutes == WAKE_PARKED_MINUTES && !late.g_cadence_reason,
+          "a ladder end a window past the last motion re-checks nothing");
+  }
+
+  // The NET-recovery reboot keeps its 1 minute at a healthy low rail; the window it opens is the re-check's.
+  Dongle recover;
+  recover.boot();
+  recover.now = 60UL * 60000UL;
+  recover.last_active = recover.now - 60000UL;
+  recover.ladder_rail = 12.42f;
+  recover.netRecover();
+  check(recover.slept_reason && !std::strcmp(recover.slept_reason, "net-recover") && recover.g_next_wake_minutes == 1,
+        "the NET-recovery reboot keeps its 1 minute at a healthy low rail");
+  check(recover.pdw_open && recover.pdw_open_us == (uint64_t)recover.now * 1000ULL, "and opens the re-check's window");
+  recover.next = 1;
+  check(recover.wake(14.9f) == WAKE_CHARGING_MINUTES && recover.reason("pdw"),
+        "a silent high-rail poke after it is inside the window");
+
   Dongle low;
-  check(low.awake(13.5f, false, SILENT, 12.6f) == WAKE_PARKED_MINUTES && !low.pdw_open, "a low rail at the ladder end opens nothing");
+  low.awake(13.5f, false, SILENT, IO36_LOCKOUT_HIGH - 0.5f);  // a weak ladder end: nothing opened (checked above)
   low.ladder_rail = 14.5f;
   low.pdwArmAtLadderEnd();
   check(!low.pdw_open && low.g_next_wake_minutes == WAKE_PARKED_MINUTES, "the ladder end decides once per wake");
@@ -1546,22 +1615,31 @@ void postDriveChecks() {
   stale.pdw_open = 0;
   stale.g_pdw_ladder_done = false;
   stale.g_next_wake_minutes = WAKE_PARKED_MINUTES;
+  stale.g_cadence_reason = nullptr;
   stale.last_active = stale.now - (POST_DRIVE_WINDOW_MINUTES + 5) * 60000UL;
   stale.pdwArmAtLadderEnd();
-  check(!stale.pdw_open && stale.g_next_wake_minutes == WAKE_PARKED_MINUTES, "a window already past opens nothing");
+  check(!stale.pdw_open && stale.g_next_wake_minutes == WAKE_PARKED_MINUTES && !stale.g_cadence_reason,
+        "a high-rail window already past opens nothing and re-checks nothing");
 
-  // The ladder never opens over a latched, capped or sampled wake.
-  for (int c = 0; c < 3; ++c) {
-    Dongle busy;
-    busy.boot();
-    busy.recently_charging = c == 0;
-    busy.charging_cap_latched = c == 1;
-    busy.g_sample_poke = c == 2;
-    busy.ladder_rail = 14.5f;
-    busy.last_active = busy.now;
-    busy.pdwArmAtLadderEnd();
-    check(!busy.pdw_open && busy.g_next_wake_minutes == WAKE_PARKED_MINUTES,
-          "a latched, capped or sample-poke wake opens no window");
+  // The ladder never opens a window or re-checks over a latched, capped, sampled, alarm-enforced or non-parked
+  // cadence wake, at a high rail or a healthy low one.
+  for (float rail : {14.5f, 12.42f}) {
+    for (int c = 0; c < 5; ++c) {
+      Dongle busy;
+      busy.boot();
+      busy.recently_charging = c == 0;
+      busy.charging_cap_latched = c == 1;
+      busy.g_sample_poke = c == 2;
+      busy.alarm = c == 3;
+      if (c == 4) busy.g_next_wake_minutes = WAKE_DC_CHARGING_MINUTES;
+      const int armed = busy.g_next_wake_minutes;
+      busy.ladder_rail = rail;
+      busy.now = 60UL * 60000UL;
+      busy.last_active = busy.now - 5UL * 60000UL;
+      busy.pdwArmAtLadderEnd();
+      check(!busy.pdw_open && busy.g_next_wake_minutes == armed && !busy.g_cadence_reason,
+            "a latched, capped, sample-poke, alarm-enforced or non-parked wake opens no window and re-checks nothing");
+    }
   }
 
   Dongle both;

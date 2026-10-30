@@ -156,6 +156,10 @@ Check the rail before powering peripherals or issuing bus traffic.
   charge budget/corroboration and the max-awake backstop. AC does not acquire the DC session latch.
 - The charge-end follow-up and post-drive window shorten cadence only after otherwise-permitted
   rail-high polls. They do not override the alarm gate. A silent charge must not reset its fast budget.
+- A plug-in after the dongle sleeps need not trip WOM (#22). A ladder ending at a healthy but low rail
+  (11 V up to `RAIL_AWAKE_VOLTS`) within the window of the last motion opens the post-drive window from
+  then and sleeps `POST_DRIVE_RECHECK_MINUTES` once (`reason=pdw-recheck`); that wake takes the unchanged
+  gate. Never on a weak rail; equal to `WAKE_PARKED_MINUTES` turns it off.
 - Bring BLE up before slow modem initialization. Suppress cellular only while `bleRelaying()` says
   the phone is the transport—not merely connected or, in v1, authenticated.
 - Normal sleep flushes/saves uploads, deinitializes BLE, powers down peripherals and arms wake sources.
