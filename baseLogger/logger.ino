@@ -1764,7 +1764,7 @@ void loop() {
     // next slept. Requiring a recent fix makes the unlatch expire on its own when fixes stop, and
     // then the 5-minute re-latch does what it was written to do.
     if (gpsMovingFresh(GPS_MOVING_MAX_AGE_MS)) {
-      driveGnss(gd->speed * 1.852f);
+      driveGnss(gd->speed * 1.852f, current_frame);
     }
 #endif
     // TIME-BASED parked re-latch (state-machine independent). The changeState re-latch can't fire while a

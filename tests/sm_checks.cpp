@@ -64,6 +64,7 @@ struct SmEvent {
   bool silent = false;
   double soc_step = 0, kwh_step = NAN, soe_step = NAN;
   double power = NAN, current = NAN, voltage = NAN, dcfc = NAN;
+  OBDVector extra;  // further PIDs exactly as the car sends them, NaN included (#95's car flags); the differential never sets it
   double poll_rail = NAN;  // the rail this cycle read; NaN keeps the last
   unsigned long fix_age_ms = 0;  // POLL: how old the GNSS fix is
 };
@@ -1104,6 +1105,11 @@ void rules() {
     playCur(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, true), t);
     check(is_currently_parked && drive_unconfirmed, "sustained motion on a car that is on is UNCONFIRMED", t);
   };
+  // A frame whose current says discharging (30 A at 400 V), the proof a charge-latch override needs (#95).
+  auto amps = [](SmEvent e) {
+    e.current = 30, e.voltage = 400;
+    return named(e, ",a=30,v=400");
+  };
 
   // 1. Desk drift: fresh moving fixes with no accelerometer motion stay PARKED, car on or off.
   begin();
@@ -1204,10 +1210,17 @@ void rules() {
   check(!is_currently_parked && sm_freezes == 0 && countLog("LEASH gnss=") == 0 && countLog("LEASH no speed") == 0,
         "fresh moving fixes without motion keep a drive going past ACTIVE_TIMER, never refused", t);
 
-  // 4. Charge block: the charge latch keeps sustained motion and GNSS out, and drops UNCONFIRMED to PARKED.
+  // 4. Charge block: the charge latch keeps sustained motion and GNSS out unless this frame discharges over
+  // DRIVE_DISCHARGE_KW (#95), and drops UNCONFIRMED to PARKED.
   begin();
-  playCur(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, true, 12.5, true), t);
+  playCur(amps(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, true, 2.5, true)), t);
   check(is_currently_parked && !drive_unconfirmed && countLog("LEASH") == 0, "sustained motion while charging stays PARKED", t);
+  begin();
+  playCur(amps(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, true, 12.5, true)), t);
+  check(!is_currently_parked && !drive_unconfirmed && parkKey(obd_result_vector.back()) == 0 && park_marker_owed &&
+        countLog("LEASH") == 1 && logged("LEASH driving accel act=100% power=12.5kW -> unlatch parked"),
+        "a discharge this frame overrides the charge latch: sustained motion at 12.5 kW is DRIVING", t);
+  begin();
   playCur(Rules(fix(), SM_CAR_RAIL, SM_MOVE_NOW, false, NAN, true), t);
   check(is_currently_parked && logged("LEASH gnss=6.0km/h refused reason=charging"), "a moving fix while charging is refused", t);
   enterUnconfirmed();
@@ -1215,6 +1228,86 @@ void rules() {
   playCur(Rules(quiet, SM_CAR_RAIL, SM_MOVE_KEEP, false, NAN, true), t);
   check(is_currently_parked && !drive_unconfirmed && sm_freezes == 0 && !park_marker_owed &&
         logged("LEASH unconfirmed charging -> parked"), "the charge latch drops UNCONFIRMED to PARKED, no freeze", t);
+
+  // 4b. This frame's discharge overrides a stale charge latch (#95), on each path; without one the latch holds.
+  for (bool discharge : {false, true}) {
+    const double kw = discharge ? 12.5 : 2.5;
+    enterUnconfirmed();
+    playCur(Advance(5000), t);
+    playCur(amps(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, true, kw, true)), t);
+    if (discharge)
+      check(!is_currently_parked && !drive_unconfirmed && park_marker_owed && countLog("LEASH unconfirmed charging") == 0 &&
+            logged("LEASH driving accel act=100% power=12.5kW -> unlatch parked"),
+            "UNCONFIRMED + charge latch + a discharge this frame is DRIVING, not PARKED", t);
+    else
+      check(is_currently_parked && !drive_unconfirmed && !park_marker_owed && logged("LEASH unconfirmed charging -> parked"),
+            "UNCONFIRMED + charge latch without a discharge drops to PARKED", t);
+
+    begin();
+    playCur(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, true, 12.5), t);
+    playCur(Advance(60000), t);
+    const unsigned long hold = g_last_speed_ms;
+    playCur(amps(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, true, kw, true)), t);
+    check(!is_currently_parked && (discharge ? g_last_speed_ms >= hold + 60000 : g_last_speed_ms == hold),
+          discharge ? "DRIVING + charge latch + a discharge this frame refreshes the hold"
+                    : "DRIVING + charge latch without a discharge leaves the hold alone", t);
+
+    begin();
+    playCur(amps(Rules(fix(), SM_CAR_RAIL, SM_MOVE_NOW, false, kw, true)), t);
+    if (discharge)
+      check(!is_currently_parked && park_marker_owed && countLog("LEASH gnss=") == 0 &&
+            logged("LEASH driving gnss=6.0km/h -> unlatch parked (no OBD speed needed)"),
+            "a moving fix with motion, car on, charge latch and a discharge this frame is DRIVING, never refused", t);
+    else
+      check(is_currently_parked && countLog("LEASH gnss=") == 1 && logged("LEASH gnss=6.0km/h refused reason=charging"),
+            "a moving fix with the charge latch and no discharge is refused for charging", t);
+  }
+
+  // What the override needs, and what vetoes it (#95). It needs proof from the latch's own signal: a current in the
+  // frame, in range and not charging by its sign, so a charging current, or none, keeps the latch whatever the power
+  // key reads. The car's own is_charging or is_dcfc at any value but exactly 0 vetoes it, a garbled one included
+  // (fail closed), and never creates a latch. With neither veto, plugged-in preconditioning or V2L drawing 7 kW at a
+  // discharging current while something moves the car is a false drive.
+  struct Veto { const char* name; const char* key; double value; double amps; double kw; bool latch, gnss, drive; };
+  const double inf = std::numeric_limits<double>::infinity();
+  const Veto vetoes[] = {
+    {"V2L, no key", nullptr, 0, 30, 7.0, true, false, true},
+    {"is_charging=0", "is_charging", 0, 30, 7.0, true, false, true},
+    {"is_dcfc=0", "is_dcfc", 0, 30, 7.0, true, false, true},
+    {"is_charging=1", "is_charging", 1, 30, 7.0, true, false, false},
+    {"is_dcfc=1", "is_dcfc", 1, 30, 7.0, true, false, false},
+    {"is_charging=NaN", "is_charging", NAN, 30, 7.0, true, false, false},
+    {"is_dcfc=+inf", "is_dcfc", inf, 30, 7.0, true, false, false},
+    {"is_charging=-inf", "is_charging", -inf, 30, 7.0, true, false, false},
+    {"is_dcfc=1e12", "is_dcfc", 1e12, 30, 7.0, true, false, false},
+    {"no latch, is_charging=1", "is_charging", 1, 30, 7.0, false, false, true},
+    {"no latch, is_dcfc=1", "is_dcfc", 1, 30, 7.0, false, false, true},
+    {"power +12, current -30", nullptr, 0, -30, 12.0, true, false, false},
+    {"power +12, current -30, gnss", nullptr, 0, -30, 12.0, true, true, false},
+    {"power +12, no current", nullptr, 0, NAN, 12.0, true, false, false},
+    {"power +12, no current, gnss", nullptr, 0, NAN, 12.0, true, true, false},
+    {"power +12, current 2500 out of range", nullptr, 0, 2500, 12.0, true, false, false},
+  };
+  for (const Veto& v : vetoes) {
+    begin();
+    SmEvent e = Rules(v.gnss ? fix() : quiet, SM_CAR_RAIL, SM_MOVE_NOW, !v.gnss, v.kw, v.latch);
+    // Only the flags go through extra: a current or power there would sit behind the event's own (first match wins).
+    check(!v.key || std::string(v.key) == "is_charging" || std::string(v.key) == "is_dcfc", "harness: extra is for car flags", t);
+    if (v.key) e.extra.emplace_back(v.key, v.value);
+    e.current = v.amps;
+    if (!std::isnan(v.amps)) e.voltage = 400;
+    playCur(named(e, std::string(",") + v.name), t);
+    const std::string what = std::string(v.name) + (v.latch ? ", charge latch" : "") + ", " +
+                             (v.gnss ? "a moving fix" : "sustained motion") + ": ";
+    if (v.drive)
+      check(!is_currently_parked && !drive_unconfirmed && park_marker_owed && countLog("LEASH") == 1 &&
+            countLog("LEASH driving") == 1, what + "DRIVING", t);
+    else if (v.gnss)
+      check(is_currently_parked && !drive_unconfirmed && countLog("LEASH") == 1 &&
+            logged("LEASH gnss=6.0km/h refused reason=charging"), what + "refused for charging", t);
+    else
+      check(is_currently_parked && !drive_unconfirmed && countLog("LEASH") == 0, what + "stays PARKED", t);
+  }
 
   // 5. UNCONFIRMED exit: ACTIVE_TIMER without motion, each motion refreshing it; the idle stage; never a freeze.
   enterUnconfirmed();
@@ -1248,9 +1341,28 @@ void playComposed(SmEvent e, std::vector<SmEvent>& trace) {
   if (e.k != SmKind::POLL || pre.sm_asleep) return;
   const bool speed = sm_polls != pre.sm_polls && !e.silent &&
     ((e.key != SM_NONE && e.speed > 0) || (e.key == SM_BOTH && e.speed2 > 0));
+  // #95: an answered frame discharging over DRIVE_DISCHARGE_KW overrides the latch only with a current in range that
+  // is not charging by its sign, and no car is_dcfc/is_charging (any value but 0); with the start's other evidence
+  // (car on: it answered) it is DRIVING, without it still PARKED. The bounds are the firmware's: power only within
+  // +-1000 kW, else current x voltage.
+  auto within = [](double v, double lo, double hi) { return v > lo && v < hi; };  // false for NaN and infinities
+  const bool has_amps = within(e.current, -2000, 2000);
+  const bool by_power = within(e.power, -1000, 1000);
+  const bool by_iv = !by_power && has_amps && within(e.voltage, 0, 1000);
+  const double kw = by_power ? e.power : by_iv ? e.current * e.voltage / 1000.0 : NAN;
+  bool car_flag = !std::isnan(e.dcfc) && e.dcfc != 0;
+  for (const auto& kv : e.extra)
+    car_flag = car_flag || ((kv.first == "is_charging" || kv.first == "is_dcfc") && !(kv.second == 0));
+  const bool discharge = sm_polls != pre.sm_polls && !e.silent && kw > (double)DRIVE_DISCHARGE_KW && has_amps &&
+                         e.current >= CHARGING_CURRENT_THRESHOLD && !car_flag;
+  const bool motion_recent = g_last_motion_ms && sm_now - g_last_motion_ms <= (unsigned long)DRIVE_MOTION_RECENT_MS;
+  const bool moving_fix = e.gnss && e.fix_age_ms <= GPS_MOVING_MAX_AGE_MS && e.gnss_kmh >= GPS_MOVING_MIN_KMH;
+  const bool start = discharge && (e.sustained || (moving_fix && motion_recent));
   if (pre.is_currently_parked && pre.recently_charging && !speed)
-    check(is_currently_parked && !drive_unconfirmed,
-          "composition: the previous charge latch blocks non-speed starts, including UNCONFIRMED", trace);
+    check(start ? !is_currently_parked && !drive_unconfirmed : is_currently_parked && !drive_unconfirmed,
+          start ? "composition: this poll's discharge overrides the previous charge latch and starts the drive"
+                : "composition: without a discharge the previous charge latch blocks non-speed starts, including UNCONFIRMED",
+          trace);
   if (speed)
     check(!is_currently_parked && !drive_unconfirmed && sm_published == 0,
           "composition: an answered positive speed PID wins over the charge latch", trace);
@@ -1285,11 +1397,14 @@ void composition() {
   accel.current = 30;
   accel.voltage = 400;
 
+  // Below DRIVE_DISCHARGE_KW (5 A x 400 V, power 2 kW) the latch holds: energy sees its release now, drive next poll.
   for (bool use_accel : {false, true}) {
     charged();
     SmEvent move = use_accel ? accel : gnss;
     move.key = SM_SPEED;
     move.speed = NAN;
+    move.current = 5;
+    if (use_accel) move.power = 2;
     for (unsigned i = 1; i <= CHARGE_RELEASE_POLLS; ++i) {
       playComposed(move, t);
       check(is_currently_parked && !drive_unconfirmed && sm_published == 1 && !park_marker_owed &&
@@ -1297,8 +1412,28 @@ void composition() {
             "composition: release is visible to energy now, but to drive only next poll", t);
     }
     playComposed(move, t);
+    if (use_accel) {
+      check(is_currently_parked && drive_unconfirmed && sm_published == -1 && !park_marker_owed,
+            "composition: released charge permits the next accel start: UNCONFIRMED below the discharge limit", t);
+      move.current = 30, move.power = 12;
+      playComposed(move, t);
+    }
     check(!is_currently_parked && sm_published == 0 && park_marker_owed && has("is_charging", 0),
           "composition: released charge permits the next GNSS/accel start", t);
+  }
+  // Over it (12 kW) this poll's discharge overrides the latch at once (#95); energy keeps the latch and only starts
+  // its release, as on a speed start.
+  for (bool use_accel : {false, true}) {
+    charged();
+    SmEvent move = use_accel ? accel : gnss;
+    move.key = SM_SPEED;
+    move.speed = NAN;
+    playComposed(move, t);
+    check(!is_currently_parked && !drive_unconfirmed && sm_published == 0 && park_marker_owed && recently_charging &&
+          has("is_charging", 0) && countLog("LEASH gnss=") == 0 &&
+          logged(use_accel ? "LEASH driving accel act=100% power=12.0kW -> unlatch parked"
+                           : "LEASH driving gnss=20.0km/h -> unlatch parked (no OBD speed needed)"),
+          "composition: a discharge this poll starts the GNSS/accel drive over the charge latch, which energy still holds", t);
   }
   for (int key : {SM_SPEED, SM_VRS}) {
     charged();

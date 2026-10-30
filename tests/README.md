@@ -62,6 +62,14 @@ drive region in `Helpers/drive_state.h`, and the runner fails if anything outsid
 a call into the drive region sits outside the blocks it extracts. The pin rule and what the harness
 cannot prove (32-bit `millis()` wrap, other flag sets, code outside the extracted blocks) are in the
 runner's header. The `rules` group (#6) also runs CUR alone, as absolute checks: the named driving-rule scenarios (desk drift, late-fix drive, discharge, charge block, UNCONFIRMED exit) over Poll inputs for the car, motion, sustained motion, power and charge latch, whose defaults make CUR agree with OLD.
+Since #95 it also covers this frame's discharge overriding the charge latch on each path (PARKED and UNCONFIRMED
+accel, the DRIVING hold, GNSS through the real `driveGnss(kmh, current_frame)` call), each against the same poll below
+`DRIVE_DISCHARGE_KW` that the latch still blocks, every override row carrying a discharging current; and one table
+of what the override needs and what vetoes it, never creating a latch: a current, so a positive power key with a
+charging current, no current or one out of range keeps the latch (accel and GNSS); the car's `is_dcfc`/`is_charging`
+(0 does not veto; 1, NaN, infinities and out-of-range values do; 1 without a latch is still DRIVING); and V2L or
+preconditioning at 7 kW and 30 A with no key, a false drive. Held-latch stop-and-go (alternating discharge and regen) was checked once in
+development: one PARKED -> DRIVING transition, no flapping; the 4b rows cover each of its steps.
 
 Since 0b-1 (#81) the differential also covers the poll-side energy block: the rail refresh and `loop()`'s block from
 the `is_charging` verdict through `dcAwakeTrack()` (release latch and silent hold, taper stall count, DC session,
@@ -133,8 +141,10 @@ the real energy latch, making its temporary substitution a no-op. Drive therefor
 energy state; energy reads this poll's drive state. The runner checks the production blocks' order.
 Existing isolated `rules` tests and historical differential groups retain their scripted input semantics.
 
-Named scenarios cover GNSS and accelerometer starts on the poll after charge release (a NaN speed cannot
-override the latch); both speed-PID keys overriding a real charge latch while energy rejects regen as charging,
+Named scenarios cover GNSS and accelerometer starts on the poll after charge release below `DRIVE_DISCHARGE_KW`
+(a NaN speed cannot override the latch), and a 12 kW GNSS or accelerometer start overriding it on its first poll
+while energy still holds the latch (#95); the composition oracle checks both sides on every generated poll, with the
+firmware's power bounds, vetoes and GNSS moving threshold; both speed-PID keys overriding a real charge latch while energy rejects regen as charging,
 and subsequent GNSS continuing that drive despite the residual release latch;
 a poll re-latching PARK and accepting trusted charge immediately; the streaming trust prerequisite;
 UNCONFIRMED accepting charge and returning to PARK on the next poll, without a freeze or marker;

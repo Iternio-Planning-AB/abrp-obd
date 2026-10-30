@@ -553,7 +553,14 @@ OBD answer within `ACTIVE_TIMER`), an accelerometer hit within `DRIVE_MOTION_REC
 without them (desk drift, a garage) is refused and logged once per streak (`LEASH gnss=… refused reason=motion|car-off|charging`).
 Sustained motion (`DRIVE_SUSTAINED_ACT_PCT` of at least `DRIVE_SUSTAINED_MIN_SAMPLED_MS` sampled, over
 `DRIVE_SUSTAINED_WINDOW_MS`) on a car that is on, with no charge latch, is UNCONFIRMED; with a discharge above
-`DRIVE_DISCHARGE_KW` (the frame's `power`, else current × voltage) it is DRIVING. UNCONFIRMED keeps
+`DRIVE_DISCHARGE_KW` (the frame's `power`, else current × voltage) it is DRIVING. That discharge also overrides
+the charge latch for both rules (#95): a latch left from before an unplug cannot hold back a drive that draws power.
+It needs a `current` in the frame at or above `CHARGING_CURRENT_THRESHOLD` (the latch's own signal; a profile with
+no current PID keeps the latch), and the car's own `is_charging` or `is_dcfc` at any value but 0 (a garbled one
+included) vetoes it; neither creates a latch. Otherwise a plugged-in car drawing over 4 kW while it is moved (V2L,
+preconditioning) reads as a drive: `is_charging` is forced to 0, so the latch releases, the CHARGING exit and DC hold
+are lost and the parked-only backstop is off, and not only for `ACTIVE_TIMER`: once DRIVING, every fresh moving fix
+refreshes the hold with the car on or off. Requiring car-on for that GNSS hold should land before or with this. UNCONFIRMED keeps
 `is_currently_parked` true (every parked-gated guard, the backstop included, treats it as parked) but the frame has no
 `is_parked` key (so no `drivingState`, no `chargingState`, an empty CSV cell), the live location replaces the frozen
 spot and no PARK marker is owed. It leaves for DRIVING on a speed key, a GNSS fix with the evidence above, or discharge;

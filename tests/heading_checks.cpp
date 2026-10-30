@@ -110,7 +110,8 @@ void esp_task_wdt_reset() {}
 #include "motion_stats.h"
 DriveMotion g_drive_motion;
 #include "drive_state.h"
-void gpsUnlatch() {
+// The poll's frame, which logger.ino's block hands to driveGnss (#95); empty here, so discharge is unknown.
+void gpsUnlatch(const OBDVector& current_frame = OBDVector{}) {
   g_last_motion_ms = fake_ms;
 #include "gps_unlatch.inc"
 }

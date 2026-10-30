@@ -766,7 +766,8 @@ static_assert(CELL_WEAK_MAX_POST_BYTES <= CELL_MAX_POST_BYTES, "the weak-signal 
 
 // The driving rules (#6, step 2 of #23). A fresh GNSS fix with speed no longer unlatches PARK on its own: a
 // car parked at a desk or in a garage reports "moving" fixes from drift (issue #6 saw a false DRIVE that way),
-// so it also needs the car on, an accelerometer hit within DRIVE_MOTION_RECENT_MS and no charge in progress.
+// so it also needs the car on, an accelerometer hit within DRIVE_MOTION_RECENT_MS and no charge in progress
+// (the charge latch, which a discharge this frame can override: drive_state.h's footnote, #95).
 // A drive's late first fix, or a profile with no speed PID, is then covered by the accelerometer alone:
 // sustained motion on a car that is on enters UNCONFIRMED (live location, no drivingState) and a discharge
 // over DRIVE_DISCHARGE_KW confirms DRIVING without waiting for a fix.
