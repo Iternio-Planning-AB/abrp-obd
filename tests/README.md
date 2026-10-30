@@ -174,6 +174,10 @@ zlib is compiled with `CC` (default `clang`), which takes `-DNDEBUG` from `CXX`.
 memory and the clock are shims. The checks do not prove what the server or the modem accepts.
 Upload group `gzip-fallback` checks that a gzip failure never sends an over-cap body or drops a frame, and
 that the sized body is the sent body.
+Upload group `weak-signal` (#52) checks the trim budget, gzip on and off: bodies within `CELL_WEAK_MAX_POST_BYTES`
+after a fresh csq of 14 or 99 (also at a `millis()` wrap), unchanged bodies at csq 15, with no sample and when stale,
+every frame once and in order, and a lone frame between the budgets still sent. The runner pins the sample
+statically: right after `loop()`'s pre-connect `netDiag()`, inside `ENABLE_LOGGING`, and nowhere else.
 
 GPS CSV `gps_read=ok` means parsing accepted a reply, including replies with zero coordinates.
 `gps_fix` still means cached nonzero coordinates. Date/time and speed are the cached accepted record,
@@ -407,6 +411,8 @@ refused values, the header budget, abort on a refused `AT+SHAHEAD`) and the best
 
 Run `python3 tests/run_modem_checks.py` normally and with `CXX='clang++ -DNDEBUG'`.
 It exercises production cellular startup, registration/recovery and sleep against fake UART/time/hardware.
+Group `csq` (#52) checks `lastCsq()`: -1 before any `netDiag()`, the parsed csq, 99 on a reply without `+CSQ` or
+a timeout, with `netDiag()`'s string and AT commands unchanged.
 Host checks do not verify real attachment timing, electrical sleep behavior or vehicle power/GPS.
 
 ## Adaptive upload-queue checks (#75)

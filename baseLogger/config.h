@@ -654,6 +654,26 @@
 // frames (more OBD PIDs) automatically mean fewer frames per POST instead of undeliverable POSTs.
 #define CELL_MAX_POST_BYTES 1000
 
+// Smaller POST bodies at weak signal (#52). At weak signal a POST that got the modem's prompt and body ACK more often
+// goes unanswered (`http=0 err=empty` after the ~8 s SHREQ wait), and more so the bigger the body. Measured over 1,218
+// car POSTs on 4 cars with #8 and #55: csq <= 9 failed 18 %, 10-14 4.8 %, >= 15 0.7 %. At csq <= 14, bodies of 800 B
+// or more failed 12.2 % (16/131) against 2.3 % (5/215) below; also with the previous POST successful (16/128 vs 4/203),
+// so not an outage's aftermath. At csq >= 15 size made no difference. Splitting is cheap: a successful weak-signal POST
+// took a median 2.2 s at >= 800 B and 0.96 s below, while a failure costs the SHREQ wait, a retry and a step on the
+// http=0 streak toward a modem restart. 700 B is about 8 frames, and UPLOAD_MAX_BATCHES_PER_CYCLE keeps the drain well
+// ahead of the fill. The trim only aims at it: a single frame between the two budgets still goes, alone.
+//
+// Weak is the csq of loop()'s pre-POST netDiag(), at most CELL_WEAK_CSQ, or 99 - which is both the modem's "unknown"
+// and an AT+CSQ that did not answer, so a missing reading counts as weak, the conservative side (only 3 measured POSTs
+// were at 99). Only a sample younger than CELL_CSQ_FRESH_MS (about two upload cycles) counts, so the pre-sleep flush
+// gets the weak budget only right after a weak in-loop cycle. The sample is taken with the NET diag line, so a
+// logging-off build never takes one and keeps CELL_MAX_POST_BYTES. Kill switch: set CELL_WEAK_MAX_POST_BYTES to
+// CELL_MAX_POST_BYTES.
+#define CELL_WEAK_CSQ 14
+#define CELL_WEAK_MAX_POST_BYTES 700
+#define CELL_CSQ_FRESH_MS 120000UL
+static_assert(CELL_WEAK_MAX_POST_BYTES <= CELL_MAX_POST_BYTES, "the weak-signal budget must not exceed the modem's cap");
+
 // zlib settings for the POST body (gzip_body.h). On synthetic 12-point driving bodies, level 9 with a 4 KB
 // window and memLevel 4 matches the miniz tdefl ratio within 0.5 % (1182 vs 1186 B). Window size makes no
 // difference from 2 KB up. Below about one point (1 KB) it collapses (1809 B). State is ~29 KB of PSRAM.

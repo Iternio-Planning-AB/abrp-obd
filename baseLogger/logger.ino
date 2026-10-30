@@ -2260,6 +2260,9 @@ void loop() {
           // Taken before connect(): its AT queries (up to 2.4 s) would otherwise sit between the idle check and
           // the POST, on a session that must not be idle past ~60 s when the POST goes out (#8).
           const std::string net_diag = network.netDiag();
+          // Its csq sizes this cycle's POSTs (#52): smaller bodies at weak signal. Only this pre-POST sample counts.
+          g_upload_csq = network.lastCsq();
+          g_upload_csq_ms = millis();
 #endif
           if (network.connect()) {
           g_ble_handoff_pending = false; // one-shot: consume the fast handoff only once a session is actually open

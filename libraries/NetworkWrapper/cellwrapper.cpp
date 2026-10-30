@@ -536,6 +536,8 @@ std::string CellWrapper::netDiag() {
   sys.xbReceive(b, sizeof(b), 800, okerr, 2);
   char* p = strstr(b, "+CSQ:");
   if (p) csq = atoi(p + 5);
+  // No reply, or none with +CSQ, stays 99 like the modem's own "unknown": the upload budget treats both as weak.
+  m_last_csq = csq;
 
   char vbat[24] = "?";
   memset(b, 0, sizeof(b));
