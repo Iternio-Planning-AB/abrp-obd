@@ -2,7 +2,7 @@
 
 Current architecture and constraints, with links to detailed evidence. Section numbers are stable
 because code comments refer to them. **Code is authoritative.** The
-[detailed reference](docs/dongle-reference.md) preserves measurements and older designs, not a current
+[detailed reference](docs/dongle-reference.md) consolidates measurements and design decisions, not a current
 implementation backlog. Build/workflow rules live in [AGENTS.md](AGENTS.md); host coverage lives in
 [tests/README.md](tests/README.md).
 
@@ -310,7 +310,7 @@ known limitations are in the [diagnostic reference](docs/dongle-reference.md#sec
 
 Use [technical overview](docs/technical-overview.md) for layout/settings,
 [getting started](docs/getting-started.md) for setup, and [RELEASING.md](RELEASING.md) for releases.
-The original design documents remain in the detailed reference. Names used in old comments map here:
+The original design documents are consolidated in the detailed reference. Names in old comments map here:
 
 | Appendix | Original document | Role |
 | --- | --- | --- |
@@ -323,7 +323,7 @@ The original design documents remain in the detailed reference. Names used in ol
 | [G](docs/dongle-reference.md#appendix-g) | `POWER_BUDGET.md` | Bench measurements |
 | [H](docs/dongle-reference.md#appendix-h) | `DEFERRED_POWER_WORK.md` | Power tradeoffs, rejected approaches and proposed work |
 | [I](docs/dongle-reference.md#appendix-i) | `IGNITION_SENSE_ARCHITECTURE.md` | Alarm/ignition architecture |
-| [J](docs/dongle-reference.md#appendix-j) | `ALARM_GATE_FIELD_FINDINGS.md` | Historical failures and original fix plan |
+| [J](docs/dongle-reference.md#appendix-j) | `ALARM_GATE_FIELD_FINDINGS.md` | Historical failures and resolution status |
 
 These are evidence, not current task lists. Check implementation and newer findings before acting on
 an old “open” item. Keep new operational guidance here; retain dated field evidence in the reference.

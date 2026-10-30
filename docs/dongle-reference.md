@@ -1,15 +1,14 @@
 # Detailed dongle reference and design history
 
 Start with [DONGLE_CONTEXT.md](../DONGLE_CONTEXT.md) for the current overview and section index.
-This is the preserved detailed reference from before that guide was condensed. Read the relevant
-section, not the whole file.
+This consolidates operational detail, dated measurements and design decisions. Read the relevant
+section, not the whole file. Protocol details live here once; implementation and release tooling
+remain authoritative.
 
-**Historical status statements are not a current backlog.** This text mixes measurements, protocol
-contracts, proposed work and later updates. In particular, the old GNSS-age warning in §7 is superseded
-by `gpsFixAgeMs()` in the code, and v1 relay status—not authentication alone—controls cellular stand-down.
-HTTP Date is WiFi-only; the cellular modem cannot return response headers through its SH interface.
-“Not implemented”, “off”, “next” and “still open” below describe the document's original context.
-Check the code and the current guide before treating them as present-day facts.
+**Evidence is not a current backlog.** Dated captures and modeled power budgets retain their
+original conditions. Research proposals are distinguished from implemented mitigations; closed-source
+app status cannot be verified from this repository. Do not infer hardware validation from a source
+inspection. The pre-consolidation text remains in git at `681c658:docs/dongle-reference.md`.
 
 Section and appendix numbers are retained for existing source references. Paths in backticks are
 relative to the repository root or `baseLogger/`, as in the original text. Named design documents
@@ -467,8 +466,9 @@ awake.** Polling a sleeping EV wakes its ECUs, which then stay awake on the *car
 - **BLE must come up early** — right after the gate, before the ~12 s cellular init — so the dongle
   advertises within ~2 s of wake. Behind cellular it took ~14 s and blew the app's 5 s reconnect
   window, churning every post-sleep reconnect.
-- `bleRelaying()` = connected **AND** authenticated. **This, not `bleConnected()`, is what the
-  cellular stand-down keys on.** Gating on mere presence meant a phone that never authorised silently
+- `bleRelaying()` requires authentication **and** the negotiated protocol's phone-transport state
+  (v1 can hand back to cellular). **This, not `bleConnected()`, controls cellular stand-down.**
+  Gating on mere presence meant a phone that never authorised silently
   starved cellular — data flowed *nowhere* live while frames piled up. Found in the field.
 - Deep sleep tears BLE fully down (`BLEDevice::deinit`) — a left-initialised controller keeps
   deep-sleep current high and holds tens of KB of heap.
@@ -741,8 +741,6 @@ bounded by `MAX_UPLOAD_BUFFER` (the oldest go first).
 | Passive listener on the cellular path | TLS only | nothing |
 | Active MITM with any certificate under the bundled roots (name and dates are not checked) | uploads: positions, battery, the api key, keyid, signatures | read; replay an exact earlier request, at any later time (no `created`); swallow uploads by answering 200, so the frames are dropped; not forge a new request or learn the token |
 | On-path network, DNS spoofer or NTP pool member (no certificate) | NTP replies | step the clock when NTP is asked and GPS is stale (only on a wake already uploading, at most once per wake): with a valid clock at most `CLOCK_NTP_MAX_DISAGREE_S` from this wake's AT+CCLK reading, or without one, beyond what `CLOCK_DRIFT_MAX_PPM` over the sleep explains; with no valid clock, freely (it is the fallback). It can nudge the drift rate within `CLOCK_DRIFT_MAX_PPM`, kept in NVS across a re-plug and halved toward the truth by each honest window after. The HTTP `Date` header is not read on cellular. It cannot roll a valid clock back days to defeat the send-time geo expiry |
-
-| Active MITM with any certificate under the bundled roots (name and dates are not checked) | uploads: positions, battery, the api key, keyid, signatures | read; replay an exact earlier request, at any later time (no `created`); swallow uploads by answering 200, so the frames are dropped; set the clock through unauthenticated NTP when a resync runs and GPS is stale (pre-existing; the HTTP `Date` header is not read on cellular), and if that resync ends an hour or more of sleep it also teaches a skewed drift rate (bounded by `CLOCK_DRIFT_MAX_PPM`, kept in NVS across a re-plug, halved toward the truth by each honest window after); not forge a new request or learn the token |
 | Anyone who can set the clock (GNSS in radio range, NTP on the path, a fake cell's NITZ); no certificate needed | — | step the clock 6 days or more forward so queued frames are dropped as too old (`UPLOAD dropped … now=`; the flash log keeps them) |
 | Anyone with the token | — | post as the car. The token reaches the dongle over BLE at pairing (ABD2 profile push; LESC Just Works: encrypted, not MITM-authenticated) and is held by the phone app; cellular signing does not change either |
 
@@ -858,22 +856,20 @@ remain, and affect only a flagged car:
    `true` regardless → no fix all wake → permit structurally unreachable → a whole blind drive.
    **Fixed.**
 
-**Design lessons worth keeping even if the feature never returns:**
+**Design constraints and field lessons:**
 - The failure asymmetry: a false permit (transmit while armed) is unrecoverable; a false deny is
   invisible and recoverable. Buy false denies cheaply.
 - **No single signal is sufficient.** A car on a flatbed has ignition off, alarm armed, and GNSS
   reporting 80 km/h. "Rail energised" alone polls a parked charging car. Only the conjunction holds.
-- **The permit must be instantaneous — no latch, no grace.** An early version held the permit while
-  the rail stayed energised, which an EV keeps up while charging: park, plug in, lock, and the latch
-  never releases. Any grace period for "stopped at a light" is the same grace period for "parked and
-  locking up", and nothing worth measuring happens while stationary anyway.
+- **Reject an unbounded rail hold.** An early proposal kept permission while the rail stayed
+  energized, which survives parked charging and locking. Current code instead has explicit,
+  bounded setup and OBD-speed continuation rules; see Appendix I §8.3, not the old “no grace” claim.
 - **The accelerometer is inadmissible** as a hold signal: getting out, closing the door and locking
   all produce motion, so it would extend the permit through exactly the arming sequence.
 - **Asymmetric debounce:** slow to permit, instant to deny.
 - **Gate the requests, not the link** — an initialised-but-idle OBD link transmits nothing.
-- **`ALARM_GNSS_MAX_AGE_MS` is currently inert**: `gd->ts` is stamped at *call* time, not fix time,
-  on the co-processor GNSS path, so a re-echoed stale fix stays "fresh" forever. Fails toward
-  permitting. Fix requires keying on the `$GNIFO` date/time fields changing.
+- **The old GNSS-age defect is fixed:** `gd->ts` is parser-call time and cannot establish freshness.
+  `gpsFixAgeMs()` now ages changes in receiver date/time, so a re-echoed fix expires.
 
 **A passive ignition signal on BMWs (2026-10-01):** `0x130` data byte 0 reads `05` with the ignition
 on, and reading it transmits nothing (§6b). That is positive evidence of "in use", which the gate
@@ -1126,21 +1122,18 @@ internals removed; see the note at its top).
 ---
 ---
 
-# PART II — FULL SOURCE DOCUMENTS
+# PART II — DESIGN DECISIONS AND FIELD EVIDENCE
 
-> Everything below is embedded **unmodified** from the original single-topic documents, so no detail
-> was lost to summarisation. They were written at different times — where one contradicts Part I or
-> the code, **the code wins, then Part I** (which is newer). Internal cross-references between these
-> documents (e.g. "see DEFERRED_POWER_WORK.md §1c") resolve to the matching appendix here.
-> Exception: the ABRP app is closed source, so its implementation detail (code paths, state, UI
-> structure, tooling) is removed and what the app must do is restated in protocol terms. Where that
-> emptied a section, sections are renumbered and cross-references retargeted.
+The former standalone documents are consolidated below, not reproduced as parallel specifications.
+Appendix letters and useful section numbers remain for source references. Rejected proposals are
+decision history, not APIs or implementation tasks. App obligations are stated on the wire;
+closed-source app internals are outside this repository.
 
 | Appendix | Document | Original filename |
 |---|---|---|
 | A | BLE security plan (design + phase history) | `BLE_SECURITY_PLAN.md` |
 | B | OTA update architecture (v1) | `ota-update-architecture-v1.md` |
-| C | OTA wire-protocol reference (authoritative) | `ota-protocol-reference.md` |
+| C | OTA wire-protocol reference (implementation wins on conflict) | `ota-protocol-reference.md` |
 | D | OTA app-side spec (transport decision and design review only) | `OTA_UPDATE_APP_SPEC.md` |
 | E | Backend expectations | `backend_implements.md` |
 | F | Power management | `POWER_MANAGEMENT.md` |
@@ -1161,8 +1154,9 @@ internals removed; see the note at its top).
 
 # ABRP OBD dongle — BLE security & access plan
 
-Design plan spanning the app and the firmware (`baseLogger`). Nothing here is
-implemented yet except where marked. Written 2026-08-18.
+Implemented security layers and their rollout history, originally drafted 2026-08-18. Current
+defaults are in §1; dated captures below establish what was observed then, not the current
+validation status of every phone/app build.
 
 Companion docs: `ota-protocol-reference.md` (ABD5/ABD6 contract), `baseLogger/DEFERRED_POWER_WORK.md`
 (power work).
@@ -1171,19 +1165,18 @@ Companion docs: `ota-protocol-reference.md` (ABD5/ABD6 contract), `baseLogger/DE
 
 ## 0. What we are protecting, and from whom
 
-| Channel | Today's control | Worst case if abused |
+| Channel | Current default controls | Protected capability / remaining boundary |
 |---|---|---|
-| ABD1 telemetry (notify) | token handshake | read live SoC/voltage/speed. **No location** — `bleTlmString` omits lat/lon/utc by design |
-| ABD2 setup / profile push | token handshake | **arbitrary CAN injection** into the vehicle (`ATSH` + arbitrary hex) |
-| ABD5/ABD6 OTA | none beyond auth flag | **replace firmware** on a device wired to the CAN bus |
-| ABD7 log dump | auth flag | exfiltrate the CSV log: **GPS traces**, timestamps, vehicle history |
-| — | | sniff the handshake → obtain `tlm_push_token` = the vehicle's **cloud upload credential** |
+| ABD1 telemetry (notify) | Encrypted link + local HMAC grant | Live SoC/voltage/speed; `bleTlmString` omits lat/lon/utc |
+| ABD2 setup / profile push | Encrypted link + local HMAC grant; profile signatures optional by default | An authenticated raw-profile writer can inject arbitrary CAN commands |
+| ABD5/ABD6 OTA | Encrypted link + local HMAC grant + mandatory image signature | Authorized staging/update requests; possession of the session secret does not allow unsigned firmware |
+| ABD7 log dump | Encrypted link + local HMAC grant | CSV GPS traces, timestamps and vehicle history |
 
-Three distinct problems, needing three different tools:
+Three independent boundaries:
 
-1. **Is this payload legitimate?** → digital signature (Phases B).
-2. **Is this user permitted?** → challenge-response against the backend (Phases C, D).
-3. **Can a bystander read the traffic?** → link-layer encryption (Phase E).
+1. **Payload legitimacy:** image signature; profile signature when strict enforcement is enabled.
+2. **Session authority:** local challenge/HMAC proves secret possession, not backend user identity.
+3. **Link privacy:** encryption; Just Works does not authenticate initial pairing against active MITM.
 
 None substitutes for another. A bonded encrypted link still lets a compromised app push a malicious profile;
 a signature does not hide anything; an ownership check does not stop eavesdropping.
@@ -1213,183 +1206,51 @@ writes, which is why the later phases exist. No firmware change.
 
 ## 3. Phase B — signed vehicle profiles (firmware + app, NO backend work)
 
-> **STATUS — IMPLEMENTED end to end (2026-08-25), shipping as an ACCEPT-BOTH add-on. Untested on
-> hardware.** The dongle takes a signed profile and still accepts the historical per-key packages, so
-> an app that knows nothing about JWS behaves byte-for-byte as before.
->
-> | Piece | Where |
-> | --- | --- |
-> | RS256 verify (RSA-2048, mbedTLS), base64url, `alg` pinned | `Helpers/jws_verify.h` |
-> | Chunk buffer, verify-then-apply on the LOOP task | `Helpers/profile_sig.h` |
-> | ABD2 `{"JWS":{"i","n","d"}}` branch + `notifySetup` | `blewrapper.cpp/.h` |
-> | JWS kept beside the parsed profile, chunked push, `JWS OK`/`JWS BAD` handling | the app |
->
-> **Wire protocol:** after `CLEAN OK` the app writes `{"JWS":{"i":<idx>,"n":<total>,"d":"<180-char
-> slice>"}}` in order (each ACKed), the dongle assembles, then verifies on the loop task and answers
-> `JWS OK` / `JWS BAD`. Only on `JWS OK` does the app send `tlm_push_token` + `utc`, which complete the
-> push exactly as before. `keys` is unchanged, so the dongle's `keys == config` completion check still
-> balances: the signed payload supplies the PID values, the two packages supply the rest.
->
-> **Isolation, per the add-on rule.** ABD2 is abrpobd's own characteristic — the generic obdble lane
-> (FFF0/18F0/FFE0) cannot reach any of it, and the abrpobd profile push runs only for an abrpobd
-> dongle. The one genuinely shared thing is the parsed profile, which the obdble lane also uses — so
-> the app keeps the JWS separately and the parsed profile keeps its exact shape and bytes. That also
-> preserves the profile `HASH` (Trap 1: never change what `HASH` is computed over; Trap 2: change only
-> how the profile is acquired, never how it is applied — both spelled out under *Remaining* below):
-> folding the JWS into the profile would have changed `HASH`'s input and dropped every reconnect onto
-> the slow full-repush + `ATZ` path. The obdble lane's writes were verified unchanged.
->
-> **On `JWS BAD` the app does NOT fall back to an unsigned push** — that would hand the dongle the very
-> profile it just refused to trust, defeating the phase. It rejects and says so in the event log.
->
-> **HARDWARE-VALIDATED (2026-08-25), happy path.** A real signed profile went end to end:
-> `HASH NOT OK` → `clean` → 10 ordered chunks (each ACKed) → `PROFILE JWS OK (1660 B, 9 keys, verify
-> 54ms)` → `SETUP OK (push complete)` → `CONFIG applied from BLE push (941 B, on loop task)` →
-> `PROFILE persisted to flash`. RSA-2048 verification costs **~54 ms**, once per profile push, on the
-> loop task where it belongs.
->
-> **Trap 1 confirmed intact on device:** later boots reported `HASH OK` → `SETUP OK (fast path, hash
-> matched)`, so `HASH` still matches and the JWS did not change what it is computed over.
-> Note the JWS rides the SLOW path only — on `HASH OK` the app sends just `utc`, so a normal reconnect
-> transfers no chunks at all and costs nothing.
->
-> **Latent sharp edge, pre-existing, worth knowing:** `clean()` does `preferences.clear()` on the
-> `"BLE"` namespace, which deletes the persisted hash, and restores only `auth_token`. So a push that
-> is cleaned and then ABORTS leaves the dongle with no stored hash and it will fully repush on the
-> next connect. That is arguably correct (the config really was cleared, so claiming a hash would be a
-> lie) but it means an interrupted setup always costs one extra full push + `ATZ`.
->
-> **NEGATIVE TEST PASSED (2026-08-25) — the security property is proven, not just the plumbing.**
-> Two independent tests, because a happy-path push looks identical whether the signature is enforced
-> or blindly accepted:
->
-> 1. **Crypto discriminates** — `JWSTEST` (serial, physical access only) re-verifies the last real
->    signed profile intact / one-character-altered / intact again:
->    `intact=ACCEPT tampered=reject restored=ACCEPT -> PASS`. The restore proves it is not a stuck
->    `false`. The alteration maps between two valid base64url characters and skips any `.`, so the
->    rejection is a genuine signature mismatch rather than malformed input.
-> 2. **The verdict is honoured end to end** — the app pushed a JWS with its last 6 characters
->    overwritten (inside the signature segment, so same length and alphabet). Result:
->    `PROFILE JWS REJECTED (bad signature, 1660 B)`, and **zero** occurrences of `PROFILE JWS OK`,
->    `SETUP OK (push complete)` or `CONFIG applied from BLE push`. That last absence is the real
->    assertion — the untrusted profile never reached the apply path or the OBD init sequence.
->
-> **Failure mode is fail-closed WITHOUT going dark**, verified in the same capture: after the
-> rejection the dongle kept polling its previous PIDs. `clean()` clears the wrapper's staging config
-> (`configJson`/`config_keys`/the NVS hash), not the profile already applied to the OBD layer — so a
-> refused profile leaves the dongle running the last one it *did* trust, rather than running nothing.
->
-> `JWSTEST` was kept as a permanent diagnostic rather than scaffolding: it is read-only, physical
-> access only, and is exactly what confirms a dongle still trusts the right key after a key rotation,
-> without pushing anything.
->
-> **SIGNATURES CAN BE REQUIRED (`PROFILE_REQUIRE_SIGNATURE 1`) — but the default in `config.h` is
-> still 0, accept-both.** This heading once read "SIGNATURES NOW REQUIRED"; the shipping default is 0
-> and stays so until the signed-profile path has been seen succeeding in the field
-> (`docs/technical-overview.md`). With the flag at 1, a raw profile value is refused with `UNSIGNED`;
-> only a signature-verified JWS can change what this dongle runs on the CAN bus. The refusal is scoped
-> to profile CONTENT - `keys`, `HASH`, `tlm_push_token` and `utc` still pass, since they are handshake
-> data and the push could not complete without them. The app treats `UNSIGNED` as a
-> clear failure rather than waiting out a timeout.
->
-> (The flag had been described in a comment before it existed - the same doc/implementation mismatch
-> made once with `AUTH_ENFORCE`. Both became real; `AUTH_ENFORCE` was later removed when the auth gate
-> became unconditional.)
->
-> **One lockout scenario, by design:** the app falls back to a package push when it holds no JWS for the
-> typecode (unsigned fetch, or a profile cached before the app kept the JWS). With the flag at 1 that
-> push is refused - but the app refetches the profile the first time it reconnects after its next
-> start. A stale cache costs one app restart, not a bricked dongle. Reverting is one line in
-> `config.h`.
->
-> ---
-> *Step-1 detail, retained:* the firmware verifier
-> (`Helpers/jws_verify.h`). It embeds the SAME RSA-2048 public key the app pins to verify the profile
-> JWS it fetches from `/vehicles/obdble_get_pids` (`signed=true`), does base64url (URL alphabet,
-> unpadded — mbedTLS needs it translated and re-padded), rejects any header not declaring `RS256`,
-> and verifies RSASSA-PKCS1-v1_5/SHA-256 over the verbatim `<header>.<payload>` ASCII. It hands back
-> the payload's LOCATION rather than its contents, so a caller cannot accidentally parse before the
-> signature is proved.
->
-> **The `alg` check is not decoration.** `alg` is attacker-controlled until the signature verifies, so
-> trusting whatever it names is the classic JWS confusion bug (`alg:none`, or an HMAC alg verified
-> against the public key as though it were a shared secret). It is pinned to RS256.
->
-> **No serial escape hatch here, unlike the auth gate, and the dependency graph is the reason:** this
-> gate does not stand in front of OTA (`otaService` checks `get_authenticated`, never the profile). A
-> broken verify — rotated key, backend format change — still leaves the dongle reachable and a fix
-> deliverable over the air, so it needs no physical override. (Contrast the auth gate, which *does*
-> gate OTA — and where `AUTHCLEAR` already serves as that override, which is why the separate
-> `AUTHOFF` idea was dropped as redundant.)
->
-> **Remaining, in order:**
-> 1. App: stop discarding the JWS after verifying it (it split the payload off and dropped the
->    signature) — carry it through to the profile push.
-> 2. Transport: a chunked verbatim push on ABD2 (~1.8 KB for a typical profile: the persisted profile
->    is ~1 KB, base64url ≈1.4 KB, plus a 342-char signature — so ~10-20 writes at MTU 247).
-> 3. Firmware: assemble, verify, then decode the JWS's OWN payload into `configJson` — the profile
->    source becomes the signed payload, NOT the reassembled key/value packages.
-> 4. App: send the JWS instead of the per-key PID packages (`tlm_push_token` and `utc` still go
->    separately — the token is not in the profile and is not the CAN-injection risk).
->
-> **Both traps still apply.** Trap 1: do not change what `HASH` is computed over — a CRC32 of the
-> JSON serialisation of the sanitised profile object with `tlm_push_token` added as its last key
-> (serialised once), sent as `{"HASH":<unsigned decimal>}`; computed app-side, the dongle stores and
-> compares it and never recomputes it — or every reconnect drops to the slow path with a full `ATZ`
-> re-init. Trap 2: change only ACQUISITION: `completeSetup` / `configCallback`, the loop-task apply,
-> the identical-profile ATZ skip, the LittleFS persist and `invalidateHash()` all stay untouched.
+**Implemented; accept-both by default.** `PROFILE_REQUIRE_SIGNATURE 0` permits raw packages as
+well as verified JWS. Setting it to 1 refuses raw profile content with `UNSIGNED`, but not
+`keys`, `HASH`, `tlm_push_token` or `utc`. Do not confuse bench verification below with a decision
+to enable strict enforcement fleet-wide.
 
-**The hole:** a pushed profile carries `init_commands` (raw AT, including `ATSH` to set arbitrary CAN headers
-and `ATSP` to choose the protocol) plus `data_commands` as arbitrary hex. That is arbitrary CAN injection with
-the dongle as transport. On a gatewayed port that is mostly UDS — which is exactly where routine-control and
-I/O-control-by-identifier live. **This hole predates every feature in this plan.**
+| Piece | Where |
+| --- | --- |
+| RSA-2048 RS256 verification, base64url and pinned key | `Helpers/jws_verify.h` |
+| Chunk assembly and loop-task verify/apply | `Helpers/profile_sig.h` |
+| ABD2 chunk receiver and acknowledgements | `BLEWrapper` |
 
-**The fix already exists, half-built.** The app's profile fetch (`/vehicles/obdble_get_pids`) requests
-`signed=true` and receives a **JWS compact string, RS256**, verified in-app against a hardcoded RSA-2048
-public key. Today the app verifies it and then **throws the signature away**, pushing only the parsed
-object. Forward the JWS instead and let the dongle verify it.
+After `CLEAN OK`, send ordered, individually acknowledged
+`{"JWS":{"i":<idx>,"n":<total>,"d":"<180-char slice>"}}` writes. The loop task verifies the
+verbatim `<header>.<payload>` using RSASSA-PKCS1-v1_5/SHA-256 and replies `JWS OK` or `JWS BAD`.
+Only after OK send the token and UTC packages that complete setup. Never fall back to an unsigned
+push after BAD. Verification translates/re-pads base64url and returns a payload location only on
+success; it does not trust an attacker-selected algorithm or parse unverified profile values.
 
-**Critical constraint discovered while designing this:** the app *mutates* the payload after verifying
-(it coerces `maxValue` to a number), and the dongle reassembles the pushed key/value packages into
-key-sorted nlohmann JSON. The bytes the dongle holds are therefore **not** the bytes that were signed. So a
-detached signature over any "canonical" form is a trap — it would break on number formatting alone. The signed
-artifact must be transported **verbatim** and verified *before* parsing, exactly like OTA hashes the bytes it
-actually stored.
+**Compatibility constraints:** keep JWS separate from the shared parsed profile so generic obdble
+behaviour and HASH input do not change. HASH is the app-computed CRC32 of the sanitized profile
+serialization with the token appended; firmware stores/compares it, not recomputes it. On HASH OK,
+no JWS chunks are transferred. Keep loop-task apply, identical-profile ATZ suppression and
+persistence semantics unchanged. A cleaned but interrupted push invalidates the hash and forces
+a later full push. Strict enforcement refuses an unsigned full push from an old **app-side cache**;
+the app must refetch the JWS. It does not re-verify an already persisted device profile.
 
-### Wire format (ABD2, additive)
+**Bench evidence, 2026-08-25:**
+- 10 ordered chunks yielded a 1660 B JWS, 9 keys, **54 ms** RSA verification, a 941 B applied config
+  and a persisted profile. Later boots took `HASH OK` / `SETUP OK` without a repush.
+- `JWSTEST` altered one valid base64url character (not a separator), then restored it:
+  `intact=ACCEPT tampered=reject restored=ACCEPT`. This distinguishes signature rejection from
+  malformed input or a verifier stuck false.
+- An app push with the last 6 signature characters overwritten logged
+  `PROFILE JWS REJECTED (bad signature, 1660 B)` and no JWS OK, setup completion or config apply.
+  The previous running profile continued polling; clearing staging did not erase the active OBD profile.
 
-```
-app → {"JWSBEGIN":<total_chunks>}
-app → {"JWS":{"i":0,"d":"<up to ~200 chars of the compact JWS>"}}   … i = 0..n-1
-app → {"JWSEND":1}
-dongle: reassemble → verify RS256 over  base64url(header) "." base64url(payload)
-        → on success parse payload, apply as today, persist to /vehicle_profile.json
-        → on failure  {"ERROR":"badsig"}, keep the running profile, invalidateHash()
-```
+`JWSTEST` remains a read-only serial diagnostic for key/verification checks. Profile signatures
+do not gate authenticated OTA, so a bad profile key/format can be repaired without an unsigned
+profile override. Auth itself does gate OTA, with `AUTHCLEAR` as the state-recovery mechanism.
 
-JWS size ≈ 1.5 KB (≈1 KB payload + 342-char RSA-2048 signature + header) → ~7 chunks at MTU 247.
-
-### File map
-
-| Change | Where |
-|---|---|
-| Keep the raw JWS per typecode; push it in chunks instead of per-key packages | app |
-| Reassembly + verify + apply | `libraries/BLEWrapper/blewrapper.cpp` (`StartupCallbacks::onWrite`), `baseLogger/Helpers/ble.h` |
-| Pinned key | new `baseLogger/Helpers/pid_pubkey.h` (RSA-2048, same key the app pins) |
-| RS256 verify | mbedTLS RSA, ~10–30 ms on ESP32. Alternative: have the backend also emit ECDSA-P256 so the dongle reuses the OTA verify path — but that *is* backend work, and the JWS route needs none |
-
-### The escape hatch this needs
-
-The app's **PID editor authors unsigned profiles** (custom PIDs). Strict
-enforcement would break it. So the dongle needs an unsigned-accept mode that is **physical-access gated**: a
-serial console command (`UNSIGNED ON`), **RAM-only** so a reboot clears it. Never an app-side toggle — an
-app-flippable bypass is not a security boundary.
-
-### Rollout without lockout (three firmware/app steps)
-
-1. Firmware accepts **both** the legacy per-key push and the new JWS push (prefers JWS).
-2. App switches to sending the JWS.
-3. Firmware flips to **requiring** a valid JWS (unless `UNSIGNED ON`).
+**Rejected draft mechanisms:** `JWSBEGIN`/`JWSEND`, a separate `pid_pubkey.h`, and a serial
+`UNSIGNED ON` escape hatch were proposals, not the implemented interface. The implemented chunk
+format and verifier are listed above. The signed bytes must remain verbatim: app-side number
+coercion or JSON reserialization changes the signature input. Strict profile enforcement would
+also refuse unsigned custom PID profiles; account for that before changing the default.
 
 ---
 
@@ -1455,30 +1316,17 @@ app-flippable bypass is not a security boundary.
 > (`greet: unprovisioned` → `provisioned`) with MTU 247 preceding every greet — the MTU fix holds, 4/4.
 > The iPhone then connected and was **refused** (`AUTH2 fail (bad proof)`), and after an `AUTHCLEAR` +
 > iPhone provisioning the Android was refused in turn. Those refusals are the gate working: each phone
-> holds only its own secret, and the dongle computed and compared an HMAC to reject the other. Note the
-> *success* path (`AUTH2 ok`) is still unwitnessed — every capture so far provisioned with one phone and
-> then connected the other; a reconnect with the SAME phone is the missing one-line confirmation.
+> holds only its own secret, and the dongle computed and compared an HMAC to reject the other.
+> Same-session success was then witnessed on 2026-08-24, below.
 >
 > **The enforce path is now real.** `authenticated` used to be one flag doing two jobs — the ABD2
 > state-machine latch (while false, the next write is parsed as an AUTH token) *and* the session grant
 > (telemetry / OTA / log dump / cellular stand-down). That conflation made enforcement impossible:
 > withholding the grant would have re-parsed every profile packet as an AUTH attempt and broken the
-> push. They are now split — `setup_unlocked` (latch) and `authenticated` (grant). Audit mode sets
-> both from the legacy write, so behaviour is unchanged; under `AUTH_ENFORCE 1` the legacy write sets
-> only the latch and **only a valid ABD8 HMAC proof authorizes**. Both paths compile; audit is the
-> shipping default. `auth_enforce` reaches the library through `set_auth_enforce` (the runtime-setter
-> pattern — the library never sees config.h).
->
-> **Audit mode grants NO access control.** Anyone signed into the account holds the vehicle's
-> `tlm_push_token`, which the legacy write accepts — so a second phone with an old app build still gets
-> telemetry, OTA and the log dump. Verified in the field 2026-08-21. That is the hole this phase exists
-> to close, and it stays open until `AUTH_ENFORCE` flips.
->
-> **Prerequisites before flipping (both are lockout risks, not polish):** the audit logs must show
-> `AUTH2 ok` on every reconnect on both platforms — enforce turns a silent audit failure into no
-> telemetry at all — and the QR give/receive flow must exist, because the secret lives in **that
-> phone's keyring, not on the account**: a second phone, or a reinstall, otherwise has no in-app way to
-> obtain it (only `AUTHCLEAR` over serial).
+> push. They are now split — `setup_unlocked` (latch) and `authenticated` (grant).
+> The former audit mode let the legacy token write grant access; that behaviour and the
+> `AUTH_ENFORCE` switch were removed. Before enforcement, successful proof/reconnect and QR
+> sharing had to work on both phone platforms because account sync does not carry the local secret.
 >
 > **Handshake verified end to end (2026-08-24):** `greet: unprovisioned` → `provisioned` →
 > `AUTH2 ok (ENFORCED - session granted)`, all in ONE session. Two fixes got it there. First, a
@@ -1492,7 +1340,7 @@ app-flippable bypass is not a security boundary.
 > ABD2 carries the PID list and the tlm push token, so a peer that can write there can inject arbitrary
 > PIDs at the CAN bus — the worst case in §0's table, and worse than reading telemetry. Pairing alone
 > does not earn that: it proves the link is private, not that the peer is allowed. Under
-> `AUTH_ENFORCE` the dongle now refuses ABD2 with `NOAUTH` until the ABD8 proof lands, and the app
+> the enforced gate the dongle refuses ABD2 with `NOAUTH` until the ABD8 proof lands, and the app
 > runs the auth handshake **before** the profile push (it used to push the profile first and
 > prove afterwards, which would fail on every first connect under enforcement). Correct layering:
 > pair → prove → data. The handshake stays non-fatal so old firmware and declined pairings still
@@ -1504,28 +1352,19 @@ app-flippable bypass is not a security boundary.
 > secret decoding to exactly 32 bytes — because a camera hands the app any QR in view and a malformed
 > keyring entry produces a dongle that silently refuses this phone.
 >
-> **`AUTH_ENFORCE` is 1** — flipped and field-confirmed (`AUTH2 ok (ENFORCED - session granted)`).
+> Enforcement was field-confirmed (`AUTH2 ok (ENFORCED - session granted)`); it is now unconditional.
 >
 > **The vestibule/bouncer is STRUCK, and replaced by something better.** Dropping a connection that
 > never authorizes cannot work here: the dongle cannot distinguish a camping stranger from a user
 > mid-pairing-decision, and dropping the link makes the poller reconnect and re-raise the OS
 > pairing prompt every cycle — precisely the churn the app's pairing-declined state was built to prevent.
 >
-> What the vestibule was actually for was denying a camper the two things it could still cost us:
-> holding the dongle awake, and occupying a connection slot. So instead the **awake-hold now keys on
-> `bleRelaying()` (connected AND authorized) rather than `bleConnected()`**. A peer that never
-> authorizes no longer refreshes the activity leash, so the device progresses ACTIVE → CHARGING →
-> STANDBY → deep sleep on its own: **~10 min (`ACTIVE_TIMER` + `CHARGING_TIMER`) instead of the 60 min
-> `MAX_AWAKE_MINUTES` backstop.** Sleeping also stops advertising entirely, so the worst case for a
-> declining user becomes one prompt per wake instead of one per poll tick — strictly better than the
-> vestibule on both counts.
->
-> **The trap that made this non-trivial:** gating the leash on relaying alone would let a legitimate
-> phone that connects while the leash is nearly expired fall out of the BLE state DURING its handshake,
-> and `CHARGING` deliberately never revives on a connection alone — so a real session would have been
-> slept out from under the user, the exact failure `BLE_CONNECTED_HOLDS_AWAKE` exists to prevent. Both
-> connect transitions therefore stamp `last_active`, giving every new session a full `ACTIVE_TIMER` to
-> authorize before the relaying check starts governing it.
+> **Replacement:** give a new connection `ACTIVE_TIMER` grace by stamping `last_active`, then
+> refresh its awake leash only on authenticated presence. That is not the same as v1 relay health:
+> a phone can stop carrying telemetry while its authenticated user still needs the dongle awake.
+> Without the initial grace, a connection near expiry could sleep during its handshake.
+> The two idle timers share a timestamp; their five-minute values do not add to ten minutes.
+> The parked max-awake backstop remains separate, with OTA/dump/maintenance exemptions.
 
 **The hole:** `{"AUTH":"<tlm_push_token>"}` is a reusable secret sent in plaintext on **every connect**, and
 the dongle logs prove it is literally the vehicle's cloud upload credential:
@@ -1553,25 +1392,10 @@ since #90, the protocol range `"proto":[MIN,MAX]`; the proof may carry `"proto":
 
 No backend call. HMAC-SHA256 is microseconds on the ESP32 and mbedTLS is already linked.
 
-**Secret provisioning — SETTLED as TOFU + QR, no backend** (decided in review; supersedes the
-backend-stored-secret idea above):
-
-- **TOFU (trust on first use):** an unprovisioned dongle (empty `auth` NVS namespace) accepts the first
-  secret written to ABD8 and locks to it. **No factory window / timeout** — dongles are claimed and
-  provisioned by their owner before they ever reach a vehicle, so a countdown adds firmware complexity for
-  a parking-lot threat that cannot occur. Rescue from a lost/mismatched secret is the `AUTHCLEAR` serial
-  command (physical access; already shipped; does not revoke a live session).
-- **One secret per dongle, no per-person slots** — slots mean chasing every holder down for rotation.
-  Sharing access = the app shows the secret as a **QR code** ("give") and scans it ("receive"), phone to
-  phone, in person. No MITM surface: you show a QR in a controlled space.
-- The provisioning write crosses BLE **encrypted** (Phase E gated ABD8 before this phase started), so the
-  original "provisioning crosses in the clear" caveat is retired.
-
-**Rollout in audit mode first:** `AUTH_ENFORCE 0` — the ABD8 handshake runs and its outcome is logged
-(`AUTH2 ok/fail`), but the legacy `{"AUTH":"<token>"}` on ABD2 keeps granting the session, so an app
-without the new handshake loses nothing. Enforcement (legacy AUTH stops granting; vestibule/bouncer
-drops never-authenticating connections) is a later, deliberate flip — same pattern that made the
-encryption rollout safe.
+**Provisioning decision:** one ECDH-derived secret per dongle, shared explicitly by QR, with no
+backend or per-person slots. The old raw-secret `provision` write and audit-mode grants were removed.
+Just Works encryption does not authenticate first provisioning against an active MITM.
+`AUTHCLEAR` now revokes a live grant too; reset details are in [§3](#section-3).
 
 **Honest limit that remains:** B2 removes the token from *every connect*, but the token is still part of a
 **full profile push** (it is one of the pushed keys and is inside `HASH`'s input), so it still crosses the
@@ -1590,58 +1414,31 @@ air — now encrypted by Phase E — whenever the profile is re-pushed.
 > permitted". With QR sharing a secret propagates to whoever the holder chooses and there is no
 > per-person revocation — rotation is all-or-nothing (`AUTHCLEAR` → re-provision → re-share).
 
-Log fetch exfiltrates GPS traces, so "which user is allowed to pull this dongle's logs" is a live question that
-only the backend can answer.
-
-```
-app    → {"CHALLENGE":1}
-dongle → {"nonce":"<16 bytes, base64>"}
-app    → HTTPS POST {dongle_id, nonce}   → backend: authenticate user
-                                          → check ownership/permission table
-                                          → sign, return signature
-app    → {"AUTHSIG":"<base64, 64 bytes raw r‖s>"}
-dongle: verify ECDSA-P256 over  "ABRPAUTH1" | dongle_id | nonce  → privileged = true (session-scoped)
-```
-
-- **Bind `dongle_id` into the signed blob.** Without it, a user legitimately authorized for *their* dongle can
-  obtain a signature and replay it against someone else's.
-- **Separate key pair from OTA signing** — different purpose, different rotation cadence, smaller blast radius.
-  New `baseLogger/Helpers/auth_pubkey.h`, new `tools/auth_keygen.py`.
-- **Extract, don't duplicate:** factor the existing mbedTLS ECDSA verify out of `Helpers/ota_update.h` into a
-  shared `Helpers/ecdsa_verify.h` so OTA and auth share one proven implementation.
-- Privileged flag is **RAM-only**, cleared on disconnect and after a timeout.
-- Enforcement: `log_dump.h` START gates on `ble.privileged()`.
-- App: an authorization step before the log fetch, calling a new endpoint next to the existing pairing
-  call, which is where the ownership record already lives.
-
-Backend: one endpoint, an ownership check, and private-key storage (KMS/HSM rather than a config file).
+The rejected alternative would have added an account/ownership endpoint signing a dongle-bound
+nonce with a separate ECDSA key. That would provide per-user authorization, unlike shared-secret
+possession, but added backend dependency and key custody. `AUTHSIG`, `auth_pubkey.h` and
+`ble.privileged()` from that proposal are not firmware APIs.
 
 ---
 
 ## 6. Phase D — same authorization for OTA
 
 > **SUPERSEDED — struck by decision (2026-08-25).** OTA START already requires the session grant
-> (`ota_update.h`, the `OTA_ERR_NOAUTH` check), which under `AUTH_ENFORCE` means a valid HMAC proof.
+> (`ota_update.h`, the `OTA_ERR_NOAUTH` check), granted only by a valid HMAC proof.
 > The prerequisite this phase demanded — a serial-only `AUTHOFF` override before enforcing — was also
 > dropped, on the reasoning that `AUTHCLEAR` already restores access for every *state* failure, and
 > the only case it cannot cover (the auth code itself being broken) needs new firmware regardless,
 > which needs physical access either way. `AUTHOFF` would have saved the build toolchain on a visit,
 > not the visit.
 
-Identical mechanism, gating `ota_update.h`'s START.
-
-**Prerequisite:** a serial-only override must exist *first* (`AUTHOFF`, RAM-only, physical access). OTA is the
-delivery mechanism for every future fix — if the auth path breaks and OTA is behind it, the fleet cannot be
-repaired. Same lesson as the anti-downgrade floor.
-
-Note the resume path: an OTA that drops mid-transfer re-authenticates within the 90 s grace window. With the
-network assumed available, that is simply a second backend call — no cached ticket needed.
+Resume after a disconnect requires a new local authenticated session within the 90 s window;
+there is no backend authorization call or cached ticket.
 
 ---
 
 ## 7. Phase E — link-layer encryption (bonding / SMP)
 
-> **STATUS — E1 + step 3 (ABD7 only) shipped and VALIDATED on Android and iOS** (2026-08-20, real dongle,
+> **First encrypted-dump validation — ABD7-only stage, Android and iOS** (2026-08-20, real dongle,
 > both phones). Confirmed on both platforms: exactly one pairing prompt, and only at the first gated access
 > (the log-dump fetch); silent LTK reuse on reconnect (Android re-encrypts eagerly at connect, iOS lazily at
 > the first gated access — both correct, just changes where `SEC bonded` lands in a log); full 2.86 MB dumps
@@ -1661,7 +1458,7 @@ network assumed available, that is simply a second backend call — no cached ti
 > | Prereq | How it was met |
 > | --- | --- |
 > | 1. Database Hash / Service Changed | **Substituted, by decision:** the GATT table is FROZEN instead, with `ABD9`/`ABDA` created unused so a future need reuses a handle rather than reshaping the table. Service Changed without Database Hash would not reliably invalidate an iOS cache, and the library provides neither. See the FROZEN TABLE note in `blewrapper.h`. |
-> | 2. Handle budget | `createService(..., 32)` — 28 used, 4 spare, arithmetic in `blewrapper.cpp`. |
+> | 2. Handle budget | Raised to 32 before bonding; current use is 30 after the reserved-characteristic change. |
 > | 3. One batched table change | Better than planned: the table change shipped **before** bonding existed, so the cache flush was paid while still unbonded (a BT toggle recovers it). E1 itself changes no handles. |
 > | 4. `BONDCLEAR` | Serial console, plus `AUTHCLEAR`. Both shipped before the thing they recover from. |
 >
@@ -1684,18 +1481,11 @@ network assumed available, that is simply a second backend call — no cached ti
 > for cellular — then `SEC bonded` → `AUTH OK` one second later (Android holds the gated write pending
 > during the dialog and retries it transparently).
 >
-> **Companion fix, field-found on the decline path:** the dongle's three cellular gates (upload, modem
-> re-init, NTP retry) keyed on `bleConnected()` under the pre-gating assumption "a connected phone relays
-> to the cloud" — so a phone that declined pairing (connected, relaying nothing) silently starved cellular
-> and the data flowed **nowhere** live (frames only buffered). They now key on `bleRelaying()` =
-> connected **and** authenticated (`Helpers/ble.h`) — AUTH on ABD2 is only possible over a paired link, so
-> it's exactly "the phone is a working transport", and it is the dongle-side mirror of the app's
-> pairing-declined state (both flip on the same AUTH event). The state machine's awake-hold deliberately stays
-> on `bleConnected()`: sleeping mid-pairing-prompt would drop the link and cause reconnect→re-prompt
-> churn; `MAX_AWAKE` bounds a camping phone. Accepted cost: a POST may now overlap the few seconds
-> between CONNECT and AUTH OK. Residual, by design: each NEW connection session prompts once — an
-> unpaired phone that keeps auto-reconnecting keeps getting one prompt per session; the cure is pairing
-> or unlinking the dongle, not suppression.
+> **Decline-path failure:** mere connection previously suppressed upload, modem re-init and NTP
+> retry, so an unpaired phone starved cellular while carrying nothing. Those paths now use
+> `bleRelaying()`; v1 also requires relay health (§2). Awake-leash rules are separate (§4 above).
+> Cellular may overlap CONNECT→proof. Each new unpaired connection can prompt again; repeatedly
+> disconnecting it is not a pairing-decline fix.
 >
 > The rollout went ABD7 → ABD1/ABD2 → everything, each step field-validated before the next. The original
 > plan kept ABD5/6 (OTA) open until last, fearing a permission mistake would brick updates — that caution
@@ -1742,28 +1532,14 @@ sec.setKeySize(16);                                    // AES-128
 pChar->setAccessPermissions(ESP_GATT_PERM_READ_ENCRYPTED | ESP_GATT_PERM_WRITE_ENCRYPTED);
 ```
 
-### Hard prerequisites — do NOT skip these
+### GATT migration decision
 
-1. **GATT Database Hash / Service Changed.** This project has already lost days to iOS serving a stale cached
-   GATT table (`notify change failed`, ABD6 "not found"), with the remedy being a Bluetooth toggle. **Bonded**
-   devices cache harder, and the user remedy escalates to "Forget This Device" in system settings. Implement
-   the Database Hash characteristic (or at minimum Service Changed) so a firmware update that changes the GATT
-   table triggers re-discovery.
-2. **Raise the service handle budget first.** Currently **21 of 24** used (7 characteristics + 6 CCCDs + the
-   service declaration). Database Hash and any auth characteristic will not fit. Raise `createService(...,
-   24)` to 32 — a few bytes of RAM.
-3. **Batch every GATT-table change into ONE firmware update** (handle count, Database Hash, any new
-   characteristic), so users pay the cache-flush disruption once instead of three times.
-4. **A serial `BONDCLEAR` command.** Bluedroid's bond list is small (single digits) and stored in NVS; between
-   dev, support and family phones it will fill and evict. There must be a recovery that is not a reflash.
-
-### Rollout order (this ordering is the safety property)
-
-1. Firmware **supports** SMP but requires it nowhere (permissions unchanged). Ship, verify nothing regressed.
-2. App-side bonding support. Verify on **both** iOS and Android, explicitly across a firmware update that
-   changes the GATT table — that is this project's known failure mode.
-3. Flip `*_ENCRYPTED` per characteristic, in this order:
-   **ABD7 (log dump, lowest blast radius) → ABD3/ABD4 → ABD1/ABD2 → ABD5/ABD6 LAST.**
+The initial plan called for Service Changed/Database Hash and a larger handle budget before bonding.
+Instead, the table was frozen and the budget raised to 32; #90's reserved-characteristic change
+uses 30. The old 21/24 and 28/32 counts describe earlier layouts, not spare capacity today.
+Stale iOS caches produced `notify change failed` and missing ABD6; bonded phones may require
+“Forget This Device”, not just a Bluetooth toggle. Do not infer safe migration from a successful
+unbonded test. `BONDCLEAR` remains the device-side recovery.
 
 ### Known limits
 
@@ -1805,28 +1581,17 @@ ABD2 profile push are one-shots — they log the refusal and fail plainly. The p
 decline the subscription already detected (it should short-circuit the next cycle); it just never
 concludes one itself.
 
-In both paths a handshake failure must not abort the flow — firmware without ABD8 rejects it and that
-firmware's ABD2 accepts the push regardless. If authorization was genuinely required and did not
-happen, the setup step is what reports it.
+The former non-fatal-handshake fallback served firmware predating ABD8. Current firmware requires
+the proof before ABD2; do not treat that historical compatibility path as an authorization bypass.
 
 ---
 
 ## 8. Ordering summary and the one invariant
 
-```
-A (dev gating)  →  B (signed profiles)  →  B2 (nonce+HMAC)  →  E1/E2 (SMP support + app bonding)
-                                        →  C (log-fetch auth)
-                                        →  E3 (flip encryption, ABD5/6 last)
-                                        →  D (OTA auth, needs AUTHOFF override)
-```
-
-**The invariant, stated once and respected everywhere:** OTA (ABD5/ABD6) is the delivery mechanism for every
-future fix, so it is the **last** thing locked in every dimension — authorization *and* encryption — and every
-gate gets a physical-access serial override before it is enforced.
-
-Practical grouping: A ships alone today. B+B2 are one firmware/app cycle (both touch ABD2 and the setup
-handshake). E1 rides along in that same firmware so SMP support and the batched GATT changes land together. C
-then D last, once the override exists.
+The rollout staged developer UI gating, signed profiles, local HMAC and link encryption; log-dump
+encryption provided evidence before OTA was gated. Separate backend authorization and `AUTHOFF`
+were rejected, not pending phases. Preserve USB recovery and validate both refusal and recovery
+before tightening a gate. The current enabled/default matrix is in [§1](#section-1).
 
 
 ---
@@ -1837,17 +1602,8 @@ then D last, once the override exists.
 
 > Original file: `ota-update-architecture-v1.md`
 
-# Firmware OTA over BLE — v1 build specification
-
-End-to-end specification for the ESP32 dongle firmware update system, covering **both
-sides** — the dongle (ESP32, PlatformIO/arduino-esp32) and the mobile app — and how
-they interact over BLE. This is a v1-only build spec: it describes exactly what gets
-built now. Deferred ideas are deliberately omitted to keep the implementation focused.
-
-The two sides share one contract: a protocol over two GATT characteristics
-(`ABD5`/`ABD6`) on the existing `ABD0` service, fixed sector/ACK framing, and a strict
-division of responsibility where the **dongle owns all trust and safety** and the
-**app is a dumb, untrusted courier + status screen**.
+Architecture decisions and implementation constraints. The single byte-level contract is in
+[Appendix C](#appendix-c); release/signing operations are in [RELEASING.md](../RELEASING.md).
 
 ---
 
@@ -1863,9 +1619,8 @@ division of responsibility where the **dongle owns all trust and safety** and th
 | Progress / result UI | App |
 | Stay out of the transfer's way (poller back-off) | App |
 
-**Failure invariant:** if the app is buggy, killed, or malicious, the worst case is a
-*failed/aborted* update — never a bricked dongle and never an unsigned image running.
-This falls out of the dongle design; the app's only obligation is not to undermine it.
+The app must not be trusted to validate an image or commit it safely. Inactive-slot staging
+contains interrupted transfers; it is not a blanket guarantee against hardware failure.
 
 ---
 
@@ -1875,9 +1630,8 @@ This falls out of the dongle design; the app's only obligation is not to undermi
    app fetches them, then transfers over BLE.
 2. **Repo access:** none. The signature is the trust boundary, so authenticated
    distribution buys nothing.
-3. **Signing trust root:** central vendor signing — one private key, kept offline/secure
-   (ideally HSM/hardware token); the corresponding public key is compiled into the dongle
-   firmware.
+3. **Signing trust root:** the vendor private key remains in KMS; the public key is compiled
+   into firmware. Release authorization and key-management operations are in `RELEASING.md`.
 4. **Transport:** BLE only. The app downloads the image and streams it to the dongle.
    Byte-transfer is isolated behind one module on each side so the OTA backend does not
    hard-code the byte source (clean seam; no alternative transport is built in v1).
@@ -1887,181 +1641,56 @@ This falls out of the dongle design; the app's only obligation is not to undermi
 6. **Crypto:** **ECDSA-P256 + SHA-256**, using the bundled mbedTLS (`mbedtls/ecdsa.h` +
    `mbedtls/sha256.h` ship in-framework; Ed25519 would need an extra library, so it is
    not used).
-7. **Version scheme:** monotonic integer (1, 2, 3, …) stored in the dongle's NVS. The
-   dongle rejects any incoming image whose version ≤ the stored value. (Integer format
-   chosen so it stays compatible with a hardware secure-version counter if that is ever
-   adopted; none is enabled in v1.)
+7. **Version scheme:** release `X.Y.Z` maps to `major*1000000 + minor*1000 + patch`.
+   Nonzero versions below the effective compiled/NVS floor are refused; equal versions are
+   allowed. RC and final names can share a numeric version. No eFuse secure-version is enabled.
 
 ---
 
 ## 2. Shared BLE contract (the interface both sides implement)
 
-One service reused so the existing connection/bonding is untouched. Two new
-characteristics; `ABD1`..`ABD4` (telemetry/startup/developer/error) are **not** touched.
+Use Appendix C's distinct ACK/status frames and error table, not the original draft's combined
+frame. ABD5 is READ + WRITE + NOTIFY; ABD6 is WRITE_NO_RESPONSE. Sectors are 4096 B,
+stop-and-wait; a NACK retries the whole sector. `cur_sector` is the **next expected sector**.
+Resume means re-authenticate and send matching START, then use ARMED's returned anchor.
 
-### 2.1 GATT layout — two new chars on the existing `ABD0` service
-| Char | UUID | Properties | Role |
-|---|---|---|---|
-| OTA control | `ABD5` | WRITE + NOTIFY | client→device commands (START/END/ABORT) + metadata; device→client status/ACK notifications |
-| OTA data | `ABD6` | WRITE_NO_RESPONSE | client→device firmware packets (throughput path) |
+The dongle caps MTU at 247; data payload is MTU−6. Request MTU before the subscription that
+triggers the greeting, not only after entering OTA. iOS negotiation is OS-controlled (historically
+around 185). At 517, large notifications were lost; see [§2](#section-2).
 
-### 2.2 Sectoring & framing (Espressif `esp_ble_ota` design)
-- Firmware split into **4096-byte sectors** (one flash page, one `esp_ota_write` per sector).
-- Each sector split into MTU-sized packets. **Data packet on `ABD6`** = 3-byte header + payload:
-  ```
-  [0] sector_index LSB
-  [1] sector_index MSB      (0xFFFF in [0..1] = "this is the last sector")
-  [2] packet_seq            (0,1,2,...; 0xFF = "last packet of this sector")
-  [3..] firmware payload    (MTU − 3 ATT − 3 header bytes)
-  ```
-- **Control/metadata on `ABD5`** (client→device), first 2 bytes = opcode LE:
-  - `0x0001` START + `uint32 image_size` + `uint32 version` + `sha256[32]` + `signature[64]`
-    (~106 B, one long write — reuse the config-push long-write path used on `ABD2`).
-  - `0x0002` END/commit-request. `0x0003` ABORT.
-- **ACK/status frame (device→client, NOTIFY on `ABD5`)** = 20 bytes, CRC16-CCITT
-  (`poly=0x1021, init=0x0000`) in the last 2 bytes:
-  ```
-  [0..1] sector_index echoed   [2..3] status   [4..5] cur_sector (resume anchor)   [18..19] CRC16
-  status: 0x0000 success, 0x0001 CRC/verify err, 0x0002 sector-index err, 0x0003 length err
-  ```
-
-### 2.3 Flow control — stop-and-wait per sector
-Client sends all packets of sector N → device assembles 4 KB → loop task `esp_ota_write`s
-it → device NOTIFYs the sector ACK (with `cur_sector`) → client sends sector N+1. Paces
-the transfer to flash speed; can't overrun. Port the **NimBLE retry logic** (not the
-weaker Bluedroid one): on `sector_index`/`packet_seq` mismatch, set a sticky sector-error,
-reset the sector to packet 0, NACK with `0x0002`, and swallow the stale `0xFF` end-marker
-until the sector retries cleanly.
-
-### 2.4 Resume anchor
-The ACK carries `cur_sector` — the last successfully-written sector. On reconnect the
-device reports it so the app can resume mid-transfer rather than restart a multi-minute
-upload. During OTA the app's update flow owns reconnect (the poller stands back, §4).
-
-### 2.5 MTU / connection interval (throughput)
-- **Dongle:** request a large MTU for the OTA session (up to 517; the existing `setMTU(185)`
-  telemetry path still works at a higher ceiling). Payload/packet = `MTU − 6`. Request the
-  fastest connection interval **only during OTA** (7.5 ms; min=max=0x06, latency=0,
-  supervision=4 s) and revert afterward.
-- **App reality check — this bounds the negotiation:** when this was written the app did not
-  request an MTU. *Superseded:* it now requests 517 before subscribing (Appendix A §4, the
-  Android greet fix), and the dongle caps the MTU at 247 (`BLEDevice::setMTU(247)`; Part I §2
-  *Hard-won BLE facts*: at 517 large notifications are lost), so Android negotiates 247. On
-  **iOS**, MTU is OS-negotiated and **cannot be forced** (you get ~185); plan iOS transfer time
-  around the lower MTU. (The original "raise MTU only for the OTA session" advice is superseded
-  too: the request now comes before the subscribe that triggers the auth greet.)
-
-### 2.6 Throughput expectation (shared reality)
-Closest reference (fbiego, NimBLE, optimized): ~1,038,544 B in 85 s ≈ **12 KB/s** →
-~1.72 MB best-case ~2.4 min; with stop-and-wait on Bluedroid plan **~2.5–5 min**.
-Acceptable for a human-present, parked, engine-off operation *if* power/sleep gating holds
-for the whole window.
+**Historical throughput estimate, not a current-firmware measurement:** the optimized NimBLE
+reference transferred 1,038,544 B in 85 s (about 12 KB/s). That implied 2.4 minutes for a then-1.72 MB
+image, or an estimated 2.5–5 minutes on Bluedroid with stop-and-wait.
 
 ---
 
 ## 3. DONGLE SIDE
 
-### 3.1 Partition table & flash (already OTA-ready)
-`default_16MB.csv`: `otadata` selector, `app0`/`ota_0` 6.5 MB, `app1`/`ota_1` 6.5 MB,
-`spiffs` 3.5 MB (LittleFS), `coredump` 64 KB. Current image **1.72 MB** → ~3.8× headroom
-per slot; the "a failed transfer only touches the inactive slot" property is already in
-place. **Freeze the table before v1** — `esp_ota_ops` updates only `ota_0`/`ota_1`, never
-the bootloader or the table; don't shrink slots. **USB/serial (`esptool`) full-flash
-recovery must always work** and is the ultimate backstop.
+The implementation is `Helpers/ota_update.h`; these are its design constraints, not pseudocode
+to copy into a second implementation.
 
-### 3.2 OTA core — native `esp_ota_ops` (NOT Arduino `Update.h`)
-The Arduino reference repos all use `Update.h` and none implement rollback/verify — they
-`ESP.restart()` blind. `esp_ota_ops` exposes the safety APIs. Exact staging sequence
-(runs on the loop task, §3.6):
-```c
-#include "esp_ota_ops.h"
-const esp_partition_t* tgt = esp_ota_get_next_update_partition(NULL); // inactive slot
-esp_ota_handle_t h;
-esp_ota_begin(tgt, image_size, &h);          // image_size from START (§2.2)
-// per 4 KB sector, flow-controlled:
-esp_ota_write(h, sector_buf, sector_len);    // unverified bytes → inactive slot
-// on last sector:
-esp_ota_end(h);                              // validates header/format/size
-// READ-BACK VERIFY before committing (§3.4): re-read tgt block-by-block → SHA-256 → ECDSA verify
-esp_ota_set_boot_partition(tgt);             // ONLY commit point; nothing before this is live
-esp_restart();
-```
-**Never verify in RAM** (image ≫ heap): write unverified chunks to flash, then read the
-partition back to hash+verify. Commit = `esp_ota_set_boot_partition`; nothing is bootable
-until the staged image both `esp_ota_end`-validates AND signature-verifies.
-
-### 3.3 Rollback (native, already enabled)
-Stock arduino-esp32 `sdkconfig` has `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y`, so this is
-**not** a framework-rebuild risk. The new image boots `ESP_OTA_IMG_PENDING_VERIFY`; it must
-run its self-test (§3.5) and call `esp_ota_mark_app_valid_cancel_rollback()` within the boot
-window, or the bootloader auto-reverts to the last-good slot on the next reset. On a failed
-self-test, call `esp_ota_mark_app_invalid_rollback_and_reboot()` to revert immediately. Read
-state with `esp_ota_get_state_partition(running, &state)`. A crash-before-self-test image is
-also rolled back natively — the strongest reason to use `esp_ota_ops`.
-**Phase-1 unknown to nail on the bench:** confirm the stock arduino startup doesn't already
-call `esp_ota_mark_app_valid_*` for us; if it does, the trial window closes before our
-self-test runs, and we must take over mark-valid timing so the self-test is meaningful.
-
-### 3.4 Signature verification — ECDSA-P256 + SHA-256 (bundled mbedTLS)
-- **Algorithm:** ECDSA over NIST P-256 (secp256r1), message = SHA-256 of the full image.
-- **Signing (post-build, off-device):** a PlatformIO `extra_scripts` post-build step hashes
-  `firmware.bin`, signs the hash (openssl / python-ecdsa) with the offline private key, and
-  emits a detached signature (64 B r||s) + metadata (version, size, sha256). **Private key
-  never in repo/project.**
-- **On-device verify:** after `esp_ota_end`, read the staged partition back in ~4 KB blocks
-  into an `mbedtls_sha256` context, then `mbedtls_ecdsa_read_signature`/verify against the
-  public key compiled into firmware. Only on success → `esp_ota_set_boot_partition`.
-- **Bind version into the signature:** hash over the image **plus** version+size metadata,
-  and keep that metadata *inside* the signed blob, so a valid signature can't be replayed
-  against a different declared version.
-
-### 3.5 Health check / self-test — hardware init, NOT connectivity
-Separate *firmware* failures from *environmental* ones; a healthy update in a no-signal
-garage must NOT roll back. Pass conditions on this device: cellular modem answers `AT`
-(existing `CellWrapper`/`check()`), BLE stack initializes (`bleInitForWake()`/advertising
-up), OBD/CAN transceiver initializes (`obd.begin`/profile init), filesystem mounts
-(`datalogger.begin`). **Do NOT require** network registration, an upload 200, or a paired
-phone. Run early in `setup()` when `state == PENDING_VERIFY`, then mark valid/invalid.
-
-### 3.6 Task / threading model (reuse the config-push hand-off)
-**All flash/`esp_ota_*` work runs on the loop task, never in the BLE `onWrite` callback** —
-the exact discipline that fixed the config-push PANICs (`configCallback` stashes
-`g_pending_config_str` + `g_config_pending`; `loop()` applies it; BLE events marshaled via
-`bleLogQueue`). For OTA:
-- `ABD6` `onWrite` (Bluedroid task): copy the packet into the current sector buffer, update
-  seq/offset; when a sector completes, hand the 4 KB buffer to the loop task via a FreeRTOS
-  queue (or double buffer + flag). **Do not** call `esp_ota_write` here.
-- `loop()`: drain the queue, `esp_ota_write` the sector, then send the sector ACK notify.
-  Stop-and-wait means one sector buffer suffices.
-- On Bluedroid, `ABD6` writes larger than one MTU arrive as prepared writes — reassemble on
-  `EXEC_WRITE` (mirror the Espressif Bluedroid impl buffering up to 600 B).
-
-### 3.7 Power & activity-state integration (reuse existing subsystems)
-- **Power gate:** begin/continue a flash only when parked on a healthy RESTING rail. Reuse
-  IO36 rail sense (`readIO36Rail`, `g_last_io36`) + ATRV; require > ~12.2 V resting and
-  `is_currently_parked`. Refuse/abort on `weak_rail` or driving. Flash-write current spikes
-  can trip the hardware brownout detector on a weak battery; OBD-II power can cut with the
-  ignition off — the window is narrow. Dual-slot contains a mid-write brownout (only the
-  inactive slot corrupts; the old image still boots).
-- **Suppress deep sleep for the whole OTA:** hold `maintenance_mode = true` (already blocks
-  the sleep state machine for USB sessions) from START until commit/abort, with the existing
-  idle auto-release as backstop.
-- **New `UPDATING` activity state** (or an `ota_in_progress` flag checked in
-  `handleActivityState` and the loop's upload/reconnect blocks): while updating, the OBD
-  poller and cellular reconnect/upload back off so nothing contends for CPU/heap or the
-  shared modem UART, and the state machine cannot transition to sleep. OTA is pinned to a
-  BLE-connected, parked session.
-- **Inactivity timeout** (device-side): if no packet arrives for N seconds, abort cleanly
-  (free buffers, release `maintenance_mode`) so an app crash can't wedge the device.
-
-### 3.8 Anti-downgrade
-Soft NVS monotonic counter (Preferences, already used): store the committed firmware version;
-reject a START whose `version` ≤ stored value. `esp_app_desc_t` (via `esp_app_get_description()`)
-carries the build version for cross-checks. Enforced on the dongle; app-side version selection
-is UX only. **Documented boundary:** NVS is erased by a USB reflash / NVS wipe, so this stops a
-*remote* downgrade (an app or attacker pushing an old signed image over BLE — the real threat)
-but not a *physical* one by someone who can reflash over USB. That physical case is out of scope
-for v1 by design.
+- **Partitions:** `default_16MB.csv` has two 6.5 MB app slots, 3.5 MB LittleFS and 64 KB coredump.
+  App OTA changes neither bootloader nor partition table. Keep USB recovery and do not shrink slots.
+- **Stage/commit:** native `esp_ota_ops` writes unverified sectors only to the inactive slot.
+  `esp_ota_end`, read-back hashing and signature verification must succeed before the boot pointer
+  changes. A whole-image RAM buffer is neither needed nor safe.
+- **Signature:** sign SHA-256 of `"ABRPOTA1" || uint32le(version) || uint32le(size) || SHA256(image)`.
+  ECDSA-P256 yields raw 32-byte `r` plus 32-byte `s`. The binary itself remains a raw app image;
+  metadata/signature travel separately. Official releases use KMS/OIDC, not a local build hook.
+- **Rollback:** `verifyRollbackLater()` in `logger.ino` defers Arduino's confirmation. The pending
+  image's `otaHandlePendingVerify()` self-test runs before the sleep gate and marks valid or rolls
+  back. A coverage outage, GNSS outage or sleeping car is not a failed firmware self-test.
+- **Tasks:** callbacks assemble/stash data; loop-task code writes flash and ACKs after writing.
+  Stop-and-wait permits one sector buffer. Do not perform flash/crypto work in Bluedroid callbacks.
+- **Power:** `otaPowerOk()` reads the rail afresh while polling is paused. Below 8 V is bench/USB,
+  at least 12.2 V is allowed, and the intermediate band is refused. Contrary to the initial plan,
+  the firmware does not enforce a parked-state requirement; the app's parking warning is not a gate.
+- **Activity:** `g_ota_active`/maintenance holds suppress normal polling, uploads and sleep.
+  The configured limits are 30 s inactivity, 90 s disconnected resume and 15 minutes per session;
+  image bounds and contiguous-heap admission are checked before staging.
+- **Downgrade:** refuse a nonzero version below `max(compiled version, NVS floor)`, not equal
+  versions. A normal PlatformIO upload preserves NVS; factory-image flashing/erase does not.
+  Physical reflashing remains outside this remote anti-downgrade boundary.
 
 ---
 
@@ -2080,8 +1709,8 @@ What the dongle relies on the app doing:
   Unsubscribe on done/abort.
 - **Stand back during the transfer.** The dongle is `UPDATING` and stops telemetry; while an update
   runs the poller must neither tear the connection down nor reconnect or stream.
-  The update flow owns reconnect: on a mid-transfer drop it reconnects, reads `cur_sector` from
-  `ABD5` and resumes; after the final reboot it reconnects and reads the version. Nothing else in the
+  The update flow owns reconnect: on a mid-transfer drop it reconnects, authenticates and sends
+  matching START, then resumes at the returned ARMED anchor; after reboot it reads the version. Nothing else in the
   telemetry path, the generic `obdble` lane or `ABD1`–`ABD4` changes.
 - **UX obligations:** drive progress from `cur_sector / total` in the ACK, not local bytes written
   (local writes lead what the dongle has committed). Treat interruptions (back-navigation, a call,
@@ -2095,95 +1724,52 @@ What the dongle relies on the app doing:
 
 ## 5. End-to-end flow (both sides)
 
-1. **Enter** the update flow → the poller stands back; read the dongle's current version.
-2. **Check** → fetch the manifest (GitHub Releases), compare versions → available / up to date.
-3. **Confirm** (user taps Update) → app shows a precondition pre-warning (park, engine off, keep
-   the app open, ~N min). The **dongle** enforces the real gate and refuses START if driving /
-   weak rail.
-4. **Download** → the image to a temporary file on the phone.
-5. **START** → app writes `0x0001` on `ABD5` (`image_size`+`version`+`sha256`+`signature`).
-   Dongle checks preconditions + anti-downgrade, `esp_ota_begin` on the inactive slot, arms.
-6. **Transfer** → app streams 4 KB sectors on `ABD6`, stop-and-wait on `ABD5` ACKs; dongle hands
-   each sector to the loop task, `esp_ota_write`s, ACKs with `cur_sector`. App shows progress
-   from the ACKs.
-7. **END / verify / commit** → app writes `0x0002`; dongle `esp_ota_end` → read-back SHA-256 →
-   ECDSA verify → `esp_ota_set_boot_partition` → `esp_restart`.
-8. **Reboot → reconnect → confirm** → connection drops; the update flow reconnects and reads the
-   version: advanced → success; unchanged → rolled back. Meanwhile the dongle boots
-   `PENDING_VERIFY`, runs the hardware self-test, and marks valid or invalid.
-9. **Exit / cleanup** → app deletes the temp file and removes the notify subscription; the poller
-   resumes. Dongle releases `maintenance_mode`.
+See Appendix C §4 for the single maintained sequence, including subscription-before-START,
+resume and post-reboot confirmation. A matching numeric version alone cannot distinguish an
+equal-version reinstallation or an RC from its final release; use reported status/build identity.
 
 ---
 
 ## 6. Non-negotiables (binding on both sides)
-- **Physical USB/serial recovery always works** (`esp_ota_ops` never touches the bootloader or
-  partition table). OTA is never the only way back.
+- **Keep physical USB/serial recovery supported.** App OTA does not change the bootloader or
+  partition table; hardware faults can still prevent recovery.
 - **Partition table sized generously and frozen before v1.**
-- **Signing key is the entire trust root:** offline, backed up, access-controlled, ideally HSM.
-- **App adds nothing the system's security depends on** — the worst app-side failure is an
-  aborted update, never a brick or an unsigned image.
+- **Signing key custody:** official signing is KMS/OIDC; follow `RELEASING.md`, not local-key recipes.
+- **App is not the verifier:** device-side checks must reject unsigned images, and inactive-slot
+  staging contains interrupted transfers. Neither is an unconditional no-brick guarantee.
 
 ---
 
 ## 7. Phasing (highest-risk-first, both sides in lockstep)
 
-**Phase 1 — bench core, unsigned, over BLE (de-risk the mechanics)**
-- Dongle: `esp_ota_ops` staging + `set_boot_partition` + `PENDING_VERIFY` self-test +
-  mark-valid/rollback. **First task: confirm the stock arduino mark-valid timing** (§3.3) — the
-  one genuine unknown. Two GATT chars + sector framing + stop-and-wait ACK + loop-task hand-off
-  (§3.6) + power/sleep gating (§3.7) + USB recovery proven. Measure real BLE transfer time.
-- App: update flow + poller back-off + read dongle version + `ABD5`/`ABD6` write/notify. Prove
-  it drives an *unsigned* bench transfer and the poller backs off cleanly (no contention, no
-  zombie teardown, clean reconnect after reboot).
-
-**Phase 2 — real update (security + full flow)**
-- Dongle: ECDSA-P256 signature + read-back verify before commit (§3.4); NVS anti-downgrade (§3.8);
-  PlatformIO post-build signing step.
-- App: manifest check + version compare + download + full sector protocol with stop-and-wait +
-  `cur_sector` resume + progress + all terminal states. Android MTU raise as the throughput
-  lever. Signature verified **on the dongle**; the app just carries bytes.
+The original rollout separated unsigned bench transfer mechanics from signed updates. Both are
+implemented; signatures are required by default. The retained lesson is to test recovery,
+rollback and refusal before deployment, not to reintroduce an unsigned production phase.
 
 
 ---
 
 <a id="appendix-c"></a>
 
-# Appendix C — OTA wire-protocol reference (authoritative)
+# Appendix C — OTA wire-protocol reference
 
 > Original file: `ota-protocol-reference.md`
 
-# OTA protocol reference — ground truth as implemented
-
-This is the AUTHORITATIVE contract for the app team, generated from the actual firmware
-(`Helpers/ota_update.h`, `Helpers/ota_pubkey.h`, `tools/ota_sign.py`), not from the design
-plan. **`ota-update-architecture-v1.md` is the build plan and is mostly still correct**
-(GATT layout, sectoring, MTU/throughput sections are accurate) — but three things changed
-during implementation and that doc has NOT been updated for them. If you're building
-against v1, read §0 first.
+Wire reference for `Helpers/ota_update.h`, `Helpers/ota_pubkey.h` and `tools/ota_sign.py`.
+Implementation wins on disagreement; Appendix B summarizes architecture rather than duplicating
+these byte-level tables.
 
 ---
 
-## 0. Corrections to `ota-update-architecture-v1.md`
+## 0. Safety and status boundaries
 
-1. **§3.7 "require `is_currently_parked`" is WRONG — updates are allowed while driving.**
-   Per an explicit product decision, the parked requirement was removed: an update is
-   always user-initiated in the app, so the user can choose to run one on the road. The
-   dongle does NOT check `is_currently_parked` at START. `OTA_ERR_NOTPARKED` (reject code
-   3) still exists in the protocol for forward compatibility but **is never sent** by the
-   current firmware. Fix any UI copy that says "you must be parked."
-2. **§3.7 power gate is understated.** It's not a flat ">12.2V" floor — it's the same
-   three-band logic as the ATRV sleep gate: `rail < 8.0V` (bench/USB, no car) → **allowed**;
-   `rail >= 12.2V` (healthy battery) → **allowed**; in between (weak-but-alive battery) →
-   **refused**. This is what makes bench testing over USB possible.
-3. **v1 documents only the sector ACK frame. There is a SECOND frame type it doesn't
-   mention: the status frame**, used for START accept/reject, verify/commit progress, and
-   an `INFO` query. See §3.3 below — this is the frame your rejection/error/success UI
-   should actually be built against.
+The dongle does not enforce parked state; `OTA_ERR_NOTPARKED` (3) is reserved, not currently sent.
+The power gate allows rail below 8 V for bench/USB and at least 12.2 V for a healthy battery;
+the intermediate band is refused. Do not present an app-side parking recommendation as a
+firmware-enforced guarantee.
 
-Everything else in v1 (GATT UUIDs, sector/packet framing on ABD6, CRC16-CCITT parameters,
-MTU/throughput expectations, task/threading model, rollback mechanics) is accurate as
-built.
+ABD5 carries distinct status and sector-ACK frames (§3.3). Parse status for START refusal,
+verification/commit progress and INFO, rather than interpreting every notification as an ACK.
 
 ---
 
@@ -2192,16 +1778,8 @@ built.
 Produced by `tools/ota_sign.py`. One manifest per firmware version, always paired with
 that version's `firmware.bin`.
 
-```json
-{
-  "version": 2,
-  "size": 1763664,
-  "sha256": "1b1a3d5c1cf94e2a2536f8724b65b99b40ba9887136f3ff2d7935dc7a20dbad1",
-  "signature": "d8d7661753c9be897ad61584b540e6cdce1a5cfd3d0a57dd11007a2434ce91b544d06cea6c3c32b605c73f3abd2883bcdec75573a147961d3c31b8f937356339",
-  "sig_alg": "ecdsa-p256-sha256",
-  "firmware": "firmware.bin"
-}
-```
+The emitter, not a stale example signature, defines the manifest. Current releases include
+`version_name`; older integer releases did not.
 
 | Field | Type | Meaning | Encoding gotcha |
 |---|---|---|---|
@@ -2229,19 +1807,13 @@ Binary assets belong on **Releases**, not committed into the git history (no blo
 LFS needed, up to 2 GB/asset). Keep the repo's actual tree minimal — a `README.md`
 explaining what the repo is, optionally a `CHANGELOG.md`. Don't put `.bin` files in commits.
 
-### 2.2 One release per version, tag = `v<N>`
+### 2.2 Release names and numeric versions
 
-> **Superseded from 0.1.0 onwards:** tags are `vX.Y.Z` / `vX.Y.Z-rc.N` (`RELEASING.md`), so
-> `parseInt(tag.slice(1))` no longer orders them. Read every release's `manifest.json` and take the
-> max `version`, which is still the integer below.
-```
-tag: v1, v2, v3, ...     (N = the integer OTA_FW_VERSION, no other format)
-```
-Trivial to parse (`parseInt(tag.slice(1))`) and matches `manifest.json`'s `version` field
-after stripping the `v`. **Do not rely on GitHub's "latest release" flag or on list
-order** — parse every tag yourself and take the numeric max, exactly as the earlier app-
-side plan already assumed. This also means a release published slightly out of order, or
-one you mark `prerelease` for a beta channel, still sorts correctly.
+Tags are `vX.Y.Z` or `vX.Y.Z-rc.N`; the numeric code is `major*1000000 + minor*1000 + patch`.
+Select by manifest version within the chosen channel, not list order or an integer parsed from
+the tag. RC and final share a code, so release identity/`version_name` must break ties, preferring
+final over its RC. Publication, signing and version injection are defined in
+[RELEASING.md](../RELEASING.md).
 
 ### 2.3 OTA uses two assets, exact filenames
 ```
@@ -2270,8 +1842,8 @@ GET  https://api.github.com/repos/{owner}/{repo}/releases/assets/{asset_id}
 Fetch `manifest.json`'s asset this way first (tiny, safe to buffer fully and `JSON.parse`),
 then `firmware.bin`'s asset the same way (streamed to disk).
 
-Unauthenticated requests share GitHub's per-IP rate limit (60/hour), which a check-on-open
-flow stays well under.
+Unauthenticated requests share GitHub's per-IP rate limit (60/hour). Fetching many manifests can
+exhaust it; account for caching and pagination rather than assuming a check-on-open is cheap.
 
 ---
 
@@ -2315,7 +1887,7 @@ Total: **106 bytes**, one write (reuse the long-write path already used for `ABD
 sha256 and signature are each **optional at the parser level** (the dongle accepts a
 shorter write and just treats them as absent) but **signature is currently required in
 practice** — the dongle has a real signing key installed and `OTA_REQUIRE_SIGNATURE` is
-on, so any START without all 106 bytes gets rejected with `NOSIG` or `NOKEY` (§3.5). Always
+on, so any START without all 106 bytes gets rejected with `NOSIG` or `NOKEY` (§3.4). Always
 send the full 106 bytes.
 
 **One command in flight at a time**: don't write a second control command until you've
@@ -2345,15 +1917,15 @@ Both frames: CRC16-CCITT (`poly=0x1021, init=0x0000`) over bytes `[0..17]`, stor
 
 | Phase | Value | Sent when | `detail` means | `extra` means |
 |---|---|---|---|---|
-| IDLE | `0x00` | ABORT ack while nothing was running; INFO reply when idle | 0 | current installed version |
-| ARMED | `0x01` | START accepted (fresh, `detail=0`) or resumed (`detail`=sector to resume from); INFO reply mid-transfer | sector to (re)start sending from | bytes already staged (0 on fresh start) |
+| IDLE | `0x00` | ABORT ack while nothing was running; INFO reply when idle | 0 | effective anti-downgrade version floor |
+| ARMED | `0x01` | START accepted or resumed; also INFO reply mid-transfer | next sector expected (0 on fresh start) | START/resume: bytes staged; INFO: effective anti-downgrade version floor |
 | VERIFYING | `0x03` | after END, while hashing/verifying the staged image | 0 | total bytes written |
 | COMMITTED | `0x04` | signature verified, boot pointer moved — **device reboots ~600ms after this** | 0 | the version being committed to |
 | ERROR | `0x05` | a step failed after acceptance (write/verify/commit failure) | `OTA_ERR_*` code (§3.4) | bytes written so far |
 | ABORTED | `0x06` | ABORT received, or a guard fired (inactivity/session-cap/link-lost/weak-power) | `OTA_ERR_*` code (§3.4) | bytes written so far |
 | REJECTED | `0x07` | START refused before anything was staged (no erase happened) | `OTA_ERR_*` code (§3.4) | 0 |
 | TRIAL | `0x08` | *(reserved, not currently emitted)* | — | — |
-| ROLLEDBACK | `0x09` | INFO reply, when this boot detected the previous update was reverted by the bootloader | current sector (irrelevant here) | current installed version |
+| ROLLEDBACK | `0x09` | INFO reply, when this boot detected the previous update was reverted by the bootloader | current sector (irrelevant here) | effective anti-downgrade version floor |
 
 **Sequence for a normal successful update:** `ARMED(0,0)` → *(sector ACKs stream)* →
 `VERIFYING` → `COMMITTED` → *(link drops, device reboots)*. There is no notification for
@@ -2431,24 +2003,27 @@ instead of a binary frame — use this to show "installed version" in the UI wit
 starting anything, and to detect success/rollback after reconnecting post-reboot:
 
 ```json
-{"fw":2,"build":"ota-test-1","signed":1,"state":"idle","rolled_back":0,"sector":0,"sectors":0}
+{"fw":1000,"floor":1000,"build":"v0.1.0","signed":1,"state":"idle","rolled_back":0,"sector":0,"sectors":0,"alarm":-1}
 ```
 
 | Field | Meaning |
 |---|---|
-| `fw` | currently installed/confirmed firmware version |
-| `build` | human-readable build tag (`FW_BUILD_TAG` in config.h + compile timestamp is in the serial banner, not here — this is just the short tag) |
+| `fw` | running image's compiled firmware version; not the NVS floor or a separate confirmation flag |
+| `floor` | effective anti-downgrade floor: maximum of compiled and NVS versions |
+| `build` | human-readable, build-injected `FW_BUILD_TAG`; compile timestamp is in the serial banner, not this field |
 | `signed` | 1 if this dongle build requires signed images (it does, by default) |
 | `state` | `"idle"` \| `"receiving"` \| `"resume_wait"` |
 | `rolled_back` | 1 if the *previous* update attempt was reverted by the bootloader this boot session |
 | `sector` / `sectors` | current progress if mid-transfer, 0/0 if idle |
+| `alarm` | raw stored alarm flag: -1 unset, 0 off, 1 enforced |
 
 **Caveat: during an active transfer, a GATT read of `ABD5` returns the *last notified
 binary ACK frame instead* of this JSON** (a BLE characteristic has one value; a notify
 necessarily overwrites it). Only rely on the JSON read while idle. To detect
-success/rollback after the post-commit reboot: reconnect, re-auth, then **read** `ABD5`
-and check `fw` against the version you just pushed — if it matches, success; if it's
-unchanged and `rolled_back` is 1, the update was reverted.
+success/rollback after reboot: reconnect, re-auth, then **read** ABD5 and check `rolled_back`,
+running `fw` and expected `build` identity. Numeric equality alone cannot distinguish RC/final
+or an equal-version reinstall. Reinstalling the identical build cannot be proven from identity
+alone; retain the transfer/commit outcome instead of claiming the version read proves it.
 
 ---
 
@@ -2456,8 +2031,8 @@ unchanged and `rolled_back` is 1, the update was reverted.
 
 1. Connect + auth (existing flow, unchanged).
 2. Subscribe to `ABD5` notifications.
-3. **Optional:** write `INFO` (`0x0004`), read the status frame to get the currently
-   installed version without needing a GATT read.
+3. Read idle ABD5 JSON for the running `fw`/`build`. Optional `INFO` (`0x0004`) reports status and
+   the effective anti-downgrade floor, not necessarily the running version.
 4. Fetch `manifest.json` from the release (§2), compare `version` to what's installed.
 5. Download `firmware.bin`, verify its length matches `manifest.size` (and optionally its
    sha256).
@@ -2468,8 +2043,7 @@ unchanged and `rolled_back` is 1, the update was reverted.
 8. All sectors done → write END (`0x0002`). Wait for `VERIFYING` then `COMMITTED`.
 9. Link drops, device reboots (~600ms after `COMMITTED`). Reconnect, re-auth (auth does
    **not** survive a BLE disconnect — always re-run it).
-10. Read `ABD5` (GATT read, not notify) → compare `fw` to the pushed version → success or
-    `rolled_back` (§3.6).
+10. Read idle ABD5 JSON and assess rollback, running version and build identity together (§3.6).
 
 **On a mid-transfer disconnect:** the dongle holds the staged session for 90s
 (`OTA_RESUME_GRACE_MS`). Reconnect within that window, re-auth, and send an **identical**
@@ -2493,11 +2067,10 @@ logic to stay well inside both.
 - **BLE preserves write order** within one connection/characteristic — packet *loss* is
   the failure mode the protocol defends against, not reordering. That's why a mismatch is
   handled as "resend the sector," not a reorder buffer.
-- **MTU**: request the largest MTU you can before starting (the app requests 517 before its first
-  subscribe; the dongle caps it at 247, so Android gets 247; iOS is OS-capped around ~185 and
-  cannot be forced higher) — this is the main throughput lever.
-  Expect **~2.5–5 minutes** for the current ~1.7MB image; plan the UI (keep-screen-awake,
-  "don't close the app") around that.
+- **MTU:** request before subscribing; the verified dongle cap is 247. Historical app captures
+  requested 517 on Android and observed around 185 on OS-controlled iOS; current app behaviour is
+  outside this repository. Appendix B §2 records the historical 1.72 MB / 2.5–5 minute estimate,
+  not a measured promise for current images. Handle backgrounding and resume regardless of duration.
 - **Every update must currently be signed.** The dongle has a real ECDSA-P256 key
   compiled in and `OTA_REQUIRE_SIGNATURE` is on. `tools/ota_sign.py` is the only supported
   way to produce a `manifest.json`/`firmware.bin` pair that a dongle will accept — hand-
@@ -2515,87 +2088,39 @@ logic to stay well inside both.
 > The protocol obligations it set out are in Appendix B §4 and Appendix C §4–5. What remains is the
 > guiding principle, the transport decision and its review of the dongle design.
 
-# Firmware OTA — App-side implementation spec (v1)
-
-Companion to `ota-update-architecture-v4.md` (dongle side).
-
----
-
 ## 0. Guiding principle — the app is a *dumb, untrusted courier + status screen*
 
-The dongle owns the entire trust boundary (signature verify), the safety (dual-slot, rollback,
-power gate), and the commit decision. The app must add **nothing** that the security of the
-system depends on. Its job is only:
-
-1. discover that a newer signed image exists,
-2. get the bytes to the dongle (or tell the dongle to fetch them),
-3. show progress/result and stay out of the way.
-
-Everything is designed so that if the app is buggy, killed, or malicious, the worst case
-is a *failed/aborted* update — never a bricked dongle and never an unsigned image running. That
-already falls out of the dongle design; the app just must not undermine it (e.g. by fighting
-the transfer with the poller — see Appendix B §4).
+The app discovers and transports an image and reports progress. Signature verification, power
+gates, dual-slot staging and the commit decision stay on the dongle. This is a design boundary,
+not proof against every hardware failure. The implemented transfer contract is in [Appendix C](#appendix-c).
 
 ---
 
 ## 1. The architecture call to make *before* writing app code
 
-**Who downloads the image — the app (over BLE) or the dongle (over its own cellular link)?**
-This single decision determines how much app code exists.
+**Chosen:** the app downloads a public signed image and transfers it over BLE. No PAT/secure-store
+dependency is required. The original estimate for a 1.72 MB image was 2.5–5 minutes, with phone
+backgrounding and disconnect/resume as the transport risks.
 
-| | **A. App downloads → BLE transfer** (v4 as written) | **B. Dongle self-fetches over cellular** (recommended to evaluate) |
-|---|---|---|
-| App work | Large: PAT/secure-store, 1.72 MB download, the full `ABD5`/`ABD6` sector protocol, resume, MTU tuning, backgrounding survival, poller back-off | Tiny: one "check/trigger" write + parse status notifications |
-| Transfer time | ~2.5–5 min BLE, human-present, parked, app foregrounded the whole time | Dongle's cellular speed, phone can walk away |
-| New dependencies | secure-storage lib unless PAT is dropped | none |
-| Credentials on device | PAT lives in the **app** (later dropped: releases are public) | fetch cred lives on the **dongle** (or public CDN) |
-| Failure surface | iOS BLE backgrounding, MTU-on-iOS ceiling, drop/resume | dongle's existing cellular retry |
-
-The dongle already authenticates and POSTs telemetry to `/1/tlm/bulk` over cellular — it has the
-exact muscle needed to `GET` a signed blob. Model **B** deletes the hardest ~70% of the app work
-(the entire BLE transfer layer) and the narrow "keep the phone glued to the dongle for 5 minutes"
-window. v4 defers a "WiFi-HTTP transport" but the dongle's cellular is *already there*.
-
-**Recommendation:** make the app's OTA layer **transport-agnostic** — a state machine + status UI
-that is identical whether the bytes move over BLE or cellular — and treat BLE transfer as the
-*fallback* for a dongle with no signal, not the default. v1 ships the full BLE path (so it needs no
-dongle-cellular-fetch work), with the transfer isolated so switching to B later does not touch the
-rest of the flow.
+**Alternative, not implemented:** dongle-side cellular fetch could remove the phone's sector
+sender and human-present transfer window, but needs its own download/staging/retry integration.
+Existing telemetry POST support is not evidence that this OTA path works. Keep transport separate
+from verification so a future fetch path can share the same trust boundary; BLE remains useful
+when the dongle has no cellular service.
 
 ---
 
 ## 2. Architecture feedback on v4 (dongle side)
 
-v4 is genuinely strong and has clearly absorbed the earlier round: dropped encryption for the
-right reason, USB recovery as a non-negotiable, native `esp_ota_ops` over `Update.h`, read-back-
-from-flash verify (no huge RAM buffer), health check = hardware-init not connectivity, power/rail
-gating, and a real app-coordination state (`UPDATING`). The read-back verify and "commit =
-`esp_ota_set_boot_partition` only after both `esp_ota_end` and signature pass" is exactly right.
+Retained review decisions:
 
-Points worth weighing:
-
-1. **Cellular self-OTA (biggest one).** You already ship telemetry over cellular; v4's whole §6
-   BLE transfer protocol, the 2.5–5 min window, MTU-on-iOS limits, and the backgrounding risk are
-   avoidable if the dongle fetches its own signed image. v4 defers "WiFi-HTTP" but the transport
-   you actually have is cellular. I'd at least prototype dongle-side `GET`+verify+`esp_ota_write`
-   over cellular; it may make BLE transfer a fallback rather than v1's core, and it shrinks the app
-   to a trigger+status screen.
-2. **No credential on the phone.** The signature is the trust root, so distribute a public
-   signed artifact.
-3. **`ecdsa.h` present / `ed25519.h` absent → ECDSA-P256 is the pragmatic pick.** Fine. Just make
-   the signed message unambiguous (hash over image *plus* version+size metadata, so a valid
-   signature can't be replayed against a different declared version) and keep the metadata inside
-   the signed blob, not alongside it.
-4. **NVS soft anti-downgrade is fine for v1**, but note it resets on a USB reflash / NVS erase — so
-   it deters a *remote* downgrade (good) but not a *physical* one (that's what the deferred eFuse
-   secure-version is for). Document that boundary so it's a conscious v1 limitation.
-5. **The stock arduino mark-valid timing** is correctly flagged as the one real unknown — nail it
-   on the bench first, because if the platform auto-marks-valid before your self-test runs, the
-   whole rollback guarantee is silently void.
-
-Net: the dongle design is sound and close to implementation-ready. The highest-leverage change is
-still *where the bytes come from* — solving that in favor of cellular makes the app side almost
-disappear and removes the fragile part of the whole system.
+- Public artifacts need authenticity, not a download credential or an application-level encryption key.
+- Bundled mbedTLS supports ECDSA-P256; adding Ed25519 would add a dependency. Bind version and size
+  with the image digest so metadata cannot be swapped under a valid signature.
+- Verify from staged flash before `esp_ota_set_boot_partition`; avoid a whole-image RAM buffer.
+- Trial self-tests assess hardware initialization, not coverage, GNSS lock or a responding car.
+- NVS anti-downgrade is a remote policy, not protection from physical flash/NVS replacement.
+- Keep USB recovery and explicitly verify the framework's mark-valid timing when changing platforms.
 
 
 ---
@@ -2606,89 +2131,52 @@ disappear and removes the fragile part of the whole system.
 
 > Original file: `backend_implements.md`
 
-# Backend requirements — ABRP OBD dongle BLE access control
-
-**Audience:** ABRP backend team.
-**Status:** revised 2026-08-19. **The scope shrank dramatically** — an earlier draft asked for a signing endpoint,
-a key pair, an allowlist and an audit log. That design was replaced by one where the dongle verifies a locally
-provisioned secret, so **no new endpoints and no new keys are needed.**
-
-**What remains is confirmation about an endpoint that already exists.** Companion doc: `BLE_SECURITY_PLAN.md`.
-
----
-
 ## 1. Context in four lines
 
-- The ABRP OBD dongle is a standalone device in the car; the phone talks to it over Bluetooth.
-- We are making the dongle refuse privileged actions (fetching its log, updating its firmware, changing its
-  vehicle profile) unless the phone can prove it holds a secret provisioned into that specific dongle.
-- That proof is computed and checked entirely on the phone and the dongle. **The backend is not involved.**
-- One existing backend behaviour is load-bearing for a different protection, and we need it confirmed and kept
-  stable. That is this whole document.
+The 2026-08-19 design removed backend-issued BLE authorization tickets in favour of a local
+shared-secret proof. No challenge endpoint, nonce store, account allowlist or access-signing key
+is required for that handshake. This does not remove the backend's separate telemetry/profile roles.
 
 ---
 
 ## 2. The one thing we need: keep serving the signed vehicle profile, unchanged
 
-`POST /vehicles/obdble_get_pids` with `signed=true` already returns the vehicle profile as a **JWS compact
-string (RS256)**. We need that to continue exactly as-is.
-
-**What changes on our side, for context:** today the app verifies that JWS, discards the signature, and forwards
-only the parsed profile to the dongle — so the dongle has no proof the profile is genuine. A profile contains raw
-CAN commands, so a forged one can send arbitrary traffic onto a vehicle's bus. We are going to forward **the JWS
-verbatim** and have the dongle verify it before use.
+`POST /vehicles/obdble_get_pids` with `signed=true` returns a compact RS256 JWS. The signed-profile
+path forwards those bytes unchanged; the dongle verifies before parsing. It must not verify a
+reserialized/coerced profile instead. Raw profiles remain permitted by the current build default.
 
 ### C1 — The RS256 signing key must be stable and long-lived
 
-We will embed its public half in dongle firmware. **Rotating it requires a firmware update to every dongle in the
-field**, so please treat it as long-lived and **notify us before any change**. If a rotation is ever planned, we
-need lead time to ship firmware first.
+The public key is embedded in firmware. Ship firmware trusting a replacement before rotating the
+backend signing key; devices that missed the update can still be repaired through authenticated OTA.
 
-### C2 — Please confirm the payload's JSON types  *(most likely to cause a silent failure)*
+### C2 — Payload types
 
-The app currently coerces numeric fields to numbers after verifying, which **masks any field that is emitted as a
-quoted string**. The dongle will consume the signed payload directly and will **not** coerce.
+The original request assumed quoted numbers would fail on the dongle. The current OBD parser
+accepts both numeric and quoted numeric fields (`jsonToDouble` in `obdwrapper.cpp`), for compatibility
+with older profiles. Keep signed bytes untouched and test actual backend payloads; do not infer
+parser equivalence from app-side coercion.
 
-So numeric fields — `minValue`, `maxValue`, and any similar — must be **genuine JSON numbers** in the signed
-payload, e.g. `"maxValue": 90` and not `"maxValue": "90"`. If any are currently strings, everything looks fine in
-the app today and would fail on the dongle for non-obvious reasons.
-
-### C3 — Please confirm the signed payload is complete and self-contained
+### C3 — Signed payload completeness
 
 Everything the dongle needs to run the profile must be inside the signed payload, since the dongle uses those
 bytes rather than anything the app assembles around them.
 
 ### C4 — Optional, not required: a version field
 
-A monotonically increasing integer in the signed payload would let the dongle refuse older profiles. Without it,
-someone in radio range could re-push an *older, legitimately signed* profile. The impact is limited to reverting
-to a different ABRP-authored PID set — not arbitrary command injection — so we are **not** treating it as a
-blocker. Only worth doing if it is cheap on your side.
+A signed monotonic version could prevent an authenticated writer from replaying an older genuine
+profile. Under strict signature enforcement, that replay changes which ABRP-authored PID set runs;
+it does not forge new commands. Mere radio proximity does not authorize ABD2, and the current
+accept-both default additionally allows authenticated raw-profile writes. Do not conflate those
+boundaries with the narrower signed-replay question.
 
 ---
 
-## 3. Explicitly NOT needed
+## 3. Scope boundary
 
-To be clear about what the earlier draft asked for and no longer does:
-
-- **No challenge-signing endpoint.**
-- **No new key pair**, and no key custody or rotation work.
-- **No account allowlist**, and no per-dongle ownership or permission model.
-- **No audit log of dongle access.**
-- **No nonce storage or validation.**
-- No changes to firmware image signing (unchanged, existing tooling and key).
-- No changes to telemetry ingest.
-- No Bluetooth knowledge or involvement of any kind.
-
----
-
-## 4. What we need back from you
-
-1. Confirmation on **C1** (signing key stability, and that you will notify us before rotating).
-2. Confirmation on **C2** (numeric fields are real JSON numbers in the signed payload) — ideally verified against
-   a real response rather than assumed, since this one fails silently.
-3. Confirmation on **C3** (payload is self-contained).
-4. A yes/no on **C4** (optional version field).
+The rejected ticket service and its new keys were unrelated to OTA signing or telemetry request
+signatures. Do not read the original “no backend changes” decision as a description of those newer
+interfaces. Their current contracts are in [§6a](#section-6a) and [Appendix C](#appendix-c).
 
 
 ---
@@ -2744,7 +2232,7 @@ Key facts that drive everything below:
   NXP datasheet its recessive supply current is ~5 mA typical, 13 mA max, and the
   only way to reduce it is to remove its VCC. On the current board its VCC is the
   always-on VCC5V, so **it burns ~5 mA continuously even in deep sleep.** This is
-  the single largest fixable sleep load.
+  the largest term in this theoretical component budget, not a measured attribution of the board's floor.
 
 ---
 
@@ -2832,210 +2320,36 @@ What requires a **board revision** to gate:
 
 ## 4. Proposed firmware low-power state machine
 
-Replace "just call `esp_deep_sleep()`" with explicit power states. The principle:
-**power down every peripheral you can, in order, before sleeping the MCU — and
-gate re-entry on real conditions, not a fixed timer.**
+**Historical proposal, not the production state machine.** LIGHT_IDLE, explicit flash/rail
+gating, MCU-owned CAN/TWAI shutdown, an 11.8 V cutoff and a 20-second/three-attempt heartbeat
+budget were proposed, not implemented as that design. The STM32, not the ESP32, owns CAN.
 
-```
-            ┌─────────────┐
-            │   BOOT      │
-            └──────┬──────┘
-                   v
-            ┌─────────────┐   parked && idle timeout && batt OK
-   ┌───────>│   ACTIVE    │──────────────────────────────────┐
-   │        │ (driving)   │                                   v
-   │        └─────────────┘                          ┌─────────────┐
-   │  motion / CAN wake          periodic wake        │  LIGHT_IDLE │
-   │        ▲                    (e.g. every N min)    │ radio off,  │
-   │        │                          │               │ CAN off*,   │
-   │        │                          │               │ LEDs off    │
-   │        │                          v               └──────┬──────┘
-   │        │                   ┌─────────────┐                │ stays idle
-   │        └───────────────────│  HEARTBEAT  │<───────────────┘
-   │                            │ brief radio │
-   │                            │ push, then  │      battery < threshold
-   │                            │ back to deep│──────────────────────┐
-   │                            └──────┬──────┘                       v
-   │                                   │ done              ┌─────────────────┐
-   │                                   v                   │ LOW_BATT_LOCKOUT│
-   │                            ┌─────────────┐            │ everything off, │
-   └────────────────────────────│ DEEP_SLEEP │            │ longest timer,  │
-       wake source fires        │ all rails  │            │ no radio at all │
-                                │ gated, MCU │            └─────────────────┘
-                                │ deep sleep │
-                                └─────────────┘
-* CAN off = firmware-only "stop using it" today; true power-off needs [HW-REV].
-```
+Production uses the activity ladder and wake gates in `state_machine.h`/`logger.ino`, with
+normal teardown in `sleep_power.h`: BLE shutdown, conditional modem shutdown, unconditional
+raw `ATGPSOFF`, then WOM/timer wake. The early crash-streak timer-only escape is an explicit
+exception that skips peripheral teardown. Co-processor reset/ATLP and additional rail gating
+remain separate experiments in [Appendix H](#appendix-h).
 
-### State definitions
+## 5. Hardware options and validation
 
-- **ACTIVE** — car is running / recently moved. All peripherals on, normal logging.
-- **LIGHT_IDLE** — parked, recently stopped. Radio off, flash in deep power-down,
-  IMU in motion-wake mode, LEDs off. MCU light-sleep with wake on IMU INT or timer.
-- **HEARTBEAT** — periodic wake from deep sleep to send a short status push, then
-  immediately tear down the radio and return to deep sleep. **Bounded**: max N
-  retries with exponential backoff, hard ceiling on radio-on time per wake.
-- **DEEP_SLEEP** — everything gateable is off; MCU in deep sleep with wake sources =
-  IMU motion INT, CAN activity (if transceiver powered), or RTC timer.
-- **LOW_BATT_LOCKOUT** — entered when `IO36_BatDec` reads below threshold. Radio
-  fully disabled, only a long-interval voltage check. Protects the car battery.
-  This is the state that would have saved your car.
+The original board-change proposal put a P-FET high-side switch on TJA1050 VCC, mirroring
+Q3/SI2301, to remove its estimated 2.8 mA-equivalent load. Routing U10/U11 enable pins to GPIO
+would need a supervisor: the ESP32 cannot remain running on a rail it cuts. These are design
+options, not measured savings or instructions to change the production wake path.
 
-### Power-down sequence before sleeping (order matters)
-
-```c
-// Pseudocode — adapt pin macros to your HAL / board header.
-
-void enter_deep_sleep(uint32_t wake_after_s) {
-    // 1. Tear down network first (biggest load).
-    modem_send_powerdown();             // graceful detach, AT+CPOWD or PWRKEY pulse
-    gpio_set(IO27_GSM_PWRKEY, /*off*/); // sequence per modem datasheet
-    gpio_set(IO12_MX_PWRKEY, RAIL_OFF); // [FW-NOW] cut VCC5V_MX -> modem + GPS dead
-
-    // 2. Quiet the bus. On current HW this is firmware-only; true power-off = [HW-REV].
-    can_stop();                         // stop TWAI/CAN driver
-    // if [HW-REV] TJA1050 load switch present:  gpio_set(CAN_PWR_EN, RAIL_OFF);
-
-    // 3. Flash into deep power-down (0xB9). Saves up to ~4 mA if it was idle-active.
-    spi_flash_deep_power_down();
-
-    // 4. IMU: configure motion-wake (low-power accel) or full sleep if not used as wake.
-    mpu9250_set_low_power_motion_wake(threshold_mg, odr_hz);  // asserts INT on motion
-
-    // 5. Kill indicator LEDs (~7 mA each when lit).
-    gpio_set(IO4_TXD_LED, OFF);
-    gpio_set(OBD_IND, OFF);
-
-    // 6. Configure wake sources.
-    esp_sleep_enable_ext0_wakeup(MPU_INT_GPIO, /*level*/);   // motion
-    if (wake_after_s) esp_sleep_enable_timer_wakeup((uint64_t)wake_after_s * 1000000ULL);
-    // optional: CAN/UART wake only if that transceiver is still powered.
-
-    // 7. Float / pull GPIOs so no rail is back-fed through a driven pin.
-    quiesce_gpios();                    // set unused pins to input, disable internal pulls
-                                        // that would otherwise leak through level shifters
-
-    // 8. Finally, sleep the MCU.
-    esp_deep_sleep_start();
-}
-```
-
-### Wake handler
-
-```c
-void on_wake(void) {
-    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
-
-    // ALWAYS check battery before doing anything power-hungry.
-    int mv = read_batt_decivolts() * 100;     // via IO36 ADC + R29/R31 scale
-    if (mv < LOW_BATT_LOCKOUT_MV) {            // e.g. 11800 mV; tune to your aux battery
-        enter_low_batt_lockout();              // long timer, radio stays OFF
-        return;
-    }
-
-    switch (cause) {
-        case ESP_SLEEP_WAKEUP_EXT0:            // motion
-            transition(STATE_ACTIVE);
-            break;
-        case ESP_SLEEP_WAKEUP_TIMER:           // scheduled heartbeat
-            spi_flash_release_deep_power_down(); // 0xAB
-            do_bounded_heartbeat();            // see retry policy below
-            enter_deep_sleep(HEARTBEAT_INTERVAL_S);
-            break;
-        default:
-            enter_deep_sleep(HEARTBEAT_INTERVAL_S);
-    }
-}
-```
-
-### Bounded network policy (this is what stops the overnight drain)
-
-The logged `http_err` storm shows the old firmware retrying the radio indefinitely.
-Enforce hard limits:
-
-```c
-#define HB_MAX_RADIO_ON_MS    20000   // never keep radio up >20s per heartbeat
-#define HB_MAX_RETRIES        3       // then give up THIS cycle
-#define HB_BACKOFF_BASE_S     60      // exponential: 60, 120, 240 ... capped
-#define HB_BACKOFF_MAX_S      3600
-
-void do_bounded_heartbeat(void) {
-    gpio_set(IO12_MX_PWRKEY, RAIL_ON);   // power modem+GPS
-    modem_power_on_sequence();
-    uint32_t t0 = millis();
-    int tries = 0;
-    bool ok = false;
-    while (tries < HB_MAX_RETRIES && (millis() - t0) < HB_MAX_RADIO_ON_MS) {
-        if (push_status() == 0) { ok = true; break; }
-        tries++;
-    }
-    // ALWAYS power the radio back down, success or fail.
-    modem_send_powerdown();
-    gpio_set(IO12_MX_PWRKEY, RAIL_OFF);
-
-    // On failure, lengthen the next interval (don't hammer the network/battery).
-    next_hb_interval_s = ok ? HEARTBEAT_INTERVAL_S
-                            : min(next_hb_interval_s * 2, HB_BACKOFF_MAX_S);
-}
-```
-
----
-
-## 5. Concrete task list for the firmware change
-
-**Firmware-only, do these first ([FW-NOW]):**
-
-1. Implement the state machine in §4; replace any bare `deep_sleep()` calls.
-2. Add the `enter_deep_sleep()` power-down sequence — especially:
-   - cut `VCC5V_MX` via `IO12_MX_PWRKEY` (modem + GPS) on every sleep;
-   - put W25Qxx flash into deep power-down (0xB9) and release (0xAB) on wake;
-   - put MPU9250 into low-power motion-wake;
-   - extinguish D3/D4 LEDs.
-3. Add the **bounded network retry/backoff** policy (§4). This is the single most
-   important change for preventing the overnight drain.
-4. Add the **low-battery lockout** using the existing `IO36_BatDec` ADC sense.
-   Pick a conservative threshold for the car's aux battery and stop all radio
-   activity below it.
-5. Stop/disable the CAN driver (`can_stop()`) before sleep so the MCU isn't kept
-   awake servicing it, even though the transceiver stays powered for now.
-6. `quiesce_gpios()` — set unused pins to input and disable internal pull-ups that
-   could leak through the M2M level shifters (page 1 transistors).
-
-**Needs a board revision to realize the full µA budget ([HW-REV]):**
-
-7. Add a P-FET high-side load switch on the **TJA1050 VCC** (mirror the existing
-   Q3/SI2301 `VCC5V_MX` circuit), gated by a spare ESP32 GPIO. This removes the
-   ~2.8 mA-equiv always-on CAN load — the biggest remaining sleep term. When CAN
-   wake is needed, leave it powered; when sleeping with timer/motion wake only,
-   cut it.
-8. (Optional, lower value) Route U10/U11 EN pins to GPIOs if a supervisor MCU
-   architecture is ever adopted. Generally not worth it because the ESP32 lives on
-   the rail it would be cutting.
-
-**Validation:**
-
-9. Measure actual sleep current at the OBD 12V pin (inline ammeter) in each state.
-   Target after [FW-NOW] work: low single-digit mA (limited by the always-on
-   TJA1050). After [HW-REV] CAN switch: a few hundred µA.
-10. Soak test parked overnight and confirm the device reaches DEEP_SLEEP and stays
-    there, with the radio off, and that `IO36_BatDec` trends flat.
+Measure supply current at the OBD pin for each state and repeat on the same rig; then soak parked
+overnight to verify the device actually sleeps and the rail remains healthy. The later 27–38 mA
+bench floor (Appendix G) is much larger than the schematic estimate, so do not declare the CAN
+transceiver the dominant real load from a component budget alone.
 
 ---
 
 ## 6. Summary
 
-- The hardware can **partially** power-manage: today, firmware can cut the
-  modem+GPS rail (`VCC5V_MX`), deep-power-down the flash, sleep the IMU, and kill
-  the LEDs. It **cannot** cut VCC5V/VCC3V3 or the CAN transceiver without a board
-  change.
-- The **TJA1050 CAN transceiver** is the dominant fixable sleep load (~2.8 mA
-  @12V); eliminating it needs a small [HW-REV] load switch and takes the sleep
-  floor from ~3.6 mA to ~0.28 mA.
-- But the overnight battery death was almost certainly **not** the sleep floor — it
-  was the device **failing to sleep** (radio thrashing, per the `http_err` log)
-  and/or a weak aux battery. The firmware must both lower the floor **and**
-  guarantee it actually reaches sleep, with bounded retries and a low-battery
-  lockout.
+The lasting lesson is to bound awake/network work as well as lower sleep current. The
+`http_err` storm supported an awake-drain hypothesis, not a measured attribution of every
+milliamp. The ~3.6 mA baseline and ~0.28 mA revised-board target above are schematic estimates,
+not demonstrated production sleep currents.
 
 
 ---
@@ -3046,11 +2360,13 @@ void do_bounded_heartbeat(void) {
 
 > Original file: `POWER_BUDGET.md`
 
-# Power Budget — measured currents vs. the production state machine
+# Power budget — dated measurements and historical model
 
 Energy model for `baseLogger/logger.ino`, built from bench measurements taken 2026-08-17 on a
 Freematics ONE+ at a supply of ~11.4 V, cross-checked against the state machine in
-`Helpers/state_machine.h` and the timings in `config.h`.
+`Helpers/state_machine.h` and the timings in `config.h` **at that time**. The daily scenarios
+below are historical calculations, not predictions for today's upload/charge cadence. Preserve
+the measurements and rig conditions; remeasure before claiming a current saving.
 
 ---
 
@@ -3064,7 +2380,7 @@ Freematics ONE+ at a supply of ~11.4 V, cross-checked against the state machine 
 | Deep sleep, first entry | **27 mA** | |
 | Deep sleep, after a WOM wake cycle | **38 mA** | ⚠ see §5 |
 | WOM wake (tap) | ~70 mA brief | |
-| Parked timer wake (gate skip) | ~60 mA for ~5 s | negligible: ~0.1 mAh/day over 48 wakes |
+| Parked timer wake (gate skip) | ~60 mA for ~5 s | 4 mAh/day over 48 wakes; ~2.2 mAh incremental over a 27 mA sleep baseline |
 
 **Cross-check.** An independent bench build with the same module set
 (IMU+GPS+OBD+CELL+BLE, no WiFi) measured 80 mA resting / 130 mA spikes. Agreement with the 86 mA
@@ -3083,7 +2399,7 @@ duty cycle between 86 and 130 mA. A TLS POST occupies roughly 0.5–2 s of each 
 
 ---
 
-## 2. What the state machine actually does
+## 2. State-machine assumptions used in the historical model
 
 From `handleActivityState()` and `config.h`:
 
@@ -3099,14 +2415,13 @@ CHARGING-> STANDBY   when now - last_active > CHARGING_TIMER  (5 min)
 ```
 
 By the time CHARGING is entered, its own exit condition is already true, so CHARGING and STANDBY
-are traversed in one or two loop iterations and the device sleeps. The `config.h` comment
-("Idle-to-sleep = ACTIVE + CHARGING = ~10 min") describes an intent the code does not implement.
-The bench observation — sleep about 5 minutes after motion stops — confirms the 5-minute
-behaviour. Either fix the comment or set `CHARGING_TIMER` to 10 min if 10 was intended.
+are traversed in one or two loop iterations and the device sleeps. The bench observation was
+about five minutes after motion stopped. The old ten-minute comment has since been corrected;
+the five-minute tail was deliberately retained, not left as an unresolved timer choice.
 
 **Parked cycle.** Deep sleep → 30-min timer wake → ATRV gate reads both voltages → parked rail
 (not `rail_awake`, not motion, not cold, heartbeat disabled) → skip → straight back to sleep,
-modem never powered. 48 such wakes per day contribute ~0.1 mAh — irrelevant to the budget.
+modem never powered. 48 such wakes consume 4 mAh/day, about 2.2 mAh above the displaced 27 mA sleep load.
 
 ---
 
@@ -3180,64 +2495,20 @@ where the ESP32 itself is down, should land at or **below** 10 mA — so 27 mA i
 `OBD_LOW_POWER_DEFAULT_ON 1` with `BENCH_AUTO_SLEEP_SECONDS 60`, then compare the sleep figure.
 Per §4 case F, getting sleep to 10 mA would extend parked life from ~5 weeks to ~4 months.
 
-**Fix** — before `esp_deep_sleep_start()`:
+This is not a safe one-line production fix. Shutdown ordering, wake initialization, CAN silence
+and the unmeasured saving must be resolved first; see Appendix H §1b and §3.
 
-```c
-obd.enterLowPowerMode();   // ATLP: the datasheet's low-power mode
-```
+### 5b. Missing shutdown acknowledgement and the 27 → 38 mA step
 
-and on wake, before the OBD profile is applied, `obd.leaveLowPowerMode()` (it retries `ATI` up to
-30× until the co-processor answers).
+The old 64-byte CPOWD receive had no expected-match strings, waited all 3000 ms and could discard
+the first `NORMAL POWER DOWN` line once the buffer passed 48 bytes. Its fallback then pulsed
+PWRKEY for 2.5 s, potentially turning an already-off modem back on. A registering SIM7070 could
+add 10–20 mA, consistent with the observed +11 mA, but that was not a measured causal attribution.
 
-### 5b. `powerOff()` can turn the modem back ON — explains the 27 → 38 mA step
-
-`CellWrapper::powerOff()`:
-
-```c
-char b[64] = { 0 };
-sys.xbPurge();
-sys.xbWrite("AT+CPOWD=1\r");
-sys.xbReceive(b, sizeof(b), 3000);        // <-- no expected[] array
-if (!strstr(b, "POWER DOWN")) {
-  sys.xbTogglePower(2510);                // <-- powers an ALREADY-OFF modem back ON
-}
-```
-
-Two problems compound:
-
-1. **No expected-match array**, so `xbReceive` never returns early — it spins the full 3000 ms
-   accumulating everything the modem emits. `cellwrapper.cpp:337` states the rule this violates:
-   *"every xbReceive() MUST pass expected-match strings."*
-2. **`bufsize` is 64**, and `xbReceive` does
-   `if (bytesRecv >= bufsize - 16) bytesRecv -= dumpLine(buffer, bytesRecv);` — past 48 bytes it
-   **discards the oldest line**. `NORMAL POWER DOWN` is the *first* thing emitted, so any
-   unsolicited output arriving in those 3 s pushes it out of the buffer.
-
-When that happens `strstr` fails and the fallback asserts PWRKEY for 2.5 s on a modem that has
-already powered down — switching it back on. The device then deep-sleeps with a booting, then
-registering, SIM7070: ~10–20 mA, matching the observed +11 mA. Whether the ack survives depends on
-network chatter in those 3 s, which is exactly why it is intermittent.
-
-`sleep_power.h` already documents the hazard for the skip path: *"powerOff() ... would
-PWRKEY-toggle an already-off modem back ON."*
-
-**Fix** — match on the ack, and never toggle PWRKEY without confirming the modem still answers:
-
-```c
-char b[160] = { 0 };
-const char* expect[] = { "POWER DOWN", "OK", "ERROR" };
-sys.xbPurge();
-sys.xbWrite("AT+CPOWD=1\r");
-int r = sys.xbReceive(b, sizeof(b), 3000, expect, 3);
-if (r != 1) {                                   // no POWER DOWN seen - is it actually still up?
-  char probe[64] = { 0 };
-  const char* ok[] = { "OK" };
-  sys.xbPurge();
-  sys.xbWrite("AT\r");
-  if (sys.xbReceive(probe, sizeof(probe), 800, ok, 1) == 1) sys.xbTogglePower(2510);
-}
-m_ready = false;
-```
+**Landed mitigation:** `CellWrapper::powerOff()` now uses 192 bytes and matches only `POWER DOWN`.
+The old proposed match list including `OK`/`ERROR` was unsafe: it could return before shutdown
+finished. The missing-ack PWRKEY fallback remains because silence can also mean a powered but
+hung modem. Do not replace it with “no AT reply means off”; further hardening is in Appendix H §2.
 
 ### 5c. GNSS power is latched in the CO-PROCESSOR, not the ESP32
 
@@ -3245,28 +2516,11 @@ m_ready = false;
 sends **`ATGPSOFF`**. GNSS power therefore lives in a separate MCU that the ESP32's deep sleep and
 reboot do not touch.
 
-Production gates the shutdown on a RAM flag that a reboot clears:
-
-```c
-if (g_gps_powered) sys.gpsEnd(true);   // g_gps_powered is a plain global
-```
-
-So **any reset between `ATGPSON` and the next clean `enterDeepSleep()` leaves GNSS powered
-indefinitely** — a WDT/panic reset (the boot-153 wedge class; WDT resets are present in the bench
-journal), a brownout, or a reflash mid-wake. Every subsequent gate-skip wake has
-`g_gps_powered == false`, so `ATGPSOFF` is never sent again. The WDT-streak escalation path is the
-same shape: it calls `enterDeepSleep(true)` *before* the GPS block, so the flag is false there too.
-
-An active GNSS receiver is ~20–40 mA, easily the largest single contributor.
-
-**Fix** — make the pre-sleep shutdown unconditional. Do **not** simply drop the `g_gps_powered`
-guard: if `gpsBegin()` was never called this boot, `FLAG_GNSS_USE_LINK` is unset and `gpsEnd()`
-takes its *other* branch (`taskGPS.destroy()`, `uart_driver_delete()`) on resources that were never
-created. Send the co-processor command directly instead — idempotent, no branch:
-
-```c
-{ char b[16]; if (sys.link) sys.link->sendCommand("ATGPSOFF\r", b, sizeof(b), 100); }
-```
+The old RAM-flag-guarded shutdown missed a GNSS receiver left on by an ESP32 reset; repeated skip
+wakes never corrected it. An active receiver could add ~20–40 mA. **Landed:** normal sleep sends
+raw `ATGPSOFF` unconditionally when the link exists. Merely removing the guard around `gpsEnd()`
+would be wrong: without this boot's link flag it takes the UART-task branch on uncreated resources.
+The early crash-streak timer-only exception still skips peripheral teardown.
 
 ### 5d. Latent: the WiFi RF-flush path bypasses the whole power-down
 
@@ -3306,9 +2560,9 @@ it becomes a real leak the moment WiFi is re-enabled.
 
 # Deferred work — sleep floor and radio hardening
 
-Companion to `POWER_BUDGET.md` and `POWER_MANAGEMENT.md`. Everything here was **reviewed and deliberately
-NOT implemented** because it needs bench measurement or carries a risk that only testing can retire. The
-zero-risk subset was landed on 2026-08-18 (see §7).
+Historical power review, not a current backlog. Co-processor sleep, rail gating and missing-ack
+modem hardening still require measurement; several mitigations below have landed, including
+those recorded on 2026-08-18 (§7). No sleep-current saving is established without same-rig measurements.
 
 Each item: **what**, **why deferred**, **what could go wrong if done blind**, **how to settle it**.
 
@@ -3317,9 +2571,10 @@ Each item: **what**, **why deferred**, **what could go wrong if done blind**, **
 ## 1. The sleep floor — the ~15-20 mA co-processor question
 
 The STM32F103 runs from `VCC3V3` (U11/MP20045 off `VCC5V`), always on, with VBAT/VDDA/VDD1-3 hardwired.
-**There is no firmware power gate for the co-processor.** The measured 27 mA sleep floor minus the TJA1050
-(~5-10 mA, always powered, no standby) minus ESP32 deep sleep (~10 µA) leaves the STM32 at roughly
-**15-20 mA** — the single largest item, and unreachable by any GPS/modem fix. Only two levers exist.
+**There is no firmware power gate for the co-processor.** The unexplained part of the 27 mA
+board-input floor motivated a hypothesis of substantial STM32 draw. The historical **15–20 mA**
+estimate was not a component measurement and did not exclude modem/GNSS leakage. Convert all
+currents to the same supply reference before attributing a remainder. Two experiments follow.
 
 ### 1a. `STM32_HOLD_RESET_ON_SLEEP` — hold the co-processor in reset (PREFERRED)
 
@@ -3441,16 +2696,14 @@ route them through one helper.
 
 ### 2c. Modem left powered after a reset (same shape as the GNSS leak)
 
-`PIN_BEE_PWR` (GPIO27) is only driven LOW as an idle level in `sys.begin()`; the modem's on/off state lives
-in the modem itself (which is why CPOWD exists). So after a reset that left it powered, the next **gate-skip**
-wake calls `enterDeepSleep(false)` → `network.powerOff()` is never reached → it draws through the sleep,
-sticky across many 30-minute cycles. The firmware's own comment at `logger.ino:630` shows the author knew the
-shape (the WDT-escalation path deliberately passes `modem_on=true`).
+**Mitigation implemented:** a validated `RTC_NOINIT_ATTR` record tracks whether the modem may
+remain on across a crash. Normal skip sleeps probe AT when that flag is set and power down a
+responding modem; only acknowledged CPOWD proves shutdown. Silence remains ambiguous. The early
+crash-streak timer-only sleep intentionally bypasses this teardown.
 
-**Why deferred:** the obvious fix (call `powerOff()` unconditionally) is only safe once §2a lands — otherwise
-the missing-ack fallback PWRKEYs an off modem back ON, which is the very bug. A skip wake also has no modem
-UART initialised, and `sys.begin(false, true)` is **not** a safe shortcut because `xbBegin()` pulses
-`PIN_BEE_PWR`. If wanted later, gate it on an `RTC_DATA_ATTR` "modem was powered" flag.
+Do not replace this record with `RTC_DATA_ATTR`, which reloads after panic/WDT/software reset.
+Nor initialize via `xbBegin()` merely to probe: it pulses PWRKEY. Unconditional `powerOff()` can
+toggle an already-off modem on through its missing-ack fallback.
 
 ### 2d. `gpio_hold` for GPIO27 (PWRKEY)
 
@@ -3503,8 +2756,8 @@ out; the in-use copy has not. Low risk, but it's a library edit that deserves it
 - **WiFi RF-flush bypass:** `logger.ino:696` calls `esp_deep_sleep_start()` directly, skipping
   `enterDeepSleep()` (no modem power-off, no `ATGPSOFF`, no BLE deinit, no WOM arming). It sits inside
   `#if ENABLE_WIFI` with `ENABLE_WIFI 0`, so it is **compiled out**. Fix when WiFi returns.
-- **`FILE_TEST` GNSS leak:** the bare `sys.gpsBegin()` at `logger.ino:467` never sets `g_gps_powered`, so a
-  `FILE_TEST` build would leak GNSS through sleep. `FILE_TEST 0`, so dormant.
+- **`FILE_TEST` GNSS shutdown:** the test still calls bare `gpsBegin()`, but normal sleep's
+  unconditional raw `ATGPSOFF` now covers link GNSS even when the RAM flag is false.
 - **Per-wake `new` leaks in `BLEWrapper::init()`:** 7 callback objects + 6 descriptors are never freed by
   `deinit()`. Harmless today because init/deinit are strictly 1:1 per boot (deinit is only reached inside
   `enterDeepSleep()`, which always ends in a reboot). Becomes a real leak the day a re-init-without-reboot
@@ -3512,7 +2765,12 @@ out; the in-use copy has not. Low risk, but it's a library edit that deserves it
 
 ---
 
-## 5. From the three-reviewer audit (2026-08-12), still open
+## 5. Findings from the three-reviewer audit (2026-08-12)
+
+These are candidate follow-ups, not approved implementation instructions. App-side ACK-timeout
+behaviour is unverified here. The log-dump mailbox, format-on-mount-failure, parameter-dependent
+resume matching and notify-retry paths remain in the firmware; recheck the exact path before
+changing it. New protocol fields must respect the negotiated-version contract in §2.
 
 - **OTA ACK-timeout resync (MEDIUM).** On a single lost ACK notification the app aborts a *healthy* session,
   and because ABORT reaches a live dongle it destroys the 90 s resume anchor, so the retry restarts from
@@ -3533,9 +2791,9 @@ out; the in-use copy has not. Low risk, but it's a library edit that deserves it
 - **`DataLogger::begin()` formats on mount failure** (`LittleFS.begin(true)`), so a transient corruption
   silently destroys the exact log the BLE dump feature exists to retrieve. Try `begin(false)` first and log
   an event before formatting.
-- **Protocol versioning.** Add `"proto":1` to the LOGDUMP header and a version byte to the OTA INFO/status
-  frame. Today the only contract authority is comments, so a future mismatch surfaces as generic timeouts
-  indistinguishable from a bad link.
+- **Protocol versioning — superseded proposal.** The earlier suggestion of independent LOGDUMP/OTA
+  version fields was not adopted. ABD8 now negotiates the session protocol; released wire fixtures
+  are frozen. Do not insert a version byte into existing OTA frames.
 - **Tail-fetch mode for the log dump.** The biggest remaining UX win: `{"LOGDUMP":{"tail":N}}` (or a START
   parameter) so the app pulls only what's new since the last fetch. A full dump measures **~9.6 KB/s → 2.7 MB
   in 278 s** (§8), not the ~22 KB/s / ~2 min this bullet claimed before — so the case is *stronger* than
@@ -3553,16 +2811,17 @@ out; the in-use copy has not. Low risk, but it's a library edit that deserves it
 
 The 27 mA baseline is **unexplained** and the 27 → 38 mA step has three equally supported causes (modem
 toggle, GNSS latch, un-parked co-processor), so nothing above should be credited with a saving until this
-runs. One session, four states, same rig:
+runs. The original experiment proposed four states on the same rig, with a **pre-fix** baseline:
 
-1. **Baseline** — as shipped.
+1. **Baseline** — the historical build before the §7 mitigations.
 2. **+ the §7 fixes** (unconditional `ATGPSOFF`, CPOWD ack detection).
 3. **+ `STM32_HOLD_RESET_ON_SLEEP`**.
 4. **+ `OBD_LOW_POWER_ON_SLEEP`** (for comparison against 3).
 
 Also, in the same session:
-- **The discriminating test for `powerOff()`:** compare the sleep floor after a gate-**skip** wake (where
-  `powerOff()` never runs) against a poll wake. If both step to 38 mA, `powerOff()` is exonerated.
+- **Current-firmware comparison:** record whether the retained-modem probe and CPOWD actually
+  ran on each wake. A skip wake can now power down a retained modem; it no longer proves
+  `powerOff()` was bypassed. Compare instrumented shutdown paths, not wake labels alone.
 - **Scope CANH/CANL** in states 3 and 4 (§1c).
 - **Watch the blue OBD_IND LED during sleep** — it runs `VCC3V3` → R32 470 Ω → LED → the STM32's PC13, so if
   PC13 stays driven low that's ~5-7 mA of the saving visibly glowing.
@@ -3722,10 +2981,10 @@ ever approaches `25 × chunks`, the retry budget — not the logging — is what
 
 # OBD-Alarm Safety & Ignition Sense
 
-> **STATUS 2026-08-28: enforcement BYPASSED** (`OBD_ALARM_ENFORCE 0`, config.h). Field testing
-> found three enforcement-breaking bugs — see `ALARM_GATE_FIELD_FINDINGS.md` for root causes, the
-> fix plan, and the re-enable checklist. The flag itself (toggle, ABD2 write, NVS, ABD5 read-back)
-> keeps working as bookkeeping; the dongle otherwise behaves exactly as before this document.
+> **Current implementation:** the compile-time bypass was removed. Only explicit `obd_alarm=1`
+> enables enforcement; unset and zero do not. See §8.3 for current continuation/setup rules and
+> Appendix J for the field failures and their resolution. GPIO34 harness/calibration sections
+> describe research, not shipped ignition sensing.
 
 **A delta against the current ABRP OBD Dongle firmware.** Third iteration. The first draft
 (preserved as `IGNITION_SENSE_ARCHITECTURE.original-draft.md`) proposed sensing OBD pins 1/8/9/13
@@ -3857,8 +3116,8 @@ implements is therefore invokable at runtime from a signed profile — the chann
 command existed all along; §4.1 shows there is no hidden command to reach. Two standing notes:
 
 - This unfiltered channel is exactly what the JWS profile-signature gate stands in front of.
-- On an alarm-flagged car, add the init-command **locality check** (§8): every init command must be
-  local AT/ST configuration, because this channel can also carry bus-transmitting commands.
+- A proposed init-command locality filter would restrict this channel to local AT/ST commands.
+  It is not implemented; current firmware instead defers profile initialization until a permit exists (§8).
 
 ### 4.4 The vendor's own ignition detection is the rail gate we already ship
 
@@ -3912,8 +3171,8 @@ guide confirms the socket is "2× GPIO (from ESP32), VCC and GND … GPIO26, GPI
 - **RTC-capable (RTC_GPIO4)** — a valid `ext0` deep-sleep wake source. The device can wake the
   instant ignition comes on instead of on the next motion/timer event.
   **A wake is a scheduling mechanism, not a permit.** Waking on the pin only means "evaluate the
-  gate sooner"; the woken firmware still runs the full §8.3 predicate, which requires
-  `rail_energised` as well. Never treat "we woke on the ignition pin, therefore ignition is on,
+  gate sooner". A future pin-enabled driving predicate must retain the rail conjunction;
+  current §8.3 has no pin input. Never treat "we woke on the ignition pin, therefore ignition is on,
   therefore poll" as a shortcut — that is precisely the scattered-gate failure §8.4 forbids, and it
   would bypass the one check that covers a stuck-high pin.
 - **Free in our firmware.** Its only other assignment is the direct GNSS UART (`gpsBeginExt`), but
@@ -3984,8 +3243,8 @@ transmission — a single sample cannot distinguish it from ignition; repeated s
 can. (With the divider sized per §6.3, "high" clips at the ADC knee — variance is measured usefully
 in the OFF/mid range, which is where the impostors live.)
 
-- **A pin qualifies:** store the mapping (§10), enable `ext0` wake on it, and the §8 policy gains
-  the measured signal as its primary permit.
+- **Proposed, if a pin qualifies:** store the mapping (§10), enable `ext0` wake and add the
+  measured signal to a future rail-conjoined permit. None of these calibration additions is shipped.
 - **No pin qualifies:** *not an error* — the expected outcome on most post-2008 CAN vehicles. The
   §8 GNSS/rail policy stands on its own.
 
@@ -4012,105 +3271,57 @@ A car on a flatbed has ignition **off**, the alarm **armed**, and GNSS reporting
 of the form "moving ⇒ in use ⇒ disarmed" polls a locked, armed car at highway speed. Symmetrically,
 "rail energised ⇒ awake ⇒ safe" polls a parked charging car — the exact i3 scenario in §2.
 
-The **conjunction** is what holds, and both inputs already exist:
+Why neither signal alone establishes an initial driving permit (**excluding setup and speed
+continuation**, specified in §8.3):
 
 | Rail | Moving | Real state | Verdict |
 |---|---|---|---|
 | energised | yes | being driven | **permit** |
 | resting | yes | **towed / transported** | deny |
-| energised | no | parked & charging, or stationary with ignition on | deny (unless §6 pin) |
+| energised | no | parked & charging, or stationary with ignition on | deny initial GNSS-based permit |
 | resting | no | parked asleep | deny |
 
-### 8.3 The permit — instantaneous, no latch, no leash
+### 8.3 The permit — current rule and rejected holds
 
-> **An earlier version of this section was wrong in a dangerous way. Recorded because the failure is
-> instructive and the fix is counter-intuitive.** It said: acquire on rail+moving, then *hold while
-> the rail stays energised*. That contradicts §8.2's own table (energised + not moving = deny) and
-> reproduces the exact i3 scenario this document exists to prevent: drive home (permit acquired),
-> park, plug in, lock the doors (alarm arms) — but the EV starts charging, so the DC-DC keeps the
-> 12 V rail energised, the latch never releases, and the dongle polls a locked, armed car.
+`alarmGatePermit()` allows a bounded setup session, or energized rail **and** either fresh
+confirmed GNSS movement or a bounded OBD-speed continuation. A calibrated ignition-pin input
+is research, not a term in the current implementation.
 
-**The permit is a pure instantaneous predicate. There is no hold state.**
+- **Setup:** a completed full profile push grants at most 10 minutes, including an identical-profile
+  push. HASH-only reconnects and authentication alone do not. With BLE enabled, authenticated
+  presence is also required, allowing a 30-second disconnect grace.
+- **Driving:** OBD speed at least 25 km/h extends continuation for 30 seconds. It cannot obtain the
+  first speed reading without another permit. GNSS movement expires after 10 seconds without a
+  new receiver date/time. A live rail drop denies immediately; a sustained 3-second drop also
+  clears stored speed continuation.
+- **Rejected rail latch:** “acquire on motion, hold while rail high” survives drive → park →
+  plug in → lock because charging keeps the DC-DC rail energized.
+- **Rejected IMU hold:** exiting, closing doors and locking all produce motion, so IMU holding
+  extends permission through the arming sequence. It is a wake source, not proof of disarm.
 
-```
-permit = setup_session_active                               // bounded window, see below
-       | rail_energised AND ( (gnss_fix_valid AND speed >= GPS_MOVING_MIN_KMH)
-                              OR calibrated_pin_ON )        // §6/§7, where a pin exists
-```
+The former “no hold/grace” and “zero exposure” claims preceded the explicit continuation and
+setup rules above. Do not use them as guarantees. A flatbed's movement alone and parked charging's
+rail alone are insufficient, but bounded holds are deliberate tradeoffs requiring vehicle tests.
 
-Deny the moment every term fails — speed drops, fix lost, rail drops, pin off.
+**Wizard evidence, 2026-08-27:** an unchanged profile took HASH OK, so the stationary wizard got
+no setup permit and only gate-denied frames, without `soc`; Save never enabled. The recorded fix
+was to force a full push in the wizard. Firmware still suppresses redundant OBD reinitialization,
+so the cost is transfer, not ATZ. Do not grant a wizard permit to background reconnects.
 
-**The setup-session term (added at implementation, 2026-08-27).** The pairing/re-pairing wizard runs
-with the user stationary in the car, and its Save button requires a live PID read — which the
-driving term can never satisfy while parked. A completed **full profile push** (CLEAN → SETUP OK,
-the config-apply block) is proof a human is actively driving the wizard at the car, so it grants a
-bounded permit (`ALARM_SETUP_PERMIT_MINUTES`, 10 min). The poller's fast path (HASH OK)
-deliberately does **not** qualify: the phone auto-reconnects from a pocket, so "any authenticated
-BLE traffic ⇒ unlocked" would re-create the 2 a.m. garage alarm — a phone within range of an armed
-car at home relays with nobody touching anything.
+Gate requests at the per-PID boundary without unnecessarily destroying an initialized, idle link
+through short permit gaps. Deferred init still needs a permit: user profile commands are not
+assumed local or safe merely because they occur during initialization.
 
-**Consequence found in the first field test (2026-08-27), fix on the app side:** a re-pair with an
-unchanged profile *takes the fast path* — HASH matches the persisted profile — so the wizard got no
-permit, its PID test saw only gate-denied frames (`is_parked`/`is_charging`, no `soc`), and Save
-never enabled. Since the fast path must stay permit-free, the wizard now **forces the full push**
-(during the setup wizard the app sends CLEAN instead of HASH). The dongle already skips
-the OBD re-init for an identical profile, so the cost is the transfer alone. Rule to keep: the
-dongle never infers "wizard" from traffic shape — the app declares it by pushing fully, and only a
-completed full push grants the permit. The WOM wake-and-wait behaviour this enables
-needs no new machinery: a motion wake stays up on the existing `ACTIVE_TIMER` leash, polls only if a
-permit arrives (movement or a wizard session), and sleeps otherwise.
+### 8.4 One centralized gate function
 
-**Why no grace period, despite tunnels.** The original latch existed to survive GNSS fix loss
-mid-drive. But *any* grace period for "stopped at a traffic light" is the same grace period for
-"parked, plugged in, and locking up" — shortening it only shrinks the exposure window, and a poll
-cadence of a few seconds lands inside it. The question that settles it: what telemetry is worth
-having while stationary? Speed is zero and SoC is unchanged — essentially nothing. The grace period
-bought nothing and cost the safety property.
-
-Consequence: park ⇒ speed hits zero ⇒ permit gone *before* the door opens. **Zero exposure.**
-Stoplight ⇒ permit drops for 45 s ⇒ returns on movement. Lost: nothing.
-
-**The accelerometer is inadmissible as a hold signal — do not re-add it.** It is the obvious
-substitute (the IMU still sees a car moving in a tunnel), but getting out of the car, closing the
-door and locking it all *produce* motion, so IMU-based holding would extend the permit through
-precisely the arming sequence. It cannot distinguish "still driving" from "occupant leaving", and
-that ambiguity falls on the catastrophic side of §8.1. It remains fine as a *wake* source, which is
-all it is used for today.
-
-**Asymmetric debounce.** `gpsMovingConfirmed()` already requires a streak to acquire — keep it — but
-**release with no debounce at all.** Slow to permit, instant to deny, always.
-
-**Decouple the OBD link lifecycle from the permit.** A strict instantaneous permit would otherwise
-thrash `initialize()` in stop-go traffic. An initialised-but-idle OBD link is silent: init is local
-AT/ST configuration on the co-processor (§8.5) and no bus traffic occurs until a request is made. So
-gate the **requests**, not the link — hold the link up across brief permit gaps, tear it down only
-on rail drop or a long gap. No re-init churn, no compromise on silence.
-
-**Cost, stated honestly:** fix loss now denies, so tunnels and underground garages produce telemetry
-gaps. Consistent with §12 (alarm-flagged cars get drive telemetry only), and it fails in the
-recoverable direction.
-
-**What the terms buy:**
-
-- *Tow case* — on a flatbed the rail never energises, so no permit. Covered.
-- *Parked charging* — rail energised but speed zero, so no permit. Covered, and this is the case the
-  latch broke.
-- *Stuck-high pin* — rail-energised is required alongside it. One residual hole (stuck-high pin
-  *during* a parked charge session), bounded by the plausibility rule in §11.
-- *Stationary with ignition on* (preconditioning, sitting in the car) — refused by the GNSS-only
-  rule, **recovered safely by a calibrated pin**. This is the strongest argument for the §6 harness:
-  the pin reads the actual physical state, so it releases the instant ignition goes off and permits
-  the stationary case that GNSS alone must deny.
-
-### 8.4 One gate function, default-deny
-
-Make the decision a **single pure function** — `mayTransmit(rail, moving, pin, flags) → bool` —
-returning false unless a permit is positively proven, and route **every** call site through it.
+Centralize the enforced decision in `alarmGatePermit()` and route transmit guards through it.
+Its setup/speed helpers use session state and time; it is not a pure function of rail and movement.
+Return false on a flagged vehicle unless one of the explicit permits is satisfied.
 
 This is the direct lesson from the transport-handoff bug (`DEFERRED_POWER_WORK`): gating on
 nearly-the-right condition in one place produced a field bug where data flowed nowhere. Scattered
-conditions are how safety gates fail. A pure function is also the only way to test this
-exhaustively — which matters because you cannot A/B a gate whose failure mode is a sounding alarm.
+conditions are how safety gates fail. Centralizing the decision also permits controlled-state/time
+host tests; a real-car A/B experiment that deliberately sounds an alarm is not an acceptable oracle.
 
 The alarm-off path is a single early return, which is what keeps this a true add-on:
 
@@ -4119,10 +3330,9 @@ if (!obd_alarm_flagged) return current_gate_verdict;   // today's behaviour, unt
 ...conjunctive permit logic...
 ```
 
-**Do not just validate the init commands — defer init entirely.** §8.5 keeps the locality check as
-defence in depth, but the stronger rule is that the OBD link is not brought up at all until a permit
-exists. Costs ~1 s at the start of a drive; removes the whole class of "did the profile contain
-something that transmits".
+**Defer init until a permit exists.** Init-command locality filtering was proposed, not implemented.
+`OBDWrapper::initialize()` forwards profile commands; even a signed profile can transmit on the bus.
+Do not infer a command-filtering safety boundary from the historical proposal.
 
 **Every** call site goes through it — including the wake path (§6.1) and the setup/validation poll,
 not just the cadence poll.
@@ -4138,21 +3348,14 @@ which inputs it saw.
 
 ### 8.5 Hard stop and init safety
 
-**Ignition-off is a hard, immediate stop — not a leash expiry, not the next cadence tick.** The
-dangerous window is the few seconds between switch-off and the lock button; a poll that lands after
-the lock arms means an alarm in a parking garage. Treat loss of the permit as an interrupt into the
-quiet state, and **check it between individual PID reads** — `readPIDs` blocks for seconds, so a
-cadence-boundary check is not tight enough. (With the §6 input this stop becomes edge-accurate.)
+Check the evaluated permit **between individual PID reads**; a cadence-only guard leaves seconds
+of in-flight requests. For the driving permit, a live rail drop denies at the next per-PID guard.
+The bounded setup permit is a separate override: ignition-off alone does not revoke it.
 
-**Init-path safety.** `OBDWrapper::initialize()` uses the `init(vector)` overload — only the
-profile's `init_commands`, never the `readPID(PID_SPEED)` probe in the other overload
-(`FreematicsOBD.cpp:405`). So init is silent *provided the profile contains only local AT/ST
-configuration*. On an alarm-flagged vehicle, validate exactly that and skip anything else — cheap,
-and it also closes the §4.3 channel for bus-transmitting commands.
-
-**Fail-safe default throughout:** unknown mapping, failed calibration, failed re-verification ⇒
-never poll while the car might be armed. A documented limitation is forgivable; a 2 a.m. alarm is
-not.
+The `init(vector)` overload avoids the other overload's standard speed probe, but still executes
+the profile's commands without a locality filter. Deferred initialization, not a hypothetical
+filter, is the implemented protection. Pin-edge stopping and calibration fail-closed rules remain
+requirements for a future harness, not guarantees supplied by the current rail/GNSS gate.
 
 ---
 
@@ -4162,7 +3365,7 @@ not.
 works without sniffing, so this reads as skippable. It is not: §12's passive frame decoding is the
 **only** path to recovering the parked-charge telemetry that alarm-flagged cars give up, and all of
 it is blocked behind this one result. Ten minutes of bench work decides whether an entire capability
-exists. Do it early (§13 build order) — it is the cheapest experiment in this document and the one
+exists. Do it early (§13 research prerequisites) — it is the cheapest experiment in this document and the one
 with the largest branch behind it.
 
 Before trusting `ATM1` as a passive signal, establish that monitor mode is actually **silent**: a CAN
@@ -4217,48 +3420,23 @@ sole writer, a second phone holding a shared QR secret cannot disturb the settin
 and relays but never reaches the toggle. No tri-state wire contract, no reconciliation, no account
 field: there is only ever one copy of the value, held by the device that enforces it.
 
-### 10.3 Default: Alarmed when nothing is stored
+### 10.3 Default: explicit opt-in after field use
 
-Skipping or rushing the question must land on the protected side; someone who knows their car is
-clean turns it off deliberately. This follows §8.1 consistently — and it is a change from an earlier
-draft of this document, which had it backwards.
+The original proposal treated unset as alarmed. Production resolves unset and zero to **not
+alarmed**; only explicit `obd_alarm=1` enables enforcement. This preserves parked telemetry for
+the majority of vehicles but does not protect an affected vehicle before opt-in.
 
-Two defaults that must stay **distinct** in the code, because collapsing them is where a subtle bug
-would live:
+Read back the stored choice rather than replacing it with an onboarding default. Otherwise an
+unrelated re-pair can silently change safety policy or remove parked telemetry, easily mistaken
+for a cellular fault. Log the effective flag and explain the tradeoff during onboarding.
+The app's current UI default is not verified in this repository.
 
-| Situation | Resolution |
-|---|---|
-| Fresh save step, dongle reports no stored value | Toggle shows **Alarmed** |
-| Save step, dongle reports a stored value | Toggle shows **the stored value** — never the default |
-| Dongle NVS empty / never written (any firmware) | Resolve to **Alarmed** |
-
-The middle row is not cosmetic: without it, anyone re-running setup on a car deliberately marked
-"No" gets the protective default pre-selected, and the re-save silently flips it back. It fails in
-the safe direction (lost telemetry, not an alarm), so it will never announce itself.
-
-**Name the symptom, because it is the expensive part.** What the user sees is *parked-charge
-telemetry quietly disappearing after an unrelated re-pair* — no error, no alarm, nothing pointing at
-this toggle. That is the precise shape this project has already misdiagnosed twice (cellular starved
-by the transport-handoff gate; a stored hash claiming a profile that was not running), and both times
-it cost days aimed at the wrong subsystem. Two cheap defences: read the stored value so the flip
-cannot happen (one line), and log the flag every wake per §8.4 so a log dump answers "why is this car
-quiet" in one grep instead of a week in the cellular stack.
-
-**Never auto-detect by deliberately triggering the alarm.** It is the only way to measure the
-property directly and it is still the wrong product.
-
-**Why unset ⇒ Alarmed is benign for a factory-fresh dongle (decided at implementation):** the
-factory-fallback profile was removed at the same time. A dongle with no persisted vehicle profile
-does not poll at all — it has no vehicle-correct PID list and no owner's push token, so factory
-polling collected wrong data for nobody, and on an alarm car it tripped the alarm before the owner
-ever reached the wizard. It now waits for the wizard's push (which persists to flash and drives
-every later wake). So "unset ⇒ Alarmed" only ever bites a dongle that HAS a profile but predates
-the flag — a firmware-upgraded in-field dongle — which loses parked-charge sampling until its next
-re-pair writes the flag, and says why in the per-wake ALARMGATE log line.
+No-profile dongles still wait for a vehicle-correct profile/token instead of using a factory
+fallback. **Never discover alarm sensitivity by deliberately triggering an alarm.**
 
 ### 10.4 Read-back: the dongle publishes its own state
 
-The app stores nothing. To initialise the toggle (§10.3, middle row) and to display the state
+The device is the authority. To initialise the toggle (the stored-choice rule in §10.3) and display the state
 anywhere it matters, the dongle **publishes the flag in the readable info JSON on ABD5**, beside the
 installed firmware version already exposed by `setOtaInfo()`. That is the established
 "dongle-publishes-its-own-state" channel, it is one more field, and it costs **zero GATT handles** —
@@ -4296,14 +3474,14 @@ This answers "did it work?" — which a correctly-read pin alone never does.
 
 ## 11. Ongoing re-verification & fleet learning
 
-Both checks use signals already collected:
+These were **proposed pin-calibration diagnostics**, not implemented checks:
 
-- **Primary:** `gpsMovingConfirmed()` true while the policy is in the quiet state ⇒ the gate is
-  broken. Independent of polling, so it can falsify (§5).
-- **Inverse (the plausibility rule §8.3 depends on):** the calibrated pin reads ON while GNSS
+- **Primary:** movement while quiet warrants inspection of rail, freshness and the evaluated permit;
+  it does not by itself prove a broken gate (a flatbed must remain denied).
+- **Inverse (proposed pin plausibility rule):** the calibrated pin reads ON while GNSS
   reports no movement for more than ~30 min ⇒ distrust the pin. **Deliberately not conditioned on
   the rail resting** — the dangerous case is pin-stuck-high *while the rail is energised*, i.e. a
-  parked charge session, which is the one combination that passes both terms of §8.3's permit. A
+  parked charge session, which could pass a future rail-plus-pin predicate. Current §8.3 has no pin term. A
   genuine ignition-on state that persists for half an hour while stationary is implausible anyway.
   Drop the mapping, fall back to §8.3's rail+GNSS permit, log it, flag the user.
 
@@ -4331,49 +3509,21 @@ research track, not a promise:
 
 ---
 
-## 13. Build order & scope summary
+## 13. Implementation versus research
 
-Sequenced by **cheap-experiment-first**: the two bench tests each take minutes and each can
-invalidate or unlock a large branch, so neither should sit behind implementation work.
+| Scope | Disposition |
+| --- | --- |
+| Device-local flag, ABD2 write and ABD5 read-back | Implemented; explicit opt-in |
+| Deferred init, per-PID guard, setup permit, fresh movement and speed continuation | Implemented |
+| Unset-default-alarmed, rail-only latch, IMU hold | Superseded/rejected |
+| Hidden pin-read command / STM32 reflash | Ruled out by §4; no recovery image, do not attach a programmer |
+| GPIO34 harness, pin calibration, ignition wake, fleet-learned maps | Research; board-revision pin tests and calibration required |
+| Passive decoding | Requires §9's silence test; i3 parked battery telemetry ruled out, only `0x130` exposed |
 
-| # | Step | Why here |
-|---|---|---|
-| 0a | **`ATM1` silence test** (§9) — locked, armed, ten minutes | Ten minutes decides whether §12 exists at all. Largest branch, smallest cost. |
-| 0b | **Bench test: +12 V into pins 1/8/9/13** (§3) — watch `ATRV`, IO36, logs | Settles whether our board revision differs from r14 before any harness work. |
-| 1 | **The gate** (§8) — one pure default-deny function, conjunctive instantaneous permit, deferred init, per-wake logging | **IMPLEMENTED 2026-08-27** (`Helpers/alarm_gate.h`, wake-gate + poll-site wiring, per-PID guard in `OBDWrapper::readPIDs`, no-factory-fallback). |
-| 2 | **Toggle + read-back** (§10) — save-step toggle, NVS flag, ABD5 info field | **IMPLEMENTED 2026-08-27** (app: toggle on the setup wizard's save step, `obd_alarm` ABD2 key, `alarm` field in the ABD5 info JSON, read-back before display). |
-| 3 | **Silence verification** (§10.6) — park, lock, two wake cycles, fetch log, expect zero transmissions | Proves the property rather than assuming it. Do before trusting it on a real alarm car. |
-| 4 | **GPIO34 tap harness + calibration** (§6, §7) — only if 0b says the pins carry anything | Optional accuracy layer; recovers the stationary-ignition-on case. |
-| 5 | **Passive frame decoding** (§12) — only if 0a passed | Research track, i3 first. |
-
-Steps 1–3 are the deliverable. 0a/0b are prerequisites for 4–5 and cost almost nothing, which is
-why they run first rather than when 4–5 are reached.
-
-| Item | Status |
-|---|---|
-| Rail gate, leashes, cadences on non-alarm cars | **Unchanged** — pure add-on discipline |
-| Hidden co-processor command for pin reads | **Ruled out** — three-way proof (§4.1); do not re-hunt |
-| STM32 firmware modification / SWD | **Ruled out** — closed blob, no image to restore; do not attach a programmer (§4.2) |
-| On-board sensing of pins 1/8/9/13 | **Ruled out** pending the §3 bench test on our revision |
-| Bench test: +12 V into 1/8/9/13, watch ATRV/IO36 | **Entry gate** — cheap, settles the revision question |
-| GPIO34 Molex tap harness + divider | **The measured route** — new accessory hardware, no board revision (§6) |
-| App-guided per-pin calibration, sequential | **Restored** (§7) |
-| `ext0` wake from calibrated ignition edge | **New**, where a pin qualifies |
-| Conjunctive rail+GNSS permit, **instantaneous — no latch, no grace period** | **The architecture** — works with or without the pin (§8.2–8.3) |
-| Accelerometer ruled inadmissible as a hold signal | **Decision** — exiting the car produces motion (§8.3) |
-| OBD link lifecycle decoupled from the permit | **New** — gate requests, not the link; avoids re-init churn (§8.3) |
-| One pure default-deny gate function, every call site through it | **New rule**, the reliability keystone (§8.4) |
-| Defer OBD init until a permit exists | **New**, stronger than validating init commands (§8.4) |
-| "OBD port Alarmed?" toggle at the setup wizard's save step, abrpobd only | **New**, small — sole write path (§10.2) |
-| Flag in dongle NVS, device-local, **no backend** | **Decision** — consistency with the HMAC access gate (§10.1) |
-| Default Alarmed when unstored; toggle reads back stored value | **New**, both defaults kept distinct (§10.3) |
-| Flag published in ABD5 info JSON for read-back | **New**, zero GATT handles (§10.4) |
-| Edit path = unlink + re-pair; no serial command | **Decision** (§10.5) |
-| Init-command locality check on alarm cars | **New**, small — also closes §4.3 (§8) |
-| `ATM1` silence test | **Prerequisite** for anything using sniffing (§9). Partial pass on an i3 (§9) |
-| Passive frame decoding for parked-charge telemetry | **Research track** (§12). i3: ruled out, only `0x130` reaches the port |
-| Fleet-learned per-model pin map | **New**, app-side, verify-don't-trust (§11) |
-| BimmerCode / CAN isolation / pin-16 reroute | **Not required** — silence suffices |
+Do not infer protected silence from feature presence: park/lock and inspect two wake cycles,
+using the transmission counter with its local-AT limitation. New hardware/pin work first needs
+the board-revision check in §3 and the input constraints in §§6–7. Non-alarm vehicles must remain
+unaffected. BimmerCode, CAN isolation and pin-16 rerouting are not required when silence is achieved.
 
 
 ---
@@ -4393,10 +3543,9 @@ GNSS chain, firmware wake/sleep + wizard, app wizard/poller) against the field s
 2. the dongle stops advertising and cannot be found again;
 3. a long real drive never produced a single permit — no telemetry by any transport.
 
-Every finding below carries file:line evidence; the wizard failure is additionally confirmed in a
-field flash-log dump. **Current state: the gate is BYPASSED (`OBD_ALARM_ENFORCE 0` in config.h) — the
-flag is still stored, published and shown in the app, but has no behavioral effect.** Re-enabling is
-that one switch — but do not flip it before the Phase-1 fixes below are in.
+The narratives below record the original failures; their source line numbers are historical.
+Several fixes have since landed and the bypass switch was removed. Use the resolution table at
+the end for current disposition, not the original proposed fixes. App-side status is unverified here.
 
 ---
 
@@ -4421,8 +3570,8 @@ runs → the loop's config-apply never fires → `alarmGrantSetupPermit()` never
 **This also made the flag unrecoverable from the app**: Save requires the PID test, the PID test
 requires the permit, the permit requires the push, the push was broken. NOTE: this bug is
 independent of the alarm gate (it dates from PROFILE_REQUIRE_SIGNATURE) — the gate only made it
-fatal. It is still latent with the gate bypassed, reachable whenever the app re-AUTHs on a live
-connection.
+fatal. At the time it remained reachable even with the gate bypassed, whenever the app re-AUTHed
+on a live connection. AUTH-key dispatch has since fixed this path.
 
 **Fix (Phase 1):** in `StartupCallbacks::onWrite`, dispatch `message_key == "AUTH"` explicitly to
 `authenticate()` (idempotent, replies AUTH OK) instead of dispatching on the latch state.
@@ -4453,7 +3602,7 @@ completes well inside a motion-opened window.
 `gpsBegin()` (FreematicsPlus.cpp ~549-578) gives the GNSS ~1.4 s to emit a sentence; on failure it
 **powers the GNSS back down** (`gpsEnd()` + clears `FLAG_GNSS_USE_LINK`) and returns false — and
 logger.ino ~839 sets `g_gps_powered = true` **regardless**. `gpsGetData()` then takes the dead
-direct-UART branch (no decode task) and returns false every cycle. No retry exists anywhere; every
+direct-UART branch (no decode task) and returned false every cycle. No retry existed in that build; every
 sleep sends `ATGPSOFF`, forcing the next wake into a cold start (TTFF measured 329 s) and the same
 one-shot. One quiet failure at wake = no fix = `gps_moving_streak` pinned 0 = **permit structurally
 unreachable for the whole wake**, i.e. the whole drive.
@@ -4478,35 +3627,35 @@ diagnostics fix (below) is what makes it visible in the field.
 
 ## Diagnostics hole — one DENY line per wake
 
-`alarmGateAllowsPoll()` logs once per wake plus transitions only. A 60-minute all-deny drive
-produces a single line and no record of WHICH term failed over time — the exact "quiet with an
+The original `alarmGateAllowsPoll()` logged once per wake plus transitions only. An all-deny drive
+produced a single line and no record of WHICH term failed over time — the exact "quiet with an
 empty log" shape the logging was meant to prevent.
 **Fix (Phase 1):** re-log every ~2 min while denied, with per-term values
 (rail, moving, fresh, hold, setup_permit, tx).
 
-## Freshness bound is inert on the link path (garage exposure still open)
+## Historical freshness defect (fixed by receiver-time tracking)
 
-`gd->ts` is stamped with `millis()` **at call time** (FreematicsPlus.cpp:627, link branch) — the
-co-processor re-echoing the last `$GNIFO` fix refreshes `ts` every cycle, so
-`ALARM_GNSS_MAX_AGE_MS` never fails and a latched movement streak stays "fresh" forever. This fails
-toward PERMIT: drive into a covered garage (fixes stop, streak latched), park, switch off (rail
+`gd->ts` is stamped with `millis()` **at call time** (historically FreematicsPlus.cpp:627, link branch).
+The old age check therefore never expired when the co-processor re-echoed its last `$GNIFO` fix;
+a latched movement streak stayed "fresh". This failed toward PERMIT: drive into a covered garage
+(fixes stop, streak latched), park, switch off (rail
 deny ✓), plug in → rail back up → permit on a locked, armed car. Secondary: `parkAccumSample()`'s
-ts-based dedupe contract is unimplementable on this path.
-**Fix (Phase 4):** key freshness on the `$GNIFO` `date`/`time` fields CHANGING (parsed but unused
-today), tracked against a local millis stamp of the last change.
+ts-based dedupe contract was unimplementable on this path.
+**Implemented fix:** freshness and dedupe now track changes in `$GNIFO` date/time, using a local
+millis stamp and sequence. Those fields were previously parsed but unused for freshness.
 
 Also found in the chain (record, low priority):
-- `$GNIFO` parse sets `good = true` before `speed` is parsed — a truncated reply yields fresh
-  coordinates with stale/zero speed.
+- The old `$GNIFO` parse set `good = true` before parsing speed, accepting fresh coordinates with
+  stale/zero speed. Candidate-record validation now prevents that partial update.
 - The `$GNIFO` raw-reply diagnostic is dead code: `#if print` (lowercase) never compiles in.
 - SPI link OOB read: FreematicsPlus.cpp ~440 reads `buf[5..11]` without checking length.
 - A timer wake mid-drive on a flagged car is dropped before GPS/BLE/modem power-up — the drive
   depends entirely on WOM, which the codebase itself documents as blind on smooth asphalt.
 - The per-PID guard routes around `alarmGateAllowsPoll()`, so the sustained-collapse timer only
   advances at cycle boundaries, never during the multi-second frame it is meant to interrupt.
-- `MAX_AWAKE_MINUTES` backstop is not conditioned on `bleRelaying()` — it can cut a live
-  authenticated wizard/drive session at 60 min. `handleActivityState()` also runs before the
-  config-apply block, so a sleep can wipe a pending (stashed) profile push.
+- The current `MAX_AWAKE_MINUTES` backstop is parked-only and exempts OTA/dump/maintenance,
+  but not every authenticated parked session. Activity handling precedes config apply, so a
+  pending stashed push is not itself a guarantee against sleep.
 
 ---
 
@@ -4530,19 +3679,19 @@ Other app-side issues found by the trace are tracked with the app.
 
 ---
 
-## Fix plan (owner-approved order; none built yet)
+## Resolution status
 
-| Phase | Fix | Where |
-|---|---|---|
-| 1 | AUTH dispatched by key, not latch (root cause 1) | blewrapper.cpp onWrite |
-| 1 | `g_gps_powered` honesty + loop-side `gpsBegin()` recovery (root cause 3) | logger.ino |
-| 1 | Periodic DENY re-log with per-term breakdown | alarm_gate.h |
-| 2 | Handshake-activity leash feed (kills the 5-min mid-wizard death) | blewrapper + state_machine |
-| 2 | DECISION: advertise on suppressed stationary wakes, or stay radio-silent | logger.ino |
-| 3 | Profile-push failures reported as success (A1) | app, abrpobd only |
-| 3 | Cancel the wizard's telemetry subscription when its wait expires (A2) | app, abrpobd only |
-| 4 | Real fix-time freshness key (closes the garage exposure) | gps_location.h |
+| Historical finding | Current disposition |
+| --- | --- |
+| Re-AUTH misparsed after CLEAN | AUTH-key dispatch implemented in `BLEWrapper` |
+| Failed GNSS init reported powered, with no retry | Actual result stored; poll-side recovery in `logger.ino` |
+| Only one DENY line in an all-denied drive | 120-second denied heartbeat in `alarm_gate.h` |
+| Replayed parser timestamp looked fresh | Receiver date/time age and sequence dedupe in `gps_location.h` |
+| Truncated `$GNIFO` accepted before speed was parsed | Candidate record committed only after required fields pass in `FreematicsPlus.cpp` |
+| Suppressed timer wake prevents BLE visibility | Still present before full bring-up; not fixed |
+| Proposed handshake/write-activity leash | Not built in that form; connect-time grace and authenticated-presence refresh are used |
+| App push-result/subscription bugs | App status unverified in this repository |
 
-**Re-enable checklist:** Phase 1 complete → flash → wizard on the flagged car (expect full push,
-`setup_permit=1`, PID test green) → one real drive with the periodic DENY log captured → only then
-set `OBD_ALARM_ENFORCE 1`.
+The enforcement bypass switch was removed; there is no `OBD_ALARM_ENFORCE` re-enable step.
+Rail calibration remains vehicle-specific. A host pass does not establish that a flagged car's
+wizard, real drive, GNSS outage and parked/armed silence are safe; retain those hardware checks.
