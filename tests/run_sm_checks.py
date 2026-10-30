@@ -64,7 +64,9 @@ the setup permit's grace runs from the last permit read that saw the phone; bleR
 phone with no relay session cannot tell from bleAuthenticated(); since_poll at the target's 32-bit width; GNSS power (a
 poll's GNSS input is the event's, also on a weak-rail cold boot, whose GNSS the firmware never powers: that is checked
 by position only), the boot profile restore and a profile push (tests/run_profile_checks.py). The multi-region layer
-is #83.
+is covered by the CUR-only composition group (#83): playComposed resolves the temporary drive charge input
+from the real previous energy latch, then runs the unchanged adapter. Named transition checks and fixed-seed
+mixed traces assert the prior-energy/current-drive ordering; the historical differential stays isolated.
 """
 
 import os
@@ -161,6 +163,11 @@ def recipe(src, side):
     alarm = src["alarm"][alarm_start:find(src["alarm"], ALARM_END, alarm_start, where["alarm"]) + 1]
     if alarm.count(ALARM_STATICS) != 1 or alarm.count(ALARM_NOTE) != 1:
         sys.exit(f"FAIL: expected alarmGateAllowsPoll's three statics together and one alarmNoteSpeed in {where['alarm']}")
+    if not (start < find(logger, DRIVE_END, start, where["logger"]) <
+            find(logger, '    if (!drive_unconfirmed) current_frame.emplace_back("is_parked"', what=where["logger"]) <
+            energy_start < find(logger, ENERGY_END, energy_start, where["logger"]) <
+            find(logger, "    if (frame_has_data) {", what=where["logger"])):
+        sys.exit(f"FAIL: composition requires drive, is_parked publication, energy, then buffering in firmware order ({side})")
     return {
         "alarm": alarm.replace(ALARM_STATICS, "").replace(ALARM_NOTE, "void alarmNoteSpeedBody(double kmh) {"),
         # Inlined, never #included: #pragma once would hand OLD the tree's copy.
