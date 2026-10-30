@@ -52,6 +52,7 @@ struct ModemUart {
     uint64_t detach_at = std::numeric_limits<uint64_t>::max();
     unsigned data_reply_ms = 5;
     int csq = 15;
+    bool csq_line = true; // false: AT+CSQ answers a bare OK, no +CSQ line
     char domain = 'E';
     char registered_state = '5';
     std::set<std::string> silent;
@@ -78,7 +79,8 @@ struct ModemUart {
                 return last_command.substr(2, last_command.size() - 4) + ": 0," +
                        (registered() && domain == pair.second ? registered_state : '2') + "\r\nOK\r\n";
         }
-        if (last_command == "AT+CSQ\r") return "+CSQ: " + std::to_string(csq) + ",99\r\nOK\r\n";
+        if (last_command == "AT+CSQ\r")
+            return csq_line ? "+CSQ: " + std::to_string(csq) + ",99\r\nOK\r\n" : "\r\nOK\r\n";
         if (last_command == "AT+CBC\r") return "+CBC: 4.05\r\nOK\r\n";
         return "\r\nOK\r\n";
     }

@@ -30,10 +30,29 @@ def section(text, first, last):
     start = text.index(first)
     return text[start:text.index(last, start)]
 
+# #52: the weak-signal budget reads only the pre-POST csq, taken directly after loop()'s pre-connect netDiag() and
+# before connect(), inside its ENABLE_LOGGING block: a logging-off build never samples and keeps CELL_MAX_POST_BYTES.
+# Nothing else (search heartbeats, open-failure and flush diags) records a sample.
+NET_DIAG = "          const std::string net_diag = network.netDiag();\n"
+if logger.count(NET_DIAG) != 1:
+    sys.exit("FAIL: expected one pre-connect netDiag() in loop()")
+diag_at = logger.index(NET_DIAG)
+after_diag = logger[diag_at + len(NET_DIAG):logger.index("          if (network.connect()) {\n", diag_at)]
+after_lines = [l.strip() for l in after_diag.splitlines() if l.strip() and not l.strip().startswith("//")]
+if after_lines != ["g_upload_csq = network.lastCsq();", "g_upload_csq_ms = millis();", "#endif"]:
+    sys.exit(f"FAIL: the csq sample must directly follow the pre-connect netDiag(), before connect(): {after_lines}")
+directives = [l.strip() for l in logger[:diag_at].splitlines() if l.lstrip().startswith("#")]
+if directives[-1] != "#if ENABLE_LOGGING":
+    sys.exit(f"FAIL: the csq sample must sit in loop()'s ENABLE_LOGGING block, not {directives[-1]!r}")
+helpers = "".join(p.read_text() for p in sorted((root / "baseLogger/Helpers").glob("*.h")))
+samples = re.findall(r"^\s*(g_upload_csq(?:_ms)?)\s*=[^=]", logger + helpers, re.M)
+if sorted(samples) != ["g_upload_csq", "g_upload_csq_ms"]:
+    sys.exit(f"FAIL: only loop()'s pre-POST sample may record the upload csq, found {samples}")
+
 compiler = shlex.split(os.environ.get("CXX", "clang++"))
 print(subprocess.check_output([*compiler, "--version"], text=True).splitlines()[0], flush=True)
 group = sys.argv[1] if len(sys.argv) > 1 else "all"
-if group not in {"all", "body-ack", "stages", "responses", "unknown", "fingerprint", "errors", "queue", "backlog-append", "geo-expiry", "geo-retry", "geo-sizing", "geo-dedup", "logging-off", "tls-ca", "signing", "gzip-fallback", "session"}:
+if group not in {"all", "body-ack", "stages", "responses", "unknown", "fingerprint", "errors", "queue", "backlog-append", "geo-expiry", "geo-retry", "geo-sizing", "geo-dedup", "logging-off", "tls-ca", "signing", "gzip-fallback", "session", "weak-signal"}:
     sys.exit("Unknown upload test group: " + group)
 environment = dict(os.environ)
 environment["UBSAN_OPTIONS"] = environment.get("UBSAN_OPTIONS", "") + ":halt_on_error=1"
@@ -85,7 +104,7 @@ with tempfile.TemporaryDirectory(prefix="obd-upload-checks-") as temporary:
     targets = []
     if group in {"all", "body-ack", "stages", "responses"}:
         targets.append(("upload_checks", "upload_checks.cpp", [], group))
-    if group in {"all", "fingerprint", "errors", "queue", "backlog-append", "geo-expiry", "geo-retry", "geo-sizing", "geo-dedup", "signing", "gzip-fallback"}:
+    if group in {"all", "fingerprint", "errors", "queue", "backlog-append", "geo-expiry", "geo-retry", "geo-sizing", "geo-dedup", "signing", "gzip-fallback", "weak-signal"}:
         targets.append(("upload_helpers_checks", "upload_helpers_checks.cpp", [], group))
     if group in {"all", "tls-ca", "signing", "session"}:
         targets.append(("tls_ca_checks", "tls_ca_checks.cpp", [], group))

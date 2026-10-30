@@ -187,6 +187,7 @@ void reset() {
     resetHeapFixture();
     host_md_fail = 0;
     g_geo_accepted = g_geo_queued = {}; reset_reason = ESP_RST_POWERON;
+    g_upload_csq = -1; g_upload_csq_ms = 0;
 #if ENABLE_LOGGING
     g_upload_request_id = 0;
     g_backlog_unread = false;
@@ -1362,6 +1363,89 @@ void gzipFallback() {
     }
 }
 
+// #52: at weak signal the trim aims under CELL_WEAK_MAX_POST_BYTES. Weak is a pre-POST sample (loop() records it
+// after its netDiag) younger than CELL_CSQ_FRESH_MS at csq <= CELL_WEAK_CSQ, or 99. Mapped fields, so they reach
+// the body.
+OBDVector weakSignalFrame(unsigned index, size_t fields) {
+    static const char* names[] = {"soh", "soe", "capacity", "kwh_charged", "power", "hvac_power", "batt_temp",
+                                  "batt_temp_min", "batt_temp_max", "ext_temp", "cabin_temp", "odometer",
+                                  "est_battery_range", "elevation"};
+    OBDVector f = frame(index);
+    for (size_t i = 0; i < fields && i < sizeof(names) / sizeof(names[0]); ++i) f.emplace_back(names[i], 12345.678901 + index);
+    return f;
+}
+void weakSignal() {
+    struct Sample { const char* name; int csq; long age_ms; bool weak; };
+    const long fresh = CELL_CSQ_FRESH_MS;
+    const std::vector<Sample> samples = {
+        {"no sample", -1, -1, false}, {"fresh csq 15", 15, 0, false}, {"fresh csq 14", 14, 0, true},
+        {"fresh csq 99", 99, 0, true}, {"csq 14 just fresh", 14, fresh - 1, true},
+        {"csq 14 stale", 14, fresh, false}, {"csq 14 at a millis() wrap", 14, -2, true},
+    };
+    auto setSample = [](const Sample& s) {
+        if (s.age_ms == -1) { fake_ms = 1000; return; } // reset() left no sample; early in a wake, so its 0 stamp looks fresh
+        // 500 ms old, just short of the wrap, where a sample's stamp plus CELL_CSQ_FRESH_MS has already wrapped
+        if (s.age_ms == -2) { fake_ms = (unsigned long)-1 - 500; g_upload_csq_ms = (unsigned long)-1 - 1000; }
+        else g_upload_csq_ms = fake_ms - (unsigned long)s.age_ms;
+        g_upload_csq = s.csq;
+    };
+    // The fake gzip stream is not JSON; the JSON it was made from is the last body compressed before the POST.
+    auto delivered = [] {
+        std::vector<json> points;
+        for (size_t i = 0; i < network.sent.size(); ++i) {
+            const auto& body = network.sent[i];
+            for (auto& point : json::parse(body[0] == '\x1f' ? gzip_inputs[gzip_inputs_at_post[i] - 1] : body))
+                points.push_back(point);
+        }
+        return json(points);
+    };
+    // Gzip on: twelve rich frames trim to 700-1000 B bodies at the normal budget. Gzip off: plain small frames.
+    for (bool gzip : {true, false}) {
+        std::vector<OBDVector> original;
+        for (unsigned i = 0; i < 3 * MAX_FRAMES_PER_POST; ++i) original.push_back(gzip ? weakSignalFrame(i * 10, 14) : frame(i * 10));
+        const std::string variant = gzip ? "gzip on: " : "gzip off: ";
+        std::vector<std::string> normal;
+        for (const auto& s : samples) {
+            reset();
+            if (gzip) gzip_enabled = true; else gzip_outcome = GZIP_OFF;
+            setSample(s);
+            obd_result_vector = original;
+            check(uploadBuffered(true) && obd_result_vector.empty() && g_upload_held.empty(),
+                  variant + s.name + ": every frame drains, none held or dropped");
+            check(delivered() == json::parse(bulkStringV2(original)), variant + s.name + ": every frame once, in order");
+            size_t largest = 0;
+            for (const auto& body : network.sent) largest = std::max(largest, body.size());
+            if (s.weak) {
+                check(largest <= CELL_WEAK_MAX_POST_BYTES, variant + s.name + ": every body within the weak budget, largest " +
+                      std::to_string(largest));
+            } else if (normal.empty()) {
+                normal = network.sent;
+                check(largest > CELL_WEAK_MAX_POST_BYTES && largest <= CELL_MAX_POST_BYTES,
+                      variant + "fixture has bodies between the weak and the normal budget, largest " + std::to_string(largest));
+            } else {
+                check(network.sent == normal, variant + s.name + ": the normal budget's bodies, unchanged");
+            }
+        }
+    }
+    // A single frame between the two budgets goes alone, at weak signal too: not dropped (gzip unavailable), not held
+    // for the backlog (gzip off), and the frame behind it follows.
+    OBDVector mid;
+    for (size_t fields = 0; fields <= 14; ++fields) {
+        mid = weakSignalFrame(0, fields);
+        const size_t size = bulkStringV2({mid}).size();
+        if (size > CELL_WEAK_MAX_POST_BYTES && size <= CELL_MAX_POST_BYTES) break;
+        check(fields < 14, "a frame between the weak and the normal budget exists");
+    }
+    for (GzipOutcome outcome : {GZIP_UNAVAILABLE, GZIP_OFF}) {
+        reset(); gzip_outcome = outcome;
+        setSample(samples[2]);
+        obd_result_vector = {mid, frame(10)};
+        check(uploadBuffered(true) && obd_result_vector.empty() && g_upload_held.empty() && network.sent.size() == 2 &&
+              network.sent[0] == bulkStringV2({mid}) && network.sent[1] == bulkStringV2({frame(10)}),
+              std::string("weak signal sends a 700-1000 B frame alone (") + (outcome == GZIP_OFF ? "gzip off)" : "gzip unavailable)"));
+    }
+}
+
 #if ENABLE_LOGGING
 // A wake that cannot upload appends to the earlier wakes' file instead of reading and rewriting it (#92).
 void backlogAppend() {
@@ -1489,5 +1573,6 @@ int main(int argc, char** argv) {
     if (group == "all" || group == "geo-dedup") geoDedup();
     if (group == "all" || group == "signing") signing();
     if (group == "all" || group == "gzip-fallback") gzipFallback();
+    if (group == "all" || group == "weak-signal") weakSignal();
     std::cout << "PASS upload helpers " << group << " logging=" << ENABLE_LOGGING << '\n';
 }

@@ -327,10 +327,42 @@ void safety() {
     check(rf.writes("AT+CFUN=0\r") == 1, "five-minute dead-RF radio cycle remains available");
 }
 
+// #52: the csq netDiag() already parses is what the upload's byte budget reads, through the base class as loop()
+// does. No reply, a reply without +CSQ and the modem's own "unknown" all read 99; -1 only before any netDiag().
+void csq() {
+    FreematicsESP32 sys;
+    CellWrapper cell{sys, "test-apn"};
+    NetworkWrapper& network = cell;
+    check(network.lastCsq() == -1, "no netDiag() yet is no sample, not a csq");
+    auto commands = [&] {
+        std::vector<std::string> sent;
+        for (const auto& event : sys.uart->events) if (!event.timeout) sent.push_back(event.command);
+        return sent;
+    };
+    const std::vector<std::string> per_diag = {"AT+CSQ\r", "AT+CBC\r", "AT+CEREG?\r"};
+    struct Case { const char* name; int csq; bool line; bool silent; int want; const char* diag; };
+    for (const Case& c : {Case{"+CSQ: 14,99", 14, true, false, 14, "csq=14(-85dBm) vbat=4.05 cereg=2"},
+                          Case{"OK without +CSQ", 14, false, false, 99, "csq=99(0dBm) vbat=4.05 cereg=2"},
+                          Case{"+CSQ: 20,99", 20, true, false, 20, "csq=20(-73dBm) vbat=4.05 cereg=2"},
+                          Case{"AT+CSQ timeout", 20, true, true, 99, "csq=99(0dBm) vbat=4.05 cereg=2"}}) {
+        sys.uart->csq = c.csq;
+        sys.uart->csq_line = c.line;
+        sys.uart->silent.clear();
+        if (c.silent) sys.uart->silent.insert("AT+CSQ\r");
+        sys.uart->events.clear();
+        const std::string diag = network.netDiag();
+        check(diag == c.diag, std::string(c.name) + ": netDiag() string unchanged, got " + diag);
+        check(network.lastCsq() == c.want, std::string(c.name) + ": lastCsq() " + std::to_string(c.want) +
+              ", got " + std::to_string(network.lastCsq()));
+        check(commands() == per_diag, std::string(c.name) + ": netDiag() sends no new AT command");
+    }
+}
+
 int main(int argc, char** argv) {
     const std::string group = argc > 1 ? argv[1] : "all";
     for (const auto& test : std::vector<std::pair<std::string, void(*)()>>{
-             {"ordinary", ordinary}, {"late", late}, {"fast", fast}, {"parked", parked}, {"safety", safety}}) {
+             {"ordinary", ordinary}, {"late", late}, {"fast", fast}, {"parked", parked}, {"safety", safety},
+             {"csq", csq}}) {
         if (group == "all" || group == test.first) {
             test.second();
             std::cout << "PASS modem " << test.first << '\n';

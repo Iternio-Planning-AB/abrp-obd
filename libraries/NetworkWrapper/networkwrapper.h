@@ -61,6 +61,9 @@ public:
   // in the field to tell apart the failure modes: low csq -> RF/signal, sagging vbat -> power brownout during
   // TX, both healthy -> session/protocol issue. Default empty; cellular overrides.
   virtual std::string netDiag() { return std::string(); }
+  // The csq the last netDiag() read: 0-31, 99 when the modem said "unknown" or did not answer; -1 before any
+  // netDiag() or on a transport without one. Read by the upload's weak-signal byte budget (#52).
+  virtual int lastCsq() const { return -1; }
   virtual HTTPTransferDiagnostics transferDiagnostics() const { return {}; }
 
   /* Close and reopen a kept-alive session idle longer than this instead of reusing it (0 = always reuse) */

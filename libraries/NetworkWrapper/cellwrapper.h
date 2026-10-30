@@ -64,6 +64,8 @@ public:
 
   /* One-line signal (AT+CSQ) + modem voltage (AT+CBC) + CEREG state snapshot for diagnostics */
   std::string netDiag() override;
+  /* The csq the last netDiag() parsed (99 if AT+CSQ gave none), -1 before the first */
+  int lastCsq() const override { return m_last_csq; }
   HTTPTransferDiagnostics transferDiagnostics() const override { return net.transferDiagnostics(); }
   std::pair<std::string, std::string> initFailureDiag();
   char registrationState() const { return m_registration; }
@@ -101,6 +103,7 @@ private:
   bool m_ready = false;  // modem set up + APN attached; coarse "link up" flag for connected()
   const char* m_init_stage = "begin";
   char m_registration = '?';
+  int m_last_csq = -1;          // netDiag()'s csq, see lastCsq()
   unsigned long m_ready_ms = 0; // millis() when m_ready last went true
   bool m_reused = false;        // last connect() kept a live session instead of calling net.open()
   unsigned long m_last_use_ms = 0;  // millis() of the session's last open or request

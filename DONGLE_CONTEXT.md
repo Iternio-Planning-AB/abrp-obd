@@ -180,6 +180,14 @@ wake; frames still over the cap after compression are logged and dropped to unbl
 Use vendored zlib, not ROM miniz: the latter overflowed the loop stack and lacks the PSRAM workaround.
 Preserve the PSRAM-safe runtime; test bodies over 4 KB after toolchain changes (`GZTEST`).
 
+**Smaller bodies at weak signal (#52):** the batch trim aims under `CELL_WEAK_MAX_POST_BYTES` (700) when
+`loop()`'s pre-POST `netDiag()` csq, under 2 min old, is `CELL_WEAK_CSQ` (14) or less, or 99 (unknown or no
+reply); otherwise 1000. In the field, csq <= 14 bodies of 800 B or more went unanswered (`http=0 err=empty`)
+12.2 % of the time against 2.3 % below; at csq >= 15 size made no difference. A lone frame over 700 B still
+goes. No sample (WiFi, logging-off builds) means 1000; the flush takes no sample of its own. Attribute it
+with `NET diag csq=` plus `UPLOAD body wire=`. Whether weak-signal `err=empty` should count toward the
+stale-bearer restart is still open on #52.
+
 **Profiles:** there is no factory profile/token. Both arrive over ABD2 and persist together in
 `/vehicle_profile.json`; the hash is committed only after persistence succeeds. Without a profile
 there is no vehicle poll. New cars normally require backend profiles, not firmware, but new cellular

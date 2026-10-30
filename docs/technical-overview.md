@@ -216,6 +216,7 @@ intended production values. The upload count ceiling is `MAX_UPLOAD_BUFFER` in `
 | `ENABLE_CELL` / `ENABLE_WIFI` | `1` / `0` | Transport select. This is the cellular build. |
 | `CATM_BANDS` (in `cellwrapper.cpp`) | `1,3,8,20,28` | LTE-M bands the modem scans: the European set. |
 | `CELL_REGISTRATION_AWAKE_MS` / `CELL_REGISTRATION_PARKED_MS` | `30000` / `45000` ms | Initial registration-search allowance: normal multi-poll wakes / single-poll parked sampling. Modem startup, SIM checks, diagnostics and successful data setup are additional, not inside this budget. |
+| `CELL_WEAK_CSQ` / `CELL_WEAK_MAX_POST_BYTES` / `CELL_CSQ_FRESH_MS` | `14` / 700 B / 120000 ms | At weak signal POST bodies are trimmed to 700 B instead of 1000 B (`CELL_MAX_POST_BYTES`). Weak means the csq read just before the upload is 14 or lower, or 99 (unknown or no reply), and was read less than 2 minutes ago. A single frame larger than 700 B still goes, on its own. Builds with logging off never read the csq, so they keep 1000 B. To turn it off, set `CELL_WEAK_MAX_POST_BYTES` to 1000. |
 | `BACKLOG_MAX_SEND_AGE_SECONDS` | 6 days | A queued or restored frame older than this when it would be sent is dropped (`UPLOAD dropped … reason=age`), judged only on a trusted clock. |
 | `MAX_UPLOAD_BUFFER` | 512 frames | Count ceiling for queued frames, about an hour of driving; past it the oldest go first. Queued frames live in PSRAM. |
 | `UPLOAD_MIN_FREE_PSRAM` | 131072 B | Free PSRAM a queued frame must leave, for gzip's state and bodies; below it the oldest frames go. |

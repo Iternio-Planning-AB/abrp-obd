@@ -176,6 +176,20 @@ bool g_geo_queued_seeded = true;
 bool g_upload_local_fail = false;
 // Frames over the cap only because gzip is off this wake; saveUploadBacklog() puts them back first.
 std::vector<OBDVector> g_upload_held;
+// The csq of loop()'s pre-POST netDiag() and its millis(), for the weak-signal budget (#52). -1 = no sample this
+// wake; a logging-off build never takes one.
+int g_upload_csq = -1;
+unsigned long g_upload_csq_ms = 0;
+
+#if ENABLE_CELL
+// The byte budget the batch trim aims under: CELL_WEAK_MAX_POST_BYTES while the last pre-POST sample is younger than
+// CELL_CSQ_FRESH_MS and weak (<= CELL_WEAK_CSQ, or 99), else CELL_MAX_POST_BYTES. No sample is not weak.
+static size_t uploadPostBudget() {
+  const bool fresh = g_upload_csq >= 0 && (unsigned long)(millis() - g_upload_csq_ms) < CELL_CSQ_FRESH_MS;
+  const bool weak = fresh && (g_upload_csq <= CELL_WEAK_CSQ || g_upload_csq == 99);
+  return weak ? CELL_WEAK_MAX_POST_BYTES : CELL_MAX_POST_BYTES;
+}
+#endif
 
 // A batch that was not POSTed: the frames stay for the next attempt, and the reason is the status.
 static bool uploadNotSent(const char* status) {
@@ -396,6 +410,10 @@ bool uploadQueued() { return !obd_result_vector.empty() || uploadBacklogUnread()
 bool uploadBuffered(bool drain) {
   bool ok = true, attempted = false;
   int batches = 0;
+#if ENABLE_CELL
+  // Once per call: a drain outlasting the sample's freshness keeps the budget it started with.
+  const size_t budget = uploadPostBudget();
+#endif
   while (!obd_result_vector.empty()) {
     esp_task_wdt_reset(); // a full drain (pre-sleep flush of a big backlog) is many sequential POSTs, each
                           // up to ~22s - legitimate, so feed per batch; a wedge INSIDE one POST still trips
@@ -429,10 +447,12 @@ bool uploadBuffered(bool drain) {
       return sized == GZIP_OK ? gz.size() : body.size();
     };
     size_t wire = wireSize(batch);
-    while (sized != GZIP_FAIL && batch.size() > 1 && wire > CELL_MAX_POST_BYTES) {
+    // The trim aims under `budget`, smaller at weak signal (#52). The single-frame checks below keep the modem's cap:
+    // a lone frame over the weak budget still goes, alone.
+    while (sized != GZIP_FAIL && batch.size() > 1 && wire > budget) {
       // Drop proportionally to the overshoot rather than one frame at a time: at 12 frames a
       // frame-at-a-time walk is up to 11 compressor passes for one POST.
-      size_t keep = (batch.size() * CELL_MAX_POST_BYTES) / wire;
+      size_t keep = (batch.size() * budget) / wire;
       if (keep >= batch.size()) keep = batch.size() - 1;
       if (keep < 1) keep = 1;
       batch.resize(keep);

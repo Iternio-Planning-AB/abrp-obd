@@ -19,7 +19,7 @@ from extract import block, find  # noqa: E402
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("group", nargs="?", default="all",
-                    choices=["all", "ordinary", "late", "fast", "parked", "safety"])
+                    choices=["all", "ordinary", "late", "fast", "parked", "safety", "csq"])
 args = parser.parse_args()
 source = (root / "libraries/FreematicsPlus/FreematicsNetwork.cpp").read_text()
 header = (root / "libraries/FreematicsPlus/FreematicsNetwork.h").read_text()
