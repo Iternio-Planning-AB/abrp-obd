@@ -1255,71 +1255,6 @@ void checks() {
 #undef ENABLE_LOGGING
 #define ENABLE_LOGGING 0
 
-struct File {
-  std::string* data = nullptr;
-  size_t position = 0;
-  explicit operator bool() const { return data != nullptr; }
-  size_t size() const { return data ? data->size() : 0; }
-  int read() { return data && position < data->size() ? static_cast<unsigned char>((*data)[position++]) : -1; }
-  void close() { data = nullptr; }
-};
-struct FilesystemStub {
-  std::map<std::string, std::string> files;
-  bool begin(bool) { return true; }
-  File open(const char* path, const char* mode) {
-    if (*mode == 'r' && !files.count(path)) return {};
-    return {&files[path]};
-  }
-} LittleFS;
-struct SerialStub {
-  template<typename... Args> void printf(const char*, Args...) {}
-} Serial;
-const size_t SEGMENT_BYTES = 256 * 1024;
-struct DataLogger {
-  bool mounted = false;
-  std::string header_;
-  File active;
-  int activeIndex = -1;
-  size_t activeSize = 0;
-  std::string pathFor(int index) {
-    char path[24];
-    std::snprintf(path, sizeof(path), "/log%04d.csv", index);
-    return path;
-  }
-  int highestIndex() {
-    int highest = -1;
-    for (const auto& entry : LittleFS.files) highest = std::max(highest, std::stoi(entry.first.substr(4, 4)));
-    return highest;
-  }
-  bool openSegment(int index) {
-    active = LittleFS.open(pathFor(index).c_str(), "a");
-    activeIndex = index;
-    if (active.size() == 0) *active.data = header_ + "\n";
-    activeSize = active.size();
-    return true;
-  }
-  void enforceBudget() {}
-  void printStats(SerialStub&) {}
-  bool begin(const std::string& header);
-};
-#include "logger_begin.inc"
-
-void schemaChecks() {
-  const std::string old = "soc,kwh_charged\n49.24,42.230\n";
-  LittleFS.files = {{"/log0000.csv", old}};
-  DataLogger updated;
-  check(updated.begin(LOG_HEADER), "updated logger mounts");
-  check(LittleFS.files.size() == 2, "CSV schema change rotates rather than appending beneath an old header");
-  check(LittleFS.files.at("/log0000.csv") == old, "schema migration preserves existing log rows");
-  check(LittleFS.files.at("/log0001.csv") == LOG_HEADER + "\n", "new segment starts with the new schema");
-  DataLogger wake;
-  check(wake.begin(LOG_HEADER), "next wake mounts");
-  check(LittleFS.files.size() == 2, "unchanged schema reuses the existing segment");
-  LittleFS.files = {{"/log0000.csv", ""}};
-  DataLogger empty;
-  check(empty.begin(LOG_HEADER) && LittleFS.files.size() == 1, "empty segment needs a header, not another segment");
-}
-
 static_assert(IO36_LOCKOUT_HIGH < CHARGE_END_POLL_FLOOR && CHARGE_END_POLL_FLOOR < RAIL_TAPER_FLOOR &&
               RAIL_TAPER_FLOOR < RAIL_AWAKE_VOLTS, "wake-gate rail bands must stay ordered");
 
@@ -1989,7 +1924,7 @@ int main(int argc, char** argv) {
   const std::string group = argc > 1 ? argv[1] : "all";
   check(group == "all" || group == "progress" || group == "signal" || group == "release" ||
         group == "corroboration" || group == "wake-gate" ||
-        group == "logging" || group == "transport" || group == "sleep-reason" || group == "wdt-streak" || group == "profiles" || group == "schema" ||
+        group == "logging" || group == "transport" || group == "sleep-reason" || group == "wdt-streak" || group == "profiles" ||
         group == "ble-frame" || group == "dc-awake", "known test group");
   if (group == "all" || group == "progress") progressChecks();
   if (group == "all" || group == "signal") signalChecks();
@@ -2012,7 +1947,6 @@ int main(int argc, char** argv) {
     topUpChecks();
   }
   if (group == "all" || group == "logging") loggingChecks();
-  if (group == "all" || group == "schema") schemaChecks();
   if (group == "all" || group == "transport") transportChecks();
   if (group == "all" || group == "ble-frame") { bleFrameChecks(); ble_frame_log::checks(); }
   if (group == "all" || group == "sleep-reason") sleep_reason::checks();

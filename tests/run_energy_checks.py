@@ -16,7 +16,7 @@ def line(text, prefix):
 
 arguments = argparse.ArgumentParser()
 arguments.add_argument("group", nargs="?", default="all",
-                       choices=["all", "progress", "signal", "release", "corroboration", "wake-gate", "logging", "schema", "transport", "sleep-reason", "wdt-streak", "ble-frame", "dc-awake", "profiles"])
+                       choices=["all", "progress", "signal", "release", "corroboration", "wake-gate", "logging", "transport", "sleep-reason", "wdt-streak", "ble-frame", "dc-awake", "profiles"])
 arguments.add_argument("--profiles", type=Path)
 args = arguments.parse_args()
 if args.group == "profiles" and args.profiles is None:
@@ -27,7 +27,6 @@ from extract import block, wake_gate  # noqa: E402
 logger = (root / "baseLogger/logger.ino").read_text()
 config = (root / "baseLogger/config.h").read_text()
 logging = (root / "baseLogger/Helpers/logging.h").read_text()
-datalogger = (root / "libraries/DataLogger/datalogger.cpp").read_text()
 sleep = (root / "baseLogger/Helpers/sleep_power.h").read_text()
 state_machine = (root / "baseLogger/Helpers/state_machine.h").read_text()
 streak = (root / "baseLogger/Helpers/wdt_streak.h").read_text()
@@ -146,9 +145,6 @@ with tempfile.TemporaryDirectory(prefix="obd-energy-checks-") as temporary:
     start = logging.index("const std::string LOG_HEADER =")
     end = logging.index("\n// Append a discrete EVENT", start)
     (build / "logging.inc").write_text(logging[start:end])
-    start = datalogger.index("bool DataLogger::begin(")
-    end = datalogger.index("\nbool DataLogger::writeLine(", start)
-    (build / "logger_begin.inc").write_text(datalogger[start:end])
     start = sleep.index('  logEvent("SLEEP enter -> %s+GPS off, timer=')
     end = sleep.index("WOM_THRESHOLD_G);\n", start) + len("WOM_THRESHOLD_G);\n")
     (build / "sleep_log.inc").write_text(sleep[start:end])

@@ -8,7 +8,9 @@ the relevant section rather than loading it all.
 
 Run from the repository root with Python 3 and `clang++` (or set `CXX`). Runners generally use
 the Python standard library and compile real production code with host fakes and ASan/UBSan.
-Run affected checks normally and with `CXX='clang++ -DNDEBUG'`; assertions must remain effective.
+Run affected C++ checks normally and with `CXX='clang++ -DNDEBUG'`; assertions must remain effective.
+Upload checks already force `NDEBUG`, so run them once. Compiler-independent release, protocol-fixture
+and server-root checks also need only one run.
 
 ```sh
 python3 tests/run_heading_checks.py
@@ -25,7 +27,8 @@ done
 test "$failed" -eq 0
 ```
 
-Repeat with `CXX='clang++ -DNDEBUG'` exported. Release-note checks need `git-cliff` (or `GIT_CLIFF`);
+Repeat with `CXX='clang++ -DNDEBUG'` exported, omitting the four once-only runners above as CI does.
+Release-note checks need `git-cliff` (or `GIT_CLIFF`);
 without it they skip locally and fail under `CI`. Live TLS-root checks may skip when the server
 is unreachable; `--require-live` makes that a failure. Do not mistake a skip for verification.
 
@@ -51,6 +54,17 @@ is unreachable; `--require-live` makes that a failure. Do not mistake a skip for
 
 ## Maintaining checks
 
+- Extend the owning suite before creating another runner or fake. Diagnostics owns DataLogger
+  schema/persistence behavior; energy owns charge decisions and energy/temperature field units.
+- Keep overlap only for a distinct regression scenario or useful fault isolation. Consolidate
+  fixtures without losing unique inputs/assertions; map removed coverage to its replacement and
+  get approval before pruning existing checks. Do not weaken checks to make a refactor pass.
+- Test observable behavior through real production code. Prefer direct includes over new textual
+  extraction; retain structural safety guards until equivalent verification replaces them.
+- Share small, repeated harness utilities only when needed; do not introduce a framework just to
+  reduce runner count. Generated sequences, historical comparisons and absolute safety properties
+  are complementary, not automatically duplicates.
+
 - Extract/include production code rather than reimplementing it in the harness. Extraction
   anchors can include comments: comment-only changes still need relevant runner checks.
 - Use independent oracles where possible; e.g. Python hashlib verifies signatures rather than
@@ -65,7 +79,8 @@ is unreachable; `--require-live` makes that a failure. Do not mistake a skip for
   state in `alarm_gate.h`. Do not weaken extraction/position guards to accommodate a refactor.
 - Firmware feature variants and target-width semantics are not implied by host coverage.
   UART, clocks, filesystems and hardware remain fakes; state explicitly what needs a dongle.
-- CI discovers every `run_*.py` and runs both CXX modes. A new CI job must also be included
-  in the required aggregate `ci` job's `needs`.
+- CI discovers every `run_*.py` in both CXX modes by default; only the four documented identical
+  second runs are omitted. Keep this exception list aligned with each runner's compiler behavior.
+  A new CI job must also be included in the required aggregate `ci` job's `needs`.
 - Update the relevant section of `README.md` when coverage changes. Keep case-by-case histories
   there, not in this short instruction file.
