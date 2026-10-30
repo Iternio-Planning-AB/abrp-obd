@@ -14,7 +14,7 @@ import tempfile
 root = Path(__file__).resolve().parents[1]
 compiler = shlex.split(os.environ.get("CXX", "clang++"))
 parser = argparse.ArgumentParser()
-parser.add_argument("group", nargs="?", default="all", choices=["all", "schema", "logging", "schema-failures", "ble-write", "motion", "fw-build", "dump-since"])
+parser.add_argument("group", nargs="?", default="all", choices=["all", "schema", "logging", "schema-failures", "ble-write", "motion", "fw-build", "dump-since", "loop-gap", "stat-widths"])
 parser.add_argument("--capture-helper", type=Path)
 parser.add_argument("--since-helper", type=Path, help="capture2.py: compare DUMP SINCE with its SinceFilter")
 arguments = parser.parse_args()
@@ -38,6 +38,29 @@ if arguments.group in ("all", "fw-build"):
     boot = re.search(r"if \(esp_reset_reason\(\) != ESP_RST_DEEPSLEEP\) logFwBuild\(\);", setup_source)
     if not boot or boot.start() < setup_source.find('logEvent("WAKE '):
         raise AssertionError("setup() must log the build after WAKE on every boot that is not a deep-sleep wake")
+# loop-gap drives the LoopGap helper (#110); these keep loop() visiting it once per iteration, at the top before the
+# activity ladder (which can sleep), and re-seeding it after a console command, whose minutes are no loop gap.
+if arguments.group in ("all", "loop-gap"):
+    loop_source = (root / "baseLogger/logger.ino").read_text()
+    loop_start = loop_source.find("\nvoid loop() {\n")
+    head_end = loop_source.find("  handleActivityState();\n", loop_start)
+    head = [l.strip() for l in loop_source[loop_start:head_end].splitlines()[2:]
+            if l.strip() and not l.lstrip().startswith(("//", "#"))]
+    if loop_start < 0 or head_end < 0 or [re.sub(r"\s*//.*", "", l) for l in head] != [
+            "esp_task_wdt_reset();", "loopGapNote(g_loop_gap, (uint32_t)millis());"]:
+        raise AssertionError(f"loop() must note the loop gap between esp_task_wdt_reset() and handleActivityState(): {head}")
+    console = loop_source.find("  if (handleLogCommands()) loopGapReseed(g_loop_gap, (uint32_t)millis());", head_end)
+    if console < 0 or loop_source.count("handleLogCommands()") != 1 or console > loop_source.find("\n}", loop_start):
+        raise AssertionError("loop() must re-seed the loop gap after a console command, its only handleLogCommands() call")
+    # A command read is a command served, on every path out (BUSY and usage included), so each re-seeds.
+    commands = (root / "baseLogger/Helpers/logging.h").read_text()
+    READ = "  if (!cmd.length()) return false;\n"
+    start = commands.find("\nbool handleLogCommands() {\n")
+    read = commands.find(READ, start)
+    end = commands.find("\n}\n", start)
+    returns = re.findall(r"\breturn\b[^;]*;", commands[read + len(READ):end])
+    if start < 0 or not start < read < end or not returns or set(returns) != {"return true;"}:
+        raise AssertionError(f"handleLogCommands() must return true on every path after reading a command: {returns}")
 
 
 def synthetic_log(rng):
@@ -146,6 +169,15 @@ with tempfile.TemporaryDirectory(prefix="obd-log-diagnostics-") as temporary:
     logging = (root / "baseLogger/Helpers/logging.h").read_text()
     end = logging.index("// Defined in ota_update.h")
     (build / "logging.inc").write_text(logging[:end] + "\n#endif\n")
+    # stat-widths renders the pre-sleep summary lines (#110) from their literal in sleep_power.h, one each.
+    sleep_source = (root / "baseLogger/Helpers/sleep_power.h").read_text()
+    stat_formats = ""
+    for prefix in ("FLUSHSTAT", "WAKESTAT"):
+        found = re.findall(r'logEvent\("(' + prefix + r' [^"]*)"', sleep_source)
+        if arguments.group in ("all", "stat-widths") and len(found) != 1:
+            raise AssertionError(f"sleep_power.h must log exactly one {prefix} line, found {len(found)}")
+        stat_formats += f'static const char* const {prefix}_FORMAT = "{found[0] if found else ""}";\n'
+    (build / "stat_formats.inc").write_text(stat_formats)
     executable = build / "log_diagnostics_checks"
     subprocess.run([
         *compiler, "-std=c++17", "-fsanitize=address,undefined", "-fno-omit-frame-pointer",

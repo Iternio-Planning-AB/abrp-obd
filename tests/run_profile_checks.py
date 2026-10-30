@@ -60,7 +60,7 @@ if failed > find(gate, 'authNotifyJson("{\\"auth\\":\\"reset\\"}");', forget, "a
 console = (root / "baseLogger/Helpers/logging.h").read_text()
 clear = code(console, 'else if (cmd.equalsIgnoreCase("AUTHCLEAR")) {', "logging.h")
 forget = find(clear, 'if (!forgetProfile("authclear")) {', find(clear, "ble.set_authenticated(false);", what="AUTHCLEAR"), "AUTHCLEAR")
-if find(clear, "ble.clearAuthSecrets();", what="AUTHCLEAR") < find(clear, "return;", forget, "AUTHCLEAR"):
+if find(clear, "ble.clearAuthSecrets();", what="AUTHCLEAR") < find(clear, "return true;", forget, "AUTHCLEAR"):
     raise SystemExit("FAIL: AUTHCLEAR must forget (and erase the log) first, and keep the secret when that fails")
 busy = code(console, "if ((g_ota_active || g_logdump_active) &&", "logging.h")
 if busy.index('cmd.equalsIgnoreCase("AUTHCLEAR")') > busy.index("BUSY:"):

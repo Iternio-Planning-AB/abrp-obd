@@ -86,6 +86,10 @@ void enterDeepSleep(bool modem_on, const char* reason = nullptr) {
   if (g_ota_active || g_logdump_active) return;
   if (g_weak_rail_cold_boot) modem_on = false;
 #if ENABLE_LOGGING
+  // WAKESTAT's prep= (#110): from here through the marker, the flush and the backlog save to just before the BLE
+  // teardown. Not "time to sleep": the peripherals' power-down and the sleep itself come after it. Also the loop
+  // gap's closing visit (below).
+  const uint32_t prep_start_ms = (uint32_t)millis();
   // A sleep that ends a held DC charge with no poll to end it (the backstop, the NET-recover reboot).
   if (g_dc_logged) logEvent("DC_AWAKE off reason=%s rail=%.2f", reason ? reason : "sleep", g_last_io36);
 #endif
@@ -130,6 +134,9 @@ void enterDeepSleep(bool modem_on, const char* reason = nullptr) {
     } else {
       if (uploadBacklogUnread()) loadUploadBacklog(); // registered: its last chance this wake. Before connect(), as in loop()
       int up_s = (int)(network.upForMs() / 1000);
+#if ENABLE_LOGGING
+      const uint32_t flush_open_ms = (uint32_t)millis(); // FLUSHSTAT open= is connect() alone, after the backlog load
+#endif
       if (!network.connect()) {
         std::string why = network.lastOpenTrace();
         Serial.printf("Pre-sleep flush skipped: open failed %s - %d frame(s) kept in flash\n", why.c_str(),
@@ -140,13 +147,23 @@ void enterDeepSleep(bool modem_on, const char* reason = nullptr) {
         logEvent("FLUSH diag %s", network.netDiag().c_str()); // separates weak signal from slow TLS
 #endif
       } else {
+#if ENABLE_LOGGING
+        const uint32_t flush_drain_ms = (uint32_t)millis();
+        const int posts = g_upload_posts, accepted = g_upload_accepted, frames_ok = g_upload_frames_ok;
+#endif
         int n = (int)obd_result_vector.size();
         Serial.printf("Flushing %d buffered frame(s) before sleep\n", n);
         bool ok = uploadBuffered(true); // drain the whole buffer in capped batches - last chance before RAM is wiped
 #if ENABLE_LOGGING
+        const uint32_t flush_done_ms = (uint32_t)millis();
         logEvent("FLUSH %s http=%d sent=%d left=%d up=%ds %s", ok ? "ok" : "partial", g_last_http,
           n - (int)obd_result_vector.size(), (int)obd_result_vector.size(), up_s,
           network.lastOpenTrace().c_str());
+        // Its own line, so FLUSH keeps its fields (#110). posts= and frames= are accepted/tried and accepted/queued at
+        // the drain's start: frames that left otherwise (aged, oversized, held) already logged their own lines.
+        logEvent("FLUSHSTAT open=%lums drain=%lums posts=%d/%d frames=%d/%d",
+          (unsigned long)(flush_drain_ms - flush_open_ms), (unsigned long)(flush_done_ms - flush_drain_ms),
+          g_upload_accepted - accepted, g_upload_posts - posts, g_upload_frames_ok - frames_ok, n);
 #endif
         network.disconnect();
       }
@@ -177,6 +194,9 @@ void enterDeepSleep(bool modem_on, const char* reason = nullptr) {
 #endif
   if (!park_marker_owed && !unsent) wdtStreakMarker(false);
 
+#if ENABLE_LOGGING
+  const uint32_t prep_end_ms = (uint32_t)millis();
+#endif
   bleDeinitForSleep(); // tear BLE down BEFORE the log flush + peripheral power-down (no-op if BLE wasn't up)
 
   // Power the modem down too when this wake never did, if an earlier one may have left it on (wdt_streak.h:
@@ -198,6 +218,13 @@ void enterDeepSleep(bool modem_on, const char* reason = nullptr) {
 #if ENABLE_MEMS && ENABLE_LOGGING
   flushMotionStats();
 #endif
+  // Once per wake that reaches this primitive (#110); the crash-streak timer sleep, the OTA reboot and ESP.restart()
+  // skip it. When loop() ran, the sleep's entry closes its last gap - a sleep from inside the loop body (net-recover
+  // after a modem stall, the poll path after an upload burst) ends the very stretch this is for - and is counted as
+  // one more visit in loops=. loops=0 (no loop() yet: the gate's skip sleeps from setup()) leaves loopmax= and at= 0.
+  if (g_loop_gap.seeded) loopGapNote(g_loop_gap, prep_start_ms);
+  logEvent("WAKESTAT prep=%lums loopmax=%lums at=%lu loops=%lu", (unsigned long)(prep_end_ms - prep_start_ms),
+    (unsigned long)g_loop_gap.max_ms, (unsigned long)g_loop_gap.max_at, (unsigned long)g_loop_gap.n);
 #if ENABLE_PERIODIC_WAKE
   // Log the chosen cadence + why, so the adaptive behavior is auditable: timer tightens during a charge and
   // relaxes when parked. (g_next_wake_minutes == WAKE_CHARGING_MINUTES => we observed an active charge.)

@@ -273,7 +273,14 @@ non-deep-sleep boot, never on a continued segment, and the `eacc642` loader not 
 taking their boot's first epoch across a segment boundary, a never-clocked boot taking the epoch before it, a
 millis-drop boot boundary, context lines under their own segment headers, a since older than everything (byte-equal
 to `DUMP`) and newer than everything (header and end marker), that segments ending before since are never opened,
-that logging resumes, and the console parse. `--since-helper <absolute path to capture2.py>` (optional; internal
+that logging resumes, and the console parse. `loop-gap` (#110) covers the `WAKESTAT` loop gap on the real helper: a
+seed-only first visit, the longest gap and when it ended, a gap across the 32-bit `millis()` wrap, a console command
+re-seeding it, and that `loop()` notes it before the activity ladder and re-seeds after `handleLogCommands()`.
+`stat-widths` renders the `FLUSHSTAT` and `WAKESTAT` literals from `sleep_power.h` through the real `logEvent` at
+their widest (107 and 78 characters). `run_modem_checks.py` pins both calls whole (arguments, stamps, the sleep entry's
+closing loop-gap visit) at their positions in `enterDeepSleep`; the upload `queue` group checks the batch counters
+behind `FLUSHSTAT`. No runner compiles the flush with logging on, so
+the lines themselves need a bench flush. `--since-helper <absolute path to capture2.py>` (optional; internal
 tool) runs 300 random synthetic logs against its `SinceFilter`. `--capture-helper <absolute-script-path>` (optional; the helper is an internal tool,
 not in this repo) also verifies a synthetic dump through it, including actual historical
 `eacc642` logger-begin and CSV-builder code simulating a firmware rollback; this does not open a device.

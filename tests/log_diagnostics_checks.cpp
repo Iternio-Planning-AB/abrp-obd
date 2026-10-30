@@ -179,6 +179,7 @@ enum ClockSource { CLK_GPS };
 time_t utcToEpoch(int, int, int, int, int, int) { return 0; }
 void setClock(ClockSource, time_t) {}
 #include "logging.inc"
+#include "stat_formats.inc" // FLUSHSTAT_FORMAT, WAKESTAT_FORMAT: the literals sleep_power.h logs
 #include "fw_build_log.h"
 #include "legacy_header.inc"
 #include "legacy_logging.inc"
@@ -560,6 +561,60 @@ void motionChecks() {
   check(!motionSustained(bypassed, 140000), "bypassed windows are not sampled time");
 }
 
+// WAKESTAT's loop gap (#110): the longest time between two visits to loop()'s service point this wake.
+std::string gapState(const LoopGap& g) {
+  return "max=" + std::to_string(g.max_ms) + " at=" + std::to_string(g.max_at) + " n=" + std::to_string(g.n);
+}
+
+void loopGapChecks() {
+  LoopGap g;
+  loopGapNote(g, 7000);  // setup() and the sleep before it are behind the first visit: no gap yet
+  check(g.n == 1 && g.max_ms == 0 && g.max_at == 0, "the first visit only seeds: " + gapState(g));
+  for (const uint32_t at : {7500u, 8700u, 9000u, 9600u}) loopGapNote(g, at);
+  check(g.n == 5 && g.max_ms == 1200 && g.max_at == 8700, "the longest gap and the millis it ended at: " + gapState(g));
+
+  LoopGap wrap;
+  loopGapNote(wrap, 0xFFFFFF00u);
+  loopGapNote(wrap, 0x00000100u);
+  check(wrap.n == 2 && wrap.max_ms == 512 && wrap.max_at == 0x100, "a gap across the 32-bit millis() wrap: " + gapState(wrap));
+
+  LoopGap console;
+  loopGapNote(console, 1000);
+  loopGapNote(console, 1500);
+  loopGapReseed(console, 61500);  // a DUMP held the loop from 1500 to 61500
+  loopGapNote(console, 61800);
+  check(console.n == 3 && console.max_ms == 500 && console.max_at == 1500,
+        "a console command's time is not a loop gap: " + gapState(console));
+}
+
+// The two #110 summary lines, rendered through the real logEvent with every field at its widest.
+template <typename... Args>
+std::string eventText(const char* format, Args... args) {
+  LittleFS = Filesystem{};
+  datalogger = DataLogger{};
+  check(datalogger.begin(LOG_HEADER), "width fixture mounts");
+  char untruncated[512];
+  snprintf(untruncated, sizeof(untruncated), format, args...);
+  logEvent(format, args...);
+  const std::string& file = LittleFS.files.at("/log0000.csv");
+  size_t text = file.rfind("EVT,");
+  for (int i = 0; i < 6; ++i) text = file.find(',', text) + 1;
+  std::string logged = file.substr(text, file.find('\n', text) - text);
+  check(logged.size() <= 119 && logged == untruncated, "logEvent keeps the whole line (" +
+        std::to_string(std::strlen(untruncated)) + " chars): " + logged);
+  datalogger = DataLogger{};
+  return logged;
+}
+
+void statWidthChecks() {
+  const unsigned long ms = UINT32_MAX;
+  check(eventText(FLUSHSTAT_FORMAT, ms, ms, INT_MIN, INT_MIN, INT_MIN, INT_MIN) ==
+        "FLUSHSTAT open=4294967295ms drain=4294967295ms posts=-2147483648/-2147483648 frames=-2147483648/-2147483648",
+        "FLUSHSTAT fields");
+  check(eventText(WAKESTAT_FORMAT, ms, ms, ms, ms) ==
+        "WAKESTAT prep=4294967295ms loopmax=4294967295ms at=4294967295 loops=4294967295", "WAKESTAT fields");
+}
+
 
 const std::string END_OF_DUMP = "===== end of dump =====\n";
 // DUMP SINCE fixtures: synthetic rows and events in the firmware's line formats (no real log content).
@@ -730,7 +785,8 @@ int main(int argc, char** argv) {
     return 0;
   }
   check(group == "all" || group == "schema" || group == "logging" || group == "schema-failures" || group == "ble-write" ||
-        group == "motion" || group == "fw-build" || group == "dump-since", "known group");
+        group == "motion" || group == "fw-build" || group == "dump-since" || group == "loop-gap" ||
+        group == "stat-widths", "known group");
   if (group == "all" || group == "schema") { schemaChecks(); std::cout << "PASS schema\n"; }
   if (group == "all" || group == "logging") { loggingChecks(); std::cout << "PASS logging\n"; }
   if (group == "all" || group == "schema-failures") { schemaFailureChecks(); std::cout << "PASS schema-failures\n"; }
@@ -738,4 +794,6 @@ int main(int argc, char** argv) {
   if (group == "all" || group == "motion") { motionChecks(); std::cout << "PASS motion\n"; }
   if (group == "all" || group == "fw-build") { fwBuildChecks(); std::cout << "PASS fw-build\n"; }
   if (group == "all" || group == "dump-since") { dumpSinceChecks(); std::cout << "PASS dump-since\n"; }
+  if (group == "all" || group == "loop-gap") { loopGapChecks(); std::cout << "PASS loop-gap\n"; }
+  if (group == "all" || group == "stat-widths") { statWidthChecks(); std::cout << "PASS stat-widths\n"; }
 }

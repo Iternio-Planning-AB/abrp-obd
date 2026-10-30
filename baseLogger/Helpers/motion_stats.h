@@ -1,7 +1,8 @@
 #pragma once
 /*
-  Per-minute accelerometer summary for the diagnostic MOTION line: aggregation only, no I/O, so a host test can
-  drive it. #included by logger.ino into the single sketch translation unit (and by tests/log_diagnostics_checks.cpp).
+  Per-minute accelerometer summary for the diagnostic MOTION line, and the loop gap the WAKESTAT line reports (#110):
+  aggregation only, no I/O, so a host test can drive it. #included by logger.ino into the single sketch translation
+  unit (and by tests/log_diagnostics_checks.cpp).
 */
 #include <cstdint>
 #include <cstdio>
@@ -58,6 +59,38 @@ void motionStatsLine(char* buf, size_t len, const MotionStats& m, bool parked, b
   snprintf(buf, len, "MOTION act=%u n=%u s=%lu peak=%.3f mean=%.3f axmax=%.3f obd=%d parked=%d chg=%d",
     m.total_ms ? (unsigned)((m.active_ms * 100ULL + m.total_ms / 2) / m.total_ms) : 0U, (unsigned)m.n, (m.last_ms - m.start_ms) / 1000UL,
     m.peak, m.n ? m.sum / m.n : 0.0f, m.axmax, m.obd ? 1 : 0, parked ? 1 : 0, chg ? 1 : 0);
+}
+
+// The longest gap between two visits to loop()'s service point this wake, for WAKESTAT (#110): a scheduler-gap proxy,
+// not a measured BLE latency. The first visit only seeds, so setup() and the deep sleep before it never count. uint32
+// arithmetic, so a gap across the 32-bit millis() wrap is still right. Its floor is detectMovement's 500 ms window
+// while stationary; an in-loop upload burst or poll shows up too, matched offline by at= against the UPLOAD/OBD lines.
+// enterDeepSleep() notes its own entry as one more visit when loop() ran, so a sleep from inside the loop body (the
+// net-recover reboot after a modem stall) still counts the stretch before it. RAM only: every wake starts a new one.
+struct LoopGap {
+  uint32_t last_ms = 0;
+  uint32_t max_ms = 0;  // longest gap
+  uint32_t max_at = 0;  // millis() it ended at
+  uint32_t n = 0;       // visits: loop()'s, and the sleep entry's
+  bool seeded = false;
+};
+LoopGap g_loop_gap; // loop()'s gap tracker
+
+void loopGapNote(LoopGap& g, uint32_t now) {
+  if (g.seeded && now - g.last_ms > g.max_ms) {
+    g.max_ms = now - g.last_ms;
+    g.max_at = now;
+  }
+  g.seeded = true;
+  g.last_ms = now;
+  g.n++;
+}
+
+// After a console command (DUMP, CLKPROBE, GZTEST...), which blocks the loop for minutes by design: the next gap
+// starts now, so a bench session never reads as a telemetry stall.
+void loopGapReseed(LoopGap& g, uint32_t now) {
+  g.seeded = true;
+  g.last_ms = now;
 }
 
 // Rolling accumulator behind the drive rules' "sustained motion" (#6): a ring of 5 s buckets of sampled and

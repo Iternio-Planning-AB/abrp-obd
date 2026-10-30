@@ -403,6 +403,10 @@ DataLogger datalogger;
 // g_last_http / g_last_status hold the most recent upload outcome (set in logNetwork).
 const char* g_wake_reason = "POWERON";
 int g_last_http = 0;
+// Upload batches this boot, bumped by uploadBuffered (#110): tried (one per `UPLOAD try` line), accepted (logNetworkAt
+// said yes, an ok_empty batch included) and the frames those erased. The pre-sleep FLUSHSTAT line reports their deltas
+// across the flush's drain; aged, oversized and held frames leave the queue without counting. RAM only.
+int g_upload_posts = 0, g_upload_accepted = 0, g_upload_frames_ok = 0;
 std::string g_last_status{ "none" };
 unsigned long g_last_post_ms = 0; // wall time of the most recent POST (diagnostic: slow success = marginal link)
 
@@ -1226,11 +1230,15 @@ void setup() {
 void loop() {
   esp_task_wdt_reset(); // feed the wedge guard - the ONLY steady-state feed, so any block anywhere in the
                         // loop body (modem, OBD, BLE, FS) trips a reset within WEDGE_WDT_TIMEOUT_S
+#if ENABLE_LOGGING
+  loopGapNote(g_loop_gap, (uint32_t)millis()); // WAKESTAT's loopmax=: ahead of the ladder, which can sleep
+#endif
   handleActivityState();
   dcPromotePoke();
   dcAwakeTrack();
 #if ENABLE_LOGGING
-  handleLogCommands(); // serve DUMP / STAT / CLEAR over serial at any time
+  // Serve DUMP / STAT / CLEAR over serial at any time. A command can hold the loop for minutes: not a loop gap.
+  if (handleLogCommands()) loopGapReseed(g_loop_gap, (uint32_t)millis());
   // Drain BLE handshake events enqueued by the Bluedroid task (see bleLogCb) - written to flash HERE, on the
   // loop task, so LittleFS is never touched from two tasks at once. This is what makes the BLE handshake
   // (CONNECT/AUTH/HASH/CLEAN/SETUP/DISCONNECT+reason) visible in the DUMP for in-car debugging.

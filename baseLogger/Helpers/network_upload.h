@@ -482,7 +482,10 @@ bool uploadBuffered(bool drain) {
       (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getMaxAllocHeap(), g_ble_up ? 1 : 0);
 #endif
     attempted = true;
+    ++g_upload_posts; // FLUSHSTAT's counts (#110): this batch was tried...
     if (!logNetworkAt(batch, send_utc)) { ok = false; break; }
+    ++g_upload_accepted; // ...accepted, and its frames go
+    g_upload_frames_ok += (int)n;
     obd_result_vector.erase(obd_result_vector.begin(), obd_result_vector.begin() + n);
     if (!drain && ++batches >= UPLOAD_MAX_BATCHES_PER_CYCLE) break; // bounded burst; drain=true is unlimited
   }
