@@ -62,6 +62,14 @@ drive region in `Helpers/drive_state.h`, and the runner fails if anything outsid
 a call into the drive region sits outside the blocks it extracts. The pin rule and what the harness
 cannot prove (32-bit `millis()` wrap, other flag sets, code outside the extracted blocks) are in the
 runner's header. The `rules` group (#6) also runs CUR alone, as absolute checks: the named driving-rule scenarios (desk drift, late-fix drive, discharge, charge block, UNCONFIRMED exit) over Poll inputs for the car, motion, sustained motion, power and charge latch, whose defaults make CUR agree with OLD.
+Since #124 they also pin that a fix holds DRIVING only while the car is on: with the car off (a low rail and no
+OBD answer within `ACTIVE_TIMER`, never answered or a speed-key drive whose answers stopped) a fix no longer
+refreshes the hold, one `hold refused` line carries the rail, the answer's age and a clamped speed, the drive
+re-latches the first poll end past `ACTIVE_TIMER` after the last accepted hold with one freeze, and a later fix logs
+today's PARKED refusal once (two refusal lines per episode); the rail alone, OBD answers on a 12.0 V rail, OBD
+answers with no rail reading (0.0, as a build without `ENABLE_IO36_RAIL`) and a one-poll rail dip keep the drive.
+No restored-DRIVING case exists to test: drive state is RAM, reset to PARKED on every boot, and the crash copy
+(`wdt_streak.h`) restores only the PARK marker debt. The line's worst case is in `run_energy_checks.py`'s table.
 
 Since 0b-1 (#81) the differential also covers the poll-side energy block: the rail refresh and `loop()`'s block from
 the `is_charging` verdict through `dcAwakeTrack()` (release latch and silent hold, taper stall count, DC session,
@@ -135,7 +143,8 @@ Existing isolated `rules` tests and historical differential groups retain their 
 
 Named scenarios cover GNSS and accelerometer starts on the poll after charge release (a NaN speed cannot
 override the latch); both speed-PID keys overriding a real charge latch while energy rejects regen as charging,
-and subsequent GNSS continuing that drive despite the residual release latch;
+and subsequent GNSS continuing that drive despite the residual release latch; such a false drive ending once the
+car is off and the fixes drift on (#124), after which a charge is seen again and the max-awake backstop applies;
 a poll re-latching PARK and accepting trusted charge immediately; the streaming trust prerequisite;
 UNCONFIRMED accepting charge and returning to PARK on the next poll, without a freeze or marker;
 silent hold and release, with marker debt beginning only after a driving frame is buffered; and a high-rail

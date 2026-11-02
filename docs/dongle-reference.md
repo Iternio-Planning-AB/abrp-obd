@@ -551,6 +551,9 @@ phone supplies its own position — so a BLE frame is smaller than the cellular 
 is DRIVING, as always. A fresh moving GNSS fix starts DRIVING only with the car on (rail ≥ `RAIL_AWAKE_VOLTS`, or an
 OBD answer within `ACTIVE_TIMER`), an accelerometer hit within `DRIVE_MOTION_RECENT_MS` and no charge latch; a fix
 without them (desk drift, a garage) is refused and logged once per streak (`LEASH gnss=… refused reason=motion|car-off|charging`).
+Once DRIVING, a fix holds the drive only while the car is on (#124); with it off the fix is refused once per drive
+(`LEASH gnss=… hold refused reason=car-off rail=… obd=…s`, the last OBD answer's age, `-1s` if none this wake) and the
+time re-latch parks it `ACTIVE_TIMER` after the last hold, so drift cannot keep the backstop and `is_charging` off.
 Sustained motion (`DRIVE_SUSTAINED_ACT_PCT` of at least `DRIVE_SUSTAINED_MIN_SAMPLED_MS` sampled, over
 `DRIVE_SUSTAINED_WINDOW_MS`) on a car that is on, with no charge latch, is UNCONFIRMED; with a discharge above
 `DRIVE_DISCHARGE_KW` (the frame's `power`, else current × voltage) it is DRIVING. UNCONFIRMED keeps

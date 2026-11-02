@@ -28,6 +28,7 @@ config = (root / "baseLogger/config.h").read_text()
 logging = (root / "baseLogger/Helpers/logging.h").read_text()
 sleep = (root / "baseLogger/Helpers/sleep_power.h").read_text()
 state_machine = (root / "baseLogger/Helpers/state_machine.h").read_text()
+drive_state = (root / "baseLogger/Helpers/drive_state.h").read_text()
 streak = (root / "baseLogger/Helpers/wdt_streak.h").read_text()
 ota = (root / "baseLogger/Helpers/ota_update.h").read_text()
 
@@ -44,8 +45,10 @@ WORST_EVENT_ARGS = {
     "DC_AWAKE refused ": ("motion", 15.99),
     "DC_AWAKE poke promoted": (1, 1),
     "POSTDRIVE window %s": ("recheck", "WIFI_RECOVERY", 15.99, 4294967295),
+    # #124: kmh clamped to [0, 999.9] for this line (sm rules pin the clamp), the longest reason, a rail far past the ADC range, a 32-bit long.
+    "LEASH gnss=%.1fkm/h hold refused": (999.9, "charging", -99.99, -2147483648),
 }
-event_sources = logger + state_machine + sleep
+event_sources = logger + state_machine + sleep + drive_state
 # The host stand-in for the streak store keeps its bytes across boots, as RTC_NOINIT_ATTR does and
 # RTC_DATA_ATTR (reloaded on every reset but a deep-sleep wake) does not.
 if not re.search(r"^RTC_NOINIT_ATTR WdtStreakStore wdt_streak_store;", streak, re.MULTILINE):

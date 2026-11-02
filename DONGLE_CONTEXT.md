@@ -205,7 +205,11 @@ The PSRAM-first queue, heap/flash reserves and cap can discard oldest frames; lo
 must re-arm its debt. Changing to a different or unknown token discards the old vehicle's backlog.
 
 **Drive and geo:** `drive_state.h` owns PARKED/DRIVING/UNCONFIRMED. GNSS needs car/motion evidence and
-no charge latch to start driving; sustained motion without sufficient driving evidence can be
+no charge latch to start driving, and a fix holds a drive under way only while the car is on (rail at
+`RAIL_AWAKE_VOLTS` or an OBD answer within `ACTIVE_TIMER`, #124): with the car off, GNSS drift no longer keeps
+DRIVING, so the time re-latch returns it to PARKED and the max-awake backstop and `is_charging` apply again. One
+`LEASH gnss=... hold refused reason=car-off rail= obd=` line per episode (`obd=-1s`: no answer this wake). Speed-key
+holds and the OTA/log-dump session hold are unaffected. Sustained motion without sufficient driving evidence can be
 UNCONFIRMED. That state omits the frame's `is_parked`, uses live location and owes no PARK marker,
 but remains parked to other readers. The alarm gate is independent.
 Location and heading retain their observation times and are sent once per accepted observation.
