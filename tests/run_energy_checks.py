@@ -119,7 +119,7 @@ with tempfile.TemporaryDirectory(prefix="obd-energy-checks-") as temporary:
     (build / "charge_signal.inc").write_text(poll[start:end])
     start = poll.index("    const bool was_recently_charging")
     end = poll.index("\n    return EnergyPoll{", start)
-    (build / "charge_release.inc").write_text(poll[start:end] + "\n" + call_site.split("\n")[1])
+    (build / "charge_release.inc").write_text(poll[start:end] + "\n    dcAwakeTrack();")
     start = poll.index("    auto chargeCounterRose =")
     end = poll.index("\n    /*\n      DC or AC", start)
     (build / "charge_progress.inc").write_text(poll[start:end])

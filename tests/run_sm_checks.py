@@ -1,23 +1,23 @@
 """Differential checks for the park/drive decision, the poll-side energy block and the setup() wake gate (state
 machine #23, steps 0a #28, 0b-1 #81 and 0b-2 #82).
 
-Three regions are compared. The drive region is drive_state.h and the blocks that call it: the speed loop, the GNSS
-branch and the time re-latch, the is_parked publish, the OTA/dump hold, changeState, the frame_has_data buffer block
-with the queue helper, the pre-sleep marker and the setup() marker restore. The energy region is the poll's rail
-refresh and the contiguous block in loop() from the is_charging verdict through dcAwakeTrack(): the release latch
-and silent hold, the taper stall count, the DC session, the next-wake cadence, the fast budget and cap,
-corroboration and the stale guard, with the helpers it calls (resetChargeCorroboration, pdwActive, chargeStateStale,
-the dcAwake* functions). In the tree (#25) that block is energy_state.h's energyOnPoll, verbatim, with the helpers
-beside it: CUR inlines the header and runs loop()'s call site, and the three values the poll returns for the
-SAMPLE_POLL line are compared with OLD's locals. The wake region is setup()'s RTC sanitize and the whole ATRV gate
-block: the ATRV read, the taper bridge and its give-up, the charge-end read, the follow-up, the poll decision, the
-alarm suppression, the counters and log lines, the weak-rail cold boot and the skip path. All are extracted with the
-same anchors from two places: OLD from the pinned commit (git show), CUR from the working tree. The context around
-them (the post-drive window at the ladder end, a sample poke's sleep after its poll, setup()'s last-poll stamp, the
+Three regions are compared. The drive region is drive_state.h and the blocks that call it: the speed loop, the
+GNSS branch and the time re-latch, the is_parked publish, the OTA/dump hold, changeState, the frame_has_data
+buffer block with the queue helper, the pre-sleep marker and the setup() marker restore. The energy region is
+the poll's rail refresh and the contiguous block in loop() from the is_charging verdict through dcAwakeTrack():
+the release latch and silent hold, the taper stall count, the DC session, the next-wake cadence, the fast budget
+and cap, corroboration and the stale guard, with the helpers it calls (resetChargeCorroboration, pdwActive,
+chargeStateStale, the dcAwake* functions). The wake region is setup()'s RTC sanitize and the whole ATRV gate block:
+the ATRV read, the taper bridge and its give-up, the charge-end read, the follow-up, the poll decision, the alarm
+suppression, the counters and log lines, the weak-rail cold boot and the skip path. All are extracted with the same
+anchors from two places: OLD from the pinned commit (git show), CUR from the working tree. The context around them
+(the post-drive window at the ladder end, a sample poke's sleep after its poll, setup()'s last-poll stamp, the
 weak-rail window's expiry and the recovery ahead of it, every sleep's modem override for that wake, loop()'s poll
 condition that decides whether a poll asks the car, the backstop, the delays) comes from the working tree for both
 sides, so a deliberate change there cannot fail the differential; a property checks that the shared backstop never
-sleeps a driving car.
+sleeps a driving car. In the tree (#25) the energy block is energy_state.h's energyOnPoll, verbatim, with
+the helpers beside it: CUR inlines the header and runs loop()'s call site, and the three values the poll returns for
+the SAMPLE_POLL line are compared with OLD's locals.
 tests/sm_checks.cpp compiles each side into its own namespace around the same harness
 (tests/sm/adapter_*.inc) and runs identical event sequences through both, asserting equal outputs after
 every event: the latch, the leash and hold times, the marker debt and its crash copy, published is_parked,
@@ -38,9 +38,9 @@ also inside the pre-sleep flush, never loses the marker debt; an absolute proper
 (CUR alone: absolute checks of the #6 driving rules), or all. A Charge or Silent poll keeps the wake's rail and
 motion; any answered poll stamps the last OBD answer. A wake carries the rail, the ATRV read, the alarm flag and an
 optional charge latch; the RTC clock and epoch run through sleeps, and a cold boot zeroes the clock until a poll.
-Before compiling, it checks that only drive_state.h assigns the park/drive storage and only energy_state.h the
-charging state, that alarm_gate.h names no drive state, that every drive call is in an extracted block, and that every
-energy call is in one or at a named site (ENERGY_UNEXTRACTED). A poll reaches the car only when loop()'s poll
+Before compiling, it checks that only drive_state.h assigns the park/drive storage, that alarm_gate.h names no
+drive state, and that every drive call is in an extracted block; likewise that only energy_state.h assigns the
+charging state and every energy call is in a compared block or at a named site (ENERGY_UNEXTRACTED). A poll reaches the car only when loop()'s poll
 condition holds (around it a profile is always loaded and the per-cycle alarm permit passes), so the property "a
 poll ran on a weak-rail wake" holds a weak-rail cold boot to the firmware's own veto (#104); it also checks that the
 condition has the veto as a term and guards the lazy init and the bus read, that every obd.readPIDs( and
@@ -123,7 +123,6 @@ DRIVE_END = "#if ENABLE_NETWORK\n    const double poll_utc = uploadSendUtc();"
 ENERGY_START = "    // Feature A - is_charging"
 ENERGY_END = "\n#if ENABLE_BLE\n    const uint16_t ble_mtu"
 ENERGY_RAIL = "    g_last_io36 = readIO36Rail();\n    // A poke held by a DC charge"
-# In the tree (#25) that block is energy_state.h's energyOnPoll, verbatim, and loop() calls it here.
 ENERGY_CALL_SITE = "    const EnergyPoll ep = energyOnPoll(current_frame, obd_count);\n    dcAwakeTrack();\n"
 # What the poll hands the SAMPLE_POLL line, compared field by field: OLD's locals, CUR's return value.
 ENERGY_OUT = ("  sm_ep_charging = {0}is_charging, sm_ep_progress = {0}charge_progress, "
@@ -179,6 +178,8 @@ def recipe(src, side):
             sys.exit(f"FAIL: loop() must call energyOnPoll once, as {ENERGY_CALL_SITE!r} ({side})")
         energy_start = find(logger, ENERGY_CALL_SITE, what=where["logger"])
         energy_end = energy_start + len(ENERGY_CALL_SITE)
+        if not logger[energy_end:].startswith(ENERGY_END):
+            sys.exit(f"FAIL: nothing may sit between loop()'s energyOnPoll call site and #if ENABLE_BLE ({side})")
         energy, statics = ENERGY_CALL_SITE, energy_state
         energy_out = ENERGY_OUT.format("ep.")
         energy_helpers, sanitize = dc, ""
@@ -500,51 +501,14 @@ if (terms[-1] != "alarmGateAllowsPoll()" or len(reads) != 2 or len(outside) != 1
              "with alarmGateAllowsPoll() its last term, directly under #if OBD_ALARM_GATE in FAKE_DATA's #else, "
              "after the cycle's rail and GNSS refresh; the one other readPIDs is the gate's #else")
 
-# Step 1 (#24), extended by #6 to drive_unconfirmed and the refusal-streak flag: drive_state.h is the only code that assigns the park/drive storage. An assignment here is
-# =, a compound assignment, ++/--, taking the address or binding a reference (an alias could assign), or
-# swap(); matched on the whole file, so a statement split over lines is still seen.
+# Step 1 (#24), extended by #6 to drive_unconfirmed and the refusal-streak flag: drive_state.h is the only code that
+# assigns the park/drive storage, and since step 3 (#25) energy_state.h the charging state. An assignment here is =, a
+# compound assignment (also chained), ++/--, taking the address or binding a reference (an alias could assign), or
+# swap(); matched on the whole file, so a statement split over lines is still seen. The storage is defined in
+# logger.ino until #27, so a definition there is exempt, but only at file scope: a local of the same name is not.
+# Blind spot: passing a field to a non-const reference parameter writes it unseen, as chargeCounterRose does inside
+# the energy owner; review must catch one outside it.
 DRIVE_STORAGE = ("is_currently_parked", "g_last_speed_ms", "park_marker_owed", "drive_unconfirmed", "g_drive_gnss_refused")
-DECLARATION = re.compile(r"(?:^|\n)\s*(?:RTC_DATA_ATTR\s+)?(?:bool|unsigned\s+long)\s*$")
-helpers = sorted((root / "baseLogger/Helpers").glob("*.h"))
-for path in [root / "baseLogger/logger.ino", *helpers]:
-    if path.name == "drive_state.h":
-        continue
-    code = code_only(path.read_text())
-    for name in DRIVE_STORAGE:
-        for m in re.finditer(rf"\b{name}\b", code):
-            before, after = code[:m.start()].rstrip(), code[m.end():].lstrip()
-            if path.name == "logger.ino" and DECLARATION.search(before) and after.startswith("="):
-                continue  # its definition
-            assigned = re.match(r"(?:[-+*/%&|^]|<<|>>)?=(?!=)|\+\+|--", after)
-            stepped = before.endswith(("++", "--"))
-            addressed = before.endswith("&") and not before.endswith("&&") and not re.search(r"[\w)\]]\s*&$", before)
-            bound = re.search(r"&\s*\w+\s*=$", before)
-            swapped = re.search(r"\bswap\s*\([^;]*$", before)
-            if assigned or stepped or addressed or bound or swapped:
-                number = code.count("\n", 0, m.start()) + 1
-                sys.exit(f"FAIL: {path.relative_to(root)}:{number} assigns {name}; only drive_state.h may (#24)")
-
-# The OBD-alarm gate takes no drive input. A regex sees identifiers, not wrappers: a helper defined elsewhere
-# that returns drive state is out of its reach, so review still matters.
-alarm = code_only(tree("baseLogger/Helpers/alarm_gate.h"))
-for pattern in (r"\bdrive[A-Z_]\w*", r"\bDrive\w*", r"\bDRIVE_\w*", r"\bis_currently_parked\b",
-                r"\bg_last_speed_ms\b", r"\bpark_marker_owed\b", r"\blast_active\b", r"\bg_drive\w*"):
-    if re.search(pattern, alarm):
-        sys.exit(f"FAIL: alarm_gate.h reads drive state ({pattern}); the OBD-alarm gate takes no drive input")
-
-# Every call into the drive region sits in a block this harness extracts, so none can be added unseen.
-DRIVE_CALL = r"\bdrive[A-Z]\w*\s*\("
-calls = sum(len(re.findall(DRIVE_CALL, code_only(p.read_text())))
-            for p in [root / "baseLogger/logger.ino", *helpers] if p.name != "drive_state.h")
-extracted = len(re.findall(DRIVE_CALL, code_only("".join(v for k, v in cur.items() if k != "drive_state"))))
-if calls != extracted:
-    sys.exit(f"FAIL: {calls} drive_state.h calls in the firmware but {extracted} in the extracted blocks; "
-             "a call outside them is not compared against SM_PIN - extract its block")
-
-# Step 3 (#25): energy_state.h is the only code that assigns the charging state, in the same assignment forms as the
-# drive check above. The storage is defined in logger.ino until #27, so a definition there is exempt, but only at file
-# scope: a local of the same name is not. Blind spot: passing a field to a non-const reference parameter writes it
-# unseen, as chargeCounterRose does inside the owner; review must catch one outside it.
 ENERGY_STORAGE = ("charging_fast_minutes", "dc_session", "charging_cap_latched", "charge_uncorroborated_s",
                   "charge_corr_last_us", "charge_corr_soc_hw", "charge_corr_kwh_hw", "charge_corr_soe_hw",
                   "recently_charging", "taper_confirm_wakes", "charge_end_polled", "prev_charge_soc", "prev_parked_soc",
@@ -552,7 +516,7 @@ ENERGY_STORAGE = ("charging_fast_minutes", "dc_session", "charging_cap_latched",
                   "pdw_open", "pdw_open_us", "pdw_polls", "charge_last_evidence_us", "g_dc_confirmed",
                   "g_dc_inferred_polls", "g_dc_silent_since_ms", "g_fast_anchor_ms", "g_last_discharge_ms",
                   "g_pdw_ladder_done", "g_pdw_recheck")
-ENERGY_DEFINITION = re.compile(r"(?:^|\n)\s*(?:RTC_DATA_ATTR\s+)?(?:bool|uint8_t|uint32_t|uint64_t|double|unsigned\s+long)\s*$")
+DEFINITION = re.compile(r"(?:^|\n)\s*(?:RTC_DATA_ATTR\s+)?(?:bool|uint8_t|uint32_t|uint64_t|double|unsigned\s+long)\s*$")
 
 
 def file_scope_blocks(code):
@@ -570,16 +534,16 @@ def file_scope_blocks(code):
     return spans
 
 
-def energy_writes(file_name, text):
-    """(line, field) of every assignment to the energy storage in text."""
+def writes(file_name, text, names):
+    """(line, name) of every assignment to names in text."""
     code = code_only(text)
     spans = file_scope_blocks(code)
     found = []
-    for name in ENERGY_STORAGE:
+    for name in names:
         for m in re.finditer(rf"\b{name}\b", code):
             before, after = code[:m.start()].rstrip(), code[m.end():].lstrip()
             inside = any(a < m.start() < b for a, b in spans)
-            if file_name == "logger.ino" and not inside and ENERGY_DEFINITION.search(before) and after.startswith("="):
+            if file_name == "logger.ino" and not inside and DEFINITION.search(before) and after.startswith("="):
                 continue  # its definition
             assigned = re.match(r"(?:[-+*/%&|^]|<<|>>)?=(?!=)|\+\+|--", after)
             stepped = before.endswith(("++", "--"))
@@ -591,6 +555,8 @@ def energy_writes(file_name, text):
     return sorted(found)
 
 
+helpers = sorted((root / "baseLogger/Helpers").glob("*.h"))
+firmware = [root / "baseLogger/logger.ino", *helpers]
 # The check must see these: a chained assignment (every name in it), a write from another helper, a shadowing local.
 # A file-scope definition must pass.
 ENERGY_FIXTURES = (("logger.ino", "void energyFixture() {\n  charge_followup = pdw_open = pdw_polls = 0;\n}\n",
@@ -598,33 +564,52 @@ ENERGY_FIXTURES = (("logger.ino", "void energyFixture() {\n  charge_followup = p
                    ("state_machine.h", "void energyFixture() {\n  recently_charging = false;\n}\n", ["recently_charging"]),
                    ("logger.ino", "void energyFixture() {\n  bool recently_charging = false;\n}\n", ["recently_charging"]),
                    ("logger.ino", "RTC_DATA_ATTR uint8_t charge_followup = 0;\n", []))
-firmware = [root / "baseLogger/logger.ino", *helpers]
 for file_name, fixture, expected in ENERGY_FIXTURES:
     text = next(p for p in firmware if p.name == file_name).read_text().rstrip("\n") + "\n"
     first = text.count("\n") + 1
-    seen = [(number, name) for number, name in energy_writes(file_name, text + fixture) if number >= first]
-    if sorted(name for _, name in seen) != sorted(expected) or any(number < first for number, _ in seen):
+    seen = [(number, name) for number, name in writes(file_name, text + fixture, ENERGY_STORAGE) if number >= first]
+    if sorted(name for _, name in seen) != sorted(expected):
         sys.exit(f"FAIL: the energy ownership check saw {seen} in the fixture {fixture!r} on {file_name}, "
                  f"expected {expected}")
 for path in firmware:
-    if path.name == "energy_state.h":
-        continue
-    for number, name in energy_writes(path.name, path.read_text()):
-        sys.exit(f"FAIL: {path.relative_to(root)}:{number} assigns {name}; only energy_state.h may (#25)")
+    for owner, names, issue in (("drive_state.h", DRIVE_STORAGE, "#24"), ("energy_state.h", ENERGY_STORAGE, "#25")):
+        if path.name == owner:
+            continue
+        for number, name in writes(path.name, path.read_text(), names):
+            sys.exit(f"FAIL: {path.relative_to(root)}:{number} assigns {name}; only {owner} may ({issue})")
 
-# Every call into energy_state.h sits in a block this harness extracts, or at one of these sites, which the
-# differential does not compare: (file, code line, calls on it, what checks it instead).
+# The OBD-alarm gate takes no drive input. A regex sees identifiers, not wrappers: a helper defined elsewhere
+# that returns drive state is out of its reach, so review still matters.
+alarm = code_only(tree("baseLogger/Helpers/alarm_gate.h"))
+for pattern in (r"\bdrive[A-Z_]\w*", r"\bDrive\w*", r"\bDRIVE_\w*", r"\bis_currently_parked\b",
+                r"\bg_last_speed_ms\b", r"\bpark_marker_owed\b", r"\blast_active\b", r"\bg_drive\w*"):
+    if re.search(pattern, alarm):
+        sys.exit(f"FAIL: alarm_gate.h reads drive state ({pattern}); the OBD-alarm gate takes no drive input")
+
+# Every call into the drive region sits in a block this harness compares, so none can be added unseen.
+DRIVE_CALL = r"\bdrive[A-Z]\w*\s*\("
+calls = sum(len(re.findall(DRIVE_CALL, code_only(p.read_text()))) for p in firmware if p.name != "drive_state.h")
+extracted = len(re.findall(DRIVE_CALL, code_only("".join(cur[k] for k in PIN_BLOCKS if k != "drive_state"))))
+if calls != extracted:
+    sys.exit(f"FAIL: {calls} drive_state.h calls in the firmware but {extracted} in the extracted blocks; "
+             "a call outside them is not compared against SM_PIN - extract its block")
+
+# Every call into energy_state.h sits in a block this harness compares, or at one of these sites, which the
+# differential does not: (file, code line, how many such lines), each with what checks it instead.
 ENERGY_CALL = (r"\b(?:energy[A-Z]\w*|resetChargeCorroboration|pdwActive|chargeStateStale|chargeWakeStateSanitize|"
                r"pdwOpenWindow|pdwArmAtLadderEnd)\s*\(")
 ENERGY_UNEXTRACTED = (
-    ("logger", "chargeWakeStateSanitize(esp_reset_reason() == ESP_RST_DEEPSLEEP);", 1,
-     "setup()'s RTC sanitize: run_energy_checks.py pins it ahead of the streak advance; the adapter boots through it"),
-    ("machine", "pdwArmAtLadderEnd();", 2,
-     "the awake ladder's two sleeps: run_energy_checks.py pins both; the adapter runs it at every ladder sleep"),
-    ("logger", "pdwOpenWindow(); // the reboot ends this awake period", 1,
-     "the net-recover reboot: energy_checks runs that block whole"),
-    ("logger", "const unsigned pdw_left = pdwActive(pdw_now_us)", 1, "the SAMPLE_POLL line's window minutes, a log field"),
-    ("logger", "energyOnPromote();", 1, "dcPromotePoke: run_energy_checks.py's Dongle runs it whole"),
+    # setup()'s RTC sanitize: run_energy_checks.py pins it ahead of the streak advance; the adapter boots through it.
+    ("logger", "chargeWakeStateSanitize(esp_reset_reason() == ESP_RST_DEEPSLEEP);", 1),
+    # The awake ladder's two sleeps, one of them the backstop's (shared context): run_energy_checks.py pins both and
+    # the adapter runs it at every ladder sleep.
+    ("machine", "pdwArmAtLadderEnd();", 2),
+    # The net-recover reboot: energy_checks runs that block whole.
+    ("logger", "pdwOpenWindow(); // the reboot ends this awake period", 1),
+    # The SAMPLE_POLL line's window minutes, a log field.
+    ("logger", "const unsigned pdw_left = pdwActive(pdw_now_us)", 1),
+    # dcPromotePoke: run_energy_checks.py's Dongle runs it whole.
+    ("logger", "energyOnPromote();", 1),
 )
 
 
@@ -636,14 +621,14 @@ def energy_calls(text):
 
 
 calls = sum(energy_calls(p.read_text()) for p in firmware if p.name != "energy_state.h")
-extracted = energy_calls("".join(v for k, v in cur.items() if k != "energy_state"))
-for key, site, count, _ in ENERGY_UNEXTRACTED:
+extracted = energy_calls("".join(cur[k] for k in PIN_BLOCKS))
+for key, site, count in ENERGY_UNEXTRACTED:
     found = [l for l in cur_src[key].splitlines() if l.strip() == site]
     if len(found) != count:
         sys.exit(f"FAIL: expected {count} {site!r} in {PATHS[key]}, found {len(found)}; update ENERGY_UNEXTRACTED")
-    extracted += count * energy_calls(site)
+    extracted += count * len(re.findall(ENERGY_CALL, code_only(site)))
 if calls != extracted:
-    sys.exit(f"FAIL: {calls} energy_state.h calls in the firmware but {extracted} in the extracted blocks and the "
+    sys.exit(f"FAIL: {calls} energy_state.h calls in the firmware but {extracted} in the compared blocks and the "
              "named sites; a call outside them is not compared against SM_PIN - extract its block or name it")
 
 # The weak-rail cold boot's veto (#104) covers every bus read in logger.ino, not only the one the harness runs: each
