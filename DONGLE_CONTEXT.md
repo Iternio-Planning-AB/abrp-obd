@@ -165,6 +165,8 @@ Check the rail before powering peripherals or issuing bus traffic.
   Risk: plugged-in preconditioning or V2L while the car is moved reads as a drive, which forces `is_charging` to 0
   (the latch releases, the CHARGING exit and DC hold are lost, the parked-only backstop is off), and GNSS drift can
   hold it past `ACTIVE_TIMER`. The car-on requirement for a DRIVING GNSS hold should land before or with this.
+- `Helpers/energy_state.h` is the only writer of the charge latch, DC session, fast budget/cap, corroboration,
+  follow-up and post-drive window state (#25); the gate's poll decision and the next-wake cadence are not yet its.
 - Bring BLE up before slow modem initialization. Suppress cellular only while `bleRelaying()` says
   the phone is the transport—not merely connected or, in v1, authenticated.
 - Normal sleep flushes/saves uploads, deinitializes BLE, powers down peripherals and arms wake sources.
