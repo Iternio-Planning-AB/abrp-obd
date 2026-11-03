@@ -109,22 +109,32 @@ with tempfile.TemporaryDirectory(prefix="obd-energy-checks-") as temporary:
         r"CHARGE_END_POLL_FLOOR|MAX_AWAKE_MINUTES|TAPER_CONFIRM_MAX_WAKES|IO36_LOCKOUT_\w+|POST_DRIVE_\w+|OBD_ALARM_GATE|ENABLE_IO36_RAIL|DC_CHARGING_MIN_KW|DC_CHARGING_AWAKE_SECONDS|"
         r"SESSION_IDLE_MAX_MS|CHARGING_TIMER|ACTIVE_TIMER|DC_CHARGING_POLL_MARGIN_MS)\b.*(?:\n[ \t]+.*)*",
         config, re.MULTILINE)))
-    start = logger.index("    // Feature A - is_charging")
-    end = logger.index("\n    /*\n      CHARGE PROGRESS", start)
-    (build / "charge_signal.inc").write_text(logger[start:end])
-    start = logger.index("    const bool was_recently_charging")
-    end = logger.index("\n\n#if ENABLE_BLE\n    const uint16_t ble_mtu", start)
-    (build / "charge_release.inc").write_text(logger[start:end])
-    start = logger.index("    auto chargeCounterRose =")
-    end = logger.index("\n    /*\n      DC or AC", start)
-    (build / "charge_progress.inc").write_text(logger[start:end])
-    start = logger.index("    bool is_dcfc = false;")
-    end = logger.index("\n    // NOTE: power is deliberately NOT derived", start)
-    (build / "charge_dcfc.inc").write_text(logger[start:end])
-    start = logger.index("    bool has_charge_counter = false;")
-    end = logger.index("\n    const bool uncorroborated =", start)
-    (build / "charge_corroboration.inc").write_text(logger[start:end])
+    # loop()'s poll is energyOnPoll (energy_state.h), sliced at the same code; its call site runs dcAwakeTrack() next.
+    call_site = "    const EnergyPoll ep = energyOnPoll(current_frame, obd_count);\n    dcAwakeTrack();\n"
+    if logger.count(call_site) != 1:
+        raise SystemExit(f"FAIL: loop() must call energyOnPoll and then dcAwakeTrack(), once: {call_site!r}")
+    poll = block(energy, "EnergyPoll energyOnPoll(OBDVector& current_frame, int obd_count) {")
+    start = poll.index("    // Feature A - is_charging")
+    end = poll.index("\n    /*\n      CHARGE PROGRESS", start)
+    (build / "charge_signal.inc").write_text(poll[start:end])
+    start = poll.index("    const bool was_recently_charging")
+    end = poll.index("\n    return EnergyPoll{", start)
+    (build / "charge_release.inc").write_text(poll[start:end] + "\n" + call_site.split("\n")[1])
+    start = poll.index("    auto chargeCounterRose =")
+    end = poll.index("\n    /*\n      DC or AC", start)
+    (build / "charge_progress.inc").write_text(poll[start:end])
+    start = poll.index("    bool is_dcfc = false;")
+    end = poll.index("\n    // NOTE: power is deliberately NOT derived", start)
+    (build / "charge_dcfc.inc").write_text(poll[start:end])
+    start = poll.index("    bool has_charge_counter = false;")
+    end = poll.index("\n    const bool uncorroborated =", start)
+    (build / "charge_corroboration.inc").write_text(poll[start:end])
     (build / "wake_gate.inc").write_text(wake_gate(logger, through="    if (g_sample_poke) g_rail_before_poke = rail;"))
+    # The gate's and the wake's writes to the charge state, called from the slices above and below.
+    (build / "energy_gate.inc").write_text("".join(block(energy, f) for f in (
+        "void energyOnRailAwake() {", "void energyGiveUpTaper(", "void energyOnMotionWake() {")))
+    (build / "energy_wake.inc").write_text(block(energy, "void energyOnSkip() {") +
+                                           block(energy, "void energyOnPromote() {"))
     start = energy.index("static const uint64_t POST_DRIVE_WINDOW_US")
     end = energy.index("\n}\n", energy.index("void chargeWakeStateSanitize(", start)) + 3
     (build / "charge_wake_state.inc").write_text(energy[start:end])

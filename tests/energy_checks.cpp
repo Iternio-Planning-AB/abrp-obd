@@ -1274,6 +1274,7 @@ struct WakeGate {
   uint64_t charge_last_evidence_us = 0;
   uint64_t esp_rtc_get_time_us() const { return 1ULL << 40; }
 #include "charge_stale.inc"
+#include "energy_gate.inc"
   bool poll(float rail, bool is_cold = false, bool is_motion = false, bool awake = false,
             bool heartbeat_due = false) {
 #include "wake_gate.inc"
@@ -1347,6 +1348,8 @@ struct Dongle : ChargePoll {
   float readIO36Rail() const { return ladder_rail; }
   bool ble_up = false;
   void bleBringUp() { ble_up = true; }
+#include "energy_gate.inc"
+#include "energy_wake.inc"
 #include "dc_promote.inc"
 #define ENABLE_SLEEP 1  // the production sleep build, where the ladder reads the rail itself
 #define ENABLE_MEMS 1
