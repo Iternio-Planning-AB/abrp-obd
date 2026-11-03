@@ -107,6 +107,8 @@ PATHS = {"logger": "baseLogger/logger.ino", "machine": "baseLogger/Helpers/state
          "logging": "baseLogger/Helpers/logging.h", "drive_state": "baseLogger/Helpers/drive_state.h",
          "motion_stats": "baseLogger/Helpers/motion_stats.h", "config": "baseLogger/config.h",
          "alarm": "baseLogger/Helpers/alarm_gate.h"}
+# Not in PATHS: it does not exist at SM_PIN, so only the tree's sources carry it.
+ENERGY_STATE = "baseLogger/Helpers/energy_state.h"
 
 
 # Code anchors only (never comment text), each failing with its own text when the code it names has moved.
@@ -137,6 +139,8 @@ ALARM_END = "\n/* Loop-task service:"
 ALARM_STATICS = ("  static bool logged_this_wake = false;\n  static bool last_permit = false;\n"
                  "  static unsigned long last_deny_log_ms = 0;\n")
 ALARM_NOTE = "void alarmNoteSpeed(double kmh) {"
+DC_FUNCTIONS = ("bool dcMotionRecent()", "const char* dcAwakeVeto(", "bool dcAwakeHeld(", "unsigned long dcAwakeDelay(",
+                "void dcAwakeTrack()")
 
 
 def recipe(src, side):
@@ -151,7 +155,19 @@ def recipe(src, side):
     if energy.count(LOGGED_DCFC) != 1:
         sys.exit(f"FAIL: expected one {LOGGED_DCFC.strip()!r} in the energy block ({side})")
     rail = find(logger, ENERGY_RAIL, what=where["logger"])
-    dc_start = find(machine, "bool dcMotionRecent() {", what=where["machine"])
+    dc = "".join(block(machine, f, where["machine"]) for f in DC_FUNCTIONS)
+    # The energy region's helpers: in logger.ino at SM_PIN, in energy_state.h (#25) in the tree.
+    energy_state = src.get("energy_state")
+    if energy_state is None:
+        energy_helpers = (block(logger, "void resetChargeCorroboration() {", where["logger"]) +
+                          line(logger, "static const uint64_t POST_DRIVE_WINDOW_US = ", where["logger"]) +
+                          block(logger, "bool pdwActive(uint64_t now_us) {", where["logger"]) +
+                          block(logger, "bool chargeStateStale(uint64_t now_us) {", where["logger"]) + dc)
+        sanitize = block(logger, "void chargeWakeStateSanitize(bool deep_sleep) {", where["logger"])
+    else:
+        if energy_state.count("#pragma once\n") != 1 or '#include "' in energy_state:
+            sys.exit(f"FAIL: {ENERGY_STATE} must be one #pragma once and no project include, to inline it")
+        energy_helpers, sanitize = dc, ""
     gate = find(logger, WAKE_GATE, what=where["logger"])
     under = logger.rfind("#if ENABLE_ATRV_GATE\n", 0, gate)
     if logger.count(WAKE_GATE) != 1 or under < 0 or re.search(r"^\s*#", logger[under + 1:gate], re.M):
@@ -190,14 +206,10 @@ def recipe(src, side):
         "queue_helper": src["upload"][upload_start:upload_end],
         "energy_rail": logger[rail:find(logger, "\n#endif", rail, where["logger"]) + 1],
         "energy": energy.replace(LOGGED_DCFC, ""),
-        "energy_helpers": block(logger, "void resetChargeCorroboration() {", where["logger"]) +
-                          line(logger, "static const uint64_t POST_DRIVE_WINDOW_US = ", where["logger"]) +
-                          block(logger, "bool pdwActive(uint64_t now_us) {", where["logger"]) +
-                          block(logger, "bool chargeStateStale(uint64_t now_us) {", where["logger"]) +
-                          machine[dc_start:find(machine, "\n// Open the post-drive window", dc_start, where["machine"]) + 1],
-        "sanitize": block(logger, "void chargeWakeStateSanitize(bool deep_sleep) {", where["logger"]),
-        "ladder_end": machine[find(machine, "bool pdwOpenWindow() {", what=where["machine"]):
-                              find(machine, "\n/*\n  Use movement and BLE", what=where["machine"]) + 1],
+        # Inlined, never #included, as drive_state.h. Only the tree has it; OLD's slot stays empty.
+        "energy_state": energy_state.replace("#pragma once\n", "") if energy_state else "",
+        "energy_helpers": energy_helpers,
+        "sanitize": sanitize,
     }
 
 
@@ -217,6 +229,7 @@ void sm_drive_poll(OBDVector& current_frame) {{
 {drive}}}
 void sm_emplace(OBDVector& current_frame) {{
 {emplace}}}
+{energy_state}
 {energy_helpers}
 {sanitize}
 {ladder_end}
@@ -276,6 +289,7 @@ void sm_motion_inputs(const SmEvent& e) {
 
 old_src = {k: pinned(p) for k, p in PATHS.items()}
 cur_src = {k: tree(p) for k, p in PATHS.items()}
+cur_src["energy_state"] = tree(ENERGY_STATE)
 pin, cur = recipe(old_src, "SM_PIN"), recipe(cur_src, "tree")
 
 # The crash copy of the marker debt (#49, Helpers/wdt_streak.h): the setup() restore, the set after the buffer
@@ -370,6 +384,11 @@ PIN_BLOCKS = DRIVE_BLOCKS + ENERGY_BLOCKS + WAKE_BLOCKS + ALARM_BLOCKS
 old = dict(cur)
 for name in PIN_BLOCKS:
     old[name] = pin[name]
+# The ladder end's post-drive window is shared context, from the tree's energy_state.h: OLD takes the two functions,
+# CUR has them inlined with the rest of the header.
+old["energy_state"], cur["ladder_end"] = "", ""
+old["ladder_end"] = (block(cur_src["energy_state"], "bool pdwOpenWindow() {", ENERGY_STATE) +
+                     block(cur_src["energy_state"], "void pdwArmAtLadderEnd() {", ENERGY_STATE))
 
 # A C++ constant, out of the macro check's reach: the pinned gate runs with the tree's value, so they must be equal.
 if pin["weak_awake_ms"] != cur["weak_awake_ms"]:
@@ -516,9 +535,7 @@ ENERGY_STORAGE = ("charging_fast_minutes", "dc_session", "charging_cap_latched",
                   "g_pdw_ladder_done", "g_pdw_recheck")
 ENERGY_DEFINITION = re.compile(r"(?:^|\n)\s*(?:RTC_DATA_ATTR\s+)?(?:bool|uint8_t|uint32_t|uint64_t|double|unsigned\s+long)\s*$")
 # Writers not yet in energy_state.h, by file and function. Each entry must still write, so the list only shrinks.
-ENERGY_WRITERS_PENDING = {("logger.ino", "loop"), ("logger.ino", "setup"), ("logger.ino", "resetChargeCorroboration"),
-                          ("logger.ino", "chargeWakeStateSanitize"), ("logger.ino", "dcPromotePoke"),
-                          ("state_machine.h", "pdwOpenWindow")}
+ENERGY_WRITERS_PENDING = {("logger.ino", "loop"), ("logger.ino", "setup"), ("logger.ino", "dcPromotePoke")}
 
 
 def file_scope_blocks(code):

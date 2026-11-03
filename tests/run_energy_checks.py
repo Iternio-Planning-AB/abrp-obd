@@ -29,6 +29,7 @@ logging = (root / "baseLogger/Helpers/logging.h").read_text()
 sleep = (root / "baseLogger/Helpers/sleep_power.h").read_text()
 state_machine = (root / "baseLogger/Helpers/state_machine.h").read_text()
 drive_state = (root / "baseLogger/Helpers/drive_state.h").read_text()
+energy = (root / "baseLogger/Helpers/energy_state.h").read_text()
 streak = (root / "baseLogger/Helpers/wdt_streak.h").read_text()
 ota = (root / "baseLogger/Helpers/ota_update.h").read_text()
 
@@ -48,7 +49,7 @@ WORST_EVENT_ARGS = {
     # #124: kmh clamped to [0, 999.9] for this line (sm rules pin the clamp), the longest reason, a rail far past the ADC range, a 32-bit long.
     "LEASH gnss=%.1fkm/h hold refused": (999.9, "charging", -99.99, -2147483648),
 }
-event_sources = logger + state_machine + sleep + drive_state
+event_sources = logger + state_machine + energy + sleep + drive_state
 # The host stand-in for the streak store keeps its bytes across boots, as RTC_NOINIT_ATTR does and
 # RTC_DATA_ATTR (reloaded on every reset but a deep-sleep wake) does not.
 if not re.search(r"^RTC_NOINIT_ATTR WdtStreakStore wdt_streak_store;", streak, re.MULTILINE):
@@ -124,12 +125,10 @@ with tempfile.TemporaryDirectory(prefix="obd-energy-checks-") as temporary:
     end = logger.index("\n    const bool uncorroborated =", start)
     (build / "charge_corroboration.inc").write_text(logger[start:end])
     (build / "wake_gate.inc").write_text(wake_gate(logger, through="    if (g_sample_poke) g_rail_before_poke = rail;"))
-    start = logger.index("static const uint64_t POST_DRIVE_WINDOW_US")
-    end = logger.index("\n}\n", logger.index("void chargeWakeStateSanitize(", start)) + 3
-    (build / "charge_wake_state.inc").write_text(logger[start:end])
-    start = logger.index("bool chargeStateStale(uint64_t now_us) {")
-    end = logger.index("\n}\n", start) + 3
-    (build / "charge_stale.inc").write_text(logger[start:end])
+    start = energy.index("static const uint64_t POST_DRIVE_WINDOW_US")
+    end = energy.index("\n}\n", energy.index("void chargeWakeStateSanitize(", start)) + 3
+    (build / "charge_wake_state.inc").write_text(energy[start:end])
+    (build / "charge_stale.inc").write_text(block(energy, "bool chargeStateStale(uint64_t now_us) {"))
     start = logger.index("      g_next_wake_minutes = WAKE_PARKED_MINUTES; // skip = parked")
     end = logger.index("      enterDeepSleep(false);", start)
     (build / "gate_skip.inc").write_text(logger[start:end])
@@ -138,12 +137,11 @@ with tempfile.TemporaryDirectory(prefix="obd-energy-checks-") as temporary:
     sleeps = re.findall(r"(\S+)\s*\n?\s*enterDeepSleep\(true(?:, \"[^\"]*\")?\);", ladder)
     if sleeps != ["pdwArmAtLadderEnd();"] * 2:
         raise SystemExit(f"FAIL: both ladder sleeps must follow pdwArmAtLadderEnd(): {sleeps}")
-    start = machine.index("bool pdwOpenWindow() {")
-    end = machine.index("\n}\n", machine.index("void pdwArmAtLadderEnd() {")) + 3
-    (build / "pdw_ladder.inc").write_text(machine[start:end])
-    start = logger.index("void resetChargeCorroboration() {") + len("void resetChargeCorroboration() {")
-    end = logger.index("\n}", start)
-    (build / "reset_corroboration.inc").write_text(logger[start:end])
+    (build / "pdw_ladder.inc").write_text(block(energy, "bool pdwOpenWindow() {") +
+                                          block(energy, "void pdwArmAtLadderEnd() {"))
+    start = energy.index("void resetChargeCorroboration() {") + len("void resetChargeCorroboration() {")
+    end = energy.index("\n}", start)
+    (build / "reset_corroboration.inc").write_text(energy[start:end])
     start = logging.index("const std::string LOG_HEADER =")
     end = logging.index("\n// Append a discrete EVENT", start)
     (build / "logging.inc").write_text(logging[start:end])

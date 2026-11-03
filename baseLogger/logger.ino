@@ -298,14 +298,6 @@ RTC_DATA_ATTR uint64_t charge_corr_last_us = 0;
 RTC_DATA_ATTR double charge_corr_soc_hw = -1.0;
 RTC_DATA_ATTR double charge_corr_kwh_hw = -1.0;
 RTC_DATA_ATTR double charge_corr_soe_hw = -1.0;
-void resetChargeCorroboration() {
-  charge_uncorroborated_s = 0;
-  charge_corr_last_us = 0;
-  charge_corr_soc_hw = -1.0;
-  charge_corr_kwh_hw = -1.0;
-  charge_corr_soe_hw = -1.0;
-  dc_session = false;  // every path that drops the old charge's state drops its DC latch
-}
 
 // Charge-taper bridge: recently_charging = the charge latch. Set when the last poll found EVIDENCE of a
 // charge - a negative current sample or the car's own counters moving (CHARGE_PROGRESS_* in config.h) - and
@@ -368,23 +360,6 @@ RTC_DATA_ATTR uint64_t charge_last_evidence_us = 0;
 bool g_pdw_ladder_done = false;          // pdwOpenWindow() decides once per wake
 bool g_pdw_recheck = false;              // its window is the low-rail re-check's (POST_DRIVE_RECHECK_MINUTES)
 const char* g_cadence_reason = nullptr;  // names an ambiguous cadence for SLEEP enter; null = derive from minutes
-static const uint64_t POST_DRIVE_WINDOW_US = (uint64_t)POST_DRIVE_WINDOW_MINUTES * 60000000ULL;
-bool pdwActive(uint64_t now_us) {
-  return pdw_open && now_us >= pdw_open_us && now_us - pdw_open_us < POST_DRIVE_WINDOW_US &&
-    pdw_polls < (uint8_t)POST_DRIVE_MAX_POLLS;
-}
-// A pause inside one session keeps the charge's budget, cap and corroboration; only this old is it dropped.
-bool chargeStateStale(uint64_t now_us) {
-  return now_us < charge_last_evidence_us ||
-    now_us - charge_last_evidence_us >= (uint64_t)CHARGE_STALE_RESET_MINUTES * 60000000ULL;
-}
-// Other images can lay RTC memory out differently, so only a deep-sleep wake trusts these.
-void chargeWakeStateSanitize(bool deep_sleep) {
-  if (deep_sleep) return;
-  charge_followup = pdw_open = pdw_polls = 0;
-  pdw_open_us = charge_last_evidence_us = 0;
-  dc_session = false;
-}
 
 // Test B (brownout vs clean sleep): set true immediately before esp_deep_sleep_start(); checked on the next
 // boot. If we wake and it's NOT set, we did NOT go through our own sleep path -> an uncommanded reset
@@ -486,6 +461,7 @@ void changeState(ActivityState new_state);     // Helpers/state_machine.h
 #include "Helpers/motion_stats.h" // pure MOTION-line aggregation, used by mems.h
 #include "Helpers/drive_state.h"  // park/drive region: the only writer of the latch globals above
 #include "Helpers/mems.h"
+#include "Helpers/energy_state.h" // energy region: the only writer of the charging state above
 #include "Helpers/server_roots.h" // data only: the trust bundle setup() hands the cellular transport
 #include "Helpers/clock_sync.h"
 #include "Helpers/telemetry_format.h"
