@@ -1,31 +1,11 @@
 #pragma once
 /*
   Energy region of the state machine (#23, step 3 #25): the charge latch and its release, the taper bridge, the DC
-  session, the fast-cadence budget and cap, corroboration, the follow-up and the post-drive window. Behaviour is
-  that of the code it was moved from; tests/run_sm_checks.py proves it against the pinned commit, down to the log
-  sequence and the clock reads.
-
-  The storage keeps its names and its definitions in logger.ino until #27; only the functions in this file assign
-  it (a runner check enforces it). The next-wake cadence (g_next_wake_minutes, g_cadence_reason) is not this
-  region's yet: energyOnPoll and pdwArmAtLadderEnd set it here, as the gate's skip path does, until step 4b owns it.
-
-    moment         caller                           effects
-    boot           setup(), before the streak       chargeWakeStateSanitize: off a deep-sleep wake, drops the
-                                                    follow-up, the post-drive window, the last evidence, DC session
-    rail awake     setup() gate                     energyOnRailAwake: taper budget reset, charge-end read re-armed
-    taper give-up  setup() gate                     energyGiveUpTaper: latch cleared, charge-end read spent, stale
-                                                    reset; a stationary wake arms the follow-up (FOLLOWUP armed)
-    motion wake    setup() gate                     energyOnMotionWake: follow-up cleared (FOLLOWUP cleared)
-    skip           setup() gate's skip path         energyOnSkip: budget, cap and corroboration reset once stale
-    poll           loop(), after is_parked          energyOnPoll: verdict, latch, DC session, cadence, budget, cap,
-                                                    corroboration, window close; returns what SAMPLE_POLL reads
-    promote        dcPromotePoke()                  energyOnPromote: a streaming wake's discharge stamp
-    ladder end     handleActivityState()'s sleeps   pdwArmAtLadderEnd: opens the post-drive window, arms its cadence
-    net recover    loop()'s reboot through sleep    pdwOpenWindow: opens the window without arming it
-
-  Included into logger.ino's single translation unit before sleep_power.h, so it relies on the logEvent
-  declaration above the includes and declares what it calls from later files. One #pragma once and no project
-  include: the state-machine harness inlines it.
+  session, the fast budget and cap, corroboration, the follow-up and the post-drive window. Their storage stays in
+  logger.ino until #27; only the functions here assign it (tests/run_sm_checks.py enforces it). Not owned yet:
+  g_next_wake_minutes and g_cadence_reason (step 4b; set here too), g_taper_confirm and g_rail_before_poke (4a),
+  g_dc_logged and g_dc_refused_logged (state_machine.h). One #pragma once and no project include, as the harness
+  inlines it. Included before sleep_power.h: it relies on logEvent's declaration and declares the later files' calls.
 */
 #if ENABLE_IO36_RAIL && ENABLE_SLEEP && ENABLE_MEMS
 float readIO36Rail();  // Helpers/sleep_power.h
@@ -109,8 +89,7 @@ void pdwArmAtLadderEnd() {
 }
 
 /*
-  The gate's moments, in setup() before any poll. The decision to poll stays in the gate until step 4a; these are
-  its writes to the charge state, in the order the gate always made them.
+  The gate's writes to the charge state, in setup() before any poll. The decision to poll stays in the gate until 4a.
 */
 // A real high-rail sample resets the taper-bridge budget and re-arms the charge-end read.
 void energyOnRailAwake() {
