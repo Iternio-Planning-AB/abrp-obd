@@ -503,6 +503,121 @@ if calls != extracted:
     sys.exit(f"FAIL: {calls} drive_state.h calls in the firmware but {extracted} in the extracted blocks; "
              "a call outside them is not compared against SM_PIN - extract its block")
 
+# Step 3 (#25): energy_state.h is the only code that assigns the charging state, in the same assignment forms as the
+# drive check above. The storage is defined in logger.ino until #27, so a definition there is exempt, but only at file
+# scope: a local of the same name is not. Blind spot: passing a field to a non-const reference parameter writes it
+# unseen, as chargeCounterRose does inside the owner; review must catch one outside it.
+ENERGY_STORAGE = ("charging_fast_minutes", "dc_session", "charging_cap_latched", "charge_uncorroborated_s",
+                  "charge_corr_last_us", "charge_corr_soc_hw", "charge_corr_kwh_hw", "charge_corr_soe_hw",
+                  "recently_charging", "taper_confirm_wakes", "charge_end_polled", "prev_charge_soc", "prev_parked_soc",
+                  "prev_parked_kwh", "prev_parked_soe", "charge_release_polls", "charge_silent_polls", "charge_followup",
+                  "pdw_open", "pdw_open_us", "pdw_polls", "charge_last_evidence_us", "g_dc_confirmed",
+                  "g_dc_inferred_polls", "g_dc_silent_since_ms", "g_fast_anchor_ms", "g_last_discharge_ms",
+                  "g_pdw_ladder_done", "g_pdw_recheck")
+ENERGY_DEFINITION = re.compile(r"(?:^|\n)\s*(?:RTC_DATA_ATTR\s+)?(?:bool|uint8_t|uint32_t|uint64_t|double|unsigned\s+long)\s*$")
+# Writers not yet in energy_state.h, by file and function. Each entry must still write, so the list only shrinks.
+ENERGY_WRITERS_PENDING = {("logger.ino", "loop"), ("logger.ino", "setup"), ("logger.ino", "resetChargeCorroboration"),
+                          ("logger.ino", "chargeWakeStateSanitize"), ("logger.ino", "dcPromotePoke"),
+                          ("state_machine.h", "pdwOpenWindow")}
+
+
+def file_scope_blocks(code):
+    """(open, close, function name or None) of every brace block opened at file scope."""
+    spans, depth, opened = [], 0, 0
+    for m in re.finditer(r"[{}]", code):
+        if m.group(0) == "{":
+            if depth == 0:
+                opened = m.start()
+            depth += 1
+            continue
+        depth -= 1
+        if depth == 0:
+            name = re.search(r"(\w+)\s*\([^;{}]*\)\s*(?:const\s*)?$", code[max(0, opened - 400):opened])
+            spans.append((opened, m.start(), name.group(1) if name else None))
+    return spans
+
+
+def energy_writes(file_name, text):
+    """(line, field, enclosing function) of every assignment to the energy storage in text."""
+    code = code_only(text)
+    spans = file_scope_blocks(code)
+    found = []
+    for name in ENERGY_STORAGE:
+        for m in re.finditer(rf"\b{name}\b", code):
+            before, after = code[:m.start()].rstrip(), code[m.end():].lstrip()
+            inside = next((s for s in spans if s[0] < m.start() < s[1]), None)
+            if file_name == "logger.ino" and not inside and ENERGY_DEFINITION.search(before) and after.startswith("="):
+                continue  # its definition
+            assigned = re.match(r"(?:[-+*/%&|^]|<<|>>)?=(?!=)|\+\+|--", after)
+            stepped = before.endswith(("++", "--"))
+            addressed = before.endswith("&") and not before.endswith("&&") and not re.search(r"[\w)\]]\s*&$", before)
+            bound = re.search(r"&\s*\w+\s*=$", before)
+            swapped = re.search(r"\bswap\s*\([^;]*$", before)
+            if assigned or stepped or addressed or bound or swapped:
+                found.append((code.count("\n", 0, m.start()) + 1, name, inside[2] if inside else None))
+    return sorted(found)
+
+
+# The check must see these: a chained assignment (every name in it), a write from another helper, a shadowing local.
+# A file-scope definition must pass.
+ENERGY_FIXTURES = (("logger.ino", "void energyFixture() {\n  charge_followup = pdw_open = pdw_polls = 0;\n}\n",
+                    ["charge_followup", "pdw_open", "pdw_polls"]),
+                   ("state_machine.h", "void energyFixture() {\n  recently_charging = false;\n}\n", ["recently_charging"]),
+                   ("logger.ino", "void energyFixture() {\n  bool recently_charging = false;\n}\n", ["recently_charging"]),
+                   ("logger.ino", "RTC_DATA_ATTR uint8_t charge_followup = 0;\n", []))
+firmware = [root / "baseLogger/logger.ino", *helpers]
+for file_name, fixture, expected in ENERGY_FIXTURES:
+    text = next(p for p in firmware if p.name == file_name).read_text().rstrip("\n") + "\n"
+    first = text.count("\n") + 1
+    seen = [(number, name) for number, name, _ in energy_writes(file_name, text + fixture) if number >= first]
+    if sorted(name for _, name in seen) != sorted(expected) or any(number < first for number, _ in seen):
+        sys.exit(f"FAIL: the energy ownership check saw {seen} in the fixture {fixture!r} on {file_name}, "
+                 f"expected {expected}")
+pending = set(ENERGY_WRITERS_PENDING)
+for path in firmware:
+    if path.name == "energy_state.h":
+        continue
+    for number, name, function in energy_writes(path.name, path.read_text()):
+        if (path.name, function) in ENERGY_WRITERS_PENDING:
+            pending.discard((path.name, function))
+            continue
+        sys.exit(f"FAIL: {path.relative_to(root)}:{number} assigns {name}; only energy_state.h may (#25)")
+if pending:
+    sys.exit(f"FAIL: {sorted(pending)} no longer assign the energy storage; drop them from ENERGY_WRITERS_PENDING")
+
+# Every call into energy_state.h sits in a block this harness extracts, or at one of these sites, which the
+# differential does not compare: (file, code line, calls on it, what checks it instead).
+ENERGY_CALL = (r"\b(?:energy[A-Z]\w*|resetChargeCorroboration|pdwActive|chargeStateStale|chargeWakeStateSanitize|"
+               r"pdwOpenWindow|pdwArmAtLadderEnd)\s*\(")
+ENERGY_UNEXTRACTED = (
+    ("logger", "chargeWakeStateSanitize(esp_reset_reason() == ESP_RST_DEEPSLEEP);", 1,
+     "setup()'s RTC sanitize: run_energy_checks.py pins it ahead of the streak advance; the adapter boots through it"),
+    ("machine", "pdwArmAtLadderEnd();", 2,
+     "the awake ladder's two sleeps: run_energy_checks.py pins both; the adapter runs it at every ladder sleep"),
+    ("logger", "pdwOpenWindow(); // the reboot ends this awake period", 1,
+     "the net-recover reboot: energy_checks runs that block whole"),
+    ("logger", "const unsigned pdw_left = pdwActive(pdw_now_us)", 1, "the SAMPLE_POLL line's window minutes, a log field"),
+)
+
+
+def energy_calls(text):
+    """Calls into the energy region in text, its definitions (a declaration at column 0) excluded."""
+    code = code_only(text)
+    return sum(1 for m in re.finditer(ENERGY_CALL, code)
+               if not code[code.rfind("\n", 0, m.start()) + 1:m.start()][:1].strip())
+
+
+calls = sum(energy_calls(p.read_text()) for p in firmware if p.name != "energy_state.h")
+extracted = energy_calls("".join(v for k, v in cur.items() if k != "energy_state"))
+for key, site, count, _ in ENERGY_UNEXTRACTED:
+    found = [l for l in cur_src[key].splitlines() if l.strip() == site]
+    if len(found) != count:
+        sys.exit(f"FAIL: expected {count} {site!r} in {PATHS[key]}, found {len(found)}; update ENERGY_UNEXTRACTED")
+    extracted += count * energy_calls(site)
+if calls != extracted:
+    sys.exit(f"FAIL: {calls} energy_state.h calls in the firmware but {extracted} in the extracted blocks and the "
+             "named sites; a call outside them is not compared against SM_PIN - extract its block or name it")
+
 # The weak-rail cold boot's veto (#104) covers every bus read in logger.ino, not only the one the harness runs: each
 # obd.readPIDs( sits inside an `if (` block whose && terms include it (the poll condition above, and the
 # OBD_ALARM_GATE=0 branch config.h does not build). GNSS is not powered on that wake either: every sys.gpsBegin() is
