@@ -3,9 +3,10 @@
   Energy region of the state machine (#23, step 3 #25): the charge latch and its release, the taper bridge, the DC
   session, the fast budget and cap, corroboration, the follow-up and the post-drive window. Their storage stays in
   logger.ino until #27; only the functions here assign it (tests/run_sm_checks.py enforces it). Not owned yet:
-  g_next_wake_minutes and g_cadence_reason (step 4b; set here too), g_taper_confirm and g_rail_before_poke (4a),
-  g_dc_logged and g_dc_refused_logged (state_machine.h). One #pragma once and no project include, as the harness
-  inlines it. Included before sleep_power.h: it relies on logEvent's declaration and declares the later files' calls.
+  g_next_wake_minutes and g_cadence_reason (step 4b; set here too), the poke-lifetime flags g_taper_confirm and
+  g_rail_before_poke (#27), g_dc_logged and g_dc_refused_logged (state_machine.h). One #pragma once and no project
+  include, as the harness inlines it. Included before sleep_power.h: it relies on logEvent's declaration and declares
+  the later files' calls.
 */
 #if ENABLE_IO36_RAIL && ENABLE_SLEEP && ENABLE_MEMS
 float readIO36Rail();  // Helpers/sleep_power.h

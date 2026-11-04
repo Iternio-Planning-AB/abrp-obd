@@ -22,7 +22,7 @@ if args.group == "profiles" and args.profiles is None:
     arguments.error("profiles checks require --profiles /path/to/abrp/obd")
 root = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(root / "tests/support"))
-from extract import block, wake_gate  # noqa: E402
+from extract import block, find, wake_gate  # noqa: E402
 logger = (root / "baseLogger/logger.ino").read_text()
 config = (root / "baseLogger/config.h").read_text()
 logging = (root / "baseLogger/Helpers/logging.h").read_text()
@@ -31,6 +31,7 @@ state_machine = (root / "baseLogger/Helpers/state_machine.h").read_text()
 drive_state = (root / "baseLogger/Helpers/drive_state.h").read_text()
 energy = (root / "baseLogger/Helpers/energy_state.h").read_text()
 streak = (root / "baseLogger/Helpers/wdt_streak.h").read_text()
+wake_gate_h = (root / "baseLogger/Helpers/wake_gate.h").read_text()
 ota = (root / "baseLogger/Helpers/ota_update.h").read_text()
 
 
@@ -49,7 +50,7 @@ WORST_EVENT_ARGS = {
     # #124: kmh clamped to [0, 999.9] for this line (sm rules pin the clamp), the longest reason, a rail far past the ADC range, a 32-bit long.
     "LEASH gnss=%.1fkm/h hold refused": (999.9, "charging", -99.99, -2147483648),
 }
-event_sources = logger + state_machine + energy + sleep + drive_state
+event_sources = logger + state_machine + energy + sleep + drive_state + wake_gate_h
 # The host stand-in for the streak store keeps its bytes across boots, as RTC_NOINIT_ATTR does and
 # RTC_DATA_ATTR (reloaded on every reset but a deep-sleep wake) does not.
 if not re.search(r"^RTC_NOINIT_ATTR WdtStreakStore wdt_streak_store;", streak, re.MULTILINE):
@@ -129,7 +130,11 @@ with tempfile.TemporaryDirectory(prefix="obd-energy-checks-") as temporary:
     start = poll.index("    bool has_charge_counter = false;")
     end = poll.index("\n    const bool uncorroborated =", start)
     (build / "charge_corroboration.inc").write_text(poll[start:end])
-    (build / "wake_gate.inc").write_text(wake_gate(logger, through="    if (g_sample_poke) g_rail_before_poke = rail;"))
+    # The gate's pure decision at file scope, and wakeGateRun's decision and effects inside each simulated wake.
+    start = find(wake_gate_h, "struct GateInputs {", what="wake_gate.h")
+    end = find(wake_gate_h, "  return d;\n}\n", start, "wake_gate.h") + len("  return d;\n}\n")
+    (build / "gate_decide.inc").write_text(wake_gate_h[start:end])
+    (build / "wake_gate.inc").write_text(wake_gate(wake_gate_h))
     # The gate's and the wake's writes to the charge state, called from the slices above and below.
     (build / "energy_gate.inc").write_text("".join(block(energy, f) for f in (
         "void energyOnRailAwake() {", "void energyGiveUpTaper(", "void energyOnMotionWake() {")))
@@ -139,9 +144,9 @@ with tempfile.TemporaryDirectory(prefix="obd-energy-checks-") as temporary:
     end = energy.index("\n}\n", energy.index("void chargeWakeStateSanitize(", start)) + 3
     (build / "charge_wake_state.inc").write_text(energy[start:end])
     (build / "charge_stale.inc").write_text(block(energy, "bool chargeStateStale(uint64_t now_us) {"))
-    start = logger.index("      g_next_wake_minutes = WAKE_PARKED_MINUTES; // skip = parked")
-    end = logger.index("      enterDeepSleep(false);", start)
-    (build / "gate_skip.inc").write_text(logger[start:end])
+    start = find(wake_gate_h, "    g_next_wake_minutes = WAKE_PARKED_MINUTES; // skip = parked", what="wake_gate.h")
+    end = find(wake_gate_h, "    enterDeepSleep(false);", start, "wake_gate.h")
+    (build / "gate_skip.inc").write_text(wake_gate_h[start:end])
     machine = state_machine
     ladder = machine[machine.index("void handleActivityState() {"):]
     sleeps = re.findall(r"(\S+)\s*\n?\s*enterDeepSleep\(true(?:, \"[^\"]*\")?\);", ladder)
