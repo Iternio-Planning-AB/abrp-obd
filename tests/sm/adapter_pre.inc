@@ -70,7 +70,8 @@
   X(uint64_t, charge_last_evidence_us, 0) \
   X(uint32_t, skips_count, 0) \
   X(uint32_t, polls_count, 0) \
-  X(time_t, last_poll_epoch, 0)
+  X(time_t, last_poll_epoch, 0) \
+  X(uint32_t, heartbeat_asleep_streak, 0)
 // Harness-only state: the trace's inputs and what the stubs recorded. Not firmware globals, so not checked.
 // sm_store_marker is the RTC_NOINIT debt copy (wdt_streak.h; its own semantics are the energy wdt-streak
 // group's). The buffer stands for RAM and the upload backlog together, except during the gate, which runs before
@@ -222,6 +223,7 @@ bool bleAuthenticated() { return sm_ble_auth; }
 bool bleRelaying() { return sm_ble_auth; }
 // The wake cause setup() reads, as the ESP-IDF values.
 enum SmWakeCause { ESP_SLEEP_WAKEUP_UNDEFINED = 0, ESP_SLEEP_WAKEUP_EXT0 = 2, ESP_SLEEP_WAKEUP_TIMER = 4 };
+using esp_sleep_wakeup_cause_t = SmWakeCause;  // wake_gate.h's wakeGateRun (#26)
 // ATRV, the co-processor's pin-16 read: the event's.
 // Every co-processor command a poll sends counts in tx_count; ATRV is not one.
 struct {
