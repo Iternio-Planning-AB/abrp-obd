@@ -97,6 +97,9 @@ bool is_currently_parked = true;
 bool drive_unconfirmed = false;
 // A GNSS-moving fix was refused this streak and logged once (drive_state.h); cleared when the state changes.
 bool g_drive_gnss_refused = false;
+// The early DC release (#128): DC-power polls in a row while DRIVING or UNCONFIRMED, and its reset line said this wake.
+uint8_t g_dc_release_polls = 0;
+bool g_dc_reset_logged = false;
 // Set when a DRIVE frame enters the upload buffer or is relayed over BLE, cleared when the pre-sleep PARK marker is queued: the
 // server has been told DRIVE and not yet PARK. RTC so a trip end that straddles a deep sleep (the mid-drive
 // modem-recovery sleep) is still closed on the next wake, while a parked heartbeat wake owes nothing and opens
@@ -1543,6 +1546,7 @@ void loop() {
         break;
       }
     }
+    bool gnss_moving = false;  // the early DC release's veto (#128)
 #if ENABLE_GPS
     // SECOND, independent movement source: the GNSS. The loop above needs the car's speed PID, which goes
     // quiet the moment the ECUs sleep and is missing from some vehicle profiles entirely - and until something
@@ -1560,6 +1564,7 @@ void loop() {
     // next slept. Requiring a recent fix makes the unlatch expire on its own when fixes stop, and
     // then the 5-minute re-latch does what it was written to do.
     if (gpsMovingFresh(GPS_MOVING_MAX_AGE_MS)) {
+      gnss_moving = true;
       driveGnss(gd->speed * 1.852f, current_frame);
     }
 #endif
@@ -1573,6 +1578,8 @@ void loop() {
     // THIRD source (#6): sustained accelerometer motion on a car that is on is UNCONFIRMED, or DRIVING with a discharge.
     driveAccel(current_frame);
     drivePollEnd();
+    // A DC fast charge right after a drive (#128): released here, so this poll's frame already says the charge.
+    driveDcCharge(current_frame, gnss_moving);
     // Before is_parked is appended: a frame whose only v2 field would be drivingState is not worth a POST.
     // utc is always present, so this asks the serializer. A location or heading already accepted, or already
     // buffered behind an unsent one, is not news; any other, frozen or live, is.
