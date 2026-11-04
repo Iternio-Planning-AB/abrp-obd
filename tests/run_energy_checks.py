@@ -49,6 +49,9 @@ WORST_EVENT_ARGS = {
     "POSTDRIVE window %s": ("recheck", "WIFI_RECOVERY", 15.99, 4294967295),
     # #124: kmh clamped to [0, 999.9] for this line (sm rules pin the clamp), the longest reason, a rail far past the ADC range, a 32-bit long.
     "LEASH gnss=%.1fkm/h hold refused": (999.9, "charging", -99.99, -2147483648),
+    # #128: kw is at most |2000 A x 1000 V| or |1000 kW| (driveFrameValue's ranges), the count at most 255.
+    "LEASH dc charge ": (2000.0, 255),
+    "LEASH dc reset ": (255, "notdc", 2000.0),
 }
 event_sources = logger + state_machine + energy + sleep + drive_state + wake_gate_h
 # The host stand-in for the streak store keeps its bytes across boots, as RTC_NOINIT_ATTR does and
@@ -108,7 +111,7 @@ with tempfile.TemporaryDirectory(prefix="obd-energy-checks-") as temporary:
         r"CHARGE_RELEASE_POLLS|CHARGE_SILENT_HOLD_POLLS|CHARGE_STALE_RESET_MINUTES|CHARGE_CORROBORATE_MINUTES|WAKE_PARKED_MINUTES|"
         r"WAKE_CHARGING_MINUTES|WAKE_DC_CHARGING_MINUTES|WAKE_CHARGING_MAX_MINUTES|CLOCK_MAX_EPOCH|GEO_MAX_SEND_AGE_SECONDS|RAIL_AWAKE_VOLTS|RAIL_TAPER_FLOOR|"
         r"CHARGE_END_POLL_FLOOR|MAX_AWAKE_MINUTES|TAPER_CONFIRM_MAX_WAKES|IO36_LOCKOUT_\w+|POST_DRIVE_\w+|OBD_ALARM_GATE|ENABLE_IO36_RAIL|DC_CHARGING_MIN_KW|DC_CHARGING_AWAKE_SECONDS|"
-        r"SESSION_IDLE_MAX_MS|CHARGING_TIMER|ACTIVE_TIMER|DC_CHARGING_POLL_MARGIN_MS)\b.*(?:\n[ \t]+.*)*",
+        r"SESSION_IDLE_MAX_MS|CHARGING_TIMER|ACTIVE_TIMER|DC_CHARGING_POLL_MARGIN_MS|DC_EARLY_HOLD|BLE_CONNECTED_HOLDS_AWAKE)\b.*(?:\n[ \t]+.*)*",
         config, re.MULTILINE)))
     # loop()'s poll is energyOnPoll (energy_state.h), sliced at the same code; its call site runs dcAwakeTrack() next.
     call_site = "    const EnergyPoll ep = energyOnPoll(current_frame, obd_count);\n    dcAwakeTrack();\n"
@@ -139,7 +142,8 @@ with tempfile.TemporaryDirectory(prefix="obd-energy-checks-") as temporary:
     (build / "energy_gate.inc").write_text("".join(block(energy, f) for f in (
         "void energyOnRailAwake() {", "void energyGiveUpTaper(", "void energyOnMotionWake() {")))
     (build / "energy_wake.inc").write_text(block(energy, "void energyOnSkip() {") +
-                                           block(energy, "void energyOnPromote() {"))
+                                           block(energy, "void energyOnPromote() {") +
+                                           block(energy, "void energyOnDcRelease() {"))
     start = energy.index("static const uint64_t POST_DRIVE_WINDOW_US")
     end = energy.index("\n}\n", energy.index("void chargeWakeStateSanitize(", start)) + 3
     (build / "charge_wake_state.inc").write_text(energy[start:end])
@@ -198,6 +202,11 @@ with tempfile.TemporaryDirectory(prefix="obd-energy-checks-") as temporary:
     start = state_machine.index("  case CHARGING:\n", state_machine.index("void handleActivityState() {"))
     end = state_machine.index("    break;\n", start) + len("    break;\n")
     (build / "charging_case.inc").write_text(state_machine[start:end])
+    # The awake ladder in time (#128): handleActivityState() from its clock read on (the backstop and the switch), whole.
+    ladder_fn = block(state_machine, "void handleActivityState() {")
+    start = ladder_fn.index("  auto now = millis();\n")
+    (build / "awake_ladder.inc").write_text(ladder_fn[start:ladder_fn.rindex("}")])
+    (build / "polling_delay.inc").write_text(block(state_machine, "unsigned long getPollingDelay("))
     start = logger.index("    if (g_sample_poke && !maintenance_mode") + len("    if (")
     end = logger.index(") {\n", start)
     (build / "poke_sleeps.inc").write_text(f"bool sleeps() {{ return {logger[start:end]}; }}\n")
