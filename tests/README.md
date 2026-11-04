@@ -70,6 +70,14 @@ today's PARKED refusal once (two refusal lines per episode); the rail alone, OBD
 answers with no rail reading (0.0, as a build without `ENABLE_IO36_RAIL`) and a one-poll rail dip keep the drive.
 No restored-DRIVING case exists to test: drive state is RAM, reset to PARKED on every boot, and the crash copy
 (`wdt_streak.h`) restores only the PARK marker debt. The line's worst case is in `run_energy_checks.py`'s table.
+Since #95 it also covers this frame's discharge overriding the charge latch on each path (PARKED and UNCONFIRMED
+accel, the DRIVING hold, GNSS through the real `driveGnss(kmh, current_frame)` call), each against the same poll below
+`DRIVE_DISCHARGE_KW` that the latch still blocks, every override row carrying a discharging current; and one table
+of what the override needs and what vetoes it, never creating a latch: a current, so a positive power key with a
+charging current, no current or one out of range keeps the latch (accel and GNSS); the car's `is_dcfc`/`is_charging`
+(0 does not veto; 1, NaN, infinities and out-of-range values do; 1 without a latch is still DRIVING); and V2L or
+preconditioning at 7 kW and 30 A with no key, a false drive. Held-latch stop-and-go (alternating discharge and regen) was checked once in
+development: one PARKED -> DRIVING transition, no flapping; the 4b rows cover each of its steps.
 
 Since 0b-1 (#81) the differential also covers the poll-side energy block: the rail refresh and `loop()`'s block from
 the `is_charging` verdict through `dcAwakeTrack()` (release latch and silent hold, taper stall count, DC session,
@@ -145,6 +153,11 @@ Named scenarios cover GNSS and accelerometer starts on the poll after charge rel
 override the latch); both speed-PID keys overriding a real charge latch while energy rejects regen as charging,
 and subsequent GNSS continuing that drive despite the residual release latch; such a false drive ending once the
 car is off and the fixes drift on (#124), after which a charge is seen again and the max-awake backstop applies;
+Named scenarios cover GNSS and accelerometer starts on the poll after charge release below `DRIVE_DISCHARGE_KW`
+(a NaN speed cannot override the latch), and a 12 kW GNSS or accelerometer start overriding it on its first poll
+while energy still holds the latch (#95); the composition oracle checks both sides on every generated poll, with the
+firmware's power bounds, vetoes and GNSS moving threshold; both speed-PID keys overriding a real charge latch while energy rejects regen as charging,
+and subsequent GNSS continuing that drive despite the residual release latch;
 a poll re-latching PARK and accepting trusted charge immediately; the streaming trust prerequisite;
 UNCONFIRMED accepting charge and returning to PARK on the next poll, without a freeze or marker;
 silent hold and release, with marker debt beginning only after a driving frame is buffered; and a high-rail
