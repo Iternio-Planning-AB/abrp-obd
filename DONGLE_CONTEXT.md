@@ -167,6 +167,8 @@ Check the rail before powering peripherals or issuing bus traffic.
   hold it past `ACTIVE_TIMER`. The car-on requirement for a DRIVING GNSS hold should land before or with this.
 - `Helpers/energy_state.h` is the only writer of the charge latch, DC session, fast budget/cap, corroboration,
   follow-up and post-drive window state (#25); the gate's poll decision and the next-wake cadence are not yet its.
+- `Helpers/wake_gate.h` is setup()'s wake gate: a pure poll decision (`gateDecide`) and the only writer of the skip/poll
+  counters, the heartbeat back-off, the last-poll stamp and the weak-rail cold boot flag (#26).
 - Bring BLE up before slow modem initialization. Suppress cellular only while `bleRelaying()` says
   the phone is the transport—not merely connected or, in v1, authenticated.
 - Normal sleep flushes/saves uploads, deinitializes BLE, powers down peripherals and arms wake sources.
