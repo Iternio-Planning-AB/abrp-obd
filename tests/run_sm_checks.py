@@ -40,7 +40,8 @@ motion; any answered poll stamps the last OBD answer. A wake carries the rail, t
 optional charge latch; the RTC clock and epoch run through sleeps, and a cold boot zeroes the clock until a poll.
 Before compiling, it checks that only drive_state.h assigns the park/drive storage, that alarm_gate.h names no
 drive state, and that every drive call is in an extracted block; likewise that only energy_state.h assigns the
-charging state and every energy call is in a compared block or at a named site (ENERGY_UNEXTRACTED). A poll reaches the car only when loop()'s poll
+charging state and every energy call is in a compared block or at a named site (ENERGY_UNEXTRACTED), and that only
+wake_gate.h assigns the gate's persisted state, its calls checked the same way (GATE_UNEXTRACTED). A poll reaches the car only when loop()'s poll
 condition holds (around it a profile is always loaded and the per-cycle alarm permit passes), so the property "a
 poll ran on a weak-rail wake" holds a weak-rail cold boot to the firmware's own veto (#104); it also checks that the
 condition has the veto as a term and guards the lazy init and the bus read, that every obd.readPIDs( and
@@ -502,10 +503,12 @@ if (terms[-1] != "alarmGateAllowsPoll()" or len(reads) != 2 or len(outside) != 1
              "after the cycle's rail and GNSS refresh; the one other readPIDs is the gate's #else")
 
 # Step 1 (#24), extended by #6 to drive_unconfirmed and the refusal-streak flag: drive_state.h is the only code that
-# assigns the park/drive storage, and since step 3 (#25) energy_state.h the charging state. An assignment here is =, a
+# assigns the park/drive storage, since step 3 (#25) energy_state.h the charging state, and since step 4a (#26)
+# wake_gate.h the gate's persisted state. An assignment here is =, a
 # compound assignment (also chained), ++/--, taking the address or binding a reference (an alias could assign), or
 # swap(); matched on the whole file, so a statement split over lines is still seen. The storage is defined in
-# logger.ino until #27, so a definition there is exempt, but only at file scope: a local of the same name is not.
+# logger.ino (two gate fields in sleep_power.h) until #27, so a definition there is exempt, but only at file scope: a
+# local of the same name is not.
 # Blind spot: passing a field to a non-const reference parameter writes it unseen, as chargeCounterRose does inside
 # the energy owner; review must catch one outside it.
 DRIVE_STORAGE = ("is_currently_parked", "g_last_speed_ms", "park_marker_owed", "drive_unconfirmed", "g_drive_gnss_refused")
@@ -516,7 +519,16 @@ ENERGY_STORAGE = ("charging_fast_minutes", "dc_session", "charging_cap_latched",
                   "pdw_open", "pdw_open_us", "pdw_polls", "charge_last_evidence_us", "g_dc_confirmed",
                   "g_dc_inferred_polls", "g_dc_silent_since_ms", "g_fast_anchor_ms", "g_last_discharge_ms",
                   "g_pdw_ladder_done", "g_pdw_recheck")
-DEFINITION = re.compile(r"(?:^|\n)\s*(?:RTC_DATA_ATTR\s+)?(?:bool|uint8_t|uint32_t|uint64_t|double|unsigned\s+long)\s*$")
+# Step 4a (#26): the wake gate's persisted state. Not owned: the poke-lifetime flags g_sample_poke, g_taper_confirm and
+# g_rail_before_poke (also written by dcPromotePoke, energyOnPoll and the DC re-poke, by design; #27), g_last_voltage,
+# wdt_reset_count, g_next_wake_minutes and g_cadence_reason (4b) and g_alarm_flag.
+GATE_STORAGE = ("skips_count", "polls_count", "heartbeat_asleep_streak", "last_poll_epoch", "g_weak_rail_cold_boot")
+DEFINITION = re.compile(r"(?:^|\n)\s*(?:RTC_DATA_ATTR\s+)?(?:static\s+)?"
+                        r"(?:bool|uint8_t|uint32_t|uint64_t|double|float|time_t|unsigned\s+long)\s*$")
+# Where each field is defined, if not logger.ino: only there is a file-scope definition exempt.
+DEFINED_IN = {"last_poll_epoch": "sleep_power.h", "heartbeat_asleep_streak": "sleep_power.h"}
+# Gate writers not yet in wake_gate.h, by file and function. Each entry must still write, so the list only shrinks.
+GATE_WRITERS_PENDING = {("logger.ino", "setup"), ("logger.ino", "loop")}
 
 
 def file_scope_blocks(code):
@@ -543,7 +555,8 @@ def writes(file_name, text, names):
         for m in re.finditer(rf"\b{name}\b", code):
             before, after = code[:m.start()].rstrip(), code[m.end():].lstrip()
             inside = any(a < m.start() < b for a, b in spans)
-            if file_name == "logger.ino" and not inside and DEFINITION.search(before) and after.startswith("="):
+            if (file_name == DEFINED_IN.get(name, "logger.ino") and not inside and DEFINITION.search(before)
+                    and after.startswith("=")):
                 continue  # its definition
             assigned = re.match(r"(?:[-+*/%&|^]|<<|>>)?=(?!=)|\+\+|--", after)
             stepped = before.endswith(("++", "--"))
@@ -564,19 +577,49 @@ ENERGY_FIXTURES = (("logger.ino", "void energyFixture() {\n  charge_followup = p
                    ("state_machine.h", "void energyFixture() {\n  recently_charging = false;\n}\n", ["recently_charging"]),
                    ("logger.ino", "void energyFixture() {\n  bool recently_charging = false;\n}\n", ["recently_charging"]),
                    ("logger.ino", "RTC_DATA_ATTR uint8_t charge_followup = 0;\n", []))
-for file_name, fixture, expected in ENERGY_FIXTURES:
-    text = next(p for p in firmware if p.name == file_name).read_text().rstrip("\n") + "\n"
-    first = text.count("\n") + 1
-    seen = [(number, name) for number, name in writes(file_name, text + fixture, ENERGY_STORAGE) if number >= first]
-    if sorted(name for _, name in seen) != sorted(expected):
-        sys.exit(f"FAIL: the energy ownership check saw {seen} in the fixture {fixture!r} on {file_name}, "
-                 f"expected {expected}")
+# A gate field written in logger.ino or in the file that defines it is seen; its definitions pass.
+GATE_FIXTURES = (("logger.ino", "void gateFixture() {\n  skips_count++;\n  polls_count += 1;\n}\n",
+                  ["skips_count", "polls_count"]),
+                 ("sleep_power.h", "void gateFixture() {\n  last_poll_epoch = 0;\n  ++heartbeat_asleep_streak;\n}\n",
+                  ["last_poll_epoch", "heartbeat_asleep_streak"]),
+                 ("logger.ino", "RTC_DATA_ATTR static time_t last_poll_epoch = 0;\n", ["last_poll_epoch"]),
+                 ("sleep_power.h", "RTC_DATA_ATTR static time_t last_poll_epoch = 0;\n"
+                                   "RTC_DATA_ATTR static uint32_t heartbeat_asleep_streak = 0;\n", []),
+                 ("logger.ino", "bool g_weak_rail_cold_boot = false;\nRTC_DATA_ATTR uint32_t skips_count = 0;\n", []))
+for fixtures, names in ((ENERGY_FIXTURES, ENERGY_STORAGE), (GATE_FIXTURES, GATE_STORAGE)):
+    for file_name, fixture, expected in fixtures:
+        text = next(p for p in firmware if p.name == file_name).read_text().rstrip("\n") + "\n"
+        first = text.count("\n") + 1
+        seen = [(number, name) for number, name in writes(file_name, text + fixture, names) if number >= first]
+        if sorted(name for _, name in seen) != sorted(expected):
+            sys.exit(f"FAIL: the ownership check saw {seen} in the fixture {fixture!r} on {file_name}, "
+                     f"expected {expected}")
+
+
+def function_at(text, number, name):
+    """The function whose file-scope body holds name on line number of text, or None."""
+    code = code_only(text)
+    start = len("\n".join(code.split("\n")[:number - 1]))
+    at = re.compile(rf"\b{name}\b").search(code, start).start()
+    opened = next((a for a, b in file_scope_blocks(code) if a < at < b), None)
+    function = None if opened is None else re.search(r"(\w+)\s*\([^;{}]*\)\s*$", code[:opened])
+    return function and function.group(1)
+
+
+pending = set(GATE_WRITERS_PENDING)
 for path in firmware:
-    for owner, names, issue in (("drive_state.h", DRIVE_STORAGE, "#24"), ("energy_state.h", ENERGY_STORAGE, "#25")):
+    for owner, names, issue in (("drive_state.h", DRIVE_STORAGE, "#24"), ("energy_state.h", ENERGY_STORAGE, "#25"),
+                                ("wake_gate.h", GATE_STORAGE, "#26")):
         if path.name == owner:
             continue
         for number, name in writes(path.name, path.read_text(), names):
+            writer = (path.name, function_at(path.read_text(), number, name))
+            if owner == "wake_gate.h" and writer in GATE_WRITERS_PENDING:
+                pending.discard(writer)
+                continue
             sys.exit(f"FAIL: {path.relative_to(root)}:{number} assigns {name}; only {owner} may ({issue})")
+if pending:
+    sys.exit(f"FAIL: {sorted(pending)} no longer assign the gate storage; drop them from GATE_WRITERS_PENDING")
 
 # The OBD-alarm gate takes no drive input. A regex sees identifiers, not wrappers: a helper defined elsewhere
 # that returns drive state is out of its reach, so review still matters.
@@ -613,10 +656,10 @@ ENERGY_UNEXTRACTED = (
 )
 
 
-def energy_calls(text):
-    """Calls into the energy region in text, its definitions (a declaration at column 0) excluded."""
+def energy_calls(text, pattern=ENERGY_CALL):
+    """Calls into the energy region (or pattern's) in text, its definitions (a declaration at column 0) excluded."""
     code = code_only(text)
-    return sum(1 for m in re.finditer(ENERGY_CALL, code)
+    return sum(1 for m in re.finditer(pattern, code)
                if not code[code.rfind("\n", 0, m.start()) + 1:m.start()][:1].strip())
 
 
@@ -630,6 +673,20 @@ for key, site, count in ENERGY_UNEXTRACTED:
 if calls != extracted:
     sys.exit(f"FAIL: {calls} energy_state.h calls in the firmware but {extracted} in the compared blocks and the "
              "named sites; a call outside them is not compared against SM_PIN - extract its block or name it")
+
+# Likewise every call into wake_gate.h (#26), or at one of these sites: (file, code line, how many such lines).
+GATE_CALL = r"\b(?:gate[A-Z]\w*|wakeGateRun)\s*\("
+GATE_UNEXTRACTED = ()
+calls = sum(energy_calls(p.read_text(), GATE_CALL) for p in firmware if p.name != "wake_gate.h")
+extracted = energy_calls("".join(cur[k] for k in PIN_BLOCKS), GATE_CALL)
+for key, site, count in GATE_UNEXTRACTED:
+    found = [l for l in cur_src[key].splitlines() if l.strip() == site]
+    if len(found) != count:
+        sys.exit(f"FAIL: expected {count} {site!r} in {PATHS[key]}, found {len(found)}; update GATE_UNEXTRACTED")
+    extracted += count * len(re.findall(GATE_CALL, code_only(site)))
+if calls != extracted:
+    sys.exit(f"FAIL: {calls} wake_gate.h calls in the firmware but {extracted} in the compared blocks and the named "
+             "sites; a call outside them is not compared against SM_PIN - extract its block or name it")
 
 # The weak-rail cold boot's veto (#104) covers every bus read in logger.ino, not only the one the harness runs: each
 # obd.readPIDs( sits inside an `if (` block whose && terms include it (the poll condition above, and the
