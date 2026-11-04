@@ -576,7 +576,8 @@
 // Through a charge confirmed DC (the latch holds through the taper and the silent hold) and with the rail
 // showing the DC-DC up, stay awake and poll and upload this often over one reused session (issue #51). A
 // 1-minute wake is about the floor for sleep and wake: each one pays a modem attach (median ~10 s) and a fresh
-// TLS open (~3 s, ~5 KB). Motion suspends it for an ACTIVE_TIMER, so a drive gets ACTIVE's cadence. Each held
+// TLS open (~3 s, ~5 KB). With DC_EARLY_HOLD 0, motion suspends it for an ACTIVE_TIMER; with it, a drive-away ends
+// it at its first poll (speed or discharge), up to one hold period late. Each held
 // poll of a sample poke counts a whole WAKE_DC_CHARGING_MINUTES toward WAKE_CHARGING_MAX_MINUTES, so the cap
 // trips sooner; a streaming wake counts its elapsed time instead. With
 // a slow poll's margin it must stay under SESSION_IDLE_MAX_MS, so every upload reuses the session (#8: a flow
@@ -590,6 +591,20 @@
 // missing either means no inference and the session is treated as AC, which is the safe way to be
 // wrong (a slower update, rather than hours of wasted 1-minute wakes on an overnight charge).
 #define DC_CHARGING_MIN_KW         40
+// Early DC release (#128). FIELD (11-04): two DC sessions (~47 kW for 4.3 min, ~66 kW for 1 min) began within a
+// minute of stopping; the drive latch holds DRIVING for ACTIVE_TIMER after the last speed, so is_charging was never
+// evaluated and neither produced a CHARGE or DC_AWAKE line. While DRIVING or UNCONFIRMED, DC_RELEASE_POLLS polls in a
+// row at a charge power of DC_CHARGING_MIN_KW (a current below CHARGING_CURRENT_THRESHOLD, |power| or |V x I|), or
+// with the car's own finite is_dcfc above 0, re-latch PARKED. A speed key above 0 or a moving GNSS fix on any of them
+// restarts the count: regen reaches DC power, and the field logs show it only in bursts of at most 2 polls. No
+// accelerometer veto: people sit in the car while it charges. A car with neither speed nor GNSS relies on the run
+// alone. The run is the regen guard, so the release also trusts the charge signal at once (no
+// CHARGE_STREAM_CONFIRM_SECONDS wait). The same flag lets motion keep the DC hold and exempts a held DC charge from
+// MAX_AWAKE_MINUTES (WAKE_CHARGING_MAX_MINUTES still bounds it). 0 restores the earlier behaviour.
+#ifndef DC_EARLY_HOLD
+#define DC_EARLY_HOLD 1
+#endif
+#define DC_RELEASE_POLLS           3
 #define WAKE_PARKED_MINUTES        30    // FIELD: parked voltage-watch. Each wake is a cheap ~5s rail check
                                          // (no modem, no poll, no BLE on a skip) ~ a few mAh/day. 30 min
                                          // bounds how late we catch a charge start with no awake dongle: a

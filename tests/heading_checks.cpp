@@ -93,7 +93,8 @@ FreematicsESP32 sys;
 GPS_DATA* gd = &gpsData;
 bool g_gps_powered = false, is_currently_parked = false, frozen_valid = false;
 // The drive rules' inputs (drive_state.h): a car that is on, with motion at every fix, unless a check says otherwise.
-bool drive_unconfirmed = false, g_drive_gnss_refused = false, recently_charging = false;
+bool drive_unconfirmed = false, g_drive_gnss_refused = false, recently_charging = false, g_dc_reset_logged = false;
+uint8_t g_dc_release_polls = 0;
 float g_last_io36 = 13.5f;
 unsigned long g_last_motion_ms = 0, g_last_obd_answer_ms = 0;
 double frozen_lat = 0, frozen_lon = 0;
@@ -113,7 +114,9 @@ DriveMotion g_drive_motion;
 // The poll's frame, which logger.ino's block hands to driveGnss (#95); empty here, so discharge is unknown.
 void gpsUnlatch(const OBDVector& current_frame = OBDVector{}) {
   g_last_motion_ms = fake_ms;
+  bool gnss_moving = false;  // logger.ino's, for the early DC release (#128)
 #include "gps_unlatch.inc"
+  (void)gnss_moving;
 }
 
 struct HttpResponse { int responseCode; std::string payload; };

@@ -132,6 +132,9 @@ void energyOnSkip() {
 // A held poke promoted by motion (dcPromotePoke) is a streaming wake: a charging sample counts only after
 // CHARGE_STREAM_CONFIRM_SECONDS without a discharge sample, as on any streaming wake, so regen is not a charge.
 void energyOnPromote() { g_last_discharge_ms = millis(); }
+// The early DC release (drive_state.h's driveDcCharge, #128): its DC_RELEASE_POLLS vetted polls are the regen guard,
+// so the releasing poll's charge sample is trusted at once, publishing is_charging and is_dcfc.
+void energyOnDcRelease() { g_last_discharge_ms = millis() - (unsigned long)CHARGE_STREAM_CONFIRM_SECONDS * 1000UL; }
 
 // What the SAMPLE_POLL line reads from a poll.
 struct EnergyPoll {

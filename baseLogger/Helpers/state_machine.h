@@ -118,8 +118,9 @@ void changeState(ActivityState new_state) {
 bool alarmEnforced(); // alarm_gate.h is included after this file
 #endif
 
-// DC_CHARGING_AWAKE_SECONDS. Motion within an ACTIVE_TIMER suspends the hold, so a drive is polled at ACTIVE's
-// own cadence from the first motion.
+// DC_CHARGING_AWAKE_SECONDS. With DC_EARLY_HOLD 0, motion within an ACTIVE_TIMER suspends the hold, so a drive is
+// polled at ACTIVE's own cadence from the first motion. With it (#128) motion does not: people sit in the car while it
+// charges, and a drive-away ends the hold at its first poll. dcPromotePoke() still reads it.
 bool dcMotionRecent() { return g_last_motion_ms && millis() - g_last_motion_ms < (unsigned long)ACTIVE_TIMER; }
 // Why a confirmed DC charge does not hold the wake awake right now, read live on every use; null when it does.
 const char* dcAwakeVeto(ActivityState state) {
@@ -128,7 +129,9 @@ const char* dcAwakeVeto(ActivityState state) {
 #if OBD_ALARM_GATE
   if (alarmEnforced()) return "alarm";                      // a flagged car is never held awake parked
 #endif
+#if !DC_EARLY_HOLD
   if (dcMotionRecent()) return "motion";
+#endif
   return nullptr;
 }
 bool dcAwakeHeld(ActivityState state) { return g_dc_confirmed && !dcAwakeVeto(state); }
@@ -213,8 +216,11 @@ void handleActivityState() {
   // after a >55min drive) would be force-slept mid-flash / mid-dump. It restricts nothing - a driving
   // car is already exempt via is_currently_parked - and both transfers carry their own inactivity
   // timeouts (plus the OTA session cap) to bound the exposure.
+  // A held DC charge (DC_EARLY_HOLD, #128) is exempt: it follows a drive that is often an hour long, its rail is up,
+  // and WAKE_CHARGING_MAX_MINUTES bounds it; the hold ends at the rail drop or the charge end, and this fires then.
   if (!maintenance_mode && !g_ota_active && !g_logdump_active && current_state != UNINITIALIZED &&
-      is_currently_parked && millis() > (unsigned long)MAX_AWAKE_MINUTES * 60UL * 1000UL) {
+      is_currently_parked && !(DC_EARLY_HOLD && dcAwakeHeld(current_state)) &&
+      millis() > (unsigned long)MAX_AWAKE_MINUTES * 60UL * 1000UL) {
     Serial.printf("MAX_AWAKE backstop: awake %lus while parked -> forcing deep sleep\n", millis() / 1000UL);
 #if ENABLE_LOGGING
     logEvent("AWAKE_BACKSTOP awake=%lus parked -> force deep sleep (ceiling=%dmin)",
@@ -276,7 +282,8 @@ void handleActivityState() {
   case CHARGING:
     // Removed the "connected -> BLE" revive: a connection ALONE must not pull us back to the awake state (that
     // was the stay-awake-while-connected behaviour). Real motion still revives; otherwise progress to sleep.
-    // A confirmed DC charge holds here, awake (DC_CHARGING_AWAKE_SECONDS); the backstop still bounds it.
+    // A confirmed DC charge holds here, awake (DC_CHARGING_AWAKE_SECONDS); WAKE_CHARGING_MAX_MINUTES bounds it, and
+    // the backstop too with DC_EARLY_HOLD 0.
     if (active) {
       changeState(ACTIVE);
     } else if (now - last_active > CHARGING_TIMER && !dcAwakeHeld(current_state)) {
