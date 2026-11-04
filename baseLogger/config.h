@@ -598,7 +598,7 @@
 // regen reaches DC power, and the field logs show it only in bursts of at most 2 polls. No accelerometer veto: people
 // sit in the car while it charges. A car with neither speed nor GNSS relies on the run alone. The run is the regen
 // guard, so the release trusts the charge signal at once (no CHARGE_STREAM_CONFIRM_SECONDS wait). The flag also keeps
-// the DC hold through motion and exempts it from MAX_AWAKE_MINUTES; 0 is the rollback.
+// the DC hold through motion and exempts it from MAX_AWAKE_MINUTES. 0 is the rollback.
 #ifndef DC_EARLY_HOLD
 #define DC_EARLY_HOLD 1
 #endif
