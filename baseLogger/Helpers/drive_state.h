@@ -22,7 +22,8 @@
     gnss          PARKED, UNCONFIRMED   gpsMovingFresh, car on, motion within           DRIVING      hold, leash, LEASH line
                                         DRIVE_MOTION_RECENT_MS, no charge latch
     gnss          PARKED, UNCONFIRMED   gpsMovingFresh, any of those missing            same         one LEASH refused line per streak
-    gnss          DRIVING               gpsMovingFresh                                  DRIVING      hold, leash (no new gate)
+    gnss          DRIVING               gpsMovingFresh, car on                          DRIVING      hold, leash (#124)
+    gnss          DRIVING               gpsMovingFresh, car off                         same         no hold; one LEASH hold refused line
     accel         PARKED                car on, sustained motion, no charge latch       UNCONFIRMED  hold = now, LEASH line
     accel         PARKED, UNCONFIRMED   ... and discharge > DRIVE_DISCHARGE_KW          DRIVING      hold, LEASH line
     accel         DRIVING               car on, sustained motion, no charge latch       DRIVING      hold (continuation, no log)
@@ -57,10 +58,11 @@ struct DriveEvidence {
   bool discharge;         // the battery is discharging above DRIVE_DISCHARGE_KW
   bool charge_latched;    // the charge latch (recently_charging) is set
 };
-// Why a fresh moving GNSS fix may not start a drive, or nullptr when it may. A drive already under way just
-// continues on it: no new gate.
+// Why a fresh moving GNSS fix may not start a drive or hold one, or nullptr when it may. A drive under way
+// continues on it while the car is on, as the accelerometer's continuation does (#124): drift on a parked car
+// must not hold DRIVING, which turns off the max-awake backstop and is_charging.
 inline const char* driveGnssRefusal(const DriveRegion& r, const DriveEvidence& e) {
-  if (r.state == DRIVE_DRIVING) return nullptr;
+  if (r.state == DRIVE_DRIVING) return e.car_on ? nullptr : "car-off";
   if (e.charge_latched) return "charging";
   if (!e.car_on) return "car-off";
   if (!e.motion_recent) return "motion";
@@ -176,13 +178,23 @@ inline void driveSpeed(double kmh) {
   driveStore(driveOnMoving(driveRegion(), millis()));
 }
 
-// gpsMovingFresh() this poll; kmh is the GNSS speed, for the log lines only. Starting a drive needs the evidence.
+// gpsMovingFresh() this poll; kmh is the GNSS speed, for the log lines only. Starting or holding a drive needs the
+// evidence. One refusal line per state: a DRIVING refusal, then (after the re-latch) at most one PARKED refusal.
 inline void driveGnss(double kmh) {
-  if (const char* refused = driveGnssRefusal(driveRegion(), driveSample(nullptr).evidence)) {
+  const DriveRegion region = driveRegion();
+  if (const char* refused = driveGnssRefusal(region, driveSample(nullptr).evidence)) {
     if (!g_drive_gnss_refused) {
       g_drive_gnss_refused = true;
 #if ENABLE_LOGGING
-      logEvent("LEASH gnss=%.1fkm/h refused reason=%s", kmh, refused);
+      if (region.state == DRIVE_DRIVING) {
+        // The evidence that ended the hold: the rail and the age of the last OBD answer (-1: none this wake).
+        // kmh is clamped for the log only, so the line stays within logEvent's 119 characters.
+        const long obd_s = g_last_obd_answer_ms ? (long)((millis() - g_last_obd_answer_ms) / 1000UL) : -1L;
+        logEvent("LEASH gnss=%.1fkm/h hold refused reason=%s rail=%.2f obd=%lds",
+          kmh > 0.0 ? (kmh < 999.9 ? kmh : 999.9) : 0.0, refused, g_last_io36, obd_s);
+      } else {
+        logEvent("LEASH gnss=%.1fkm/h refused reason=%s", kmh, refused);
+      }
 #endif
     }
     return;
