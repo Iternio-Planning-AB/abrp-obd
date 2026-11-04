@@ -162,7 +162,12 @@ with tempfile.TemporaryDirectory(prefix="obd-energy-checks-") as temporary:
     (build / "net_recover_sleep.inc").write_text(block(logger, "if (g_recovers_since_ok >= 2 && net_reboot_count < 2) {"))
     start = logger.index("  wdt_reset_count = wdtStreakAdvance(")
     (build / "wdt_streak_wake.inc").write_text(logger[start:logger.index("\n", start) + 1])
-    (build / "wdt_streak_sleep.inc").write_text(block(logger, "if (wdt_reset_count >= 2) {"))
+    (build / "wdt_streak_sleep.inc").write_text(
+        block(logger, "if (wdtStreakAction(wdt_reset_count) != WDT_STREAK_CONTINUE) {"))
+    # The escalation's pure steps, for the sleep-reason check, which runs that sleep outside the streak namespace.
+    action = streak.index("enum WdtStreakAction {")
+    (build / "wdt_streak_action.inc").write_text(
+        streak[action:streak.index("\n", streak.index("int wdtStreakSleepMinutes(", action)) + 1])
     end = logger.index("#if PRINT", start)
     startup = logger[start:end]
     startup_end = start + len(startup)
