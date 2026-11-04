@@ -576,7 +576,7 @@ void setup() {
   wdt_reset_count = wdtStreakAdvance(esp_reset_reason(), &g_wdt_streak_retained);
   if (esp_reset_reason() != ESP_RST_DEEPSLEEP && wdtStreakMarkerOwed()) driveMarkerRestored();
 #if ENABLE_SLEEP && ENABLE_MEMS
-  if (wdt_reset_count >= 3) {
+  if (wdtStreakAction(wdt_reset_count) == WDT_STREAK_EARLY_SLEEP) {
     Serial.begin(115200);
     Serial.printf("EARLY crash reset=%s streak=%lu parked=%dmin timer-only; peripherals unchanged\n",
       resetReasonStr(), (unsigned long)wdt_reset_count, WAKE_PARKED_MINUTES);
@@ -958,9 +958,8 @@ void setup() {
 #if ENABLE_SLEEP && ENABLE_MEMS
   // Wedge-guard escalation: two CONSECUTIVE wakes just ended in a WDT, panic or brownout reset (wdt_streak.h;
   // a wedge is usually in the init path below). Don't run it a third time back-to-back - sleep and try fresh next wake, so a persistently-wedging
-  // modem costs ~2 WDT windows per cycle, not a 5-minute reset loop all night. The parked cadence, unless the
-  // rail says the car is awake (driving or charging): WOM can miss a smooth road, and a charge is followed at
-  // the charging cadence anyway.
+  // modem costs ~2 WDT windows per cycle, not a 5-minute reset loop all night. A longer streak slept at the top of
+  // setup(); != CONTINUE keeps this sleep for it too should that one ever be compiled out apart.
   // Placed AFTER the gate/MEMS init (enterDeepSleep needs the sensor) and BEFORE BLE/modem bring-up.
   // modem_on only when a wake since the last acknowledged power-down reached network init (wdt_streak.h):
   // after a mid-init WDT reset the modem is almost certainly still powered (the wedge IS modem init) - CPOWD
@@ -968,8 +967,8 @@ void setup() {
   // ends in a 2.5 s PWRKEY pulse, which switches an off modem ON.
   // A restored marker debt is not paid here: these boots zeroed the clock, which keeps enterDeepSleep's marker
   // block shut, so the backlog this boot never loaded is not overwritten.
-  if (wdt_reset_count >= 2) {
-    g_next_wake_minutes = g_last_io36 >= RAIL_AWAKE_VOLTS ? WAKE_CHARGING_MINUTES : WAKE_PARKED_MINUTES;
+  if (wdtStreakAction(wdt_reset_count) != WDT_STREAK_CONTINUE) {
+    g_next_wake_minutes = wdtStreakSleepMinutes(g_last_io36);
 #if ENABLE_LOGGING
     logEvent("WDT streak=%lu -> skip init, sleep %dmin (retry fresh next wake)",
       (unsigned long)wdt_reset_count, g_next_wake_minutes);

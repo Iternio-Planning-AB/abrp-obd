@@ -435,6 +435,7 @@ void recoverSleep() {
 #include "net_recover_sleep.inc"
 }
 bool wdtStreakModemMayBeOn() { return true; }
+#include "wdt_streak_action.inc"
 void wdtSleep() {
 #include "wdt_streak_sleep.inc"
 }
