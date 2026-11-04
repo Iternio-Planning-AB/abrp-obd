@@ -95,6 +95,9 @@ the one `POST_DRIVE_RECHECK_MINUTES` sleep (`pdw-recheck`), then each re-check w
 cadence with no second re-check, a high rail with a charging answer takes the charging cadence, and a silent one gets
 the window's bounded 3-minute retries, then parked. Its RAM flag `g_pdw_recheck` is newer than `SM_PIN`, so like
 `maintenance_mode` its initialiser is checked in the tree only, and the runner fails if a pinned block names it.
+Since step 3 (#25) the CUR side is `Helpers/energy_state.h`: `energyOnPoll` (the block, verbatim, whose returned
+SAMPLE_POLL values are compared with OLD's locals) and the gate's calls, and the runner fails if anything outside it
+assigns the charging state or if an energy call sits outside the extracted blocks and its named sites.
 
 Since 0b-2 (#82) it also covers the `setup()` wake: the whole ATRV gate block (the ATRV
 read, the taper bridge and its give-up, the charge-end read, the follow-up, the poll decision, the alarm suppression,

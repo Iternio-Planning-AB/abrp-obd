@@ -29,6 +29,7 @@ logging = (root / "baseLogger/Helpers/logging.h").read_text()
 sleep = (root / "baseLogger/Helpers/sleep_power.h").read_text()
 state_machine = (root / "baseLogger/Helpers/state_machine.h").read_text()
 drive_state = (root / "baseLogger/Helpers/drive_state.h").read_text()
+energy = (root / "baseLogger/Helpers/energy_state.h").read_text()
 streak = (root / "baseLogger/Helpers/wdt_streak.h").read_text()
 ota = (root / "baseLogger/Helpers/ota_update.h").read_text()
 
@@ -48,7 +49,7 @@ WORST_EVENT_ARGS = {
     # #124: kmh clamped to [0, 999.9] for this line (sm rules pin the clamp), the longest reason, a rail far past the ADC range, a 32-bit long.
     "LEASH gnss=%.1fkm/h hold refused": (999.9, "charging", -99.99, -2147483648),
 }
-event_sources = logger + state_machine + sleep + drive_state
+event_sources = logger + state_machine + energy + sleep + drive_state
 # The host stand-in for the streak store keeps its bytes across boots, as RTC_NOINIT_ATTR does and
 # RTC_DATA_ATTR (reloaded on every reset but a deep-sleep wake) does not.
 if not re.search(r"^RTC_NOINIT_ATTR WdtStreakStore wdt_streak_store;", streak, re.MULTILINE):
@@ -108,28 +109,36 @@ with tempfile.TemporaryDirectory(prefix="obd-energy-checks-") as temporary:
         r"CHARGE_END_POLL_FLOOR|MAX_AWAKE_MINUTES|TAPER_CONFIRM_MAX_WAKES|IO36_LOCKOUT_\w+|POST_DRIVE_\w+|OBD_ALARM_GATE|ENABLE_IO36_RAIL|DC_CHARGING_MIN_KW|DC_CHARGING_AWAKE_SECONDS|"
         r"SESSION_IDLE_MAX_MS|CHARGING_TIMER|ACTIVE_TIMER|DC_CHARGING_POLL_MARGIN_MS)\b.*(?:\n[ \t]+.*)*",
         config, re.MULTILINE)))
-    start = logger.index("    // Feature A - is_charging")
-    end = logger.index("\n    /*\n      CHARGE PROGRESS", start)
-    (build / "charge_signal.inc").write_text(logger[start:end])
-    start = logger.index("    const bool was_recently_charging")
-    end = logger.index("\n\n#if ENABLE_BLE\n    const uint16_t ble_mtu", start)
-    (build / "charge_release.inc").write_text(logger[start:end])
-    start = logger.index("    auto chargeCounterRose =")
-    end = logger.index("\n    /*\n      DC or AC", start)
-    (build / "charge_progress.inc").write_text(logger[start:end])
-    start = logger.index("    bool is_dcfc = false;")
-    end = logger.index("\n    // NOTE: power is deliberately NOT derived", start)
-    (build / "charge_dcfc.inc").write_text(logger[start:end])
-    start = logger.index("    bool has_charge_counter = false;")
-    end = logger.index("\n    const bool uncorroborated =", start)
-    (build / "charge_corroboration.inc").write_text(logger[start:end])
+    # loop()'s poll is energyOnPoll (energy_state.h), sliced at the same code; its call site runs dcAwakeTrack() next.
+    call_site = "    const EnergyPoll ep = energyOnPoll(current_frame, obd_count);\n    dcAwakeTrack();\n"
+    if logger.count(call_site) != 1:
+        raise SystemExit(f"FAIL: loop() must call energyOnPoll and then dcAwakeTrack(), once: {call_site!r}")
+    poll = block(energy, "EnergyPoll energyOnPoll(OBDVector& current_frame, int obd_count) {")
+    start = poll.index("    // Feature A - is_charging")
+    end = poll.index("\n    /*\n      CHARGE PROGRESS", start)
+    (build / "charge_signal.inc").write_text(poll[start:end])
+    start = poll.index("    const bool was_recently_charging")
+    end = poll.index("\n    return EnergyPoll{", start)
+    (build / "charge_release.inc").write_text(poll[start:end] + "\n    dcAwakeTrack();")
+    start = poll.index("    auto chargeCounterRose =")
+    end = poll.index("\n    /*\n      DC or AC", start)
+    (build / "charge_progress.inc").write_text(poll[start:end])
+    start = poll.index("    bool is_dcfc = false;")
+    end = poll.index("\n    // NOTE: power is deliberately NOT derived", start)
+    (build / "charge_dcfc.inc").write_text(poll[start:end])
+    start = poll.index("    bool has_charge_counter = false;")
+    end = poll.index("\n    const bool uncorroborated =", start)
+    (build / "charge_corroboration.inc").write_text(poll[start:end])
     (build / "wake_gate.inc").write_text(wake_gate(logger, through="    if (g_sample_poke) g_rail_before_poke = rail;"))
-    start = logger.index("static const uint64_t POST_DRIVE_WINDOW_US")
-    end = logger.index("\n}\n", logger.index("void chargeWakeStateSanitize(", start)) + 3
-    (build / "charge_wake_state.inc").write_text(logger[start:end])
-    start = logger.index("bool chargeStateStale(uint64_t now_us) {")
-    end = logger.index("\n}\n", start) + 3
-    (build / "charge_stale.inc").write_text(logger[start:end])
+    # The gate's and the wake's writes to the charge state, called from the slices above and below.
+    (build / "energy_gate.inc").write_text("".join(block(energy, f) for f in (
+        "void energyOnRailAwake() {", "void energyGiveUpTaper(", "void energyOnMotionWake() {")))
+    (build / "energy_wake.inc").write_text(block(energy, "void energyOnSkip() {") +
+                                           block(energy, "void energyOnPromote() {"))
+    start = energy.index("static const uint64_t POST_DRIVE_WINDOW_US")
+    end = energy.index("\n}\n", energy.index("void chargeWakeStateSanitize(", start)) + 3
+    (build / "charge_wake_state.inc").write_text(energy[start:end])
+    (build / "charge_stale.inc").write_text(block(energy, "bool chargeStateStale(uint64_t now_us) {"))
     start = logger.index("      g_next_wake_minutes = WAKE_PARKED_MINUTES; // skip = parked")
     end = logger.index("      enterDeepSleep(false);", start)
     (build / "gate_skip.inc").write_text(logger[start:end])
@@ -138,12 +147,11 @@ with tempfile.TemporaryDirectory(prefix="obd-energy-checks-") as temporary:
     sleeps = re.findall(r"(\S+)\s*\n?\s*enterDeepSleep\(true(?:, \"[^\"]*\")?\);", ladder)
     if sleeps != ["pdwArmAtLadderEnd();"] * 2:
         raise SystemExit(f"FAIL: both ladder sleeps must follow pdwArmAtLadderEnd(): {sleeps}")
-    start = machine.index("bool pdwOpenWindow() {")
-    end = machine.index("\n}\n", machine.index("void pdwArmAtLadderEnd() {")) + 3
-    (build / "pdw_ladder.inc").write_text(machine[start:end])
-    start = logger.index("void resetChargeCorroboration() {") + len("void resetChargeCorroboration() {")
-    end = logger.index("\n}", start)
-    (build / "reset_corroboration.inc").write_text(logger[start:end])
+    (build / "pdw_ladder.inc").write_text(block(energy, "bool pdwOpenWindow() {") +
+                                          block(energy, "void pdwArmAtLadderEnd() {"))
+    start = energy.index("void resetChargeCorroboration() {") + len("void resetChargeCorroboration() {")
+    end = energy.index("\n}", start)
+    (build / "reset_corroboration.inc").write_text(energy[start:end])
     start = logging.index("const std::string LOG_HEADER =")
     end = logging.index("\n// Append a discrete EVENT", start)
     (build / "logging.inc").write_text(logging[start:end])
