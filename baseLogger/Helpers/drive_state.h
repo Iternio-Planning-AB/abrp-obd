@@ -6,7 +6,8 @@
   group covers the step-2 rules.
 
   The region owns the park/drive latch, the UNCONFIRMED flag, the time of the last movement hold, and the
-  park-marker debt. They are still stored in the old globals - is_currently_parked, drive_unconfirmed,
+  park-marker debt, and the early DC release's count (#128). They are still stored in the old globals -
+  is_currently_parked, drive_unconfirmed,
   g_last_speed_ms and park_marker_owed, defined in logger.ino, read directly by their many readers - until
   #27 retires the names. UNCONFIRMED is parked to every one of those readers: is_currently_parked stays true,
   so the backstop, is_charging and the pre-sleep marker gate need no change; the frame just omits is_parked
@@ -30,6 +31,9 @@
     accel         UNCONFIRMED           charge latch* set                               PARKED       LEASH line, no freeze
     poll end      UNCONFIRMED           hold = last motion; now - hold > ACTIVE_TIMER   PARKED       LEASH line, no freeze
     poll end      DRIVING               now - last hold > ACTIVE_TIMER                  PARKED       freeze, LEASH re-latch line
+    dc charge     DRIVING, UNCONFIRMED  DC_RELEASE_POLLS polls in a row at DC power     PARKED       freeze if DRIVING, LEASH line,
+                                        (or the car's is_dcfc), speed a clean 0 or                   charge trusted (#128)
+                                        none, no moving fix; DC_EARLY_HOLD
     idle          DRIVING               activity state -> CHARGING or STANDBY           PARKED       freeze
     idle          UNCONFIRMED           activity state -> CHARGING or STANDBY           PARKED       LEASH line, no freeze
     session hold  DRIVING               an OTA update or log dump is running            DRIVING      hold
@@ -51,7 +55,8 @@
 
   #included by logger.ino after motion_stats.h - it is NOT a standalone compilation unit - and compiled by
   the host runners (heading, sm). Uses is_currently_parked, drive_unconfirmed, g_last_speed_ms, last_active,
-  g_last_io36, g_last_motion_ms, g_last_obd_answer_ms and recently_charging, which logger.ino defines above
+  g_last_io36, g_last_motion_ms, g_last_obd_answer_ms, recently_charging, g_dc_release_polls and g_dc_reset_logged,
+  which logger.ino defines above
   its helper includes, and g_drive_motion (mems.h).
 */
 
@@ -107,6 +112,10 @@ inline DriveRegion driveOnPollEnd(DriveRegion r, unsigned long now_ms) {
   if (r.state != DRIVE_PARKED && now_ms - r.last_hold_ms > (unsigned long)ACTIVE_TIMER) r.state = DRIVE_PARKED;
   return r;
 }
+inline DriveRegion driveOnDcCharge(DriveRegion r, uint8_t polls) {
+  if (r.state != DRIVE_PARKED && polls >= (uint8_t)DC_RELEASE_POLLS) r.state = DRIVE_PARKED;
+  return r;
+}
 inline DriveRegion driveOnIdle(DriveRegion r) {
   r.state = DRIVE_PARKED;
   return r;
@@ -123,12 +132,13 @@ extern bool park_marker_owed;  // RTC, defined in logger.ino; the heading fixtur
 extern DriveMotion g_drive_motion;  // mems.h
 #endif
 void freezeParkedLocation();   // Helpers/gps_location.h
+void energyOnDcRelease();      // Helpers/energy_state.h
 
 inline DriveRegion driveRegion() {
   return {!is_currently_parked ? DRIVE_DRIVING : drive_unconfirmed ? DRIVE_UNCONFIRMED : DRIVE_PARKED, g_last_speed_ms};
 }
 inline void driveStore(const DriveRegion& r) {
-  if (driveRegion().state != r.state) g_drive_gnss_refused = false;
+  if (driveRegion().state != r.state) g_drive_gnss_refused = false, g_dc_release_polls = 0;  // a run is within one state
   is_currently_parked = r.state != DRIVE_DRIVING;
   drive_unconfirmed = r.state == DRIVE_UNCONFIRMED;
   g_last_speed_ms = r.last_hold_ms;
@@ -151,6 +161,14 @@ inline bool driveFrameValue(const OBDVector& frame, const char* key, double lo, 
   }
   return false;
 }
+// The frame's current (A) and current x voltage (kW, positive = discharge); false without both in range.
+inline bool driveFrameIv(const OBDVector& frame, double* amps, double* kw) {
+  double volts = 0;
+  if (!driveFrameValue(frame, "current", -2000.0, 2000.0, amps) ||
+      !driveFrameValue(frame, "voltage", 0.0, 1000.0, &volts)) return false;
+  *kw = *amps * volts / 1000.0;
+  return true;
+}
 inline DriveSample driveSample(const OBDVector* frame) {
   const unsigned long now = millis();
   DriveSample s = {};
@@ -160,15 +178,12 @@ inline DriveSample driveSample(const OBDVector* frame) {
 #if ENABLE_MEMS
   s.evidence.motion_sustained = motionSustained(g_drive_motion, now, &s.act_pct);
 #endif
-  double amps = 0, volts = 0;
+  double amps = 0;
   bool known = false, has_amps = false, car_flag = false;
   if (frame) {
     has_amps = driveFrameValue(*frame, "current", -2000.0, 2000.0, &amps);
     known = driveFrameValue(*frame, "power", -1000.0, 1000.0, &s.kw);
-    if (!known && has_amps && driveFrameValue(*frame, "voltage", 0.0, 1000.0, &volts)) {
-      s.kw = amps * volts / 1000.0;
-      known = true;
-    }
+    if (!known && has_amps) known = driveFrameIv(*frame, &amps, &s.kw);
     // Before loop() appends its own is_charging/is_dcfc, either key here is the profile's: the car's own word. Any
     // value but exactly 0 counts, NaN and infinities included: a garbled flag fails closed, keeping the latch.
     for (const auto& res : *frame)
@@ -262,6 +277,72 @@ inline void drivePollEnd() {
       (unsigned long)(ACTIVE_TIMER / 1000UL));
   else
     logEvent("LEASH unconfirmed no motion for %lus -> parked", (unsigned long)(ACTIVE_TIMER / 1000UL));
+#endif
+}
+
+// The early DC release's evidence from this poll's frame (#128). A veto: a speed key that is not finite and in
+// (-0.5, 0] (a garbled or reverse speed fails closed; above 0 is a drive, as loop() reads it), or a moving GNSS fix.
+// DC: the car's own is_dcfc decides when it is finite ((0, 255] is DC, 0 is not); otherwise (absent, NaN or infinite:
+// a garbled flag must not end a drive) a current below CHARGING_CURRENT_THRESHOLD at |V x I| >= DC_CHARGING_MIN_KW,
+// the power energyOnPoll infers DC from. kw is |V x I|, NaN without both, for the log lines.
+struct DcChargeEvidence {
+  const char* veto;  // "speed", "gnss", or nullptr
+  bool dc;
+  double kw;
+};
+inline DcChargeEvidence driveDcChargeEvidence(const OBDVector& frame, bool gnss_moving) {
+  DcChargeEvidence ev = {nullptr, false, NAN};
+  for (const auto& res : frame)
+    if ((res.first == "speed" || res.first == "vehicle_reported_speed") && !(res.second > -0.5 && res.second <= 0.0))
+      ev.veto = "speed";
+  if (!ev.veto && gnss_moving) ev.veto = "gnss";
+  double amps = 0, kw = 0, flag = 0;
+  const bool iv = driveFrameIv(frame, &amps, &kw);
+  if (iv) ev.kw = fabs(kw);
+  if (driveFrameValue(frame, "is_dcfc", -INFINITY, INFINITY, &flag)) ev.dc = flag > 0.0 && flag <= 255.0;
+  else ev.dc = iv && amps < CHARGING_CURRENT_THRESHOLD && ev.kw >= (double)DC_CHARGING_MIN_KW;
+  return ev;
+}
+
+// The log lines' kW: "?" without a V x I.
+struct DriveKwText { char text[12]; };
+inline DriveKwText driveKwText(double kw) {
+  DriveKwText t = {"?"};
+  if (kw >= 0.0) snprintf(t.text, sizeof(t.text), "%.0f", kw);
+  return t;
+}
+
+// After drivePollEnd(), before is_parked is appended, so the releasing poll's frame already carries the charge.
+// gnss_moving is loop()'s gpsMovingFresh(GPS_MOVING_MAX_AGE_MS), false without GNSS.
+inline void driveDcCharge(const OBDVector& frame, bool gnss_moving) {
+#if DC_EARLY_HOLD
+  const DriveRegion region = driveRegion();
+  const DcChargeEvidence ev = driveDcChargeEvidence(frame, gnss_moving);
+  if (region.state == DRIVE_PARKED || ev.veto || !ev.dc) {
+    // The first reset of a started run, once per wake: GNSS drift under a charger's canopy shows here.
+    const bool first_reset = region.state != DRIVE_PARKED && g_dc_release_polls && !g_dc_reset_logged;
+#if ENABLE_LOGGING
+    if (first_reset)
+      logEvent("LEASH dc reset n=%u why=%s kw=%s", (unsigned)g_dc_release_polls, ev.veto ? ev.veto : "notdc",
+        driveKwText(ev.kw).text);
+#endif
+    if (first_reset) g_dc_reset_logged = true;
+    g_dc_release_polls = 0;
+    return;
+  }
+  if (g_dc_release_polls < 255) g_dc_release_polls++;
+  const uint8_t polls = g_dc_release_polls;
+  const DriveRegion next = driveOnDcCharge(region, polls);
+  if (next.state == region.state) return;
+  if (region.state == DRIVE_DRIVING) freezeParkedLocation();
+  driveStore(next);
+#if ENABLE_LOGGING
+  logEvent("LEASH dc charge %skW x%u -> re-latch parked", driveKwText(ev.kw).text, (unsigned)polls);
+#endif
+  energyOnDcRelease();
+#else
+  (void)frame;
+  (void)gnss_moving;
 #endif
 }
 

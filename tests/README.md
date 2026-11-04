@@ -179,6 +179,22 @@ by a newly buffered charging frame.
 These are bounded generated tests, not exhaustive combined-state coverage or a second implementation of the
 energy controller. Transport, actual motion sampling, firmware-width clocks and hardware remain outside this group.
 
+Run `python3 tests/run_sm_checks.py dc` for #128's early DC release (also in the default run). `sm_checks.cpp`
+compiles the tree a third time, as `sm_dc`, with `DC_EARLY_HOLD 1`; both differential sides compile with 0, so the
+differential stays exact equality with `SM_PIN` and the other CUR groups never run the release. Like `composition`,
+`playDc` feeds the drive region the real charge latch. Named cases: the field shapes (-125 A at 358 V; -184 A then
+-129 A) on a speed-PID car, a GNSS-only car and one with neither, each PARKED on the third poll with is_charging,
+is_dcfc and the DC hold in that frame, then the DC session on the next; a speed > 0 or moving fix on each of the
+three polls restarting the count; regen with speed or a moving fix never releasing; GNSS drift and the once-per-wake
+reset line; an AC poll interrupting the run; an infinite or out-of-range `is_dcfc` and AC-power `is_charging` never
+releasing, a finite `is_dcfc` releasing (accepted); a NaN, infinite or reverse speed vetoing while -0.2 does not; a
+power key playing no part (V x I decides, as the DC inference does); a 60 kW discharge and a run across a drive-state
+change never releasing early; and UNCONFIRMED releasing without a freeze. Generated traces (depth 5 over 13
+drive/charge symbols, and 5 seeds x 1000 x 30 random events with DC currents mixed in) run against an oracle kept from
+the inputs: a release only on the third vetted poll in a row in one drive state, always on it, ending PARKED, its
+frame publishing the charge. The adapter's backstop property exempts a DC charge the hold would keep (in BLE too)
+under `DC_EARLY_HOLD` and fails if the backstop sleeps one. The timed ladder (acceptance 3) is in the energy runner's `dc-awake` group.
+
 ## Diagnostic host checks
 
 Run `python3 tests/run_log_diagnostics_checks.py` for actual DataLogger, CSV, and GPS-selection checks.
@@ -362,8 +378,13 @@ never reconnecting the modem, plus the extracted startup slice verifying the thr
 before `sys.begin()`; RTC retention and actual peripheral power remain hardware gates), the DC fast-charge hold
 (`dc-awake`: entry on the car's `is_dcfc` or inferred power, the per-charge DC latch through the taper, the
 time-based silent hold (a seeded hour of 60 % silence) and the backstop sleep, budget by elapsed time on motion wakes, the 30 s cadence outside BLE, the CHARGING hold and the sample-poke stay, the
-live rail/alarm/motion vetoes, motion promoting a held poke, every exit and its sleep tier, a new AC charge not
-latched, and the cadence kept under `SESSION_IDLE_MAX_MS`), the ABD1 frame fitted to MTU−3 (`ble-frame`: compact 2 dp numbers, key filtering, priority trimming, MTU 23, and the `BLE tlm` log cadence), telemetry serialization and energy/temperature CSV columns under
+live rail/alarm vetoes, motion keeping the hold and promoting a held poke, every exit and its sleep tier, a new AC
+charge not latched, and the cadence kept under `SESSION_IDLE_MAX_MS`; and #128's timed awake ladder: the real
+`handleActivityState()` from its clock read on, ticked every 500 ms with loop()'s poll gate, through a drive past
+`MAX_AWAKE_MINUTES` then a DC charge with people in the car (no sleep path while held, the backstop at the unplug), a
+flagged car still backstopped, the rail drop and the charge end sleeping through the ladder, a phone connected past
+`MAX_AWAKE_MINUTES` (not backstopped with a DC charge, backstopped without one) and leaving mid-charge, and a
+drive-away ending the hold at its first poll; a promoted held poke keeps the charge trusted), the ABD1 frame fitted to MTU−3 (`ble-frame`: compact 2 dp numbers, key filtering, priority trimming, MTU 23, and the `BLE tlm` log cadence), telemetry serialization and energy/temperature CSV columns under
 ASan/UBSan. Add `--profiles /path/to/profiles` to exercise actual Scenic/iX3 production/developer
 equations with the firmware parser (optional: the ABRP backend profiles are not public). The runner extracts the current charging and logging code;
 hardware is fake, not on-device verification. DataLogger schema rotation is owned by the diagnostics runner.
