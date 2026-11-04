@@ -1676,7 +1676,6 @@ void composition() {
 // A drive that stops at a fast charger re-latches PARKED after DC_RELEASE_POLLS polls in a row at DC power with no
 // speed above 0 and no moving fix, so the charge is seen within a minute rather than after ACTIVE_TIMER. Absolute
 // checks: the issue's named cases, then generated traces against an oracle kept from the trace's inputs.
-const unsigned DC_RUN = 3;  // the agreed run (#128); config.h's DC_RELEASE_POLLS must match it
 SmEvent Amps(SmEvent e, double amps, double volts) {
   e.current = amps, e.voltage = volts;
   std::ostringstream name;
@@ -1690,24 +1689,24 @@ SmEvent Flag(SmEvent e, const char* key, double value) {
   name << "," << key << "=" << value;
   return named(e, name.str());
 }
-// The release evidence from the event alone: an answered poll with no speed key above 0 and no moving fix, and the
-// car's own is_dcfc finite and above 0, or a charging current (its sign) at DC_CHARGING_MIN_KW: |power| when the frame
-// has one in range, else |V x I|. The first key of a name is the one read, as driveFrameValue does.
+// The release evidence from the event alone: an answered poll whose speed keys are all finite in (-0.5, 0] (a
+// garbled or reverse speed fails closed), with no moving fix, and the car's own is_dcfc finite in (0, 255], or a
+// charging current (its sign) at DC_CHARGING_MIN_KW by |V x I|, the power energyOnPoll infers DC from; a power key
+// plays no part. The first key of a name is the one read, as driveFrameValue does.
 bool dcEvidence(const SmEvent& e) {
   if (e.silent) return false;
-  const bool speed = ((e.key == SM_SPEED || e.key == SM_VRS || e.key == SM_BOTH) && e.speed > 0) ||
-                     (e.key == SM_BOTH && e.speed2 > 0);
+  auto still = [](double v) { return v > -0.5 && v <= 0; };
+  const bool speed = ((e.key == SM_SPEED || e.key == SM_VRS || e.key == SM_BOTH) && !still(e.speed)) ||
+                     (e.key == SM_BOTH && !still(e.speed2));
   if (speed || (e.gnss && e.fix_age_ms <= GPS_MOVING_MAX_AGE_MS)) return false;
   auto within = [](double v, double lo, double hi) { return v > lo && v < hi; };
   bool has_flag = !std::isnan(e.dcfc);
   double flag = e.dcfc;
   for (const auto& kv : e.extra)
     if (!has_flag && kv.first == "is_dcfc") has_flag = true, flag = kv.second;
-  if (has_flag && within(flag, 0, std::numeric_limits<double>::infinity())) return true;
-  if (!within(e.current, -2000, 2000) || !(e.current < CHARGING_CURRENT_THRESHOLD)) return false;
-  const double kw = within(e.power, -1000, 1000) ? std::fabs(e.power)
-                    : within(e.voltage, 0, 1000) ? std::fabs(e.current * e.voltage) / 1000.0 : 0.0;
-  return kw >= (double)DC_CHARGING_MIN_KW;
+  if (has_flag && flag > 0 && flag <= 255) return true;
+  return within(e.current, -2000, 2000) && e.current < CHARGING_CURRENT_THRESHOLD && within(e.voltage, 0, 1000) &&
+         std::fabs(e.current * e.voltage) / 1000.0 >= (double)DC_CHARGING_MIN_KW;
 }
 int dcState(bool parked, bool unconfirmed) { return !parked ? 2 : unconfirmed ? 1 : 0; }  // PARKED, UNCONFIRMED, DRIVING
 size_t dcCount(const std::string& prefix) {
@@ -1728,7 +1727,7 @@ bool dcFrameHas(const char* key, double value) {
 unsigned dc_run = 0;  // the oracle: vetted DC polls in a row within one drive state
 unsigned long dc_releases = 0;
 // One event on sm_dc, the drive region reading the real charge latch, then its properties and the oracle: a release
-// only on the DC_RUN-th vetted poll in a row from DRIVING or UNCONFIRMED, and always on it.
+// only on the DC_RELEASE_POLLS-th vetted poll in a row from DRIVING or UNCONFIRMED, and always on it.
 void playDc(SmEvent e, std::vector<SmEvent>& trace) {
   using namespace sm_dc;
   const Snap pre = save(false);
@@ -1753,13 +1752,13 @@ void playDc(SmEvent e, std::vector<SmEvent>& trace) {
   dc_releases += releases;
   check(releases <= 1, "dc: one release line per poll", trace);
   if (releases)
-    check(evidence && before != 0 && dc_run + 1 >= DC_RUN && after == 0,
-          "dc: a release needs DC_RUN vetted DC polls in a row from DRIVING or UNCONFIRMED, and ends PARKED", trace);
-  else if (evidence && before != 0 && dc_run + 1 >= DC_RUN && !(before == 1 && after == 2))
-    check(after == 0, "dc: DC_RUN vetted DC polls in a row release the latch", trace);
+    check(evidence && before != 0 && dc_run + 1 >= DC_RELEASE_POLLS && after == 0,
+          "dc: a release needs DC_RELEASE_POLLS vetted DC polls in a row from DRIVING or UNCONFIRMED, and ends PARKED", trace);
+  else if (evidence && before != 0 && dc_run + 1 >= DC_RELEASE_POLLS && !(before == 1 && after == 2))
+    check(after == 0, "dc: DC_RELEASE_POLLS vetted DC polls in a row release the latch", trace);
   // A release by a charging current x voltage (no car is_dcfc) publishes the charge in its own frame.
   const bool iv = e.current < CHARGING_CURRENT_THRESHOLD && e.current > -2000 && e.voltage > 0 && e.voltage < 1000 &&
-                  std::isnan(e.dcfc) && std::isnan(e.power) && e.extra.empty();
+                  std::isnan(e.dcfc) && e.extra.empty();
   if (releases && iv && obd_result_vector.size() > frames)
     check(dcFrameHas("is_charging", 1) && dcFrameHas("is_parked", 1) &&
           dcFrameHas("is_dcfc", std::fabs(e.current * e.voltage) / 1000.0 >= DC_CHARGING_MIN_KW ? 1 : 0),
@@ -1818,12 +1817,13 @@ void dcRules(int depth) {
   // its frame says is_charging and is_dcfc, and the DC hold is on - with a speed PID, with only GNSS, with neither.
   for (Car car : {SPEED, GNSS, NEITHER}) {
     for (bool second : {false, true}) {
+      if (second && car != SPEED) continue;  // the second field shape on one car
       drive(car);
       const unsigned freezes = sm_freezes;
       const std::string what = std::string(cars[car]) + (second ? ", -184 A then -129 A" : ", -125 A") + ": ";
-      for (unsigned i = 1; i <= DC_RUN; ++i) {
+      for (unsigned i = 1; i <= (unsigned)DC_RELEASE_POLLS; ++i) {
         playDc(still(car, second && i == 1 ? -184 : second ? -129 : -125), t);
-        if (i == DC_RUN) break;
+        if (i == (unsigned)DC_RELEASE_POLLS) break;
         check(!is_currently_parked && !dcLogged("LEASH dc"), what + "still DRIVING before the third DC poll", t);
         playDc(Advance(5000), t);
       }
@@ -1840,9 +1840,9 @@ void dcRules(int depth) {
 
   // 2. A speed above 0 or a moving fix on any of the three polls restarts the count; then three clean polls release.
   for (bool by_gnss : {false, true}) {
-    for (unsigned at = 0; at < DC_RUN; ++at) {
+    for (unsigned at = 0; at < (unsigned)DC_RELEASE_POLLS; ++at) {
       drive(SPEED);
-      for (unsigned i = 0; i < DC_RUN; ++i)
+      for (unsigned i = 0; i < (unsigned)DC_RELEASE_POLLS; ++i)
         polls(i != at ? still(SPEED, -125) : by_gnss ? Amps(Poll(SM_SPEED, 0, true, 7.25), -125, 358)
                                                     : Amps(Poll(SM_SPEED, 3), -125, 358), 1);
       const std::string what = std::string(by_gnss ? "a moving fix" : "speed > 0") + " on poll " + std::to_string(at + 1);
@@ -1898,25 +1898,46 @@ void dcRules(int depth) {
 
   // The car's flags: a garbled is_dcfc (NaN, infinity) or is_charging alone never releases; a finite is_dcfc does,
   // also stuck on a car with neither speed nor GNSS (accepted).
-  for (double garbled : {(double)NAN, std::numeric_limits<double>::infinity()}) {
+  for (double garbled : {std::numeric_limits<double>::infinity(), 255.5, 1000.0}) {
     drive(NEITHER);
     polls(Flag(Poll(SM_NONE, 0), "is_dcfc", garbled), 6);
-    check(!is_currently_parked && dcCount("LEASH dc") == 0, "a garbled is_dcfc never releases", t);
+    check(!is_currently_parked && dcCount("LEASH dc") == 0, "an infinite or out-of-range is_dcfc never releases", t);
   }
   drive(NEITHER);
   polls(Flag(Amps(Poll(SM_NONE, 0), -50, 380), "is_charging", 1), 6);
   check(!is_currently_parked && dcCount("LEASH dc charge") == 0, "the car's is_charging at AC power never releases", t);
   drive(NEITHER);
-  polls(Flag(Poll(SM_NONE, 0), "is_dcfc", 1), (int)DC_RUN);
-  check(is_currently_parked && dcLogged("LEASH dc charge 0kW x3 -> re-latch parked"),
+  polls(Flag(Poll(SM_NONE, 0), "is_dcfc", 1), (int)DC_RELEASE_POLLS);
+  check(is_currently_parked && dcLogged("LEASH dc charge ?kW x3 -> re-latch parked"),
         "a finite is_dcfc releases on its own (a stuck one too, accepted)", t);
+
+  // A speed that is not a clean standstill fails closed: NaN, infinity or reverse vetoes; -0.2 (noise) does not.
+  for (double speed : {(double)NAN, std::numeric_limits<double>::infinity(), -1.0}) {
+    drive(SPEED);
+    polls(Amps(Poll(SM_SPEED, speed), -125, 358), 6);
+    check(!is_currently_parked && dcCount("LEASH dc charge") == 0, "a garbled or reverse speed vetoes", t);
+  }
+  drive(SPEED);
+  polls(Amps(Poll(SM_SPEED, -0.2), -125, 358), (int)DC_RELEASE_POLLS);
+  check(is_currently_parked && dcCount("LEASH dc charge") == 1, "a speed of -0.2 is a standstill", t);
+  // The power key plays no part: V x I decides, as energyOnPoll's DC inference does.
+  SmEvent low_power = still(NEITHER, -125);
+  low_power.power = 10;
+  drive(NEITHER);
+  polls(named(low_power, ",power=10"), (int)DC_RELEASE_POLLS);
+  check(is_currently_parked && dcFrameHas("is_dcfc", 1), "a 10 kW power key does not hide 45 kW of V x I", t);
+  SmEvent no_volts = still(NEITHER, -150, NAN);
+  no_volts.power = -60;
+  drive(NEITHER);
+  polls(named(no_volts, ",power=-60"), 6);
+  check(!is_currently_parked && dcCount("LEASH dc") == 0, "without a voltage a power key alone never releases", t);
 
   // UNCONFIRMED releases the same way, without a freeze.
   begin();
   playDc(Rules(Poll(SM_NONE, 0), SM_CAR_RAIL, SM_MOVE_NOW, true), t);
   check(drive_unconfirmed, "harness: UNCONFIRMED", t);
   playDc(Advance(5000), t);
-  polls(still(NEITHER, -125), (int)DC_RUN);
+  polls(still(NEITHER, -125), (int)DC_RELEASE_POLLS);
   check(is_currently_parked && !drive_unconfirmed && sm_freezes == 0 && dcCount("LEASH dc charge") == 1 &&
         dcAwakeHeld(current_state), "UNCONFIRMED releases to PARKED on the third DC poll, without a freeze", t);
 

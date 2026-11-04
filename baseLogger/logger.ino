@@ -545,15 +545,18 @@ void bleBringUp() {
 /*
   Motion while a DC charge holds a sample poke awake: somebody is at the car. Become the wake motion would have
   started instead of sleeping, because configureWOM() clears motion already seen and WOM would not fire again
-  for a person sitting still. BLE and GNSS come up, and from here a charging sample counts only after
-  CHARGE_STREAM_CONFIRM_SECONDS without a discharge sample, as on any streaming wake, so regen is not a charge.
-  Until then a held poke keeps its one-shot inputs on purpose: single-sample trust (nothing has moved), the
-  frozen fix, the release's follow-up arming and the pause-keeps-the-budget rule of a sample poke.
+  for a person sitting still. BLE and GNSS come up. Without DC_EARLY_HOLD, from here a charging sample counts only
+  after CHARGE_STREAM_CONFIRM_SECONDS without a discharge sample, as on any streaming wake, so regen is not a charge.
+  With it (#128) the trust stays: people sit in the car while it charges, and a drive-away ends the hold through the
+  drive latch (speed, GNSS, discharge), as the early release relies on. Until then a held poke keeps its one-shot
+  inputs on purpose: the frozen fix, the release's follow-up arming and the pause-keeps-the-budget rule of a sample poke.
 */
 void dcPromotePoke() {
   if (!g_sample_poke || !g_dc_confirmed || !dcMotionRecent()) return;
   g_sample_poke = false;
+#if !DC_EARLY_HOLD
   energyOnPromote();
+#endif
   bleBringUp();
 #if ENABLE_GPS
   if (!g_gps_powered) g_gps_powered = sys.gpsBegin();  // the next poll reads it; a failure retries per poll
