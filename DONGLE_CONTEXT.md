@@ -153,12 +153,12 @@ Check the rail before powering peripherals or issuing bus traffic.
   calibration car; do not invent hysteresis or assume every car has the same margin.
 - Normal wake sources are motion and timer. Parked/charging/DC sleep tiers are 30/3/1 minutes.
   A confirmed DC charge can stay awake at a 30 s cadence, bounded by rail, alarm, BLE, silence and
-  charge budget/corroboration (`WAKE_CHARGING_MAX_MINUTES`). With `DC_EARLY_HOLD` (default, #128) motion does not
-  suspend it and the max-awake backstop skips a held charge; 0 restores both. AC does not acquire the DC session latch.
+  charge budget/corroboration (`WAKE_CHARGING_MAX_MINUTES`); motion does not suspend it and the max-awake backstop
+  skips it, in BLE too (`DC_EARLY_HOLD`, #128). AC does not acquire the DC session latch.
 - A DC charge right after a drive (#128): while DRIVING or UNCONFIRMED, `DC_RELEASE_POLLS` (3) polls in a row at DC
-  power (a charging current at `DC_CHARGING_MIN_KW`, or the car's finite `is_dcfc` > 0) re-latch PARKED and trust that
-  poll's charge sample, so it publishes `is_charging`/`is_dcfc` and starts the hold. A speed key > 0 or a moving GNSS
-  fix on any of them restarts the count; nothing else guards regen on a car with neither (accepted risk).
+  power (a charging current at `DC_CHARGING_MIN_KW` by V x I, or the car's `is_dcfc`) re-latch PARKED and trust that
+  poll's charge sample, so it publishes `is_charging`/`is_dcfc` and starts the hold. A speed other than a clean 0 or
+  a moving GNSS fix on any of them restarts the count; nothing else guards regen on a car with neither (accepted risk).
 - The charge-end follow-up and post-drive window shorten cadence only after otherwise-permitted
   rail-high polls. They do not override the alarm gate. A silent charge must not reset its fast budget.
 - A plug-in after the dongle sleeps need not trip WOM (#22). A ladder ending at a healthy but low rail

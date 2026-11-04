@@ -424,19 +424,18 @@ awake.** Polling a sleeping EV wakes its ECUs, which then stay awake on the *car
   and a car silent on ~60 % of polls would otherwise drop to `parked-held` several times an hour. The dongle then stays awake and polls
   and uploads every `DC_CHARGING_AWAKE_SECONDS` (30) over one reused session, and the ladder holds in `CHARGING`.
   - `dcAwakeHeld()` vetoes the hold live, not only at a poll: the BLE state (it keeps its own cadence), a rail under
-    `RAIL_AWAKE_VOLTS`, or an alarm-flagged car (§7). Motion is no veto with `DC_EARLY_HOLD` (default, #128): people sit
-    in the car while it charges, and a drive-away ends the hold at its first poll (speed or discharge), up to one 30 s
-    poll late. With `DC_EARLY_HOLD 0`, motion within an `ACTIVE_TIMER` (`g_last_motion_ms`, stamped only by
-    `detectMovement`) vetoes it, so a drive starting is polled at ACTIVE's 5 s from its first motion.
-  - With `DC_EARLY_HOLD`, the `MAX_AWAKE_MINUTES` backstop skips a held charge (it often follows an hour's drive);
-    `WAKE_CHARGING_MAX_MINUTES` bounds it, and the backstop fires once the hold ends.
+    `RAIL_AWAKE_VOLTS`, or an alarm-flagged car (§7). Motion is no veto (#128): people sit in the car while it charges,
+    and a drive-away ends the hold at its first poll (speed or discharge), up to one 30 s poll late. A promoted poke
+    keeps the charge trusted. The `MAX_AWAKE_MINUTES` backstop skips a charge the hold would keep, in the BLE state
+    too; `WAKE_CHARGING_MAX_MINUTES` bounds it. `DC_EARLY_HOLD 0` is the rollback to the motion veto and the backstop.
   - **Early release** (#128): a fast charge right after a drive is seen within about three polls, not after the
     5-minute drive leash. While DRIVING or UNCONFIRMED, `DC_RELEASE_POLLS` (3) polls in a row at DC power (a current
-    under `CHARGING_CURRENT_THRESHOLD` at `DC_CHARGING_MIN_KW`, by `|power|` or `|V x I|`, or the car's own finite
-    `is_dcfc` > 0; a car `is_charging` alone does not count, a NaN flag counts as nothing) re-latch PARKED (a freeze
-    from DRIVING) and trust that poll's charge sample, skipping `CHARGE_STREAM_CONFIRM_SECONDS`: the run is the regen
-    guard. A speed key > 0 or a fresh moving GNSS fix on any of the polls restarts the count. A car with neither relies
-    on the run alone; the field logs showed regen at that power in bursts of at most 2 polls.
+    under `CHARGING_CURRENT_THRESHOLD` at `DC_CHARGING_MIN_KW` by `|V x I|`, the power the DC inference uses, or the
+    car's own `is_dcfc` finite in (0, 255]; a power key, a car `is_charging` or a NaN flag counts for nothing)
+    re-latch PARKED (a freeze from DRIVING) and trust that poll's charge sample, skipping
+    `CHARGE_STREAM_CONFIRM_SECONDS`: the run is the regen guard. A speed key that is not finite in (-0.5, 0] or a
+    fresh moving GNSS fix on any of the polls restarts the count. A car with neither relies on the run alone; the
+    field logs showed regen at that power in bursts of at most 2 polls.
   - Motion on a held sample poke promotes the wake in place: BLE and GNSS come up, and from then on charging samples
     need the streaming confirm (`CHARGE_STREAM_CONFIRM_SECONDS`), so regen is never a charge. Sleeping instead would
     not bring a motion wake: `configureWOM()` clears motion already seen, and a person sitting still does not trip WOM.
@@ -1014,10 +1013,9 @@ order and decline detection → Appendix A §7b; OTA → Appendix B §4, Appendi
   `net-recover`). `DC_AWAKE refused reason=<veto>`, once per wake, is a DC poll that could not hold: a car whose DC-DC
   sits under `RAIL_AWAKE_VOLTS` shows `rail`, charger vibration over the 0.1 g `detectMovement` threshold shows
   `motion` (read the `MOTION` lines; `DC_EARLY_HOLD 0` only). `DC_AWAKE poke promoted` is motion on a held sample
-  poke. With `DC_EARLY_HOLD 0`, `AWAKE_BACKSTOP` is expected once an awake hour during a held charge (counted from
-  boot, so sooner after a long drive); with it, only after the hold ends.
+  poke. `AWAKE_BACKSTOP` comes only after the hold ends.
 - **`LEASH dc charge <kW>kW x<n> -> re-latch parked`** is the early DC release (§6, #128): the charge power of the
-  releasing poll and the run length. Expect `CHARGE ... -> DC` and `DC_AWAKE on` right after it. **`LEASH dc reset
+  releasing poll's V x I (`?` without one, an `is_dcfc`-only release) and the run length. Expect `CHARGE ... -> DC` and `DC_AWAKE on` right after it. **`LEASH dc reset
   n=<n> why=speed|gnss|notdc kw=<kW>`**, once per wake, is the first run that restarted before releasing; `why=gnss`
   at a standstill charger is GNSS drift holding the drive.
 - **`<reset> reset recovered (streak=<n> retained=<0|1> owed=<0|1>)`** follows the `WAKE` of a panic, WDT

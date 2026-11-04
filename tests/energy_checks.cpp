@@ -440,11 +440,11 @@ void wdtSleep() {
 #include "wdt_streak_sleep.inc"
 }
 bool maintenance_mode = false, g_ota_active = false, g_logdump_active = false, is_currently_parked = true;
-enum { UNINITIALIZED, STANDBY } current_state = STANDBY;
+enum { UNINITIALIZED, ACTIVE, STANDBY } current_state = STANDBY;
 unsigned long millis() { return (MAX_AWAKE_MINUTES + 1) * 60UL * 1000UL; }
 struct { void printf(const char*, ...) {} } Serial;
 bool g_dc_confirmed = true;  // a DC charge whose hold has ended (here: no rail) is bounded by the backstop
-bool dcAwakeHeld(decltype(current_state)) { return false; }
+const char* dcAwakeVeto(decltype(current_state)) { return "rail"; }  // not held
 void backstopSleep() {
 #include "backstop_sleep.inc"
 }
@@ -1770,7 +1770,7 @@ struct Awake : Dongle {
       if (asleep || now - last_poll <= dcAwakeDelay(current_state, polling_delay)) continue;
       last_poll = now;
       if (driving) is_currently_parked = false, last_active = now, stopped_polls = 0;
-      else if (!is_currently_parked && ++stopped_polls >= 3) is_currently_parked = true, energyOnDcRelease();
+      else if (!is_currently_parked && ++stopped_polls >= DC_RELEASE_POLLS) is_currently_parked = true, energyOnDcRelease();
       poll(frame, is_currently_parked);
       polls.push_back({now, dcAwakeHeld(current_state)});
     }
@@ -1839,16 +1839,25 @@ void dcLadderChecks() {
   }
 
   // A phone connected mid-charge keeps its own cadence; when it leaves the hold takes over and the wake stays up.
+  // Past MAX_AWAKE_MINUTES, as on a road trip with the app open: a DC charge is not backstopped in BLE either.
   Awake phone;
-  phone.run(10 * 60000UL, DRIVING, 14.9f, 0, true);
+  phone.run((MAX_AWAKE_MINUTES + 5) * 60000UL, DRIVING, 14.9f, 0, true);
   phone.charge(10, motion_ms);  // the person with the phone is at the car: only ACTIVE takes a connection to BLE
   phone.ble = true;
   phone.charge(10);
-  check(phone.current_state == BLE && !phone.dcAwakeHeld(BLE) && !phone.asleep, "a connected phone keeps the BLE cadence");
+  check(phone.current_state == BLE && !phone.dcAwakeHeld(BLE) && phone.g_dc_confirmed && !phone.asleep,
+        "a connected phone keeps the BLE cadence, and a DC charge in BLE is not backstopped");
   phone.ble = false;
   const size_t left = phone.polls.size();
   phone.charge(20);
   check(!phone.asleep && phone.heldFrom(left + 1), "after the phone leaves the DC hold holds the wake");
+  // A phone and no charge past MAX_AWAKE_MINUTES is still backstopped.
+  Awake idle_phone;
+  idle_phone.run((MAX_AWAKE_MINUTES + 5) * 60000UL, DRIVING, 14.9f, 0, true);
+  idle_phone.ble = true;
+  idle_phone.run(10 * 60000UL, UNPLUGGED, 14.9f, motion_ms);
+  check(idle_phone.asleep && idle_phone.sleep_reason && !strcmp(idle_phone.sleep_reason, "backstop"),
+        "a connected phone with no DC charge past MAX_AWAKE_MINUTES is backstopped");
 
   // Unplug and drive away: the hold ends at the first poll after the drive starts, at most one DC poll late.
   Awake away;
@@ -2029,23 +2038,26 @@ void dcAwakeChecks() {
   Dongle flap = held();
   flap.g_last_motion_ms = flap.now;
   flap.dcPromotePoke();
-  check(!flap.g_sample_poke && flap.ble_up, "motion promotes a held poke: BLE up and the streaming trust rule from now");
-  check(!flap.hold(dcFrame(31)) && !flap.g_dc_confirmed, "its next sample is not trusted yet, so regen is not DC");
-  flap.now += (unsigned long)ACTIVE_TIMER;
-  check(flap.hold(dcFrame(32)), "once still and trusted, the promoted wake holds again");
+  check(!flap.g_sample_poke && flap.ble_up, "motion promotes a held poke: BLE up");
+  check(flap.hold(dcFrame(31)) && flap.poll(dcFrame(31.2)).charging && flap.g_dc_confirmed,
+        "the promoted poke keeps the charge trusted (#128): is_charging, is_dcfc and DC_AWAKE stay");
   Dongle unheld;
   unheld.wake(14.9f, dcFrame(30, -12));
   unheld.g_last_motion_ms = unheld.now;
   unheld.dcPromotePoke();
   check(unheld.g_sample_poke && !unheld.ble_up, "a poke no DC charge holds is not promoted; it sleeps as before");
-  // A drive off a held poke on a car with no speed PID: regen at 60 kW after the promotion is never a charge.
+  // A drive off a promoted poke on a car with no speed PID: its first discharge ends the hold, and once the drive
+  // latch says DRIVING (#95's discharge override) regen at 60 kW is never a charge.
   Dongle regen = held();
   regen.g_last_motion_ms = regen.now;
   regen.dcPromotePoke();
+  regen.now += 5000;
+  regen.poll(dcFrame(31, 25));
+  check(!regen.g_dc_confirmed, "a discharge poll ends the hold");
   for (int i = 0; i < 6; ++i) {
     regen.now += 5000;
-    regen.poll(i % 2 ? dcFrame(31, 25) : dcFrame(31, -150));
-    check(!regen.g_dc_confirmed, "regen on a promoted poke is never held as DC");
+    regen.poll(i % 2 ? dcFrame(31, 25) : dcFrame(31, -150), false);
+    check(!regen.g_dc_confirmed, "regen on a drive off a promoted poke is never held as DC");
   }
 
   // An hour of somebody moving about the car during a DC charge (a streaming wake, 5 s polls) costs an hour of budget.
