@@ -282,9 +282,9 @@ inline void drivePollEnd() {
 
 // The early DC release's evidence from this poll's frame (#128). A veto: a speed key that is not finite and in
 // (-0.5, 0] (a garbled or reverse speed fails closed; above 0 is a drive, as loop() reads it), or a moving GNSS fix.
-// DC: a current below CHARGING_CURRENT_THRESHOLD at |V x I| >= DC_CHARGING_MIN_KW, the power energyOnPoll infers DC
-// from, or the car's own is_dcfc finite in (0, 255] (NaN or infinity is nothing: a garbled flag must not end a drive).
-// kw is |V x I|, NaN without both, for the log lines.
+// DC: the car's own is_dcfc decides when it is finite ((0, 255] is DC, 0 is not); otherwise (absent, NaN or infinite:
+// a garbled flag must not end a drive) a current below CHARGING_CURRENT_THRESHOLD at |V x I| >= DC_CHARGING_MIN_KW,
+// the power energyOnPoll infers DC from. kw is |V x I|, NaN without both, for the log lines.
 struct DcChargeEvidence {
   const char* veto;  // "speed", "gnss", or nullptr
   bool dc;
@@ -299,9 +299,17 @@ inline DcChargeEvidence driveDcChargeEvidence(const OBDVector& frame, bool gnss_
   double amps = 0, kw = 0, flag = 0;
   const bool iv = driveFrameIv(frame, &amps, &kw);
   if (iv) ev.kw = fabs(kw);
-  ev.dc = (iv && amps < CHARGING_CURRENT_THRESHOLD && ev.kw >= (double)DC_CHARGING_MIN_KW) ||
-          (driveFrameValue(frame, "is_dcfc", 0.0, 256.0, &flag) && flag <= 255.0);
+  if (driveFrameValue(frame, "is_dcfc", -INFINITY, INFINITY, &flag)) ev.dc = flag > 0.0 && flag <= 255.0;
+  else ev.dc = iv && amps < CHARGING_CURRENT_THRESHOLD && ev.kw >= (double)DC_CHARGING_MIN_KW;
   return ev;
+}
+
+// The log lines' kW: "?" without a V x I.
+struct DriveKwText { char text[12]; };
+inline DriveKwText driveKwText(double kw) {
+  DriveKwText t = {"?"};
+  if (kw >= 0.0) snprintf(t.text, sizeof(t.text), "%.0f", kw);
+  return t;
 }
 
 // After drivePollEnd(), before is_parked is appended, so the releasing poll's frame already carries the charge.
@@ -310,16 +318,13 @@ inline void driveDcCharge(const OBDVector& frame, bool gnss_moving) {
 #if DC_EARLY_HOLD
   const DriveRegion region = driveRegion();
   const DcChargeEvidence ev = driveDcChargeEvidence(frame, gnss_moving);
-#if ENABLE_LOGGING
-  char kw[12] = "?";
-  if (ev.kw >= 0.0) snprintf(kw, sizeof(kw), "%.0f", ev.kw);  // NaN: no V x I
-#endif
   if (region.state == DRIVE_PARKED || ev.veto || !ev.dc) {
     // The first reset of a started run, once per wake: GNSS drift under a charger's canopy shows here.
     const bool first_reset = region.state != DRIVE_PARKED && g_dc_release_polls && !g_dc_reset_logged;
 #if ENABLE_LOGGING
     if (first_reset)
-      logEvent("LEASH dc reset n=%u why=%s kw=%s", (unsigned)g_dc_release_polls, ev.veto ? ev.veto : "notdc", kw);
+      logEvent("LEASH dc reset n=%u why=%s kw=%s", (unsigned)g_dc_release_polls, ev.veto ? ev.veto : "notdc",
+        driveKwText(ev.kw).text);
 #endif
     if (first_reset) g_dc_reset_logged = true;
     g_dc_release_polls = 0;
@@ -332,7 +337,7 @@ inline void driveDcCharge(const OBDVector& frame, bool gnss_moving) {
   if (region.state == DRIVE_DRIVING) freezeParkedLocation();
   driveStore(next);
 #if ENABLE_LOGGING
-  logEvent("LEASH dc charge %skW x%u -> re-latch parked", kw, (unsigned)polls);
+  logEvent("LEASH dc charge %skW x%u -> re-latch parked", driveKwText(ev.kw).text, (unsigned)polls);
 #endif
   energyOnDcRelease();
 #else

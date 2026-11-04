@@ -659,6 +659,7 @@ ENERGY_UNEXTRACTED = (
     ("logger", "const unsigned pdw_left = pdwActive(pdw_now_us)", 1),
     # dcPromotePoke: run_energy_checks.py's Dongle runs it whole.
     ("logger", "energyOnPromote();", 1),
+    ("logger", "if (!g_last_discharge_ms) energyOnDcRelease();", 1),
 )
 
 

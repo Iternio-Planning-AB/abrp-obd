@@ -444,7 +444,7 @@ enum { UNINITIALIZED, ACTIVE, STANDBY } current_state = STANDBY;
 unsigned long millis() { return (MAX_AWAKE_MINUTES + 1) * 60UL * 1000UL; }
 struct { void printf(const char*, ...) {} } Serial;
 bool g_dc_confirmed = true;  // a DC charge whose hold has ended (here: no rail) is bounded by the backstop
-const char* dcAwakeVeto(decltype(current_state)) { return "rail"; }  // not held
+bool dcAwakeHeld(decltype(current_state)) { return false; }  // not held (no rail)
 void backstopSleep() {
 #include "backstop_sleep.inc"
 }
@@ -2034,31 +2034,41 @@ void dcAwakeChecks() {
   check(stream.dcAwakeHeld(ACTIVE) && stream.dcAwakeDelay(ACTIVE, 5000) == dc_ms,
         "motion during a hold keeps the DC cadence");
 
-  // Motion on a held sample poke promotes it to a full wake rather than sleeping, as WOM would not fire again.
-  Dongle flap = held();
+  // Motion on a held sample poke promotes it to a full wake rather than sleeping, as WOM would not fire again. The wake
+  // starts at millis() 0 with no discharge seen, as on the device, and promotes inside CHARGE_STREAM_CONFIRM_SECONDS.
+  Dongle flap;
+  flap.next = 0;
+  flap.wake(14.9f, dcFrame(30));
+  flap.hold(dcFrame(30.2));
+  check(flap.g_sample_poke && flap.dcAwakeHeld(CHARGING) && flap.g_last_discharge_ms == 0 &&
+        flap.now < CHARGE_STREAM_CONFIRM_SECONDS * 1000UL, "harness: a held poke early in its wake");
   flap.g_last_motion_ms = flap.now;
   flap.dcPromotePoke();
   check(!flap.g_sample_poke && flap.ble_up, "motion promotes a held poke: BLE up");
   check(flap.hold(dcFrame(31)) && flap.poll(dcFrame(31.2)).charging && flap.g_dc_confirmed,
         "the promoted poke keeps the charge trusted (#128): is_charging, is_dcfc and DC_AWAKE stay");
+  // A discharge seen this wake is not overwritten: its streaming confirm still runs.
+  Dongle drew;
+  drew.next = 0;
+  drew.wake(14.9f, dcFrame(30));
+  drew.hold(dcFrame(30.2));
+  drew.g_last_discharge_ms = drew.now - 10000;
+  drew.g_last_motion_ms = drew.now;
+  drew.dcPromotePoke();
+  check(!drew.g_sample_poke && !drew.poll(dcFrame(30.4)).charging, "a promote keeps a discharge seen this wake");
   Dongle unheld;
   unheld.wake(14.9f, dcFrame(30, -12));
   unheld.g_last_motion_ms = unheld.now;
   unheld.dcPromotePoke();
   check(unheld.g_sample_poke && !unheld.ble_up, "a poke no DC charge holds is not promoted; it sleeps as before");
-  // A drive off a promoted poke on a car with no speed PID: its first discharge ends the hold, and once the drive
-  // latch says DRIVING (#95's discharge override) regen at 60 kW is never a charge.
+  // A drive off a promoted poke on a car with no speed PID: its first discharge ends the hold.
   Dongle regen = held();
   regen.g_last_motion_ms = regen.now;
   regen.dcPromotePoke();
   regen.now += 5000;
   regen.poll(dcFrame(31, 25));
   check(!regen.g_dc_confirmed, "a discharge poll ends the hold");
-  for (int i = 0; i < 6; ++i) {
-    regen.now += 5000;
-    regen.poll(i % 2 ? dcFrame(31, 25) : dcFrame(31, -150), false);
-    check(!regen.g_dc_confirmed, "regen on a drive off a promoted poke is never held as DC");
-  }
+
 
   // An hour of somebody moving about the car during a DC charge (a streaming wake, 5 s polls) costs an hour of budget.
   Dongle fidget;

@@ -214,10 +214,10 @@ void handleActivityState() {
   // after a >55min drive) would be force-slept mid-flash / mid-dump. It restricts nothing - a driving
   // car is already exempt via is_currently_parked - and both transfers carry their own inactivity
   // timeouts (plus the OTA session cap) to bound the exposure.
-  // A DC charge the hold would keep (DC_EARLY_HOLD, #128; in the BLE state too, whose cadence stays the app's) is
-  // exempt: it often follows an hour's drive, and WAKE_CHARGING_MAX_MINUTES bounds it.
+  // A DC charge the hold would keep (DC_EARLY_HOLD, #128) is exempt, read as ACTIVE so the BLE state is too (its cadence
+  // stays the app's): it often follows an hour's drive, and WAKE_CHARGING_MAX_MINUTES bounds it.
   if (!maintenance_mode && !g_ota_active && !g_logdump_active && current_state != UNINITIALIZED &&
-      is_currently_parked && !(DC_EARLY_HOLD && g_dc_confirmed && !dcAwakeVeto(ACTIVE)) &&
+      is_currently_parked && !(DC_EARLY_HOLD && dcAwakeHeld(ACTIVE)) &&
       millis() > (unsigned long)MAX_AWAKE_MINUTES * 60UL * 1000UL) {
     Serial.printf("MAX_AWAKE backstop: awake %lus while parked -> forcing deep sleep\n", millis() / 1000UL);
 #if ENABLE_LOGGING

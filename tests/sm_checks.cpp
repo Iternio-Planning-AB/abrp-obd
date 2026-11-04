@@ -1690,9 +1690,9 @@ SmEvent Flag(SmEvent e, const char* key, double value) {
   return named(e, name.str());
 }
 // The release evidence from the event alone: an answered poll whose speed keys are all finite in (-0.5, 0] (a
-// garbled or reverse speed fails closed), with no moving fix, and the car's own is_dcfc finite in (0, 255], or a
-// charging current (its sign) at DC_CHARGING_MIN_KW by |V x I|, the power energyOnPoll infers DC from; a power key
-// plays no part. The first key of a name is the one read, as driveFrameValue does.
+// garbled or reverse speed fails closed), with no moving fix, and the car's own is_dcfc in (0, 255] when it is finite
+// (0 is not DC), else a charging current (its sign) at DC_CHARGING_MIN_KW by |V x I|, the power energyOnPoll infers
+// DC from; a power key plays no part. The first key of a name is the one read, as driveFrameValue does.
 bool dcEvidence(const SmEvent& e) {
   if (e.silent) return false;
   auto still = [](double v) { return v > -0.5 && v <= 0; };
@@ -1704,7 +1704,7 @@ bool dcEvidence(const SmEvent& e) {
   double flag = e.dcfc;
   for (const auto& kv : e.extra)
     if (!has_flag && kv.first == "is_dcfc") has_flag = true, flag = kv.second;
-  if (has_flag && flag > 0 && flag <= 255) return true;
+  if (has_flag && std::isfinite(flag)) return flag > 0 && flag <= 255;
   return within(e.current, -2000, 2000) && e.current < CHARGING_CURRENT_THRESHOLD && within(e.voltage, 0, 1000) &&
          std::fabs(e.current * e.voltage) / 1000.0 >= (double)DC_CHARGING_MIN_KW;
 }
@@ -1920,6 +1920,13 @@ void dcRules(int depth) {
   drive(SPEED);
   polls(Amps(Poll(SM_SPEED, -0.2), -125, 358), (int)DC_RELEASE_POLLS);
   check(is_currently_parked && dcCount("LEASH dc charge") == 1, "a speed of -0.2 is a standstill", t);
+  // A finite car is_dcfc decides: 0 vetoes 45 kW of V x I; a NaN one leaves it to V x I.
+  drive(NEITHER);
+  polls(Flag(still(NEITHER, -125), "is_dcfc", 0), 6);
+  check(!is_currently_parked && dcCount("LEASH dc charge") == 0, "the car's is_dcfc=0 outranks V x I", t);
+  drive(NEITHER);
+  polls(Flag(still(NEITHER, -125), "is_dcfc", NAN), (int)DC_RELEASE_POLLS);
+  check(is_currently_parked && dcCount("LEASH dc charge") == 1, "a NaN is_dcfc leaves the release to V x I", t);
   // The power key plays no part: V x I decides, as energyOnPoll's DC inference does.
   SmEvent low_power = still(NEITHER, -125);
   low_power.power = 10;

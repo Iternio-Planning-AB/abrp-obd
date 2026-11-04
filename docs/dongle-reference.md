@@ -430,8 +430,9 @@ awake.** Polling a sleeping EV wakes its ECUs, which then stay awake on the *car
     too; `WAKE_CHARGING_MAX_MINUTES` bounds it. `DC_EARLY_HOLD 0` is the rollback to the motion veto and the backstop.
   - **Early release** (#128): a fast charge right after a drive is seen within about three polls, not after the
     5-minute drive leash. While DRIVING or UNCONFIRMED, `DC_RELEASE_POLLS` (3) polls in a row at DC power (a current
-    under `CHARGING_CURRENT_THRESHOLD` at `DC_CHARGING_MIN_KW` by `|V x I|`, the power the DC inference uses, or the
-    car's own `is_dcfc` finite in (0, 255]; a power key, a car `is_charging` or a NaN flag counts for nothing)
+    under `CHARGING_CURRENT_THRESHOLD` at `DC_CHARGING_MIN_KW` by `|V x I|`, the power the DC inference uses; the
+    car's own `is_dcfc` decides instead when finite, (0, 255] being DC; a power key, a car `is_charging` or a NaN flag
+    counts for nothing)
     re-latch PARKED (a freeze from DRIVING) and trust that poll's charge sample, skipping
     `CHARGE_STREAM_CONFIRM_SECONDS`: the run is the regen guard. A speed key that is not finite in (-0.5, 0] or a
     fresh moving GNSS fix on any of the polls restarts the count. A car with neither relies on the run alone; the
