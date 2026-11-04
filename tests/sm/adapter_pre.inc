@@ -11,6 +11,8 @@
   X(bool, g_drive_gnss_refused, false) \
   X(unsigned long, g_last_obd_answer_ms, 0) \
   X(unsigned long, g_last_speed_ms, 0) \
+  X(uint8_t, g_dc_release_polls, 0) \
+  X(bool, g_dc_reset_logged, false) \
   X(unsigned long, last_active, 0) \
   X(ActivityState, current_state, UNINITIALIZED) \
   X(unsigned long, g_ble_disconnect_ms, 0) \
