@@ -11,13 +11,14 @@ chargeStateStale, the dcAwake* functions). The wake region is setup()'s RTC sani
 the ATRV read, the taper bridge and its give-up, the charge-end read, the follow-up, the poll decision, the alarm
 suppression, the counters and log lines, the weak-rail cold boot and the skip path. All are extracted with the same
 anchors from two places: OLD from the pinned commit (git show), CUR from the working tree. The context around them
-(the post-drive window at the ladder end, a sample poke's sleep after its poll, setup()'s last-poll stamp, the
+(the post-drive window at the ladder end, a sample poke's sleep after its poll, the
 weak-rail window's expiry and the recovery ahead of it, every sleep's modem override for that wake, loop()'s poll
 condition that decides whether a poll asks the car, the backstop, the delays) comes from the working tree for both
 sides, so a deliberate change there cannot fail the differential; a property checks that the shared backstop never
 sleeps a driving car. In the tree (#25) the energy block is energy_state.h's energyOnPoll, verbatim, with
 the helpers beside it: CUR inlines the header and runs loop()'s call site, and the three values the poll returns for
-the SAMPLE_POLL line are compared with OLD's locals.
+the SAMPLE_POLL line are compared with OLD's locals. Likewise (#26) the gate block and setup()'s last-poll stamp are
+wake_gate.h's wakeGateRun and gateStampPoll: CUR inlines the header and runs both call sites, OLD the pinned code.
 tests/sm_checks.cpp compiles each side into its own namespace around the same harness
 (tests/sm/adapter_*.inc) and runs identical event sequences through both, asserting equal outputs after
 every event: the latch, the leash and hold times, the marker debt and its crash copy, published is_parked,
@@ -40,7 +41,8 @@ motion; any answered poll stamps the last OBD answer. A wake carries the rail, t
 optional charge latch; the RTC clock and epoch run through sleeps, and a cold boot zeroes the clock until a poll.
 Before compiling, it checks that only drive_state.h assigns the park/drive storage, that alarm_gate.h names no
 drive state, and that every drive call is in an extracted block; likewise that only energy_state.h assigns the
-charging state and every energy call is in a compared block or at a named site (ENERGY_UNEXTRACTED). A poll reaches the car only when loop()'s poll
+charging state and every energy call is in a compared block or at a named site (ENERGY_UNEXTRACTED), and that only
+wake_gate.h assigns the gate's persisted state, its calls checked the same way (GATE_UNEXTRACTED). A poll reaches the car only when loop()'s poll
 condition holds (around it a profile is always loaded and the per-cycle alarm permit passes), so the property "a
 poll ran on a weak-rail wake" holds a weak-rail cold boot to the firmware's own veto (#104); it also checks that the
 condition has the veto as a term and guards the lazy init and the bus read, that every obd.readPIDs( and
@@ -60,8 +62,8 @@ than the config.h defaults with PRINT 0 (lines under #if PRINT and other branche
 outside the extracted blocks (the rest of handleActivityState, dcPromotePoke and motion inside a wake, the
 SAMPLE_POLL line, the modem, detectMovement timing, RTC retention, hardware); the wdt-streak sleeps before and after
 the gate; resets other than a deep-sleep wake, a power loss, a panic and a WDT (a brownout or software reset reloads
-RTC as those do, so the sanitize cannot show); the heartbeat (ENABLE_PARKED_HEARTBEAT 0, so the branch and
-heartbeat_asleep_streak are not compiled); the per-PID alarm guard inside readPIDs (alarmPollGuard), the deferred
+RTC as those do, so the sanitize cannot show); the heartbeat (ENABLE_PARKED_HEARTBEAT 0, so the branch is not
+compiled and loop()'s gateOnPollResult, which keeps heartbeat_asleep_streak, never runs); the per-PID alarm guard inside readPIDs (alarmPollGuard), the deferred
 OBD init and a missing profile (g_no_profile stays false); the loop's own phone-presence stamp (alarmGateService), so
 the setup permit's grace runs from the last permit read that saw the phone; bleRelaying(), which the pin asked and a
 phone with no relay session cannot tell from bleAuthenticated(); since_poll at the target's 32-bit width; GNSS power (a
@@ -110,8 +112,9 @@ PATHS = {"logger": "baseLogger/logger.ino", "machine": "baseLogger/Helpers/state
          "logging": "baseLogger/Helpers/logging.h", "drive_state": "baseLogger/Helpers/drive_state.h",
          "motion_stats": "baseLogger/Helpers/motion_stats.h", "config": "baseLogger/config.h",
          "alarm": "baseLogger/Helpers/alarm_gate.h"}
-# Not in PATHS: it does not exist at SM_PIN, so only the tree's sources carry it.
+# Not in PATHS: they do not exist at SM_PIN, so only the tree's sources carry them.
 ENERGY_STATE = "baseLogger/Helpers/energy_state.h"
+WAKE_GATE_H = "baseLogger/Helpers/wake_gate.h"
 
 
 # Code anchors only (never comment text), each failing with its own text when the code it names has moved.
@@ -131,6 +134,10 @@ LOGGED_DCFC = "        static int logged_dcfc = -1;"
 # The setup() wake gate (#82): the ATRV read, the taper bridge and its give-up, the charge-end read, the poll decision,
 # the counters and log lines, the weak-rail cold boot and the skip path, as one brace-matched block.
 WAKE_GATE = "  {\n    g_last_voltage = obd.getVoltage();\n"
+# In the tree (#26) the block is wake_gate.h's wakeGateRun, called here, and the last-poll stamp its gateStampPoll.
+WAKE_GATE_CALL = "  wakeGateRun(wake_cause);\n"
+STAMP = "  if (clockValid()) last_poll_epoch = rtc.getEpoch();"
+STAMP_CALL = "  gateStampPoll();"
 WEAK_EXPIRY = "    if (g_weak_rail_cold_boot && !maintenance_mode && !bleConnected() &&"
 WEAK_RECOVERED = ("    if (g_weak_rail_cold_boot && !maintenance_mode && g_last_io36 >= RAIL_AWAKE_VOLTS && "
                   "!(bleConnected() && authResetWindowOpen())) {")
@@ -186,10 +193,20 @@ def recipe(src, side):
     # Function-local, so a boot resets it (adapter_pre.inc SM_LOCAL), as a deep-sleep wake does.
     if statics.count(LOGGED_DCFC) != 1:
         sys.exit(f"FAIL: expected one {LOGGED_DCFC.strip()!r} in the energy block ({side})")
-    gate = find(logger, WAKE_GATE, what=where["logger"])
+    wake_gate_h = src.get("wake_gate_h")
+    gate_opener = WAKE_GATE if wake_gate_h is None else WAKE_GATE_CALL
+    gate = find(logger, gate_opener, what=where["logger"])
     under = logger.rfind("#if ENABLE_ATRV_GATE\n", 0, gate)
-    if logger.count(WAKE_GATE) != 1 or under < 0 or re.search(r"^\s*#", logger[under + 1:gate], re.M):
+    if logger.count(gate_opener) != 1 or under < 0 or re.search(r"^\s*#", logger[under + 1:gate], re.M):
         sys.exit(f"FAIL: expected one wake gate block, under #if ENABLE_ATRV_GATE with no directive between ({side})")
+    if wake_gate_h is None:
+        wake_gate, stamp = block(logger, WAKE_GATE, where["logger"]), line(logger, STAMP, where["logger"])
+    else:
+        if wake_gate_h.count("#pragma once\n") != 1 or '#include "' in wake_gate_h:
+            sys.exit(f"FAIL: {WAKE_GATE_H} must be one #pragma once and no project include, to inline it")
+        if not logger[gate + len(WAKE_GATE_CALL):].startswith("#endif\n") or "wakeGateRun(" in logger.replace(WAKE_GATE_CALL, ""):
+            sys.exit(f"FAIL: setup() must call wakeGateRun once, as {WAKE_GATE_CALL!r} directly before its #endif ({side})")
+        wake_gate, stamp = WAKE_GATE_CALL, line(logger, STAMP_CALL, where["logger"])
     for header in ("motion_stats", "drive_state"):
         if src[header].count("#pragma once\n") != 1 or '#include "' in src[header]:
             sys.exit(f"FAIL: {where[header]} must be one #pragma once and no project include, to inline it")
@@ -219,7 +236,10 @@ def recipe(src, side):
         "marker": block(src["sleep"], "  if (rtc.getEpoch() > 1e9 && is_currently_parked", where["sleep"]),
         "session": block(machine, "if (g_ota_active || g_logdump_active) {", where["machine"]),
         "backstop": block(machine, "if (!maintenance_mode && !g_ota_active && !g_logdump_active", where["machine"]),
-        "wake_gate": block(logger, WAKE_GATE, where["logger"]),
+        "wake_gate": wake_gate,
+        "stamp": stamp,
+        # Inlined, never #included, as energy_state.h. Only the tree has it; OLD's slot stays empty.
+        "wake_gate_h": wake_gate_h.replace("#pragma once\n", "") if wake_gate_h else "",
         "weak_awake_ms": line(logger, "static const uint32_t WEAK_RAIL_COLD_BOOT_AWAKE_MS = ", where["logger"]),
         "queue_helper": src["upload"][upload_start:upload_end],
         "energy_rail": logger[rail:find(logger, "\n#endif", rail, where["logger"]) + 1],
@@ -258,6 +278,7 @@ void sm_energy(OBDVector& current_frame, int obd_count) {{
 {energy}{energy_out}}}
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wsign-compare"  // the gate's `now > 1000000000UL` on the host's signed time_t
+{wake_gate_h}
 void sm_wake_gate(SmWakeCause wake_cause) {{
 {wake_gate}}}
 #pragma GCC diagnostic pop
@@ -309,6 +330,7 @@ void sm_motion_inputs(const SmEvent& e) {
 old_src = {k: pinned(p) for k, p in PATHS.items()}
 cur_src = {k: tree(p) for k, p in PATHS.items()}
 cur_src["energy_state"] = tree(ENERGY_STATE)
+cur_src["wake_gate_h"] = tree(WAKE_GATE_H)
 pin, cur = recipe(old_src, "SM_PIN"), recipe(cur_src, "tree")
 
 # The crash copy of the marker debt (#49, Helpers/wdt_streak.h): the setup() restore, the set after the buffer
@@ -323,10 +345,8 @@ if advance + cur["restore"] not in logger:
     sys.exit("FAIL: the marker restore must directly follow the streak advance in setup(), ahead of every sleep")
 cur["poke_sleep"] = line(logger, POKE_SLEEP, PATHS["logger"]).strip()[len("if ("):-len(") {")]
 cur["marker_set"] = line(logger, "    if (park_marker_owed) wdtStreakMarker(true);", PATHS["logger"])
-# Around the gate, from the tree for both sides: setup()'s last-poll stamp once the network is up, the weak-rail cold
-# boot's window expiry (inside the poll block, after the poll and before the poke's sleep) and every sleep's modem
-# override for that wake.
-cur["stamp"] = line(logger, "  if (clockValid()) last_poll_epoch = rtc.getEpoch();", PATHS["logger"])
+# Around the gate, from the tree for both sides: the weak-rail cold boot's window expiry (inside the poll block, after
+# the poll and before the poke's sleep) and every sleep's modem override for that wake.
 cur["weak_expiry"] = block(logger, WEAK_EXPIRY, PATHS["logger"])
 if not logger.index(cur["marker_set"]) < find(logger, WEAK_EXPIRY, what=PATHS["logger"]) < logger.index(POKE_SLEEP):
     sys.exit("FAIL: the weak-rail window expiry must follow the poll's buffer and marker set, before the poke's sleep")
@@ -393,9 +413,10 @@ DRIVE_BLOCKS = ("motion_stats", "drive_state", "drive", "emplace", "session", "m
 # Step 0b-1 (#81) adds the poll-side energy region the same way: the rail refresh, the energy block and the
 # helpers it calls come from SM_PIN for OLD.
 ENERGY_BLOCKS = ("energy_rail", "energy", "energy_helpers")
-# Step 0b-2 (#82) adds the setup() wake: the RTC sanitize and the whole gate block, with its skip path. The ladder's
-# post-drive window, the poke's sleep, the last-poll stamp and the weak-rail window stay shared context.
-WAKE_BLOCKS = ("sanitize", "wake_gate")
+# Step 0b-2 (#82) adds the setup() wake: the RTC sanitize and the whole gate block, with its skip path; step 4a (#26)
+# the last-poll stamp, which became a gate call. The ladder's post-drive window, the poke's sleep and the weak-rail
+# window stay shared context.
+WAKE_BLOCKS = ("sanitize", "wake_gate", "stamp")
 # Step 0b-3 (#83) adds the OBD-alarm permit the loop asks before every poll. The poll site itself is the adapter's,
 # pinned below by position.
 ALARM_BLOCKS = ("alarm",)
@@ -405,7 +426,7 @@ for name in PIN_BLOCKS:
     old[name] = pin[name]
 # The ladder end's post-drive window is shared context, from the tree's energy_state.h: OLD takes the two functions,
 # CUR has them inlined with the rest of the header.
-old["energy_state"], cur["ladder_end"] = "", ""
+old["energy_state"], old["wake_gate_h"], cur["ladder_end"] = "", "", ""
 old["energy_out"] = pin["energy_out"]
 old["ladder_end"] = (block(cur_src["energy_state"], "bool pdwOpenWindow() {", ENERGY_STATE) +
                      block(cur_src["energy_state"], "void pdwArmAtLadderEnd() {", ENERGY_STATE))
@@ -502,10 +523,12 @@ if (terms[-1] != "alarmGateAllowsPoll()" or len(reads) != 2 or len(outside) != 1
              "after the cycle's rail and GNSS refresh; the one other readPIDs is the gate's #else")
 
 # Step 1 (#24), extended by #6 to drive_unconfirmed and the refusal-streak flag: drive_state.h is the only code that
-# assigns the park/drive storage, and since step 3 (#25) energy_state.h the charging state. An assignment here is =, a
+# assigns the park/drive storage, since step 3 (#25) energy_state.h the charging state, and since step 4a (#26)
+# wake_gate.h the gate's persisted state. An assignment here is =, a
 # compound assignment (also chained), ++/--, taking the address or binding a reference (an alias could assign), or
 # swap(); matched on the whole file, so a statement split over lines is still seen. The storage is defined in
-# logger.ino until #27, so a definition there is exempt, but only at file scope: a local of the same name is not.
+# logger.ino (two gate fields in sleep_power.h) until #27, so a definition there is exempt, but only at file scope: a
+# local of the same name is not.
 # Blind spot: passing a field to a non-const reference parameter writes it unseen, as chargeCounterRose does inside
 # the energy owner; review must catch one outside it.
 DRIVE_STORAGE = ("is_currently_parked", "g_last_speed_ms", "park_marker_owed", "drive_unconfirmed", "g_drive_gnss_refused")
@@ -516,7 +539,14 @@ ENERGY_STORAGE = ("charging_fast_minutes", "dc_session", "charging_cap_latched",
                   "pdw_open", "pdw_open_us", "pdw_polls", "charge_last_evidence_us", "g_dc_confirmed",
                   "g_dc_inferred_polls", "g_dc_silent_since_ms", "g_fast_anchor_ms", "g_last_discharge_ms",
                   "g_pdw_ladder_done", "g_pdw_recheck")
-DEFINITION = re.compile(r"(?:^|\n)\s*(?:RTC_DATA_ATTR\s+)?(?:bool|uint8_t|uint32_t|uint64_t|double|unsigned\s+long)\s*$")
+# Step 4a (#26): the wake gate's persisted state. Not owned: the poke-lifetime flags g_sample_poke, g_taper_confirm and
+# g_rail_before_poke (also written by dcPromotePoke, energyOnPoll and the DC re-poke, by design; #27), g_last_voltage,
+# wdt_reset_count, g_next_wake_minutes and g_cadence_reason (4b) and g_alarm_flag.
+GATE_STORAGE = ("skips_count", "polls_count", "heartbeat_asleep_streak", "last_poll_epoch", "g_weak_rail_cold_boot")
+DEFINITION = re.compile(r"(?:^|\n)\s*(?:RTC_DATA_ATTR\s+)?(?:static\s+)?"
+                        r"(?:bool|uint8_t|uint32_t|uint64_t|double|float|time_t|unsigned\s+long)\s*$")
+# Where each field is defined, if not logger.ino: only there is a file-scope definition exempt.
+DEFINED_IN = {"last_poll_epoch": "sleep_power.h", "heartbeat_asleep_streak": "sleep_power.h"}
 
 
 def file_scope_blocks(code):
@@ -543,7 +573,8 @@ def writes(file_name, text, names):
         for m in re.finditer(rf"\b{name}\b", code):
             before, after = code[:m.start()].rstrip(), code[m.end():].lstrip()
             inside = any(a < m.start() < b for a, b in spans)
-            if file_name == "logger.ino" and not inside and DEFINITION.search(before) and after.startswith("="):
+            if (file_name == DEFINED_IN.get(name, "logger.ino") and not inside and DEFINITION.search(before)
+                    and after.startswith("=")):
                 continue  # its definition
             assigned = re.match(r"(?:[-+*/%&|^]|<<|>>)?=(?!=)|\+\+|--", after)
             stepped = before.endswith(("++", "--"))
@@ -564,15 +595,27 @@ ENERGY_FIXTURES = (("logger.ino", "void energyFixture() {\n  charge_followup = p
                    ("state_machine.h", "void energyFixture() {\n  recently_charging = false;\n}\n", ["recently_charging"]),
                    ("logger.ino", "void energyFixture() {\n  bool recently_charging = false;\n}\n", ["recently_charging"]),
                    ("logger.ino", "RTC_DATA_ATTR uint8_t charge_followup = 0;\n", []))
-for file_name, fixture, expected in ENERGY_FIXTURES:
-    text = next(p for p in firmware if p.name == file_name).read_text().rstrip("\n") + "\n"
-    first = text.count("\n") + 1
-    seen = [(number, name) for number, name in writes(file_name, text + fixture, ENERGY_STORAGE) if number >= first]
-    if sorted(name for _, name in seen) != sorted(expected):
-        sys.exit(f"FAIL: the energy ownership check saw {seen} in the fixture {fixture!r} on {file_name}, "
-                 f"expected {expected}")
+# A gate field written in logger.ino or in the file that defines it is seen; its definitions pass.
+GATE_FIXTURES = (("logger.ino", "void gateFixture() {\n  skips_count++;\n  polls_count += 1;\n}\n",
+                  ["skips_count", "polls_count"]),
+                 ("sleep_power.h", "void gateFixture() {\n  last_poll_epoch = 0;\n  ++heartbeat_asleep_streak;\n}\n",
+                  ["last_poll_epoch", "heartbeat_asleep_streak"]),
+                 ("logger.ino", "RTC_DATA_ATTR static time_t last_poll_epoch = 0;\n", ["last_poll_epoch"]),
+                 ("sleep_power.h", "RTC_DATA_ATTR static time_t last_poll_epoch = 0;\n"
+                                   "RTC_DATA_ATTR static uint32_t heartbeat_asleep_streak = 0;\n", []),
+                 ("logger.ino", "bool g_weak_rail_cold_boot = false;\nRTC_DATA_ATTR uint32_t skips_count = 0;\n", []))
+for fixtures, names in ((ENERGY_FIXTURES, ENERGY_STORAGE), (GATE_FIXTURES, GATE_STORAGE)):
+    for file_name, fixture, expected in fixtures:
+        text = next(p for p in firmware if p.name == file_name).read_text().rstrip("\n") + "\n"
+        first = text.count("\n") + 1
+        seen = [(number, name) for number, name in writes(file_name, text + fixture, names) if number >= first]
+        if sorted(name for _, name in seen) != sorted(expected):
+            sys.exit(f"FAIL: the ownership check saw {seen} in the fixture {fixture!r} on {file_name}, "
+                     f"expected {expected}")
+
 for path in firmware:
-    for owner, names, issue in (("drive_state.h", DRIVE_STORAGE, "#24"), ("energy_state.h", ENERGY_STORAGE, "#25")):
+    for owner, names, issue in (("drive_state.h", DRIVE_STORAGE, "#24"), ("energy_state.h", ENERGY_STORAGE, "#25"),
+                                ("wake_gate.h", GATE_STORAGE, "#26")):
         if path.name == owner:
             continue
         for number, name in writes(path.name, path.read_text(), names):
@@ -613,15 +656,16 @@ ENERGY_UNEXTRACTED = (
 )
 
 
-def energy_calls(text):
-    """Calls into the energy region in text, its definitions (a declaration at column 0) excluded."""
+def energy_calls(text, pattern=ENERGY_CALL):
+    """Calls into the energy region (or pattern's) in text, its definitions (a declaration at column 0) excluded."""
     code = code_only(text)
-    return sum(1 for m in re.finditer(ENERGY_CALL, code)
+    return sum(1 for m in re.finditer(pattern, code)
                if not code[code.rfind("\n", 0, m.start()) + 1:m.start()][:1].strip())
 
 
+# The inlined wake_gate.h counts as compared: CUR runs it whole from setup()'s call site.
 calls = sum(energy_calls(p.read_text()) for p in firmware if p.name != "energy_state.h")
-extracted = energy_calls("".join(cur[k] for k in PIN_BLOCKS))
+extracted = energy_calls("".join(cur[k] for k in PIN_BLOCKS + ("wake_gate_h",)))
 for key, site, count in ENERGY_UNEXTRACTED:
     found = [l for l in cur_src[key].splitlines() if l.strip() == site]
     if len(found) != count:
@@ -630,6 +674,24 @@ for key, site, count in ENERGY_UNEXTRACTED:
 if calls != extracted:
     sys.exit(f"FAIL: {calls} energy_state.h calls in the firmware but {extracted} in the compared blocks and the "
              "named sites; a call outside them is not compared against SM_PIN - extract its block or name it")
+
+# Likewise every call into wake_gate.h (#26), or at one of these sites: (file, code line, how many such lines).
+GATE_CALL = r"\b(?:gate[A-Z]\w*|wakeGateRun)\s*\("
+GATE_UNEXTRACTED = (
+    # loop()'s heartbeat back-off: ENABLE_PARKED_HEARTBEAT 0 here, so nothing reads the streak; a one-off build with
+    # the heartbeat on compiles it.
+    ("logger", "gateOnPollResult(obd_count); // the heartbeat back-off", 1),
+)
+calls = sum(energy_calls(p.read_text(), GATE_CALL) for p in firmware if p.name != "wake_gate.h")
+extracted = energy_calls("".join(cur[k] for k in PIN_BLOCKS), GATE_CALL)
+for key, site, count in GATE_UNEXTRACTED:
+    found = [l for l in cur_src[key].splitlines() if l.strip() == site]
+    if len(found) != count:
+        sys.exit(f"FAIL: expected {count} {site!r} in {PATHS[key]}, found {len(found)}; update GATE_UNEXTRACTED")
+    extracted += count * len(re.findall(GATE_CALL, code_only(site)))
+if calls != extracted:
+    sys.exit(f"FAIL: {calls} wake_gate.h calls in the firmware but {extracted} in the compared blocks and the named "
+             "sites; a call outside them is not compared against SM_PIN - extract its block or name it")
 
 # The weak-rail cold boot's veto (#104) covers every bus read in logger.ino, not only the one the harness runs: each
 # obd.readPIDs( sits inside an `if (` block whose && terms include it (the poll condition above, and the

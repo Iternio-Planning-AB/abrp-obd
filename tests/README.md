@@ -108,8 +108,10 @@ rail, the ATRV read, the alarm flag and an optional charge latch; the RTC epoch 
 zeroes the clock. A wake alphabet (17 symbols, about 1.4 M sequences at depth 5: each gate threshold, latched wakes in
 every give-up band, the ATRV threshold, a weak cold boot, an alarm-enforced poke) is enumerated beside the other two,
 and named scenarios cover the taper budget to its give-up, the charge-end read once per latch, a weak cold boot's BLE
-window and its modem-off expiry, and the counters and `since_poll` across wakes. setup()'s last-poll stamp, the weak-rail
-window's expiry and the sleep's modem override for it are shared context. So is `loop()`'s poll condition (#104): a
+window and its modem-off expiry, and the counters and `since_poll` across wakes. Since step 4a (#26) the CUR side is
+`Helpers/wake_gate.h`'s `wakeGateRun` and `gateStampPoll` (setup()'s last-poll stamp, now pinned for OLD too), and the
+runner fails if anything outside it assigns the gate's persisted state or if a gate call sits outside the compared
+blocks and its named sites. The weak-rail window's expiry and the sleep's modem override for it are shared context. So is `loop()`'s poll condition (#104): a
 poll reaches the car only when it holds, so the property "a poll ran on a weak-rail wake" holds a weak cold boot to the
 firmware's own veto (`!g_weak_rail_cold_boot`), and the named scenario checks that its window's cycles ask the car
 nothing. The veto never lifts within the wake, which ends when the window expires with no phone connected or when a
