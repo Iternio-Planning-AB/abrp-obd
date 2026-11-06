@@ -384,7 +384,15 @@ charge not latched, and the cadence kept under `SESSION_IDLE_MAX_MS`; and #128's
 `MAX_AWAKE_MINUTES` then a DC charge with people in the car (no sleep path while held, the backstop at the unplug), a
 flagged car still backstopped, the rail drop and the charge end sleeping through the ladder, a phone connected past
 `MAX_AWAKE_MINUTES` (not backstopped with a DC charge, backstopped without one) and leaving mid-charge, and a
-drive-away ending the hold at its first poll; a promoted held poke keeps the charge trusted), the ABD1 frame fitted to MTU−3 (`ble-frame`: compact 2 dp numbers, key filtering, priority trimming, MTU 23, and the `BLE tlm` log cadence), telemetry serialization and energy/temperature CSV columns under
+drive-away ending the hold at its first poll; a promoted held poke keeps the charge trusted), #131's silent retry
+(`silent-retry`: the real `silentRetryArm`/`silentRetryRailOk` run in time on the same ladder and poll gate with the
+poke's end block, compiled at `OBD_SILENT_RETRY_SECONDS` 45 and 0: a silent high-rail poke asks exactly once more 45 s
+later, an answered charge on the retry starts the cadence as one answered poll does, and a silent retry ends the wake
+with the same cadence, reason and counted inputs as one silent poll (follow-up, post-drive window, silent hold, past
+it); never on a partial answer, a lower rail, a cycle that asked nothing, delay 0, a later poll or a DC-held poll; a
+rail that falls during the wait sends nothing; motion does not extend the wake, a DC answer holds it and motion then
+promotes it, a serial session holds it at ACTIVE's cadence; the runner pins the exit ahead of everything that counts
+a poll and the rail term in both poll conditions; the sm differential never arms one), the ABD1 frame fitted to MTU−3 (`ble-frame`: compact 2 dp numbers, key filtering, priority trimming, MTU 23, and the `BLE tlm` log cadence), telemetry serialization and energy/temperature CSV columns under
 ASan/UBSan. Add `--profiles /path/to/profiles` to exercise actual Scenic/iX3 production/developer
 equations with the firmware parser (optional: the ABRP backend profiles are not public). The runner extracts the current charging and logging code;
 hardware is fake, not on-device verification. DataLogger schema rotation is owned by the diagnostics runner.
