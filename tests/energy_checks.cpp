@@ -2290,6 +2290,10 @@ void silentRetryChecks() {
   stream.g_sample_poke = false;
   check(!dc.silentRetryArm(true, 0) && !stream.silentRetryArm(true, 0),
         "only a sample poke the DC hold does not want arms the retry");
+  Poke<OBD_SILENT_RETRY_SECONDS> unused(14.9f, {}), spent(14.9f, {});
+  unused.g_last_io36 = spent.g_last_io36 = 12.6f;
+  spent.g_silent_retry = decltype(spent)::RETRY_SPENT;
+  check(unused.silentRetryRailOk() && spent.silentRetryRailOk(), "the rail veto holds back only an armed retry");
 
   // The converter went off during the modem attach: the wake's rail is high, the first poll's is not. No wait on battery.
   Poke<OBD_SILENT_RETRY_SECONDS> attach(14.9f, {});

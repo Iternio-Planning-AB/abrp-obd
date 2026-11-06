@@ -53,7 +53,7 @@ WORST_EVENT_ARGS = {
     "LEASH dc charge ": ("2000", 255),
     "LEASH dc reset ": (255, "notdc", "2000"),
     # #131: the wake's rail, a 32-bit delay and wait, and the outcome's whole 24-byte buffer.
-    "OBD retry armed ": (15.99, 4294967295),
+    "OBD retry armed ": (15.99, -99.99, 4294967295),
     "OBD retry after ": (4294967295, "x" * 23),
 }
 event_sources = logger + state_machine + energy + sleep + drive_state + wake_gate_h
