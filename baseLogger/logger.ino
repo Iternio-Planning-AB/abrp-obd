@@ -586,7 +586,8 @@ bool silentRetryArm(bool attempted, int obd_count) {
     g_silent_retry_ms = last_poll = millis();
     polling_delay = (unsigned long)OBD_SILENT_RETRY_SECONDS * 1000UL;
 #if ENABLE_LOGGING
-    logEvent("OBD retry armed rail=%.2f in=%lus", g_rail_before_poke, (unsigned long)OBD_SILENT_RETRY_SECONDS);
+    logEvent("OBD retry armed rail=%.2f live=%.2f in=%lus", g_rail_before_poke, g_last_io36,
+             (unsigned long)OBD_SILENT_RETRY_SECONDS);
 #endif
     return true;
   }
