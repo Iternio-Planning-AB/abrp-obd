@@ -2151,7 +2151,6 @@ void dcAwakeChecks() {
 #define ENABLE_LOGGING 1
 template <unsigned RETRY_S>
 struct Poke : Awake {
-  uint8_t g_silent_retry = 0;
   unsigned long g_silent_retry_ms = 0;
   std::vector<std::string> events;
   void logEvent(const char* format, ...) {
@@ -2163,6 +2162,7 @@ struct Poke : Awake {
     events.push_back(line);
   }
 #include "silent_retry.inc"
+  SilentRetry g_silent_retry = RETRY_UNUSED;
 #include "poke_sleeps.inc"
   std::vector<OBDVector> answers;  // the car's answer to each request in turn, silent past the end
   std::vector<unsigned long> requests;
@@ -2221,7 +2221,7 @@ bool sameOutcome(const A& a, const B& b) {
 }
 
 // #131: a high-rail poke whose first poll is fully silent stays awake and asks once more OBD_SILENT_RETRY_SECONDS
-// later. Only the final poll counts, so a silent retry ends the wake exactly as today's single silent poll did.
+// later. Only the final poll counts, so a silent retry ends the wake like any silent poll.
 void silentRetryChecks() {
   const unsigned long retry_ms = OBD_SILENT_RETRY_SECONDS * 1000UL, minute = 60000;
   static_assert(OBD_SILENT_RETRY_SECONDS > 0, "the shipped build retries");
@@ -2243,7 +2243,7 @@ void silentRetryChecks() {
   check(resumed.polls.size() == 1 && resumed.requests.size() == 2 && resumed.now - resumed.requests[1] <= 500,
         "the provisional poll is dropped and the poke sleeps after the retry");
 
-  // Acceptance 2: silent twice sleeps exactly as one silent poll did: same cadence, reason and counted inputs.
+  // Acceptance 2: silent twice ends the wake like one silent poll: same cadence, reason and counted inputs.
   struct Start { const char* what; void (*set)(ChargePoll&); };
   const Start starts[] = {
     {"an armed follow-up", [](ChargePoll& c) { c.charge_followup = 1; }},
@@ -2261,13 +2261,8 @@ void silentRetryChecks() {
     once.go(5 * minute);
     check(twice.requests.size() == 2 && once.requests.size() == 1 && sameOutcome(twice, once) &&
           twice.said(after + "silent"),
-          std::string("a silent retry sleeps as one silent poll did, from ") + s.what);
+          std::string("a silent retry ends the wake like one silent poll, from ") + s.what);
   }
-  Poke<OBD_SILENT_RETRY_SECONDS> followup(14.9f, {});
-  followup.charge_followup = 1;
-  followup.go(5 * minute);
-  check(followup.reason("followup") && followup.g_next_wake_minutes == WAKE_CHARGING_MINUTES && !followup.charge_followup,
-        "a silent retry still spends the follow-up: 3 minutes, reason followup");
 
   // Never armed: a partial answer, a rail under RAIL_AWAKE_VOLTS, a cycle that asked nothing, OBD_SILENT_RETRY_SECONDS 0.
   Poke<OBD_SILENT_RETRY_SECONDS> partial(14.9f, {{{"soc", 60}}});
@@ -2275,11 +2270,13 @@ void silentRetryChecks() {
   Poke<OBD_SILENT_RETRY_SECONDS> denied(14.9f, {});
   denied.denied = true;
   Poke<0> off(14.9f, {});
-  for (auto* p : {&partial, &taper, &denied}) p->go(5 * minute);
+  partial.go(5 * minute);
+  denied.go(5 * minute);
+  taper.go(5 * minute, 14.9f);  // the rail rose during the attach: energy still reads this poke at the taper band
   off.go(5 * minute);
   check(partial.requests.size() == 1 && partial.asleep && !partial.logged("OBD retry"), "a partial answer never retries");
   check(taper.requests.size() == 1 && taper.asleep && !taper.logged("OBD retry"),
-        "a rail under RAIL_AWAKE_VOLTS never retries");
+        "a wake rail under RAIL_AWAKE_VOLTS never retries, even with the live rail up");
   check(denied.requests.empty() && denied.asleep && denied.now <= 6000 && !denied.logged("OBD retry"),
         "a cycle that asked the car nothing never retries");
   check(off.requests.size() == 1 && off.asleep && off.now <= 6000 && !off.logged("OBD retry"),
@@ -2290,7 +2287,8 @@ void silentRetryChecks() {
   serial.maintenance_mode = true;
   serial.maintenance_since = 0;
   serial.go(minute + 30000);
-  check(!serial.asleep && serial.logged("OBD retry armed ") == 1 && serial.requests.size() >= 4 &&
+  check(!serial.asleep && serial.logged("OBD retry armed ") == 1 && serial.logged("OBD retry after ") == 1 &&
+        serial.requests.size() >= 4 &&
         serial.requests[2] - serial.requests[1] <= 5500,
         "a serial session holds the poke after the retry, at ACTIVE's cadence, and never arms a second retry");
   Poke<OBD_SILENT_RETRY_SECONDS> late(14.9f, {TOP_UP});
@@ -2305,7 +2303,16 @@ void silentRetryChecks() {
   check(!dc.silentRetryArm(true, 0) && !stream.silentRetryArm(true, 0),
         "only a sample poke the DC hold does not want arms the retry");
 
-  // The rail falls during the wait: the retry asks nothing, and the wake ends as one silent poll did.
+  // The converter went off during the modem attach: the wake's rail is high, the first poll's is not. No wait on battery.
+  Poke<OBD_SILENT_RETRY_SECONDS> attach(14.9f, {});
+  Poke<0> attach_once(14.9f, {});
+  attach.charge_followup = attach_once.charge_followup = 1;
+  attach.go(5 * minute, 12.7f);
+  attach_once.go(5 * minute, 12.7f);
+  check(attach.requests.size() == 1 && attach.now <= 6000 && !attach.logged("OBD retry") && sameOutcome(attach, attach_once),
+        "a live rail under RAIL_AWAKE_VOLTS at the first poll never arms: it sleeps as one silent poll");
+
+  // The rail falls during the wait: the retry asks nothing, and the wake ends like one silent poll.
   Poke<OBD_SILENT_RETRY_SECONDS> fell(14.9f, {});
   Poke<0> fell_once(14.9f, {});
   fell.charge_followup = fell_once.charge_followup = 1;
@@ -2313,7 +2320,7 @@ void silentRetryChecks() {
   fell.go(5 * minute, 12.7f);
   fell_once.go(5 * minute);
   check(fell.requests.size() == 1 && fell.logged(after + "skipped rail=12.70") == 1 &&
-        sameOutcome(fell, fell_once), "a rail that falls during the wait sends no second request and sleeps as today");
+        sameOutcome(fell, fell_once), "a rail that falls during the wait sends no second request and ends the wake like one silent poll");
 
   // Acceptance 3: motion during the wait does not extend a poke; a retry that answers a DC charge holds the wake, and
   // motion then promotes it, as on any held poke.

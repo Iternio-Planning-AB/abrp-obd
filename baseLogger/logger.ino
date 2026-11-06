@@ -181,9 +181,9 @@ bool logged_obd_state = false;
 // optional parked heartbeat). Lets the loop poll once and sleep immediately instead of idling the full ACTIVE
 // leash. A drive (motion) is NOT a sample poke - it streams via the normal state machine.
 bool g_sample_poke = false;
-// The silent retry (OBD_SILENT_RETRY_SECONDS, #131), RAM so every wake gets at most one: 0 before the wake's first
-// request, 1 armed (the first was silent and dropped), 2 spent. g_silent_retry_ms: when it was armed.
-uint8_t g_silent_retry = 0;
+// The silent retry (OBD_SILENT_RETRY_SECONDS, #131), RAM so every wake gets at most one. g_silent_retry_ms: when armed.
+enum SilentRetry : uint8_t { RETRY_UNUSED, RETRY_ARMED, RETRY_SPENT };  // ARMED: the first request was silent, dropped
+SilentRetry g_silent_retry = RETRY_UNUSED;
 unsigned long g_silent_retry_ms = 0;
 
 /*
@@ -507,8 +507,11 @@ static_assert(WEAK_RAIL_COLD_BOOT_AWAKE_MS > AUTH_RESET_WINDOW_MS,
 // A held DC charge's upload must reuse the session: its cadence plus a slow poll under the reopen limit.
 static_assert((unsigned long)DC_CHARGING_AWAKE_SECONDS * 1000UL + DC_CHARGING_POLL_MARGIN_MS <= SESSION_IDLE_MAX_MS,
   "a DC_CHARGING_AWAKE_SECONDS upload would reopen the session instead of reusing it");
-// The ladder must not leave ACTIVE during the wait: changeState would overwrite the retry's polling_delay.
-static_assert((unsigned long)OBD_SILENT_RETRY_SECONDS * 1000UL < (unsigned long)(ACTIVE_TIMER),
+// The ladder must not leave ACTIVE during the wait: changeState would overwrite the retry's polling_delay. A poke's
+// leash runs from boot, so the bound is the modem attach before the first poll, that poll (up to ~5 s on a silent car,
+// DC_CHARGING_POLL_MARGIN_MS covers it) and the wait.
+static_assert((unsigned long)CELL_REGISTRATION_PARKED_MS + DC_CHARGING_POLL_MARGIN_MS +
+              (unsigned long)OBD_SILENT_RETRY_SECONDS * 1000UL < (unsigned long)(ACTIVE_TIMER),
   "a silent retry must fire inside ACTIVE_TIMER");
 
 #if ENABLE_OTA
@@ -550,33 +553,36 @@ void bleBringUp() {
 }
 
 // A term of loop()'s poll condition: an armed retry asks the car only while the rail still says the converter is on.
-bool silentRetryRailOk() { return g_silent_retry != 1 || g_last_io36 >= RAIL_AWAKE_VOLTS; }
+bool silentRetryRailOk() { return g_silent_retry != RETRY_ARMED || g_last_io36 >= RAIL_AWAKE_VOLTS; }
 
 /*
   After a poll's log lines, before anything counts it (#131). true: this was a high-rail poke's first request and the
   car gave no PID at all, so the poll is provisional: loop() drops it (no heartbeat back-off, frame, energy, upload or
-  sleep) and the gate fires again OBD_SILENT_RETRY_SECONDS later. The retry's result is then the poll that counts, so a
-  silent retry ends the wake exactly as one silent poll did. The rail is the wake's (g_rail_before_poke), as
-  energyOnPoll's high-rail silence reads it; the retry's own request also needs the live rail (silentRetryRailOk).
+  sleep) and the gate fires again OBD_SILENT_RETRY_SECONDS later. Only the retry's result counts, so a silent retry
+  ends the wake like any silent poll. Both rails must be high: the wake's (g_rail_before_poke, which energyOnPoll's
+  high-rail silence reads) and this cycle's, so a converter that went off during the modem attach never buys a wait on
+  the 12 V battery; the retry's own request needs the live rail again (silentRetryRailOk).
 */
 bool silentRetryArm(bool attempted, int obd_count) {
-  if (g_silent_retry == 1) {
-    g_silent_retry = 2;
+  if (g_silent_retry == RETRY_ARMED) {
+    g_silent_retry = RETRY_SPENT;
     polling_delay = getPollingDelay(current_state);
 #if ENABLE_LOGGING
-    const unsigned long waited = (millis() - g_silent_retry_ms) / 1000UL;
-    if (!attempted) logEvent("OBD retry after %lus -> skipped rail=%.2f", waited, g_last_io36);
-    else if (obd_count > 0) logEvent("OBD retry after %lus -> answered %d pids", waited, obd_count);
-    else logEvent("OBD retry after %lus -> silent", waited);
+    char got[24];
+    if (!attempted) snprintf(got, sizeof(got), "skipped rail=%.2f", g_last_io36);
+    else if (obd_count > 0) snprintf(got, sizeof(got), "answered %d pids", obd_count);
+    else snprintf(got, sizeof(got), "silent");
+    logEvent("OBD retry after %lus -> %s", (millis() - g_silent_retry_ms) / 1000UL, got);
 #endif
     return false;
   }
-  if (!attempted || g_silent_retry) return false;  // only a request that was sent, and only the wake's first
-  g_silent_retry = 2;
+  if (!attempted || g_silent_retry != RETRY_UNUSED) return false;  // only a request that was sent, the wake's first
+  g_silent_retry = RETRY_SPENT;
 #if ENABLE_IO36_RAIL
+  // !g_dc_confirmed is a guard: no poll has set it before the wake's first, but a held DC charge must never arm.
   if (OBD_SILENT_RETRY_SECONDS > 0 && g_sample_poke && obd_count == 0 && !g_dc_confirmed &&
-      g_rail_before_poke >= RAIL_AWAKE_VOLTS) {
-    g_silent_retry = 1;
+      g_rail_before_poke >= RAIL_AWAKE_VOLTS && g_last_io36 >= RAIL_AWAKE_VOLTS) {
+    g_silent_retry = RETRY_ARMED;
     g_silent_retry_ms = last_poll = millis();
     polling_delay = (unsigned long)OBD_SILENT_RETRY_SECONDS * 1000UL;
 #if ENABLE_LOGGING

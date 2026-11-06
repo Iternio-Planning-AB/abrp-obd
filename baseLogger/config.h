@@ -562,8 +562,7 @@
 // alternated. That fits an ECU or gateway that needs the first request, or some time, to wake. The wait stays awake
 // (modem up) rather than deep-sleeping: a sleep reboots through setup() and pays another ~10 s attach and a TLS open,
 // and a high rail means the converter, not the 12 V battery, pays for the ~45 s plus the 5 s rail-after delay.
-// The silent first poll is dropped; only the retry counts, so a silent retry sleeps exactly as today. Never on a
-// partial answer, a lower rail, a held DC charge or a cycle that asked nothing; at most once a wake. 0 = off.
+// Only the retry counts, so a silent retry ends the wake like any silent poll. 0 = off.
 #ifndef OBD_SILENT_RETRY_SECONDS
 #define OBD_SILENT_RETRY_SECONDS 45
 #endif
