@@ -15,7 +15,7 @@ def line(text, prefix):
 
 arguments = argparse.ArgumentParser()
 arguments.add_argument("group", nargs="?", default="all",
-                       choices=["all", "progress", "signal", "release", "corroboration", "wake-gate", "logging", "transport", "sleep-reason", "wdt-streak", "ble-frame", "dc-awake", "profiles"])
+                       choices=["all", "progress", "signal", "release", "corroboration", "wake-gate", "logging", "transport", "sleep-reason", "wdt-streak", "ble-frame", "dc-awake", "silent-retry", "profiles"])
 arguments.add_argument("--profiles", type=Path)
 args = arguments.parse_args()
 if args.group == "profiles" and args.profiles is None:
@@ -52,6 +52,9 @@ WORST_EVENT_ARGS = {
     # #128: kw is at most |2000 A x 1000 V| or |1000 kW| (driveFrameValue's ranges), the count at most 255.
     "LEASH dc charge ": ("2000", 255),
     "LEASH dc reset ": (255, "notdc", "2000"),
+    # #131: the wake's rail, a 32-bit delay and wait, and the outcome's whole 24-byte buffer.
+    "OBD retry armed ": (15.99, -99.99, 4294967295),
+    "OBD retry after ": (4294967295, "x" * 23),
 }
 event_sources = logger + state_machine + energy + sleep + drive_state + wake_gate_h
 # The host stand-in for the streak store keeps its bytes across boots, as RTC_NOINIT_ATTR does and
@@ -100,6 +103,20 @@ for gate in ("( millis() - last_poll ) > dcAwakeDelay(current_state, polling_del
              "    dcPromotePoke();\n    if (g_sample_poke && !maintenance_mode"):
     if logger.count(gate) != 1:
         raise SystemExit(f"FAIL: the loop's upload and poll gates must take the DC hold exactly once: {gate}")
+# #131: a silent first poll of a high-rail poke is provisional. Its exit sits after the poll's log lines and ahead of
+# everything that counts a poll (the heartbeat back-off, the frame, energyOnPoll, the upload and the poke's sleep);
+# the retry's rail term vetoes the second request in both poll conditions.
+retry_exit = ("    if (silentRetryArm(obd_read_attempted, obd_count)) return;\n"
+              "    gateOnPollResult(obd_count); // the heartbeat back-off\n    scrubGeoMetadata(current_frame);\n")
+retry_at = logger.find(retry_exit)
+if (logger.count(retry_exit) != 1 or logger.count("gateOnPollResult(") != 1 or logger.count("silentRetryArm(") != 2
+        or not logger.index('logEvent("OBD no response') < retry_at < logger.index("const EnergyPoll ep = energyOnPoll(")):
+    raise SystemExit("FAIL: loop() must drop a provisional poll (silentRetryArm) after its log lines, ahead of the "
+                     f"heartbeat back-off and everything else that counts a poll: {retry_exit!r}")
+for condition in ("    if (!g_no_profile && !g_weak_rail_cold_boot && silentRetryRailOk() && alarmGateAllowsPoll()) {\n",
+                  "    if (!g_weak_rail_cold_boot && silentRetryRailOk()) {\n"):
+    if logger.count(condition) != 1:
+        raise SystemExit(f"FAIL: the retry's live-rail check must veto the request in loop()'s poll condition: {condition!r}")
 # Only detectMovement() stamps the motion that vetoes the hold (not the console or an unlatch, via last_active).
 mems = (root / "baseLogger/Helpers/mems.h").read_text()
 if mems.count("last_active = g_last_motion_ms = millis();") != 1 or (logger + state_machine).count("g_last_motion_ms = ") != 1:
@@ -111,7 +128,7 @@ with tempfile.TemporaryDirectory(prefix="obd-energy-checks-") as temporary:
         r"CHARGE_RELEASE_POLLS|CHARGE_SILENT_HOLD_POLLS|CHARGE_STALE_RESET_MINUTES|CHARGE_CORROBORATE_MINUTES|WAKE_PARKED_MINUTES|"
         r"WAKE_CHARGING_MINUTES|WAKE_DC_CHARGING_MINUTES|WAKE_CHARGING_MAX_MINUTES|CLOCK_MAX_EPOCH|GEO_MAX_SEND_AGE_SECONDS|RAIL_AWAKE_VOLTS|RAIL_TAPER_FLOOR|"
         r"CHARGE_END_POLL_FLOOR|MAX_AWAKE_MINUTES|TAPER_CONFIRM_MAX_WAKES|IO36_LOCKOUT_\w+|POST_DRIVE_\w+|OBD_ALARM_GATE|ENABLE_IO36_RAIL|DC_CHARGING_MIN_KW|DC_CHARGING_AWAKE_SECONDS|"
-        r"SESSION_IDLE_MAX_MS|CHARGING_TIMER|ACTIVE_TIMER|DC_CHARGING_POLL_MARGIN_MS|DC_EARLY_HOLD|DC_RELEASE_POLLS|BLE_CONNECTED_HOLDS_AWAKE)\b.*(?:\n[ \t]+.*)*",
+        r"SESSION_IDLE_MAX_MS|CHARGING_TIMER|ACTIVE_TIMER|DC_CHARGING_POLL_MARGIN_MS|DC_EARLY_HOLD|DC_RELEASE_POLLS|BLE_CONNECTED_HOLDS_AWAKE|OBD_SILENT_RETRY_SECONDS)\b.*(?:\n[ \t]+.*)*",
         config, re.MULTILINE)))
     # loop()'s poll is energyOnPoll (energy_state.h), sliced at the same code; its call site runs dcAwakeTrack() next.
     call_site = "    const EnergyPoll ep = energyOnPoll(current_frame, obd_count);\n    dcAwakeTrack();\n"
@@ -206,6 +223,9 @@ with tempfile.TemporaryDirectory(prefix="obd-energy-checks-") as temporary:
     ladder_fn = block(state_machine, "void handleActivityState() {")
     start = ladder_fn.index("  auto now = millis();\n")
     (build / "awake_ladder.inc").write_text(ladder_fn[start:ladder_fn.rindex("}")])
+    (build / "silent_retry.inc").write_text(line(logger, "enum SilentRetry : uint8_t {") +
+                                            block(logger, "bool silentRetryRailOk() {") +
+                                            block(logger, "bool silentRetryArm(bool attempted, int obd_count) {"))
     (build / "polling_delay.inc").write_text(block(state_machine, "unsigned long getPollingDelay("))
     start = logger.index("    if (g_sample_poke && !maintenance_mode") + len("    if (")
     end = logger.index(") {\n", start)

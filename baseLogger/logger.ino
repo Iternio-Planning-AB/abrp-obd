@@ -181,6 +181,10 @@ bool logged_obd_state = false;
 // optional parked heartbeat). Lets the loop poll once and sleep immediately instead of idling the full ACTIVE
 // leash. A drive (motion) is NOT a sample poke - it streams via the normal state machine.
 bool g_sample_poke = false;
+// The silent retry (OBD_SILENT_RETRY_SECONDS, #131), RAM so every wake gets at most one. g_silent_retry_ms: when armed.
+enum SilentRetry : uint8_t { RETRY_UNUSED, RETRY_ARMED, RETRY_SPENT };  // ARMED: the first request was silent, dropped
+SilentRetry g_silent_retry = RETRY_UNUSED;
+unsigned long g_silent_retry_ms = 0;
 
 /*
   This wake is a POWER-ON boot whose rail is in the weak-battery band, so the ATRV gate refused the poll -
@@ -503,6 +507,12 @@ static_assert(WEAK_RAIL_COLD_BOOT_AWAKE_MS > AUTH_RESET_WINDOW_MS,
 // A held DC charge's upload must reuse the session: its cadence plus a slow poll under the reopen limit.
 static_assert((unsigned long)DC_CHARGING_AWAKE_SECONDS * 1000UL + DC_CHARGING_POLL_MARGIN_MS <= SESSION_IDLE_MAX_MS,
   "a DC_CHARGING_AWAKE_SECONDS upload would reopen the session instead of reusing it");
+// The ladder must not leave ACTIVE during the wait: changeState would overwrite the retry's polling_delay. A poke's
+// leash runs from boot, so the bound is the modem attach before the first poll, that poll (up to ~5 s on a silent car,
+// DC_CHARGING_POLL_MARGIN_MS covers it) and the wait.
+static_assert((unsigned long)CELL_REGISTRATION_PARKED_MS + DC_CHARGING_POLL_MARGIN_MS +
+              (unsigned long)OBD_SILENT_RETRY_SECONDS * 1000UL < (unsigned long)(ACTIVE_TIMER),
+  "a silent retry must fire inside ACTIVE_TIMER");
 
 #if ENABLE_OTA
 /*
@@ -540,6 +550,49 @@ void bleBringUp() {
     ble.set_profile_sig_hook(profileSigAppend); // ABD2 {"JWS":...} -> phase-B signed profile
   }
 #endif
+}
+
+// A term of loop()'s poll condition: an armed retry asks the car only while the rail still says the converter is on.
+bool silentRetryRailOk() { return g_silent_retry != RETRY_ARMED || g_last_io36 >= RAIL_AWAKE_VOLTS; }
+
+/*
+  After a poll's log lines, before anything counts it (#131). true: this was a high-rail poke's first request and the
+  car gave no PID at all, so the poll is provisional: loop() drops it (no heartbeat back-off, frame, energy, upload or
+  sleep) and the gate fires again OBD_SILENT_RETRY_SECONDS later. Only the retry's result counts, so a silent retry
+  ends the wake like any silent poll. Both rails must be high: the wake's (g_rail_before_poke, which energyOnPoll's
+  high-rail silence reads) and this cycle's, so a converter that went off during the modem attach never buys a wait on
+  the 12 V battery; the retry's own request needs the live rail again (silentRetryRailOk).
+*/
+bool silentRetryArm(bool attempted, int obd_count) {
+  if (g_silent_retry == RETRY_ARMED) {
+    g_silent_retry = RETRY_SPENT;
+    polling_delay = getPollingDelay(current_state);
+#if ENABLE_LOGGING
+    char got[24];
+    if (!attempted) snprintf(got, sizeof(got), "skipped rail=%.2f", g_last_io36);
+    else if (obd_count > 0) snprintf(got, sizeof(got), "answered %d pids", obd_count);
+    else snprintf(got, sizeof(got), "silent");
+    logEvent("OBD retry after %lus -> %s", (millis() - g_silent_retry_ms) / 1000UL, got);
+#endif
+    return false;
+  }
+  if (!attempted || g_silent_retry != RETRY_UNUSED) return false;  // only a request that was sent, the wake's first
+  g_silent_retry = RETRY_SPENT;
+#if ENABLE_IO36_RAIL
+  // !g_dc_confirmed is a guard: no poll has set it before the wake's first, but a held DC charge must never arm.
+  if (OBD_SILENT_RETRY_SECONDS > 0 && g_sample_poke && obd_count == 0 && !g_dc_confirmed &&
+      g_rail_before_poke >= RAIL_AWAKE_VOLTS && g_last_io36 >= RAIL_AWAKE_VOLTS) {
+    g_silent_retry = RETRY_ARMED;
+    g_silent_retry_ms = last_poll = millis();
+    polling_delay = (unsigned long)OBD_SILENT_RETRY_SECONDS * 1000UL;
+#if ENABLE_LOGGING
+    logEvent("OBD retry armed rail=%.2f live=%.2f in=%lus", g_rail_before_poke, g_last_io36,
+             (unsigned long)OBD_SILENT_RETRY_SECONDS);
+#endif
+    return true;
+  }
+#endif
+  return false;
 }
 
 /*
@@ -1370,7 +1423,7 @@ void loop() {
     // further down still runs. Ahead of alarmGateAllowsPoll(), so a flagged car logs no DENY for it (#104).
     OBDVector current_frame{};
     bool obd_read_attempted = false;
-    if (!g_no_profile && !g_weak_rail_cold_boot && alarmGateAllowsPoll()) {
+    if (!g_no_profile && !g_weak_rail_cold_boot && silentRetryRailOk() && alarmGateAllowsPoll()) {
       if (g_obd_needs_init) {
         obd.initialize();
         g_obd_needs_init = false;
@@ -1388,7 +1441,7 @@ void loop() {
     // No alarm gate, but the weak-rail cold boot's veto still holds (#104): its cycles ask the car nothing.
     OBDVector current_frame{};
     bool obd_read_attempted = false;
-    if (!g_weak_rail_cold_boot) {
+    if (!g_weak_rail_cold_boot && silentRetryRailOk()) {
 #if ENABLE_LOGGING
       obd.fail_known = obd.pids_hash == obd_fail_profile ? obd_fail_logged : 0;  // #85: only new failures kept
 #endif
@@ -1410,7 +1463,6 @@ void loop() {
     // the alarm gate reads it. Re-reading here would only make the telemetry row's rail marginally
     // fresher while re-opening the stale-input bug the hoist fixed if the two ever got reordered.
 
-    gateOnPollResult(obd_count); // the heartbeat back-off
     if (obd_count > 0) { g_last_obd_answer_ms = millis(); }
 #if ENABLE_LOGGING
     if (obd_read_attempted) {
@@ -1518,6 +1570,8 @@ void loop() {
     }
 #endif
 
+    if (silentRetryArm(obd_read_attempted, obd_count)) return;
+    gateOnPollResult(obd_count); // the heartbeat back-off
     scrubGeoMetadata(current_frame);
 #if ENABLE_GPS
     // gd was refreshed at the top of this cycle (the alarm gate needs the movement verdict before it

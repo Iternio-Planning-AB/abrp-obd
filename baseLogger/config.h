@@ -556,6 +556,16 @@
 // the state stale enough to drop, so a car whose rail never falls (a 12 V maintainer) starts its next real
 // charge fresh. 6 h is past any pause inside one session and short of the gap between two.
 #define CHARGE_STALE_RESET_MINUTES 360
+// A sample poke at a rail >= RAIL_AWAKE_VOLTS whose poll got no PID at all stays awake and asks once more this many
+// seconds later (#131). FIELD (AC charge, a scheduled pause): two wakes at a 14.8 V rail each got "no response" on
+// their one poll and the resumed charge was first seen about an hour later; mid-charge, answered and silent polls
+// alternated. That fits an ECU or gateway that needs the first request, or some time, to wake. The wait stays awake
+// (modem up) rather than deep-sleeping: a sleep reboots through setup() and pays another ~10 s attach and a TLS open,
+// and a high rail means the converter, not the 12 V battery, pays for the ~45 s plus the 5 s rail-after delay.
+// Only the retry counts, so a silent retry ends the wake like any silent poll. 0 = off.
+#ifndef OBD_SILENT_RETRY_SECONDS
+#define OBD_SILENT_RETRY_SECONDS 45
+#endif
 
 // ---- Adaptive wake cadence (Feature B) ----
 // The next deep-sleep timer is chosen PER-SLEEP from what this wake observed - there is no persistent "mode":

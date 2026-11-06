@@ -2128,6 +2128,206 @@ void dcAwakeChecks() {
   check(taper.g_dc_confirmed && taper.taper_confirm_wakes <= 1, "held polls do not spend the taper stall budget");
 }
 
+// A sample poke in time (#131), RETRY_S standing for OBD_SILENT_RETRY_SECONDS: the Awake ladder and loop()'s poll gate,
+// the retry's rail term of the poll condition, the car's answer, silentRetryArm (extracted whole), then the energy poll
+// and the poke's end block in loop()'s order. run_energy_checks.py pins the call sites this models.
+#pragma push_macro("OBD_SILENT_RETRY_SECONDS")
+#pragma push_macro("ENABLE_LOGGING")
+#undef OBD_SILENT_RETRY_SECONDS
+#undef ENABLE_LOGGING
+#define OBD_SILENT_RETRY_SECONDS RETRY_S
+#define ENABLE_LOGGING 1
+template <unsigned RETRY_S>
+struct Poke : Awake {
+  unsigned long g_silent_retry_ms = 0;
+  std::vector<std::string> events;
+  void logEvent(const char* format, ...) {
+    char line[256];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(line, sizeof(line), format, args);
+    va_end(args);
+    events.push_back(line);
+  }
+#include "silent_retry.inc"
+  SilentRetry g_silent_retry = RETRY_UNUSED;
+#include "poke_sleeps.inc"
+  std::vector<OBDVector> answers;  // the car's answer to each request in turn, silent past the end
+  std::vector<unsigned long> requests;
+  int energy_polls = 0;
+  bool denied = false;  // the alarm gate, a missing profile or a weak-rail veto: the cycle asks nothing
+  Poke(float rail, std::vector<OBDVector> car) : answers(std::move(car)) {
+    g_sample_poke = true;
+    g_rail_before_poke = g_last_io36 = rail;
+  }
+  // ms of loop passes; the rail each pass reads, motion every motion_ms (0: none). Stops at a sleep.
+  Poke& go(unsigned long ms, float rail = -1, unsigned long motion_ms = 0) {
+    if (rail < 0) rail = g_rail_before_poke;
+    for (const unsigned long end = now + ms; now < end && !asleep;) {
+      now += 500;
+      g_last_io36 = rail;
+      active = motion_ms && now % motion_ms == 0;
+      if (active) last_active = g_last_motion_ms = now;
+      ladder();
+      dcPromotePoke();
+      if (asleep || now - last_poll <= dcAwakeDelay(current_state, polling_delay)) continue;
+      OBDVector frame;
+      const bool attempted = !denied && silentRetryRailOk();
+      if (attempted) {
+        frame = requests.size() < answers.size() ? answers[requests.size()] : SILENT;
+        requests.push_back(now);
+      }
+      if (silentRetryArm(attempted, (int)frame.size())) continue;
+      energy_polls++;
+      poll(frame);
+      last_poll = now;
+      polls.push_back({now, dcAwakeHeld(current_state)});
+      dcPromotePoke();
+      if (sleeps()) enterDeepSleep(true);
+    }
+    return *this;
+  }
+  int logged(const std::string& prefix) const {
+    return (int)std::count_if(events.begin(), events.end(),
+                              [&](const std::string& e) { return e.compare(0, prefix.size(), prefix) == 0; });
+  }
+  bool said(const std::string& line) const { return std::find(events.begin(), events.end(), line) != events.end(); }
+};
+#pragma pop_macro("ENABLE_LOGGING")
+#pragma pop_macro("OBD_SILENT_RETRY_SECONDS")
+
+// What the next wake inherits from a poke: the cadence and its reason, and every one-shot or counted charge input.
+template <class A, class B>
+bool sameOutcome(const A& a, const B& b) {
+  return a.asleep && b.asleep && a.g_next_wake_minutes == b.g_next_wake_minutes &&
+         ((!a.g_cadence_reason && !b.g_cadence_reason) ||
+          (a.g_cadence_reason && b.g_cadence_reason && !strcmp(a.g_cadence_reason, b.g_cadence_reason))) &&
+         a.recently_charging == b.recently_charging && a.charge_followup == b.charge_followup &&
+         a.pdw_polls == b.pdw_polls && a.charge_silent_polls == b.charge_silent_polls &&
+         a.charge_release_polls == b.charge_release_polls && a.charging_fast_minutes == b.charging_fast_minutes &&
+         a.dc_session == b.dc_session && a.energy_polls == 1 && b.energy_polls == 1;
+}
+
+// #131: a high-rail poke whose first poll is fully silent stays awake and asks once more OBD_SILENT_RETRY_SECONDS
+// later. Only the final poll counts, so a silent retry ends the wake like any silent poll.
+void silentRetryChecks() {
+  const unsigned long retry_ms = OBD_SILENT_RETRY_SECONDS * 1000UL, minute = 60000;
+  static_assert(OBD_SILENT_RETRY_SECONDS > 0, "the shipped build retries");
+  const OBDVector CHARGE = {{"current", -12.0}, {"soc", 60}};
+  const std::string after = "OBD retry after " + std::to_string(OBD_SILENT_RETRY_SECONDS) + "s -> ";
+
+  // Acceptance 1: silent, then the retry answers a charge: the charge cadence starts, as one answered poll starts it.
+  Poke<OBD_SILENT_RETRY_SECONDS> resumed(14.9f, {SILENT, CHARGE});
+  Poke<0> answered(14.9f, {CHARGE});
+  resumed.go(5 * minute);
+  answered.go(5 * minute);
+  check(resumed.requests.size() == 2 && resumed.requests[1] - resumed.requests[0] > retry_ms &&
+        resumed.requests[1] - resumed.requests[0] <= retry_ms + 500,
+        "a silent high-rail poke asks the car exactly once more, OBD_SILENT_RETRY_SECONDS after the first poll");
+  check(resumed.recently_charging && resumed.g_next_wake_minutes == WAKE_CHARGING_MINUTES &&
+        sameOutcome(resumed, answered), "a retry that answers a charge starts the charge cadence, as an answered poll does");
+  check(resumed.logged("OBD retry armed ") == 1 && resumed.said(after + "answered 2 pids"),
+        "the retry logs its arming and its outcome");
+  check(resumed.polls.size() == 1 && resumed.requests.size() == 2 && resumed.now - resumed.requests[1] <= 500,
+        "the provisional poll is dropped and the poke sleeps after the retry");
+
+  // Acceptance 2: silent twice ends the wake like one silent poll: same cadence, reason and counted inputs.
+  struct Start { const char* what; void (*set)(ChargePoll&); };
+  const Start starts[] = {
+    {"an armed follow-up", [](ChargePoll& c) { c.charge_followup = 1; }},
+    {"the post-drive window", [](ChargePoll& c) { c.pdw_open = 1; c.pdw_open_us = 0; }},
+    {"a latched charge in its silent hold", [](ChargePoll& c) { c.recently_charging = true; c.prev_charge_soc = 60; }},
+    {"a latched charge past its silent hold", [](ChargePoll& c) {
+       c.recently_charging = true; c.charge_silent_polls = CHARGE_SILENT_HOLD_POLLS; }},
+  };
+  for (const Start& s : starts) {
+    Poke<OBD_SILENT_RETRY_SECONDS> twice(14.9f, {});
+    Poke<0> once(14.9f, {});
+    s.set(twice);
+    s.set(once);
+    twice.go(5 * minute);
+    once.go(5 * minute);
+    check(twice.requests.size() == 2 && once.requests.size() == 1 && sameOutcome(twice, once) &&
+          twice.said(after + "silent"),
+          std::string("a silent retry ends the wake like one silent poll, from ") + s.what);
+  }
+
+  // Never armed: a partial answer, a rail under RAIL_AWAKE_VOLTS, a cycle that asked nothing, OBD_SILENT_RETRY_SECONDS 0.
+  Poke<OBD_SILENT_RETRY_SECONDS> partial(14.9f, {{{"soc", 60}}});
+  Poke<OBD_SILENT_RETRY_SECONDS> taper(13.1f, {});
+  Poke<OBD_SILENT_RETRY_SECONDS> denied(14.9f, {});
+  denied.denied = true;
+  Poke<0> off(14.9f, {});
+  partial.go(5 * minute);
+  denied.go(5 * minute);
+  taper.go(5 * minute, 14.9f);  // the rail rose during the attach: energy still reads this poke at the taper band
+  off.go(5 * minute);
+  check(partial.requests.size() == 1 && partial.asleep && !partial.logged("OBD retry"), "a partial answer never retries");
+  check(taper.requests.size() == 1 && taper.asleep && !taper.logged("OBD retry"),
+        "a wake rail under RAIL_AWAKE_VOLTS never retries, even with the live rail up");
+  check(denied.requests.empty() && denied.asleep && denied.now <= 6000 && !denied.logged("OBD retry"),
+        "a cycle that asked the car nothing never retries");
+  check(off.requests.size() == 1 && off.asleep && off.now <= 6000 && !off.logged("OBD retry"),
+        "OBD_SILENT_RETRY_SECONDS 0 is today's single poll");
+
+  // At most one retry a wake, and only after the wake's first request: a serial session holds the poke awake.
+  Poke<OBD_SILENT_RETRY_SECONDS> serial(14.9f, {});
+  serial.maintenance_mode = true;
+  serial.maintenance_since = 0;
+  serial.go(minute + 30000);
+  check(!serial.asleep && serial.logged("OBD retry armed ") == 1 && serial.logged("OBD retry after ") == 1 &&
+        serial.requests.size() >= 4 &&
+        serial.requests[2] - serial.requests[1] <= 5500,
+        "a serial session holds the poke after the retry, at ACTIVE's cadence, and never arms a second retry");
+  Poke<OBD_SILENT_RETRY_SECONDS> late(14.9f, {TOP_UP});
+  late.maintenance_mode = true;
+  late.go(minute);
+  check(late.requests.size() >= 5 && !late.logged("OBD retry"), "a silent poll after the wake's first never retries");
+  // Both are unreachable on a wake's first poll today (g_dc_confirmed comes from a poll; only a poke sets the wake's
+  // rail), so they are checked on the predicate itself.
+  Poke<OBD_SILENT_RETRY_SECONDS> dc(14.9f, {}), stream(14.9f, {});
+  dc.g_dc_confirmed = true;
+  stream.g_sample_poke = false;
+  check(!dc.silentRetryArm(true, 0) && !stream.silentRetryArm(true, 0),
+        "only a sample poke the DC hold does not want arms the retry");
+  Poke<OBD_SILENT_RETRY_SECONDS> unused(14.9f, {}), spent(14.9f, {});
+  unused.g_last_io36 = spent.g_last_io36 = 12.6f;
+  spent.g_silent_retry = decltype(spent)::RETRY_SPENT;
+  check(unused.silentRetryRailOk() && spent.silentRetryRailOk(), "the rail veto holds back only an armed retry");
+
+  // The converter went off during the modem attach: the wake's rail is high, the first poll's is not. No wait on battery.
+  Poke<OBD_SILENT_RETRY_SECONDS> attach(14.9f, {});
+  Poke<0> attach_once(14.9f, {});
+  attach.charge_followup = attach_once.charge_followup = 1;
+  attach.go(5 * minute, 12.7f);
+  attach_once.go(5 * minute, 12.7f);
+  check(attach.requests.size() == 1 && attach.now <= 6000 && !attach.logged("OBD retry") && sameOutcome(attach, attach_once),
+        "a live rail under RAIL_AWAKE_VOLTS at the first poll never arms: it sleeps as one silent poll");
+
+  // The rail falls during the wait: the retry asks nothing, and the wake ends like one silent poll.
+  Poke<OBD_SILENT_RETRY_SECONDS> fell(14.9f, {});
+  Poke<0> fell_once(14.9f, {});
+  fell.charge_followup = fell_once.charge_followup = 1;
+  fell.go(10000);
+  fell.go(5 * minute, 12.7f);
+  fell_once.go(5 * minute);
+  check(fell.requests.size() == 1 && fell.logged(after + "skipped rail=12.70") == 1 &&
+        sameOutcome(fell, fell_once), "a rail that falls during the wait sends no second request and ends the wake like one silent poll");
+
+  // Acceptance 3: motion during the wait does not extend a poke; a retry that answers a DC charge holds the wake, and
+  // motion then promotes it, as on any held poke.
+  Poke<OBD_SILENT_RETRY_SECONDS> moved(14.9f, {});
+  moved.go(5 * minute, -1, 1000);
+  check(moved.asleep && moved.requests.size() == 2 && moved.now - moved.requests[1] <= 500 && !moved.ble_up,
+        "motion during the wait does not extend the wake: it sleeps after the retry");
+  Poke<OBD_SILENT_RETRY_SECONDS> fast(14.9f, {SILENT, dcFrame(30, -150, 1), dcFrame(30.4, -150, 1)});
+  fast.go(retry_ms + 10000);
+  check(!fast.asleep && fast.dcAwakeHeld(fast.current_state) && fast.g_sample_poke,
+        "a retry that answers a DC charge holds the poke awake");
+  fast.go(10000, -1, 1000);
+  check(!fast.asleep && !fast.g_sample_poke && fast.ble_up, "motion then promotes the held poke: BLE up");
+}
+
 void profileChecks(const std::string& directory) {
   Parser parser;
   for (const auto& name : {"scenic", "scenic_devel", "ix3", "ix3_devel"}) {
@@ -2162,7 +2362,7 @@ int main(int argc, char** argv) {
   check(group == "all" || group == "progress" || group == "signal" || group == "release" ||
         group == "corroboration" || group == "wake-gate" ||
         group == "logging" || group == "transport" || group == "sleep-reason" || group == "wdt-streak" || group == "profiles" ||
-        group == "ble-frame" || group == "dc-awake", "known test group");
+        group == "ble-frame" || group == "dc-awake" || group == "silent-retry", "known test group");
   if (group == "all" || group == "progress") progressChecks();
   if (group == "all" || group == "signal") signalChecks();
   if (group == "all" || group == "release") {
@@ -2188,6 +2388,7 @@ int main(int argc, char** argv) {
   if (group == "all" || group == "ble-frame") { bleFrameChecks(); ble_frame_log::checks(); }
   if (group == "all" || group == "sleep-reason") sleep_reason::checks();
   if (group == "all" || group == "dc-awake") { dcAwakeChecks(); dcLadderChecks(); dc_track::checks(); }
+  if (group == "all" || group == "silent-retry") silentRetryChecks();
   if (group == "all" || group == "wdt-streak") wdt_streak::checks();
   if (argc > 2 && (group == "all" || group == "profiles")) profileChecks(argv[2]);
   std::cout << "Energy " << group << " checks PASS\n";

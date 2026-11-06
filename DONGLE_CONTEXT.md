@@ -159,6 +159,11 @@ Check the rail before powering peripherals or issuing bus traffic.
   power (a charging current at `DC_CHARGING_MIN_KW` by V x I, or the car's `is_dcfc`) re-latch PARKED and trust that
   poll's charge sample, so it publishes `is_charging`/`is_dcfc` and starts the hold. A speed other than a clean 0 or
   a moving GNSS fix on any of them restarts the count; nothing else guards regen on a car with neither (accepted risk).
+- A sample poke at a rail >= `RAIL_AWAKE_VOLTS` whose first request gets no PID at all stays awake and asks once
+  more `OBD_SILENT_RETRY_SECONDS` (45 s) later (#131): ECUs or a gateway can need the first request, or time, to wake.
+  The silent first poll is dropped (no frame, energy, back-off or sleep), so a silent retry ends the wake like any
+  silent poll. Never on a partial answer, a lower wake or live rail, a held DC charge or a cycle that asked nothing; at
+  most once a wake, and the retry asks the car only if the live rail is still up. `0` turns it off.
 - The charge-end follow-up and post-drive window shorten cadence only after otherwise-permitted
   rail-high polls. They do not override the alarm gate. A silent charge must not reset its fast budget.
 - A plug-in after the dongle sleeps need not trip WOM (#22). A ladder ending at a healthy but low rail
@@ -324,6 +329,7 @@ ABD7 retrieves logs without unplugging the dongle. Logs contain private location
 | `MOTION` | Sampled vibration/activity, not sustained acceleration or proof of driving |
 | `ALARMGATE` / `ATRVGATE` | Permit inputs and wake/poll decision |
 | `SAMPLE_POLL`, `DC_AWAKE`, `FOLLOWUP`, `POSTDRIVE` | Charge evidence and cadence/hold reasons |
+| `OBD retry armed rail= live= in=`, `OBD retry after <s>s -> answered <n> pids \| silent \| skipped rail=` | A silent high-rail poke's one retry (#131) and what the second request got; `skipped`: nothing was asked (the rail fell during the wait, or the alarm gate denied; the retry is spent) |
 | `UPLOAD not sent` | Local token/signature/header failure, not a failed bearer |
 | `NET diag ... open=` | Fresh/reused session and idle duration; modem state alone misses stale sessions |
 | `FLUSHSTAT` | Open/drain timings and accepted/tried batches and frames |

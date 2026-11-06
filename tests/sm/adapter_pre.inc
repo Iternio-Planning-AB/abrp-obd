@@ -223,6 +223,9 @@ bool alarmEnforced() { return g_alarm_flag == 1; }
 bool bleConnected() { return sm_ble_connected; }
 bool bleAuthenticated() { return sm_ble_auth; }
 bool bleRelaying() { return sm_ble_auth; }
+// The silent retry's rail term of loop()'s poll condition (#131): it vetoes only an armed retry, and this harness
+// never arms one (the provisional poll's exit is not extracted; tests/run_energy_checks.py runs the retry in time).
+bool silentRetryRailOk() { return true; }
 // The wake cause setup() reads, as the ESP-IDF values.
 enum SmWakeCause { ESP_SLEEP_WAKEUP_UNDEFINED = 0, ESP_SLEEP_WAKEUP_EXT0 = 2, ESP_SLEEP_WAKEUP_TIMER = 4 };
 using esp_sleep_wakeup_cause_t = SmWakeCause;  // wake_gate.h's wakeGateRun (#26)
