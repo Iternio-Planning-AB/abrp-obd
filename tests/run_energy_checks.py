@@ -52,11 +52,9 @@ WORST_EVENT_ARGS = {
     # #128: kw is at most |2000 A x 1000 V| or |1000 kW| (driveFrameValue's ranges), the count at most 255.
     "LEASH dc charge ": ("2000", 255),
     "LEASH dc reset ": (255, "notdc", "2000"),
-    # #131: the wake's rail, a 32-bit delay and wait, the most PIDs a profile answers in one poll.
+    # #131: the wake's rail, a 32-bit delay and wait, and the outcome's whole 24-byte buffer.
     "OBD retry armed ": (15.99, 4294967295),
-    "OBD retry after %lus -> answered": (4294967295, 999),
-    "OBD retry after %lus -> silent": (4294967295,),
-    "OBD retry after %lus -> skipped": (4294967295, -99.99),
+    "OBD retry after ": (4294967295, "x" * 23),
 }
 event_sources = logger + state_machine + energy + sleep + drive_state + wake_gate_h
 # The host stand-in for the streak store keeps its bytes across boots, as RTC_NOINIT_ATTR does and
@@ -225,7 +223,8 @@ with tempfile.TemporaryDirectory(prefix="obd-energy-checks-") as temporary:
     ladder_fn = block(state_machine, "void handleActivityState() {")
     start = ladder_fn.index("  auto now = millis();\n")
     (build / "awake_ladder.inc").write_text(ladder_fn[start:ladder_fn.rindex("}")])
-    (build / "silent_retry.inc").write_text(block(logger, "bool silentRetryRailOk() {") +
+    (build / "silent_retry.inc").write_text(line(logger, "enum SilentRetry : uint8_t {") +
+                                            block(logger, "bool silentRetryRailOk() {") +
                                             block(logger, "bool silentRetryArm(bool attempted, int obd_count) {"))
     (build / "polling_delay.inc").write_text(block(state_machine, "unsigned long getPollingDelay("))
     start = logger.index("    if (g_sample_poke && !maintenance_mode") + len("    if (")
