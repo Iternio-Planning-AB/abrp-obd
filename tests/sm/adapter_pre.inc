@@ -20,6 +20,9 @@
   X(bool, g_ble_session_relayed, false) \
   X(bool, logging_message_printed, false) \
   X(bool, maintenance_mode, false) \
+  X(unsigned long, maintenance_since, 0) \
+  X(bool, config_initialized, false) \
+  X(bool, config_message_printed, false) \
   X(bool, g_taper_confirm, false) \
   X(unsigned long, polling_delay, 5000) \
   X(unsigned long, transmission_delay, 25000) \
@@ -119,12 +122,14 @@ enum SmReset { ESP_RST_POWERON = 1, ESP_RST_PANIC = 4, ESP_RST_TASK_WDT = 6, ESP
   X(unsigned long, sm_fix_age, 0) \
   X(bool, sm_ep_charging, false) \
   X(bool, sm_ep_progress, false) \
-  X(bool, sm_ep_silent, false)
+  X(bool, sm_ep_silent, false) \
+  X(std::string, sm_windows, "")
 // Harness state for one wake, reset by every boot as RAM is: the car's command counter (obd.tx_count), an
 // authenticated phone, and the alarm permit's oracle, kept from the trace's inputs rather than the gate's state.
 #define SM_WAKE(X) \
   X(unsigned long, sm_tx, 0) \
   X(bool, sm_ble_auth, false) \
+  X(bool, sm_ble_relay, false) \
   X(bool, sm_note_on, false) \
   X(unsigned long, sm_note_ms, 0) \
   X(bool, sm_low_on, false) \
@@ -221,7 +226,9 @@ bool alarmEnforced() { return g_alarm_flag == 1; }
 // power-on): the extracted blocks see it only through bleConnected(). An authenticated one is the setup permit's
 // "human still here".
 bool bleConnected() { return sm_ble_connected; }
-bool bleAuthenticated() { return sm_ble_auth; }
+bool bleAuthenticated() { return sm_ble_connected && sm_ble_auth; }  // as ble.h: only a connected phone is
+// The phone is the transport: authenticated and its session's protocol says so (a PHONE event's inputs).
+bool bleRelaying() { return bleAuthenticated() && sm_ble_relay; }
 // The silent retry's rail term of loop()'s poll condition (#131): it vetoes only an armed retry, and this harness
 // never arms one (the provisional poll's exit is not extracted; tests/run_energy_checks.py runs the retry in time).
 bool silentRetryRailOk() { return true; }
@@ -246,3 +253,26 @@ void wdtStreakMarker(bool owed) { sm_store_marker = owed; }
 bool wdtStreakMarkerOwed() { return sm_store_marker; }
 bool uploadBacklogPending() { return sm_backlog_file; }
 void enterDeepSleep(bool modem_on, const char* reason = nullptr);
+
+// The awake ladder's inputs (#29). A TICK's detectMovement(): the event's motion, found 1 ms in with mems.h's stamp
+// (run_sm_checks.py pins that line), else the whole window. Its windows are recorded for both motion notes, which are
+// compared: S/s sampled with/without motion, - bypassed (drive), A/a/_ the same for the MOTION statistics.
+bool sm_tick_motion = false;
+int sm_tick_during = 0;  // what starts inside the window: 1 an OTA update, 2 a log dump, 3 a phone connects
+bool detectMovement(unsigned long duration) {
+  if (sm_tick_during == 1) g_ota_active = true;
+  if (sm_tick_during == 2) g_logdump_active = true;
+  if (sm_tick_during == 3) sm_ble_connected = true;
+  if (sm_tick_motion) {
+    sm_now += SM_IO_MS;
+    last_active = g_last_motion_ms = millis();
+    return true;
+  }
+  sm_now += duration;
+  return false;
+}
+void noteDriveMotionWindow(bool sampled, bool active) { sm_windows += sampled ? (active ? 'S' : 's') : '-'; }
+void noteMotionWindow(bool sampled, bool active) { sm_windows += sampled ? (active ? 'A' : 'a') : '_'; }
+// enterDeepSleep never returns on the device: inside a tick the adapter's throws this, and the tick catches it.
+struct SmSlept {};
+bool sm_in_tick = false;

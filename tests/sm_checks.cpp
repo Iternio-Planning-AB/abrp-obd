@@ -23,7 +23,7 @@
 
 #include "../libraries/OBDWrapper/obd_vector.h"
 
-enum class SmKind { POLL, ADVANCE, LADDER, HOLD, SLEEP, WAKE, MAINT, CRASH, SETUP };
+enum class SmKind { POLL, ADVANCE, LADDER, HOLD, SLEEP, WAKE, MAINT, CRASH, SETUP, TICK, PHONE };
 enum class SmTo { ACTIVE, BLE, CHARGING, STANDBY };
 enum { SM_NONE, SM_SPEED, SM_VRS, SM_BOTH };  // which speed keys the poll carries (BOTH: speed, then vrs)
 enum { SM_TIMER, SM_MOTION, SM_COLD };   // wake cause
@@ -53,7 +53,9 @@ struct SmEvent {
   double atrv = NAN;   // WAKE: the ATRV read; NaN: 13.5 awake, 5.3 asleep
   bool alarm = false;  // WAKE: the OBD-alarm gate is enforced for this car
   bool dump = false;  // HOLD: the log dump rather than an OTA update
-  bool on = false;    // MAINT: the console's maintenance_mode
+  bool on = false;    // MAINT: the console's maintenance_mode; TICK: detectMovement() sees motion
+  int phone = 0;      // PHONE: 0 gone, 1 connected, 2 authenticated, 3 relaying; TICK: 1 OTA, 2 dump, 3 phone start
+                      // inside its motion window
   // POLL inputs to the driving rules (#6). The defaults: car on, motion this poll, no sustained motion, no power, no
   // charge latch. Charge and Silent polls keep the wake's rail and motion instead.
   int car = SM_CAR_RAIL;
@@ -127,6 +129,26 @@ SmEvent Ladder(SmTo to) {
   const char* names[] = {"ACTIVE", "BLE", "CHARGING", "STANDBY"};
   SmEvent e{SmKind::LADDER, std::string("LADDER(") + names[(int)to] + ")"};
   e.to = to;
+  return e;
+}
+// One loop pass of the awake ladder (handleActivityState(), #29), with or without motion in its window.
+SmEvent Tick(bool motion = false) {
+  SmEvent e{SmKind::TICK, motion ? "TICK(motion)" : "TICK"};
+  e.on = motion;
+  return e;
+}
+// A tick in whose motion window an OTA update (1) or a log dump (2) starts, or a phone connects (3). The transfer
+// ends with the tick, as a HOLD's does.
+SmEvent TickStart(int during) {
+  const char* names[] = {"", "ota", "dump", "phone"};
+  SmEvent e{SmKind::TICK, std::string("TICK(") + names[during] + " starts)"};
+  e.phone = during;
+  return e;
+}
+SmEvent Phone(int level) {
+  const char* names[] = {"gone", "connected", "authenticated", "relaying"};
+  SmEvent e{SmKind::PHONE, std::string("PHONE(") + names[level] + ")"};
+  e.phone = level;
   return e;
 }
 SmEvent Hold(bool dump = false) {
@@ -300,6 +322,7 @@ const std::vector<SmEvent> ALPHABET = {
   Poll(SM_NONE, 0), Poll(SM_SPEED, 0), Poll(SM_SPEED, 12.35), Poll(SM_VRS, 0.15), Poll(SM_NONE, 0, true, 7.25),
   Poll(SM_SPEED, 30.05, true, 88.85), Advance(AT), Advance(AT + 1), Advance(MAX_AWAKE_MS),
   Ladder(SmTo::CHARGING), Ladder(SmTo::STANDBY), Hold(), Sleep(), Wake(SM_MOTION, 12.6f), Wake(SM_COLD, 9.5f),
+  Tick(),
 };
 
 const unsigned long CONFIRM_MS = (unsigned long)CHARGE_STREAM_CONFIRM_SECONDS * 1000UL;
@@ -369,7 +392,10 @@ SmEvent randomEvent(std::mt19937& rng) {
     return Advance((unsigned long)pick({1, 4999, 5000, (double)(AT - 1), (double)AT, (double)(AT + 1), (double)CONFIRM_MS,
                                         (double)GPS_MOVING_MAX_AGE_MS, (double)MAX_AWAKE_MS,
                                         (double)std::uniform_int_distribution<unsigned long>(0, 400000)(rng)}));
-  case 5: return Ladder((SmTo)std::uniform_int_distribution<int>(0, 3)(rng));
+  case 5: {  // a forced change or a ladder tick, in one draw
+    const int to = std::uniform_int_distribution<int>(0, 5)(rng);
+    return to < 4 ? Ladder((SmTo)to) : Tick(to == 5);
+  }
   case 6: return pick({0, 1}) != 0 ? Hold(pick({0, 1}) != 0) : Maint(pick({0, 1}) != 0);
   case 7: return Sleep(pick({0, 1, 1}) != 0, pick({0, 1, 1}) != 0);
   default: {
@@ -514,15 +540,28 @@ void scenarios() {
   play(Poll(SM_NONE, 0), t);
   check(!is_currently_parked && sm_freezes == 0, "the log-dump hold keeps a drive through the dump", t);
 
-  // Maintenance mode (a console session) holds off the backstop; releasing it lets the next tick sleep.
+  // Maintenance mode (a console session) holds off the backstop; releasing it lets the next tick sleep. A command a
+  // minute keeps the session inside MAINTENANCE_IDLE_MS; past it, the tick auto-releases and the backstop applies.
+  start(t);
+  while (sm_now <= MAX_AWAKE_MS) {
+    play(Maint(true), t);
+    play(Advance(60000), t);
+    play(Tick(true), t);
+  }
+  check(!sm_asleep && maintenance_mode, "no backstop sleep during a console session", t);
+  play(Ladder(SmTo::STANDBY), t);
+  play(Maint(true), t);
+  play(Tick(), t);
+  check(!sm_asleep && current_state == STANDBY, "nor STANDBY's sleep: a USB dump is not cut mid-stream", t);
+  play(Maint(false), t);
+  play(Tick(), t);
+  check(sm_asleep && sm_sleep_reason == "backstop", "the backstop sleeps once the session ends", t);
   start(t);
   play(Maint(true), t);
-  play(Advance(MAX_AWAKE_MS + 1), t);
-  play(Ladder(SmTo::ACTIVE), t);
-  check(!sm_asleep, "no backstop sleep during a console session", t);
-  play(Maint(false), t);
-  play(Ladder(SmTo::ACTIVE), t);
-  check(sm_asleep && sm_sleep_reason == "backstop", "the backstop sleeps once the session ends", t);
+  play(Advance(MAX_AWAKE_MS), t);
+  play(Tick(true), t);
+  check(sm_asleep && sm_sleep_reason == "backstop" && !maintenance_mode,
+        "a console session idle past MAINTENANCE_IDLE_MS is released, and the same tick takes the backstop", t);
 
   // Speed and GNSS in the same cycle: one LEASH line (speed wins), one alarm note.
   start(t);
@@ -1133,7 +1172,7 @@ void rules() {
   check(logged("LEASH unconfirmed accel act=100% rail=13.50 obd=1 -> live location, no drivingState"),
         "the UNCONFIRMED line", t);
   play(Advance(MAX_AWAKE_MS), t);
-  play(Ladder(SmTo::ACTIVE), t);
+  play(Tick(), t);
   check(sm_asleep && sm_sleep_reason == "backstop", "the max-awake backstop still applies to UNCONFIRMED", t);
   enterUnconfirmed();
   play(Advance(5000), t);
@@ -1563,7 +1602,7 @@ void composition() {
     check(is_currently_parked && has("is_charging", 1) && recently_charging,
           "composition: after the car-off re-latch a charge is seen again", t);
     playComposed(Advance(MAX_AWAKE_MS), t);
-    playComposed(Ladder(SmTo::ACTIVE), t);
+    playComposed(Tick(), t);
     check(sm_asleep && sm_sleep_reason == "backstop", "composition: and the max-awake backstop applies again", t);
   }
 
@@ -1960,6 +1999,178 @@ void dcRules(int depth) {
   check(dc_releases > 0, "dc: the generated traces reach a release", t);
 }
 
+// ---- the awake ladder (#29): handleActivityState() whole, equality throughout ----
+// Ticks with and without motion, the timers, a phone at each level, both transfer holds, a console session, a drive,
+// a held DC charge (the car's is_dcfc, rail above DC_HOLD_RAIL_VOLTS), a sleep and a wake. Reachability counters prove
+// each rung is taken on CUR.
+const SmEvent DC_POLL = Charge(-150, 400, 1, 14.4, NAN, 1);
+const std::vector<SmEvent> LADDER_ALPHABET = {
+  Tick(), Tick(true), Advance(AT + 1), Advance(MAX_AWAKE_MS), Phone(0), Phone(1), Phone(2), Phone(3), Hold(),
+  Hold(true), Maint(true), Poll(SM_SPEED, 30.05), DC_POLL, Sleep(), Wake(SM_TIMER, 13.6f), TickStart(1), TickStart(2),
+  TickStart(3),
+};
+struct LadderReach { unsigned charging, standby, sleep, backstop, refused, held, relayed, released; } ladder_reach{};
+unsigned long ladder_leaves = 0;
+void playLadder(const SmEvent& e, std::vector<SmEvent>& trace) {
+  using namespace sm_cur;
+  const Snap pre = save(false);
+  play(e, trace);
+  if (pre.sm_asleep || (e.k != SmKind::TICK && e.k != SmKind::HOLD)) return;
+  ladder_reach.charging += pre.current_state != CHARGING && current_state == CHARGING;
+  ladder_reach.standby += pre.current_state == CHARGING && current_state == STANDBY;
+  ladder_reach.sleep += sm_asleep && sm_sleep_reason.empty();
+  ladder_reach.backstop += sm_asleep && sm_sleep_reason == "backstop";
+  ladder_reach.refused += e.k == SmKind::HOLD && pre.current_state == STANDBY && !sm_asleep;
+  ladder_reach.held += pre.current_state == CHARGING && current_state == CHARGING && g_dc_confirmed &&
+                       sm_now - last_active > (unsigned long)(CHARGING_TIMER);
+  ladder_reach.relayed += pre.current_state == BLE && current_state != BLE && g_ble_disconnect_ms != pre.g_ble_disconnect_ms;
+  ladder_reach.released += pre.maintenance_mode && !maintenance_mode;
+}
+void enumerateLadder(int depth, std::vector<SmEvent>& trace) {
+  if (depth == 0) { ladder_leaves++; return; }
+  const sm_old::Snap old_node = sm_old::save();
+  const sm_cur::Snap cur_node = sm_cur::save();
+  for (const auto& e : LADDER_ALPHABET) {
+    sm_old::restore(old_node);
+    sm_cur::restore(cur_node);
+    playLadder(e, trace);
+    enumerateLadder(depth - 1, trace);
+    trace.pop_back();
+  }
+}
+void ladderGroup(int depth) {
+  std::vector<SmEvent> t;
+  using namespace sm_cur;
+  // The rungs in time: ACTIVE_TIMER idle leaves ACTIVE; CHARGING then lasts one tick; STANDBY sleeps on the next tick.
+  start(t);
+  play(Tick(), t);
+  check(current_state == ACTIVE, "a tick inside ACTIVE_TIMER stays ACTIVE", t);
+  play(Advance(AT), t);
+  play(Tick(), t);
+  check(current_state == CHARGING && is_currently_parked, "ACTIVE_TIMER idle steps to CHARGING", t);
+  play(Tick(), t);
+  // #129: CHARGING_TIMER is timed from ACTIVE_TIMER's leash; its fix times it from CHARGING's entry and changes this.
+  check(current_state == STANDBY, "CHARGING_TIMER runs from the same leash: STANDBY one tick later (#129)", t);
+  play(Hold(), t);
+  check(!sm_asleep && current_state == STANDBY, "an OTA transfer refuses STANDBY's sleep, and the ladder waits", t);
+  play(Tick(true), t);
+  check(current_state == ACTIVE, "motion revives ACTIVE from STANDBY", t);
+  play(Advance(AT + 1), t);
+  play(Tick(), t);
+  play(Tick(), t);
+  play(Tick(), t);
+  check(sm_asleep && sm_sleep_reason.empty() && sm_sleeps == 1, "STANDBY sleeps without a reason of its own", t);
+  // A held DC charge keeps CHARGING past CHARGING_TIMER; the backstop exempts it (DC_EARLY_HOLD).
+  start(t);
+  play(DC_POLL, t);
+  play(Advance(AT + 1), t);
+  play(DC_POLL, t);
+  check(g_dc_confirmed, "two DC polls a confirm apart confirm the charge", t);
+  play(Tick(), t);
+  play(Tick(), t);
+  check(current_state == CHARGING && g_dc_confirmed, "a held DC charge stays in CHARGING", t);
+  play(Advance(MAX_AWAKE_MS), t);
+  play(Tick(), t);
+  check(!sm_asleep && current_state == CHARGING, "the backstop exempts a held DC charge", t);
+  // An hour's drive that stops is slept by the backstop at its first parked tick, without waiting for the ladder.
+  start(t);
+  play(Poll(SM_SPEED, 50), t);
+  play(Advance(MAX_AWAKE_MS), t);
+  play(Poll(SM_SPEED, 50), t);
+  play(Tick(), t);
+  check(!sm_asleep, "the backstop never sleeps a driving car", t);
+  play(Advance(AT + 1), t);
+  play(Poll(SM_NONE, 0), t);
+  play(Tick(), t);
+  // #133: the backstop counts millis() since boot; its fix counts time parked and changes this.
+  check(sm_asleep && sm_sleep_reason == "backstop", "after a long drive the first parked tick takes the backstop (#133)", t);
+  // A transfer or a phone that starts inside the motion window counts in the same pass: no backstop and no STANDBY
+  // sleep under the transfer, the window counted as bypassed, and a phone connecting in it enters BLE at once.
+  for (int during : {1, 2}) {
+    start(t);
+    play(Advance(MAX_AWAKE_MS), t);
+    play(TickStart(during), t);
+    check(!sm_asleep && sm_windows.back() == '_' && countLog("AWAKE_BACKSTOP") == 0,
+          "a transfer starting in the motion window holds off the backstop", t);
+    play(Ladder(SmTo::STANDBY), t);
+    play(TickStart(during), t);
+    check(!sm_asleep && current_state == STANDBY, "and STANDBY's sleep in the same pass", t);
+  }
+  start(t);
+  play(TickStart(3), t);
+  check(current_state == BLE, "a phone connecting in the motion window enters BLE in the same pass", t);
+  // ACTIVE -> BLE stamps the leash: a phone connecting with the leash nearly spent still gets a full ACTIVE_TIMER.
+  start(t);
+  play(Advance(AT - 1000), t);
+  play(Phone(1), t);
+  play(Tick(), t);
+  play(Advance(2000), t);
+  play(Tick(), t);
+  check(current_state == BLE, "a new session gets a full ACTIVE_TIMER to authorize", t);
+  // A phone: connecting stamps the leash and enters BLE; an authenticated one holds it; one that relayed hands the
+  // transport back when it leaves (g_ble_disconnect_ms), one that never relayed does not.
+  for (int level : {1, 2, 3}) {
+    start(t);
+    play(Phone(level), t);
+    play(Tick(), t);
+    check(current_state == BLE, "a connected phone enters BLE", t);
+    play(Advance(AT + 1), t);
+    play(Tick(), t);
+    check((current_state == BLE) == (level >= 2), "only an authenticated phone holds BLE past ACTIVE_TIMER", t);
+    play(Phone(0), t);
+    play(Tick(), t);
+    check(level < 2 ? current_state == STANDBY : current_state == ACTIVE && (g_ble_disconnect_ms != 0) == (level == 3),
+          "a phone that relayed stamps the handoff when it leaves", t);
+    check(g_ble_handoff_pending == (level == 3), "and only it arms the fast handoff", t);
+    if (level != 3) continue;
+    // A reconnect starts a new session that has not relayed: when it leaves, no second hold-off.
+    const unsigned long left_ms = g_ble_disconnect_ms;
+    play(Phone(1), t);
+    play(Tick(), t);
+    play(Phone(0), t);
+    play(Tick(), t);
+    check(current_state == ACTIVE && g_ble_disconnect_ms == left_ms, "a session that never relayed stamps no hold-off", t);
+  }
+  // UNINITIALIZED (the first loop pass): it waits for the profile, printing once; then a phone takes it to BLE, or
+  // none to ACTIVE.
+  for (bool phone : {false, true}) {
+    start(t);
+    sm_old::current_state = sm_old::UNINITIALIZED;
+    sm_cur::current_state = sm_cur::UNINITIALIZED;
+    sm_old::config_initialized = sm_cur::config_initialized = false;
+    play(Tick(), t);
+    play(Tick(), t);
+    play(Advance(MAX_AWAKE_MS), t);
+    play(Tick(), t);
+    size_t awaiting = 0;
+    for (const auto& l : sm_serial) awaiting += l == "Awaiting initialization\n";
+    check(current_state == UNINITIALIZED && !sm_asleep && config_message_printed && awaiting == 1,
+          "without a profile the ladder waits, past the backstop's ceiling too, saying so once", t);
+    sm_old::config_initialized = sm_cur::config_initialized = true;
+    if (phone) play(Phone(1), t);
+    play(Tick(), t);
+    check(current_state == (phone ? BLE : ACTIVE) && (!phone || last_active == sm_now - SM_IO_MS),
+          "once configured, a phone enters BLE with a fresh leash, else ACTIVE", t);
+  }
+  start(t);
+  enumerateLadder(depth, t);
+  for (uint32_t seed : {29u, 291u, 292u, 293u, 294u}) {
+    std::mt19937 rng(seed);
+    for (int sequence = 0; sequence < 500; ++sequence) {
+      start(t);
+      for (int i = 0; i < 40; ++i) {
+        const size_t pick = std::uniform_int_distribution<size_t>(0, LADDER_ALPHABET.size())(rng);
+        playLadder(pick < LADDER_ALPHABET.size() ? LADDER_ALPHABET[pick]
+                                                 : Advance(std::uniform_int_distribution<unsigned long>(0, 400000)(rng)), t);
+      }
+    }
+  }
+  const LadderReach& r = ladder_reach;
+  check(r.charging && r.standby && r.sleep && r.backstop && r.refused && r.held && r.relayed && r.released,
+        "ladder: generated traces reach every rung, the backstop, a refused sleep, the DC hold, a relayed handoff and "
+        "the console's release", t);
+}
+
 int main(int argc, char** argv) {
   std::string group = "all";
   int depth = 5;  // caught every harness mutant that depth 6 did, in ~3 s; --depth 6 runs the 11 M sequences
@@ -1969,8 +2180,8 @@ int main(int argc, char** argv) {
     else group = arg;
   }
   if (group != "all" && group != "enumerate" && group != "random" && group != "scenarios" && group != "crash" &&
-      group != "rules" && group != "composition" && group != "dc") {
-    std::cerr << "unknown group " << group << " (all, enumerate, random, scenarios, crash, rules, composition, dc)\n";
+      group != "rules" && group != "composition" && group != "dc" && group != "ladder") {
+    std::cerr << "unknown group " << group << " (all, enumerate, random, scenarios, crash, rules, composition, dc, ladder)\n";
     return 2;
   }
   using clock = std::chrono::steady_clock;
@@ -2022,6 +2233,11 @@ int main(int argc, char** argv) {
     dcRules(depth);
     std::cout << "PASS: dc (DC_EARLY_HOLD on: the #128 release cases, depth " << depth << ", " << dc_leaves
               << " sequences, 5 seeds x 1000 x 30, " << dc_releases << " releases)\n";
+  }
+  if (group == "all" || group == "ladder") {
+    ladderGroup(depth);
+    std::cout << "PASS: ladder (handleActivityState whole: named rungs, depth " << depth << " over "
+              << LADDER_ALPHABET.size() << " symbols, " << ladder_leaves << " sequences, 5 seeds x 500 x 40)\n";
   }
   std::cout << "events compared: " << events << '\n';
 }

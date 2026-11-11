@@ -39,15 +39,15 @@ set `GIT_CLIFF`); without it, it is skipped, and with `CI` set it fails.
 
 ## State-machine differential harness
 
-Run `python3 tests/run_sm_checks.py` (groups `scenarios`, `random`, `enumerate`, `crash`, `rules`, `composition`, `dc`; `--depth N`, default 5) for
+Run `python3 tests/run_sm_checks.py` (groups `scenarios`, `random`, `enumerate`, `crash`, `rules`, `composition`, `dc`, `ladder`; `--depth N`, default 5) for
 the park/drive decision. The differential covers the drive region; shared context comes from the working
-tree. The blocks that write drive state (the poll-time unlatch and re-latch, the `is_parked` publish, the
-OTA/dump hold, `changeState`, the buffer block and the pre-sleep marker) come from the pinned `main` commit
-(`SM_PIN`, via `git show`) for OLD and from the working tree for CUR; the context around them (the
-backstop, the delays) comes from the working tree for both, so a deliberate change there does not fail it. Each
+tree. The blocks that write drive state (the poll-time unlatch and re-latch, the `is_parked` publish, the buffer
+block and the pre-sleep marker) come from the pinned `main` commit (`SM_PIN`, via `git show`) for OLD and from the
+working tree for CUR; the context around them comes from the working tree for both, so a deliberate change there
+does not fail it. Each
 side compiles into its own namespace around one harness (`tests/sm/`), and identical event sequences run
 through both: every sequence of 5 events over a
-15-symbol alphabet (about 760 k, a few seconds; `--depth 6` runs about 11 M in under a minute), 5000
+16-symbol alphabet (about 1 M, a few seconds; `--depth 6` runs about 17 M in about a minute), 5000
 fixed-seed sequences of 30, and named field cases (garage latch, smooth-road leash, re-latch boundary,
 OTA and log-dump holds, a console session, both speed keys and a NaN speed, trip-end marker, the two
 no-speed-PID drives). The fake clock advances inside every log line and freeze, as the device's does.
@@ -124,6 +124,24 @@ runner fails if the condition loses that term or stops guarding the lazy init an
 a sample poke, and `FILE_TEST` excepted), if setup()'s boot clock resync loses its `!g_weak_rail_cold_boot` guard, or
 if the recovery block leaves its place directly ahead of the expiry. GNSS power itself is not modelled: a poll's GNSS
 input is the event's.
+
+Since 4b (#29) it also covers the awake ladder: all of `Helpers/state_machine.h` (the delays, `changeState`, the DC
+hold's helpers and `handleActivityState()` whole), pinned for OLD, so the backstop and the delays are no longer shared
+context. A `TICK` event runs one loop pass of the ladder: `detectMovement()` returns the event's motion with
+`mems.h`'s leash and motion stamp (pinned by the runner), both motion notes are recorded and compared, and a sleep
+inside a tick ends it, as the device's never returns. `HOLD` is a tick under the OTA or dump flag, whose sleep the
+tree's `enterDeepSleep` guard refuses (a property: the ladder never sleeps under a transfer); `LADDER` only forces a
+state change; `PHONE` connects a phone at a level (connected, authenticated, relaying); `MAINT` stamps
+`maintenance_since` as a console command does. The backstop properties run on ticks. The `ladder` group asserts the
+rungs in time on CUR (CHARGING lasting one tick, #129, and the backstop timed from boot, #133, pinned as they are until
+their fixes), a held DC charge in CHARGING and past the backstop, a phone at each level with the relayed handoff and
+a non-relaying reconnect, the ACTIVE -> BLE handshake grace, a console session holding STANDBY, and UNINITIALIZED
+past the ceiling, and an OTA update, a log dump or a phone starting inside a tick's motion window (counted in that
+pass); then every 5-event sequence over 18 ladder symbols and 2500 random ones, with reachability counters for
+each rung, the backstop, a refused sleep, the DC hold, a relayed handoff and the console's release. The runner fails if
+anything outside `state_machine.h` assigns `current_state`, `g_ble_session_relayed`, `g_ble_disconnect_ms`,
+`g_dc_logged`, `g_dc_refused_logged` or `config_message_printed` (fixtures: a chained assignment, a write in another
+helper, a shadowing local), or if a ladder call sits outside the compared blocks and its named sites.
 
 Since #83 the fast-cadence budget is checked as properties on both sides, against the adapter's own record: a poll on
 the charging branch (a fast tier, no cadence reason) never comes with the budget already at `WAKE_CHARGING_MAX_MINUTES`;
