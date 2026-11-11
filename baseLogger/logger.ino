@@ -482,6 +482,8 @@ void changeState(ActivityState new_state);     // Helpers/state_machine.h
 #include "Helpers/misc.h"
 #include "Helpers/alarm_gate.h"   // OBD-alarm gate (§8/§10): uses preferences, logEvent, gpsMovingFresh;
                                   // must precede ota_update.h (otaPublishInfo publishes g_alarm_flag)
+#include "Helpers/wake_gate.h"    // wake gate: the only writer of the gate's persisted state; uses
+                                  // sleep_power.h's statics, logEvent and g_alarm_flag
 #include "Helpers/ota_update.h"   // last: uses ble, logEvent, the rail sense and the globals above
 #include "Helpers/log_dump.h"     // BLE log retrieval (ABD7): uses ble, datalogger, logEvent, g_ota_active
 #include "Helpers/auth_gate.h"    // phase-2 auth gate (ABD8): uses ble, logEvent, json - the ONLY session grant
@@ -576,7 +578,7 @@ void setup() {
   wdt_reset_count = wdtStreakAdvance(esp_reset_reason(), &g_wdt_streak_retained);
   if (esp_reset_reason() != ESP_RST_DEEPSLEEP && wdtStreakMarkerOwed()) driveMarkerRestored();
 #if ENABLE_SLEEP && ENABLE_MEMS
-  if (wdt_reset_count >= 3) {
+  if (wdtStreakAction(wdt_reset_count) == WDT_STREAK_EARLY_SLEEP) {
     Serial.begin(115200);
     Serial.printf("EARLY crash reset=%s streak=%lu parked=%dmin timer-only; peripherals unchanged\n",
       resetReasonStr(), (unsigned long)wdt_reset_count, WAKE_PARKED_MINUTES);
@@ -796,158 +798,8 @@ void setup() {
 #endif
 
 #if ENABLE_ATRV_GATE
-  // Sleep gate. Read the OBD pin-16 voltage (ATRV) - a LOCAL read, NO CAN traffic - to learn whether the car
-  // is awake WITHOUT poking the bus (poking it is what wakes a sleeping car). Run HERE, BEFORE the modem and
-  // OBD profile are brought up: if the car is asleep and no heartbeat is due, we go straight back to deep
-  // sleep having powered NOTHING this wake (no modem, no poll) - the cheapest possible skip. A long-asleep
-  // car still gets ONE deliberate reading per HEARTBEAT_POLL_MINUTES. The clock comes from the RTC, which
-  // keeps running across deep sleep (last set from NITZ), so the skip events still carry a valid utc.
-  // OBSERVE mode (ATRV_GATE_ENFORCE 0) logs the verdict but changes nothing.
-  {
-    g_last_voltage = obd.getVoltage();
-    float v = g_last_voltage;
-    float rail = g_last_io36;                           // TRUE rail (IO36) - the trustworthy battery signal
-    bool awake = v >= ATRV_AWAKE_VOLTS;                 // ATRV verdict: a COLLAPSE detector only (see below)
-    bool is_motion = (wake_cause == ESP_SLEEP_WAKEUP_EXT0);
-    bool is_cold   = (wake_cause == ESP_SLEEP_WAKEUP_UNDEFINED);
-    time_t now = rtc.getEpoch();
-    bool clock_ok = now > 1000000000UL;
-    // since_poll is only meaningful once we have a clock AND a baseline stamp; -1 = "not established yet"
-    // (this is what printed the raw epoch before - last_poll_epoch was stuck at 0 all run).
-    long since_poll = (clock_ok && last_poll_epoch != 0) ? (long)(now - last_poll_epoch) : -1;
-    // Backed-off heartbeat interval: base doubled once per consecutive asleep poke, capped. A car parked for
-    // days is poked rarely instead of every HEARTBEAT_POLL_MINUTES forever (see heartbeat_asleep_streak).
-    // Optional parked time-heartbeat (default OFF - see ENABLE_PARKED_HEARTBEAT). Proven to return nothing
-    // useful on this car, so rail-rise + motion are the real triggers; this is kept only for A/B.
-#if ENABLE_PARKED_HEARTBEAT
-    long hb_interval = (long)HEARTBEAT_POLL_MINUTES * 60;
-    for (uint32_t i = 0; i < heartbeat_asleep_streak && hb_interval < (long)HEARTBEAT_POLL_MAX_MINUTES * 60; i++)
-      hb_interval *= 2;
-    if (hb_interval > (long)HEARTBEAT_POLL_MAX_MINUTES * 60) hb_interval = (long)HEARTBEAT_POLL_MAX_MINUTES * 60;
-    bool heartbeat_due = since_poll >= 0 && since_poll >= hb_interval;
-#else
-    long hb_interval = 0;
-    bool heartbeat_due = false;
-#endif
-
-    // Low-rail lockout: rail in [LOW, HIGH) = weak-but-alive battery -> suppress ALL polling so we don't push
-    // a recoverable 12V over the edge. rail < LOW = bench/no-car (allowed to run, so USB DUMP works); rail >=
-    // HIGH = healthy. Uses the TRUE rail because ATRV is unreliable (diverges up to 3.6V).
-    bool weak_rail = (rail >= IO36_LOCKOUT_LOW && rail < IO36_LOCKOUT_HIGH);
-
-    // RAIL-AWAKE: the true rail is high -> the car's DC-DC is on (charging / remote climate) -> it's genuinely
-    // awake and WILL answer OBD with real data. This is the main parked-period data source. We sample ONCE
-    // then sleep (g_sample_poke below); the next wake re-checks the rail, so a charge is followed at the wake
-    // cadence WITHOUT holding the car awake - we sleep between samples, so the rail can truthfully fall when
-    // the charge ends (a free exit, no rail-drop masking). A confirmed DC charge is the exception: it stays awake
-    // (DC_CHARGING_AWAKE_SECONDS) and every poll re-reads the rail that ends it.
-    bool rail_awake = rail >= RAIL_AWAKE_VOLTS;
-    if (rail_awake) energyOnRailAwake();
-
-    // TAPER BRIDGE: the last poll saw charging but the rail has since dropped into the taper band (below
-    // RAIL_AWAKE yet >= RAIL_TAPER_FLOOR). Rail alone can't tell a taper from a parked car here, so spend a
-    // confirm-poll to read the current sign. Bounded by taper_confirm_wakes. If the rail is below the floor
-    // (weak/collapsed) or the budget is spent, give up: it's not a recoverable taper -> clear the latch.
-    bool taper_bridge = false;
-    bool charge_end_poll = false;
-    if (recently_charging && !rail_awake && !weak_rail) {
-      if (rail >= RAIL_TAPER_FLOOR && taper_confirm_wakes < (uint32_t)TAPER_CONFIRM_MAX_WAKES) {
-        taper_bridge = true;             // confirm-poll; the loop updates the budget from SoC progress
-      } else {
-        // Rail fell out of the taper band: read the car once more so the charge end and final SoC reach ABRP
-        // (CHARGE_END_POLL_FLOOR). A spent stall budget gets no extra read - those polls already reported.
-        charge_end_poll = !charge_end_polled && rail < RAIL_TAPER_FLOOR && rail >= CHARGE_END_POLL_FLOOR;
-        energyGiveUpTaper(rail, is_motion, charge_end_poll);
-      }
-    }
-    g_taper_confirm = taper_bridge;      // tell the loop this poll is a taper confirm (for the SoC-stall test)
-    if (is_motion) energyOnMotionWake();
-
-    // Decide whether to poll. A plain TIMER wake on a PARKED car (rail ~12.6) does NOT poll - polling a parked
-    // Scenic returns nothing useful and only costs a voltage sag. We poll only for a real reason, never on a
-    // weak rail:  cold boot | motion + awake (a drive) | rail high (charging/climate) | taper bridge (confirm
-    // a tapering charge whose rail dropped) | charge end | optional parked heartbeat. ATRV's 8V threshold is just a collapse detector.
-    bool should_poll = !weak_rail &&
-      (is_cold || (is_motion && awake) || rail_awake || taper_bridge || charge_end_poll || heartbeat_due);
-#if OBD_ALARM_GATE
-    // ALARM GATE (§8.2): on a flagged vehicle a STATIONARY poke - rail-awake charge sample, taper
-    // confirm, heartbeat - is exactly the parked-and-armed scenario, and polling it trips the OBD
-    // alarm every cadence tick. Suppress the poke and sleep on the normal skip path (modem never
-    // powered). Motion and cold-boot wakes still proceed: they only keep the device AWAKE - the
-    // actual bus requests are gated per-cycle and per-PID by the §8.3 permit in loop().
-    if (alarmEnforced() && should_poll && !is_motion && !is_cold) {
-      should_poll = false;
-#if ENABLE_LOGGING
-      logEvent("ALARMGATE stationary poke suppressed (flag=%d rail=%.2f) - parked+armed scenario",
-        g_alarm_flag, rail);
-#endif
-    }
-#endif
-    // A "sample poke" = a stationary one-shot read (rail-awake / taper bridge / charge end / heartbeat): poll
-    // once, log, sleep, re-check next wake. NOT a drive (motion streams) and NOT a cold boot.
-    g_sample_poke = should_poll && (rail_awake || taper_bridge || charge_end_poll || heartbeat_due) &&
-      !is_motion && !is_cold;
-    if (g_sample_poke) g_rail_before_poke = rail; // rail BEFORE the poke, vs rail_after in the fast-path
-    if (should_poll) polls_count++; else skips_count++;
-    const char* verdict = awake ? "AWAKE" : "ASLEEP";   // ATRV-vs-8V (collapse/bench detector)
-    const char* action = !should_poll ? (weak_rail ? "skip(weak-rail)" : "skip")
-                       : !g_sample_poke ? "poll"
-                       : rail_awake ? "poll(rail-awake)"
-                       : taper_bridge ? "poll(taper-confirm)"
-                       : charge_end_poll ? "poll(charge-end)" : "poll(heartbeat)";
-#if ENABLE_LOGGING
-    if (taper_bridge)
-      logEvent("TAPER_CONFIRM attempt=%lu/%d rail=%.2f (recently_charging) -> confirm-poll",
-        (unsigned long)taper_confirm_wakes, TAPER_CONFIRM_MAX_WAKES, rail);
-    if (charge_end_poll)
-      logEvent("CHARGE_END rail=%.2f < taper floor %.2f -> final poll, latch cleared", rail, RAIL_TAPER_FLOOR);
-#endif
-    Serial.printf("ATRVGATE: atrv=%.2f rail=%.2f -> %s, %s %s\n",
-      v, rail, verdict, action, ATRV_GATE_ENFORCE ? "[ENFORCE]" : "[observe]");
-#if ENABLE_LOGGING
-    // rail_awake and weak_rail follow from rail; logEvent keeps 119 characters.
-    logEvent("ATRVGATE atrv=%.2f rail=%.2f %s %s since_poll=%lds skips=%lu polls=%lu rc=%d %s",
-      v, rail, verdict, action, since_poll, (unsigned long)skips_count, (unsigned long)polls_count,
-      recently_charging ? 1 : 0, ATRV_GATE_ENFORCE ? "ENFORCE" : "observe");
-#endif
-    // NOTE: last_poll_epoch is stamped AFTER NITZ (below), not here - on a cold boot the clock isn't valid
-    // yet at this point, which is exactly why the heartbeat never fired before.
-
-#if ATRV_GATE_ENFORCE && ENABLE_SLEEP && ENABLE_MEMS
-    // Don't poll -> sleep without powering the modem. A COLD BOOT never takes this path, weak rail or not.
-    //
-    // It used to: the reasoning was that a bench supply reads below LOW, so a cold boot in the weak band had
-    // to be a real weak car. That assumption is false in practice - a bench supply or a sagging feed sits
-    // squarely in the band (measured 10.95 against the 11.00 threshold), and a genuinely weak car still has
-    // an owner standing at it who just plugged the dongle in. Either way the device went silent on BLE for
-    // the whole parked cadence, which is where the log-dump, the update and the connection-key reset all
-    // live - the reset especially, since it is only accepted within seconds of this very boot.
-    //
-    // The poll is still refused: should_poll is false, and because loop() never reads it, every bus and GNSS
-    // site checks g_weak_rail_cold_boot itself (see its definition; #104). So no OBD request is made, GNSS
-    // stays off and the modem is never powered on this path (the loop's offline reconnect skips it too, or an
-    // unanswering modem would be powered on). Only the radio comes up, for a bounded window.
-    if (!should_poll && weak_rail && wake_cause == ESP_SLEEP_WAKEUP_UNDEFINED) {
-      g_weak_rail_cold_boot = true;
-#if ENABLE_LOGGING
-      logEvent("ATRVGATE weak-rail COLD BOOT (rail=%.2f) - no poll, no modem, BLE up for %lus",
-        rail, (unsigned long)(WEAK_RAIL_COLD_BOOT_AWAKE_MS / 1000UL));
-#endif
-      Serial.printf("ATRVGATE: weak rail on a power-on -> staying awake for BLE (no poll, no modem)\n");
-    }
-    if (!should_poll && !g_weak_rail_cold_boot &&
-        (wake_cause != ESP_SLEEP_WAKEUP_UNDEFINED || weak_rail)) {
-      Serial.printf("ATRVGATE: not polling -> deep sleep (%s)\n", weak_rail ? "weak rail lockout" : "asleep");
-#if ENABLE_LOGGING
-      logEvent("ATRVGATE skip -> deep sleep (%s, modem never powered)", weak_rail ? "WEAK RAIL" : "asleep");
-#endif
-      g_next_wake_minutes = WAKE_PARKED_MINUTES; // skip = parked: long cadence
-      g_cadence_reason = nullptr;
-      energyOnSkip();
-      enterDeepSleep(false); // modem_on=false: never powered it this wake - never returns
-    }
-#endif
-  }
+  // The sleep gate (Helpers/wake_gate.h): poll, or sleep without powering the modem and never return.
+  wakeGateRun(wake_cause);
 #endif
 
   // Bring BLE up HERE - the instant the gate decides to poll, BEFORE the ~12s cellular modem init - so the
@@ -958,9 +810,8 @@ void setup() {
 #if ENABLE_SLEEP && ENABLE_MEMS
   // Wedge-guard escalation: two CONSECUTIVE wakes just ended in a WDT, panic or brownout reset (wdt_streak.h;
   // a wedge is usually in the init path below). Don't run it a third time back-to-back - sleep and try fresh next wake, so a persistently-wedging
-  // modem costs ~2 WDT windows per cycle, not a 5-minute reset loop all night. The parked cadence, unless the
-  // rail says the car is awake (driving or charging): WOM can miss a smooth road, and a charge is followed at
-  // the charging cadence anyway.
+  // modem costs ~2 WDT windows per cycle, not a 5-minute reset loop all night. A longer streak slept at the top of
+  // setup(); != CONTINUE keeps this sleep for it too should that one ever be compiled out apart.
   // Placed AFTER the gate/MEMS init (enterDeepSleep needs the sensor) and BEFORE BLE/modem bring-up.
   // modem_on only when a wake since the last acknowledged power-down reached network init (wdt_streak.h):
   // after a mid-init WDT reset the modem is almost certainly still powered (the wedge IS modem init) - CPOWD
@@ -968,8 +819,8 @@ void setup() {
   // ends in a 2.5 s PWRKEY pulse, which switches an off modem ON.
   // A restored marker debt is not paid here: these boots zeroed the clock, which keeps enterDeepSleep's marker
   // block shut, so the backlog this boot never loaded is not overwritten.
-  if (wdt_reset_count >= 2) {
-    g_next_wake_minutes = g_last_io36 >= RAIL_AWAKE_VOLTS ? WAKE_CHARGING_MINUTES : WAKE_PARKED_MINUTES;
+  if (wdtStreakAction(wdt_reset_count) != WDT_STREAK_CONTINUE) {
+    g_next_wake_minutes = wdtStreakSleepMinutes(g_last_io36);
 #if ENABLE_LOGGING
     logEvent("WDT streak=%lu -> skip init, sleep %dmin (retry fresh next wake)",
       (unsigned long)wdt_reset_count, g_next_wake_minutes);
@@ -1072,12 +923,7 @@ void setup() {
 #endif
 
 #if ENABLE_ATRV_GATE
-  // Heartbeat baseline (THE fix for the heartbeat never firing). We only reach here on a wake that's going to
-  // poll (a skip slept back in the gate), and the clock is now valid (NITZ ran above). Stamp last_poll_epoch
-  // so the heartbeat interval measures from this poll. Previously this was attempted IN the gate gated on
-  // clock_ok, but the gate runs BEFORE NITZ, so on a cold boot clock_ok was false, the stamp never happened,
-  // last_poll_epoch stayed 0, and heartbeat_due could never become true.
-  if (clockValid()) last_poll_epoch = rtc.getEpoch();
+  gateStampPoll(); // heartbeat baseline, now that NITZ has set the clock
 #endif
 
   // obd.begin(sys.link) already done earlier (before the low-battery lockout check).
@@ -1555,10 +1401,8 @@ void loop() {
     // the alarm gate reads it. Re-reading here would only make the telemetry row's rail marginally
     // fresher while re-opening the stale-input bug the hoist fixed if the two ever got reordered.
 
-    // Heartbeat back-off bookkeeping: any successful read means the car is responsive -> reset. A heartbeat
-    // poke that still finds nothing -> lengthen the interval (see heartbeat_asleep_streak / the gate).
-    if (obd_count > 0) { heartbeat_asleep_streak = 0; g_last_obd_answer_ms = millis(); }
-    else if (g_sample_poke && heartbeat_asleep_streak < 16) heartbeat_asleep_streak++;
+    gateOnPollResult(obd_count); // the heartbeat back-off
+    if (obd_count > 0) { g_last_obd_answer_ms = millis(); }
 #if ENABLE_LOGGING
     if (obd_read_attempted) {
       const uint64_t now_us = esp_rtc_get_time_us();

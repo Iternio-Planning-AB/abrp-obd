@@ -435,6 +435,7 @@ void recoverSleep() {
 #include "net_recover_sleep.inc"
 }
 bool wdtStreakModemMayBeOn() { return true; }
+#include "wdt_streak_action.inc"
 void wdtSleep() {
 #include "wdt_streak_sleep.inc"
 }
@@ -1258,7 +1259,9 @@ void checks() {
 static_assert(IO36_LOCKOUT_HIGH < CHARGE_END_POLL_FLOOR && CHARGE_END_POLL_FLOOR < RAIL_TAPER_FLOOR &&
               RAIL_TAPER_FLOOR < RAIL_AWAKE_VOLTS, "wake-gate rail bands must stay ordered");
 
-// The setup() wake gate, extracted whole: its RTC latches are members so each check controls the wake.
+#include "gate_decide.inc"
+// The setup() wake gate's decision and effects (wake_gate.h): its RTC latches are members so each check controls the
+// wake.
 struct WakeGate {
   bool recently_charging = false, charge_end_polled = false, g_taper_confirm = false;
   bool taper = false, charge_end = false;

@@ -50,6 +50,16 @@ uint32_t wdtStreakAdvance(esp_reset_reason_t rr, bool* retained) {
   return count;
 }
 
+// setup()'s crash-loop escalation, by streak: a third crash in a row sleeps at once, before any peripheral is
+// touched; a second skips the init path (where wedges usually are) and sleeps after the gate.
+enum WdtStreakAction { WDT_STREAK_CONTINUE, WDT_STREAK_SKIP_INIT, WDT_STREAK_EARLY_SLEEP };
+WdtStreakAction wdtStreakAction(uint32_t count) {
+  return count >= 3 ? WDT_STREAK_EARLY_SLEEP : count >= 2 ? WDT_STREAK_SKIP_INIT : WDT_STREAK_CONTINUE;
+}
+// The skip-init sleep's cadence: the parked one, unless the rail says the car is awake (driving or charging): WOM
+// can miss a smooth road, and a charge is followed at the charging cadence anyway. The early sleep is always parked.
+int wdtStreakSleepMinutes(float rail) { return rail >= RAIL_AWAKE_VOLTS ? WAKE_CHARGING_MINUTES : WAKE_PARKED_MINUTES; }
+
 void wdtStreakModem(bool on) { wdtStreakWrite(wdt_streak_store.count, on ? 1 : 0); }
 bool wdtStreakModemMayBeOn() { return wdt_streak_store.modem != 0; }
 void wdtStreakMarker(bool owed) { wdtStreakWrite(wdt_streak_store.count, wdt_streak_store.modem, owed ? 1 : 0); }
