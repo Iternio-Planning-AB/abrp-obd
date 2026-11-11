@@ -36,7 +36,9 @@ ALARM_SPEED_HOLD_MS, a sustained rail collapse voiding the note. Every DENY line
 between two of them; only the gated branch moves the counter here, so that checks the transition logging. Groups:
 enumerate (exhaustive over a drive, an energy and a wake alphabet, --depth, default 5), random (fixed seeds), scenarios (named field and charge cases), crash (CUR alone: a panic,
 also inside the pre-sleep flush, never loses the marker debt; an absolute property, not a comparison), rules
-(CUR alone: absolute checks of the #6 driving rules), or all. A Charge or Silent poll keeps the wake's rail and
+(CUR alone: absolute checks of the #6 driving rules), dc (the tree built again with DC_EARLY_HOLD on: #128's early DC
+release, named cases and generated traces against an oracle kept from the inputs), or all. Both differential sides
+compile with DC_EARLY_HOLD 0, so the differential stays exact equality; only the dc group runs the release. A Charge or Silent poll keeps the wake's rail and
 motion; any answered poll stamps the last OBD answer. A wake carries the rail, the ATRV read, the alarm flag and an
 optional charge latch; the RTC clock and epoch run through sleeps, and a cold boot zeroes the clock until a poll.
 Before compiling, it checks that only drive_state.h assigns the park/drive storage, that alarm_gate.h names no
@@ -465,9 +467,12 @@ for macro in sorted(used):
 # The harness resets each firmware global to a literal; that literal must be the firmware's initialiser: in
 # the tree for all of them, and at SM_PIN too except those only the shared context reads: maintenance_mode, and
 # g_pdw_recheck (#22, the ladder end's re-check), which is newer than SM_PIN and must stay out of every pinned block.
-SHARED_ONLY = ("maintenance_mode", "g_pdw_recheck")
-if any(re.search(r"\bg_pdw_recheck\b", pin[block_name]) for block_name in PIN_BLOCKS):
-    sys.exit("FAIL: g_pdw_recheck appears in a pinned block; define it at SM_PIN and check its initialiser there")
+# The early DC release's count and reset-line flag (#128) are newer than SM_PIN too, read by the tree's drive_state.h.
+NEWER_THAN_PIN = ("g_pdw_recheck", "g_dc_release_polls", "g_dc_reset_logged")
+SHARED_ONLY = ("maintenance_mode",) + NEWER_THAN_PIN
+for name in NEWER_THAN_PIN:
+    if any(re.search(rf"\b{name}\b", pin[block_name]) for block_name in PIN_BLOCKS):
+        sys.exit(f"FAIL: {name} appears in a pinned block; define it at SM_PIN and check its initialiser there")
 adapter = tree("tests/sm/adapter_pre.inc")
 for region, prefix in (("SM_RAM", ""), ("SM_RTC", "RTC_DATA_ATTR ")):
     body = re.search(rf"^#define {region}\(X\) \\\n((?:.*\\\n)*.*)", adapter, re.M).group(1)
@@ -531,7 +536,8 @@ if (terms[-1] != "alarmGateAllowsPoll()" or len(reads) != 2 or len(outside) != 1
 # local of the same name is not.
 # Blind spot: passing a field to a non-const reference parameter writes it unseen, as chargeCounterRose does inside
 # the energy owner; review must catch one outside it.
-DRIVE_STORAGE = ("is_currently_parked", "g_last_speed_ms", "park_marker_owed", "drive_unconfirmed", "g_drive_gnss_refused")
+DRIVE_STORAGE = ("is_currently_parked", "g_last_speed_ms", "park_marker_owed", "drive_unconfirmed", "g_drive_gnss_refused",
+                 "g_dc_release_polls", "g_dc_reset_logged")
 ENERGY_STORAGE = ("charging_fast_minutes", "dc_session", "charging_cap_latched", "charge_uncorroborated_s",
                   "charge_corr_last_us", "charge_corr_soc_hw", "charge_corr_kwh_hw", "charge_corr_soe_hw",
                   "recently_charging", "taper_confirm_wakes", "charge_end_polled", "prev_charge_soc", "prev_parked_soc",
@@ -653,6 +659,7 @@ ENERGY_UNEXTRACTED = (
     ("logger", "const unsigned pdw_left = pdwActive(pdw_now_us)", 1),
     # dcPromotePoke: run_energy_checks.py's Dongle runs it whole.
     ("logger", "energyOnPromote();", 1),
+    ("logger", "if (!g_last_discharge_ms) energyOnDcRelease();", 1),
 )
 
 

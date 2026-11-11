@@ -576,7 +576,7 @@
 // Through a charge confirmed DC (the latch holds through the taper and the silent hold) and with the rail
 // showing the DC-DC up, stay awake and poll and upload this often over one reused session (issue #51). A
 // 1-minute wake is about the floor for sleep and wake: each one pays a modem attach (median ~10 s) and a fresh
-// TLS open (~3 s, ~5 KB). Motion suspends it for an ACTIVE_TIMER, so a drive gets ACTIVE's cadence. Each held
+// TLS open (~3 s, ~5 KB). A drive-away ends it at its first poll (DC_EARLY_HOLD). Each held
 // poll of a sample poke counts a whole WAKE_DC_CHARGING_MINUTES toward WAKE_CHARGING_MAX_MINUTES, so the cap
 // trips sooner; a streaming wake counts its elapsed time instead. With
 // a slow poll's margin it must stay under SESSION_IDLE_MAX_MS, so every upload reuses the session (#8: a flow
@@ -590,6 +590,26 @@
 // missing either means no inference and the session is treated as AC, which is the safe way to be
 // wrong (a slower update, rather than hours of wasted 1-minute wakes on an overnight charge).
 #define DC_CHARGING_MIN_KW         40
+// Early DC release (#128). FIELD (11-04): two DC sessions (~47 kW for 4.3 min, ~66 kW for 1 min) began within a
+// minute of stopping; the drive latch holds DRIVING for ACTIVE_TIMER after the last speed, so is_charging was never
+// evaluated and neither produced a CHARGE or DC_AWAKE line. While DRIVING or UNCONFIRMED, DC_RELEASE_POLLS polls in a
+// row at a charge power of DC_CHARGING_MIN_KW (a current below CHARGING_CURRENT_THRESHOLD at |V x I|), or with the
+// car's own is_dcfc, re-latch PARKED. A speed other than 0 or a moving GNSS fix on any of them restarts the count:
+// regen reaches DC power, and the field logs show it only in bursts of at most 2 polls. No accelerometer veto: people
+// sit in the car while it charges. A car with neither speed nor GNSS relies on the run alone. The run is the regen
+// guard, so the release trusts the charge signal at once (no CHARGE_STREAM_CONFIRM_SECONDS wait). The flag also keeps
+// the DC hold through motion and exempts it from MAX_AWAKE_MINUTES. 0 is the rollback.
+#ifndef DC_EARLY_HOLD
+#define DC_EARLY_HOLD 1
+#endif
+#define DC_RELEASE_POLLS           3
+// The DC hold's rail veto (dcAwakeVeto) and a latched DC session's taper/silent hold (g_dc_confirmed). FIELD: an
+// MEB DC-DC ran at ~13.3-13.5 V through DC fast charges (low 13.31 V), at the edge of RAIL_AWAKE_VOLTS. The rail
+// here says only that the DC-DC is up; the DC verdict comes from the car's is_dcfc or the latched session. Kept above
+// the AC-taper and full-battery rest band (~13.18-13.2 V). The rollback (DC_EARLY_HOLD 0) keeps RAIL_AWAKE_VOLTS.
+#ifndef DC_HOLD_RAIL_VOLTS
+#define DC_HOLD_RAIL_VOLTS         (DC_EARLY_HOLD ? 13.2f : RAIL_AWAKE_VOLTS)
+#endif
 #define WAKE_PARKED_MINUTES        30    // FIELD: parked voltage-watch. Each wake is a cheap ~5s rail check
                                          // (no modem, no poll, no BLE on a skip) ~ a few mAh/day. 30 min
                                          // bounds how late we catch a charge start with no awake dongle: a
@@ -633,6 +653,8 @@ static_assert(POST_DRIVE_RECHECK_MINUTES < POST_DRIVE_WINDOW_MINUTES ||
 #define RAIL_TAPER_FLOOR        13.0f  // confirm-poll only if rail >= this. NOT a charge signal (taper ~13.18
                                        // and parked-rest ~13.19 both sit above it) - purely a safety floor so
                                        // we never confirm-poll a weak/collapsing battery. Current sign decides.
+static_assert(DC_HOLD_RAIL_VOLTS <= RAIL_AWAKE_VOLTS && DC_HOLD_RAIL_VOLTS > RAIL_TAPER_FLOOR,
+              "the DC hold's rail veto sits between the taper floor and the awake rail");
 // Charge-end read: when the rail falls below RAIL_TAPER_FLOOR with the latch still up, the charge has most
 // likely just ended, and without one more poll ABRP keeps the last CHARGING point until the next drive. FIELD
 // (Scenic, 2026-10-09): rail 13.17 -> 12.70 three minutes after a 20kW AC charge, the latch dropped silently,

@@ -337,11 +337,16 @@ const char* propertyBroken(const Snap& pre, const SmEvent& e) {
   if (g_weak_rail_cold_boot && !sm_cold_boot) return "the weak-rail BLE window opened on a deep-sleep wake";
   if (!pre.sm_asleep && sm_asleep && pre.g_weak_rail_cold_boot && sm_sleep_modem)
     return "a weak-rail cold boot slept with the modem on (marker, flush)";
-  // The backstop runs at the top of a ladder tick, so the state it judges is the one before the tick.
+  // The backstop runs at the top of a ladder tick, so the state it judges is the one before the tick. With
+  // DC_EARLY_HOLD (#128) a DC charge the hold would keep is exempt, in the BLE state too: the rail and alarm terms, read
+  // from the state before the tick.
+  const bool dc_held = DC_EARLY_HOLD && pre.g_dc_confirmed && pre.g_last_io36 >= DC_HOLD_RAIL_VOLTS && pre.g_alarm_flag != 1;
   if (e.k == SmKind::LADDER && !pre.sm_asleep && pre.is_currently_parked && !pre.maintenance_mode &&
-      pre.current_state != UNINITIALIZED && sm_now > (unsigned long)MAX_AWAKE_MINUTES * 60UL * 1000UL &&
+      pre.current_state != UNINITIALIZED && sm_now > (unsigned long)MAX_AWAKE_MINUTES * 60UL * 1000UL && !dc_held &&
       !(sm_asleep && sm_sleep_reason == "backstop"))
     return "awake past MAX_AWAKE_MINUTES while parked, and the next ladder tick did not take the backstop sleep";
+  if (e.k == SmKind::LADDER && !pre.sm_asleep && dc_held && sm_asleep && sm_sleep_reason == "backstop")
+    return "the backstop slept a held DC charge";
   // The backstop is shared context but reads the latch: it must never take a driving car to sleep.
   if (e.k == SmKind::LADDER && !pre.sm_asleep && !pre.is_currently_parked && sm_asleep && sm_sleep_reason == "backstop")
     return "the backstop slept while driving";

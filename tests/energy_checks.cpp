@@ -440,10 +440,11 @@ void wdtSleep() {
 #include "wdt_streak_sleep.inc"
 }
 bool maintenance_mode = false, g_ota_active = false, g_logdump_active = false, is_currently_parked = true;
-enum { UNINITIALIZED, STANDBY } current_state = STANDBY;
+enum { UNINITIALIZED, ACTIVE, STANDBY } current_state = STANDBY;
 unsigned long millis() { return (MAX_AWAKE_MINUTES + 1) * 60UL * 1000UL; }
 struct { void printf(const char*, ...) {} } Serial;
-bool g_dc_confirmed = true;  // the backstop bounds the DC hold too
+bool g_dc_confirmed = true;  // a DC charge whose hold has ended (here: no rail) is bounded by the backstop
+bool dcAwakeHeld(decltype(current_state)) { return false; }  // not held (no rail)
 void backstopSleep() {
 #include "backstop_sleep.inc"
 }
@@ -462,7 +463,7 @@ void checks() {
   check(has("reason=backstop ") && dc_off.empty(), "the parked MAX_AWAKE backstop logs its own reason");
   g_dc_logged = true;
   backstopSleep();
-  check(dc_off.find("DC_AWAKE off reason=backstop ") == 0, "a backstop that ends a held DC charge closes its DC_AWAKE line");
+  check(dc_off.find("DC_AWAKE off reason=backstop ") == 0, "a backstop after a DC hold closes its DC_AWAKE line");
   g_dc_logged = false;
   check(g_next_wake_minutes == WAKE_CHARGING_MINUTES, "the backstop still ends the ladder with the post-drive window");
   g_cadence_reason = "parked-held";
@@ -518,11 +519,7 @@ void checks() {
   g_last_io36 = 14.9f;
   check(edge("DC_AWAKE on rail=14.90 fast=7min"), "the hold logs its start once");
   g_last_motion_ms = now;
-  g_dc_refused_logged = false;  // a new wake
-  check(edge("DC_AWAKE off reason=motion rail=14.90 peak=0.210 axmax=0.120"),
-        "motion ends it with the window's peak, and no refused line follows");
-  now += (unsigned long)ACTIVE_TIMER;
-  check(edge("DC_AWAKE on "), "it resumes once still");
+  check(edge(nullptr), "motion does not end it (#128): people sit in the car while it charges");
   g_dc_confirmed = false;
   g_cadence_reason = "parked-cap";
   check(edge("DC_AWAKE off reason=parked-cap "), "a cadence decision names itself");
@@ -1729,6 +1726,152 @@ struct PokeEnd : ChargePoll {
 #include "poke_sleeps.inc"
 };
 
+// The awake ladder in time (#128): handleActivityState() from its clock read on, whole (the backstop and the switch),
+// one tick per loop pass (detectMovement's 500 ms), then loop()'s poll gate. millis() is time awake. The drive region
+// is the scenario's: a driving poll unlatches and holds the leash, as driveSpeed does, and a stop re-latches PARKED on
+// its third DC poll, as the early release does.
+struct Awake : Dongle {
+  static constexpr unsigned long MAINTENANCE_IDLE_MS = 120000;
+  bool active = false, maintenance_mode = false, g_ota_active = false, g_logdump_active = false;
+  bool config_initialized = true, config_message_printed = false, g_ble_session_relayed = false, ble = false;
+  bool is_currently_parked = true, asleep = false;
+  unsigned long maintenance_since = 0, polling_delay = 5000, last_poll = 0;
+  int stopped_polls = 0;
+  const char* sleep_reason = nullptr;
+  struct Poll { unsigned long at; bool held; };
+  std::vector<Poll> polls;
+  struct { void printf(const char*, ...) {} } Serial;
+  bool bleConnected() const { return ble; }
+  bool bleAuthenticated() const { return ble; }
+  bool bleRelaying() const { return ble; }
+  void enterDeepSleep(bool, const char* reason = nullptr) { asleep = true; sleep_reason = reason; }
+#include "polling_delay.inc"
+  void changeState(ActivityState s) {
+    current_state = s;
+    if (s == CHARGING || s == STANDBY) is_currently_parked = true;  // driveIdle
+    polling_delay = getPollingDelay(s);
+  }
+  void ladder() {
+#define ENABLE_SLEEP 1
+#define ENABLE_MEMS 1
+#include "awake_ladder.inc"
+#undef ENABLE_SLEEP
+#undef ENABLE_MEMS
+  }
+  Awake() { changeState(ACTIVE); }
+  // ms of loop passes at this rail and frame: motion every motion_ms (0: none), driving or stopped. Stops at a sleep.
+  void run(unsigned long ms, const OBDVector& frame, float rail = 14.9f, unsigned long motion_ms = 0, bool driving = false) {
+    for (const unsigned long end = now + ms; now < end && !asleep;) {
+      now += 500;
+      g_last_io36 = ladder_rail = rail;
+      active = motion_ms && now % motion_ms == 0;
+      if (active) last_active = g_last_motion_ms = now;  // detectMovement's stamp
+      ladder();
+      if (asleep || now - last_poll <= dcAwakeDelay(current_state, polling_delay)) continue;
+      last_poll = now;
+      if (driving) is_currently_parked = false, last_active = now, stopped_polls = 0;
+      else if (!is_currently_parked && ++stopped_polls >= DC_RELEASE_POLLS) is_currently_parked = true, energyOnDcRelease();
+      poll(frame, is_currently_parked);
+      polls.push_back({now, dcAwakeHeld(current_state)});
+    }
+  }
+  // A DC charge for minutes, the SoC rising.
+  void charge(int minutes, unsigned long motion_ms = 0, float rail = 14.9f, double amps = -150) {
+    for (int m = 0; m < minutes && !asleep; ++m) run(60000, dcFrame(30 + 0.5 * soc_step++, amps), rail, motion_ms);
+  }
+  int soc_step = 0;
+  // Since poll i: every poll held, and at most the DC cadence (plus a pass) apart.
+  bool heldFrom(size_t i) const {
+    for (size_t j = i; j < polls.size(); ++j)
+      if (!polls[j].held || (j > i && polls[j].at - polls[j - 1].at > DC_CHARGING_AWAKE_SECONDS * 1000UL + 500)) return false;
+    return i < polls.size();
+  }
+  size_t firstHeld(size_t from = 0) const {
+    while (from < polls.size() && !polls[from].held) ++from;
+    return from;
+  }
+};
+const OBDVector DRIVING = {{"current", 30.0}, {"voltage", 400.0}, {"soc", 50}};
+const OBDVector UNPLUGGED = {{"current", 0.3}, {"voltage", 400.0}, {"soc", 20}};  // under any charged SoC: no progress
+
+// While DC-held with the rail up, motion present (people sit in the car while it charges), no sleep path is taken, past
+// MAX_AWAKE_MINUTES too; at charge end, a rail drop or a drive the normal ladder resumes and sleeps.
+void dcLadderChecks() {
+  const unsigned long dc_ms = DC_CHARGING_AWAKE_SECONDS * 1000UL, motion_ms = 10000;
+  // A drive past MAX_AWAKE_MINUTES, then a DC charge with people in the car: held from the trusted charge on.
+  Awake road;
+  road.run((MAX_AWAKE_MINUTES + 5) * 60000UL, DRIVING, 14.9f, 0, true);
+  check(!road.asleep && !road.is_currently_parked, "harness: a drive past MAX_AWAKE_MINUTES");
+  const size_t stop = road.polls.size();
+  const unsigned long stopped = road.now;
+  road.charge(30, motion_ms);
+  const size_t held = road.firstHeld(stop);
+  check(!road.asleep, "a held DC charge past MAX_AWAKE_MINUTES, with motion, takes no sleep path (backstop included)");
+  check(held < road.polls.size() &&
+        road.polls[held].at - stopped <= CHARGE_STREAM_CONFIRM_SECONDS * 1000UL + dc_ms + 5000 && road.heldFrom(held),
+        "the hold starts once the charge is trusted and holds every poll, DC_CHARGING_AWAKE_SECONDS apart, motion or not");
+  const unsigned long unplugged = road.now;
+  road.run(5 * 60000UL, UNPLUGGED);
+  check(road.asleep && road.sleep_reason && !strcmp(road.sleep_reason, "backstop") && road.now - unplugged <= dc_ms + 1000,
+        "the unplug ends the hold at its next poll and the backstop sleeps at once");
+  // The OBD-alarm veto keeps the backstop: a flagged car is never held, so it sleeps right after the stop.
+  Awake flagged;
+  flagged.alarm = true;
+  flagged.run((MAX_AWAKE_MINUTES + 5) * 60000UL, DRIVING, 14.9f, 0, true);
+  const unsigned long flagged_stop = flagged.now;
+  flagged.charge(10);
+  check(flagged.asleep && !strcmp(flagged.sleep_reason, "backstop") && flagged.now - flagged_stop <= 60000,
+        "an alarm-flagged car is not held: the backstop sleeps it after the stop");
+
+  // A short drive: the rail drop ends the hold at the next pass, and the ladder sleeps ACTIVE_TIMER after the last motion.
+  for (const bool rail_drop : {true, false}) {
+    Awake town;
+    town.run(10 * 60000UL, DRIVING, 14.9f, 0, true);
+    const size_t from = town.polls.size();
+    town.charge(15, motion_ms);
+    check(!town.asleep && town.heldFrom(town.firstHeld(from)), "a held DC charge with motion stays held and awake");
+    const unsigned long ended = town.now;
+    if (rail_drop) town.charge(15, 0, 13.1f, -60);
+    else town.run(15 * 60000UL, UNPLUGGED);
+    check(town.asleep && !town.sleep_reason && !town.dcAwakeHeld(town.current_state) &&
+          town.now - ended <= (unsigned long)ACTIVE_TIMER + 5000,
+          rail_drop ? "a rail drop ends the hold and the ladder sleeps" : "the charge end ends the hold and the ladder sleeps");
+  }
+
+  // A phone connected mid-charge keeps its own cadence; when it leaves the hold takes over and the wake stays up.
+  // Past MAX_AWAKE_MINUTES, as on a road trip with the app open: a DC charge is not backstopped in BLE either.
+  Awake phone;
+  phone.run((MAX_AWAKE_MINUTES + 5) * 60000UL, DRIVING, 14.9f, 0, true);
+  phone.charge(10, motion_ms);  // the person with the phone is at the car: only ACTIVE takes a connection to BLE
+  phone.ble = true;
+  phone.charge(10);
+  check(phone.current_state == BLE && !phone.dcAwakeHeld(BLE) && phone.g_dc_confirmed && !phone.asleep,
+        "a connected phone keeps the BLE cadence, and a DC charge in BLE is not backstopped");
+  phone.ble = false;
+  const size_t left = phone.polls.size();
+  phone.charge(20);
+  check(!phone.asleep && phone.heldFrom(left + 1), "after the phone leaves the DC hold holds the wake");
+  // A phone and no charge past MAX_AWAKE_MINUTES is still backstopped.
+  Awake idle_phone;
+  idle_phone.run((MAX_AWAKE_MINUTES + 5) * 60000UL, DRIVING, 14.9f, 0, true);
+  idle_phone.ble = true;
+  idle_phone.run(10 * 60000UL, UNPLUGGED, 14.9f, motion_ms);
+  check(idle_phone.asleep && idle_phone.sleep_reason && !strcmp(idle_phone.sleep_reason, "backstop"),
+        "a connected phone with no DC charge past MAX_AWAKE_MINUTES is backstopped");
+
+  // Unplug and drive away: the hold ends at the first poll after the drive starts, at most one DC poll late.
+  Awake away;
+  away.run(10 * 60000UL, DRIVING, 14.9f, 0, true);
+  away.charge(10);
+  check(away.heldFrom(away.polls.size() - 1), "harness: held before the drive-away");
+  const size_t before = away.polls.size();
+  const unsigned long drove = away.now;
+  away.run(2 * 60000UL, DRIVING, 14.9f, 500, true);
+  check(away.polls.size() > before + 2 && !away.polls[before].held && away.polls[before].at - drove <= dc_ms + 500 &&
+        away.polls[before + 1].at - away.polls[before].at <= 5500 && !away.asleep,
+        "a drive-away ends the hold at its first poll, at most one DC poll late, then polls at ACTIVE's cadence");
+}
+
 void dcAwakeChecks() {
   const unsigned long dc_ms = DC_CHARGING_AWAKE_SECONDS * 1000UL;
   for (const int car : {-1, 1}) {
@@ -1861,10 +2004,22 @@ void dcAwakeChecks() {
   Dongle rail = held();
   check(!rail.hold(dcFrame(31, -60), 13.1f) && rail.next == WAKE_CHARGING_MINUTES,
         "a rail drop ends the session's hold and sleeps as before");
-  Dongle rail_dc = held();
-  check(!rail_dc.hold(dcFrame(31), 13.1f) && rail_dc.g_dc_confirmed && rail_dc.next == WAKE_DC_CHARGING_MINUTES,
-        "a DC reading at a low rail is not held, and keeps the 1-minute DC wake");
-  check(rail_dc.g_rail_before_poke == 13.1f, "a held poke judges silence on the latest rail, not the wake's");
+  // A DC session holds down to DC_HOLD_RAIL_VOLTS, under RAIL_AWAKE_VOLTS (an MEB rail sat at 13.31 V on DC):
+  // a fresh DC reading, and the taper under DC_CHARGING_MIN_KW.
+  for (const float rail_v : {13.25f, 13.15f}) {
+    const bool up = rail_v >= 13.2f;
+    Dongle rail_dc = held();
+    const bool is_held = rail_dc.hold(dcFrame(31), rail_v);
+    const char* veto = rail_dc.dcAwakeVeto(CHARGING);
+    check(is_held == up && (up ? !veto : veto && !strcmp(veto, "rail")) && rail_dc.g_dc_confirmed &&
+          rail_dc.next == WAKE_DC_CHARGING_MINUTES,
+          up ? "a DC reading at 13.25 V is held" : "a DC reading at 13.15 V is vetoed (rail), and keeps the 1-minute DC wake");
+    check(rail_dc.g_rail_before_poke == rail_v, "a held poke judges silence on the latest rail, not the wake's");
+    Dongle taper = held();
+    check(taper.hold(dcFrame(31, -60), rail_v) == up && taper.g_dc_confirmed == up &&
+          taper.next == (up ? WAKE_DC_CHARGING_MINUTES : WAKE_CHARGING_MINUTES),
+          up ? "the taper at 13.25 V stays DC" : "the taper at 13.15 V ends the hold");
+  }
   Dongle car_ac = held();
   check(!car_ac.hold(dcFrame(31, -150, 0)) && !car_ac.dc_session && car_ac.next == WAKE_CHARGING_MINUTES,
         "the car's is_dcfc=0 ends the session, over 60 kW");
@@ -1883,39 +2038,49 @@ void dcAwakeChecks() {
   check(backstop.wake(14.9f, dcFrame(32, -60)) == WAKE_DC_CHARGING_MINUTES && backstop.dcAwakeHeld(CHARGING),
         "after a sleep the DC session's next poke holds again");
 
-  // Motion: the hold yields to ACTIVE's own cadence at once, and resumes after an ACTIVE_TIMER of stillness.
+  // Motion does not suspend the hold (#128): people sit in the car while it charges. A drive ends it by its poll.
   Dongle stream;
   stream.awake(14.9f, false, dcFrame(30));
   stream.current_state = ACTIVE;
   stream.g_last_motion_ms = stream.now;
-  check(!stream.dcAwakeHeld(ACTIVE) && stream.dcAwakeDelay(ACTIVE, 5000) == 5000,
-        "motion during a hold drops to ACTIVE's 5 s polling at once");
-  stream.now += (unsigned long)ACTIVE_TIMER;
-  stream.current_state = CHARGING;
-  check(stream.hold(dcFrame(31)), "after an ACTIVE_TIMER without motion the hold resumes");
+  check(stream.dcAwakeHeld(ACTIVE) && stream.dcAwakeDelay(ACTIVE, 5000) == dc_ms,
+        "motion during a hold keeps the DC cadence");
 
-  // Motion on a held sample poke promotes it to a full wake rather than sleeping, as WOM would not fire again.
-  Dongle flap = held();
+  // Motion on a held sample poke promotes it to a full wake rather than sleeping, as WOM would not fire again. The wake
+  // starts at millis() 0 with no discharge seen, as on the device, and promotes inside CHARGE_STREAM_CONFIRM_SECONDS.
+  Dongle flap;
+  flap.next = 0;
+  flap.wake(14.9f, dcFrame(30));
+  flap.hold(dcFrame(30.2));
+  check(flap.g_sample_poke && flap.dcAwakeHeld(CHARGING) && flap.g_last_discharge_ms == 0 &&
+        flap.now < CHARGE_STREAM_CONFIRM_SECONDS * 1000UL, "harness: a held poke early in its wake");
   flap.g_last_motion_ms = flap.now;
   flap.dcPromotePoke();
-  check(!flap.g_sample_poke && flap.ble_up, "motion promotes a held poke: BLE up and the streaming trust rule from now");
-  check(!flap.hold(dcFrame(31)) && !flap.g_dc_confirmed, "its next sample is not trusted yet, so regen is not DC");
-  flap.now += (unsigned long)ACTIVE_TIMER;
-  check(flap.hold(dcFrame(32)), "once still and trusted, the promoted wake holds again");
+  check(!flap.g_sample_poke && flap.ble_up, "motion promotes a held poke: BLE up");
+  check(flap.hold(dcFrame(31)) && flap.poll(dcFrame(31.2)).charging && flap.g_dc_confirmed,
+        "the promoted poke keeps the charge trusted (#128): is_charging, is_dcfc and DC_AWAKE stay");
+  // A discharge seen this wake is not overwritten: its streaming confirm still runs.
+  Dongle drew;
+  drew.next = 0;
+  drew.wake(14.9f, dcFrame(30));
+  drew.hold(dcFrame(30.2));
+  drew.g_last_discharge_ms = drew.now - 10000;
+  drew.g_last_motion_ms = drew.now;
+  drew.dcPromotePoke();
+  check(!drew.g_sample_poke && !drew.poll(dcFrame(30.4)).charging, "a promote keeps a discharge seen this wake");
   Dongle unheld;
   unheld.wake(14.9f, dcFrame(30, -12));
   unheld.g_last_motion_ms = unheld.now;
   unheld.dcPromotePoke();
   check(unheld.g_sample_poke && !unheld.ble_up, "a poke no DC charge holds is not promoted; it sleeps as before");
-  // A drive off a held poke on a car with no speed PID: regen at 60 kW after the promotion is never a charge.
+  // A drive off a promoted poke on a car with no speed PID: its first discharge ends the hold.
   Dongle regen = held();
   regen.g_last_motion_ms = regen.now;
   regen.dcPromotePoke();
-  for (int i = 0; i < 6; ++i) {
-    regen.now += 5000;
-    regen.poll(i % 2 ? dcFrame(31, 25) : dcFrame(31, -150));
-    check(!regen.g_dc_confirmed, "regen on a promoted poke is never held as DC");
-  }
+  regen.now += 5000;
+  regen.poll(dcFrame(31, 25));
+  check(!regen.g_dc_confirmed, "a discharge poll ends the hold");
+
 
   // An hour of somebody moving about the car during a DC charge (a streaming wake, 5 s polls) costs an hour of budget.
   Dongle fidget;
@@ -2034,7 +2199,7 @@ int main(int argc, char** argv) {
   if (group == "all" || group == "transport") transportChecks();
   if (group == "all" || group == "ble-frame") { bleFrameChecks(); ble_frame_log::checks(); }
   if (group == "all" || group == "sleep-reason") sleep_reason::checks();
-  if (group == "all" || group == "dc-awake") { dcAwakeChecks(); dc_track::checks(); }
+  if (group == "all" || group == "dc-awake") { dcAwakeChecks(); dcLadderChecks(); dc_track::checks(); }
   if (group == "all" || group == "wdt-streak") wdt_streak::checks();
   if (argc > 2 && (group == "all" || group == "profiles")) profileChecks(argv[2]);
   std::cout << "Energy " << group << " checks PASS\n";
