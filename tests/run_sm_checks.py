@@ -62,7 +62,8 @@ never a skip.
 What it cannot prove: 32-bit millis() wrap (the host unsigned long is 64-bit); any feature-flag set other
 than the config.h defaults with PRINT 0 (lines under #if PRINT and other branches are not compiled); code
 outside the extracted blocks (the rest of handleActivityState, dcPromotePoke and motion inside a wake, the
-SAMPLE_POLL line, the modem, detectMovement timing, RTC retention, hardware); the wdt-streak sleeps before and after
+SAMPLE_POLL line, the silent retry (#131, see the stub in sm/adapter_pre.inc), the modem, detectMovement timing,
+RTC retention, hardware); the wdt-streak sleeps before and after
 the gate; resets other than a deep-sleep wake, a power loss, a panic and a WDT (a brownout or software reset reloads
 RTC as those do, so the sanitize cannot show); the heartbeat (ENABLE_PARKED_HEARTBEAT 0, so the branch is not
 compiled and loop()'s gateOnPollResult, which keeps heartbeat_asleep_streak, never runs); the per-PID alarm guard inside readPIDs (alarmPollGuard), the deferred

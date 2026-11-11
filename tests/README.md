@@ -384,7 +384,10 @@ charge not latched, and the cadence kept under `SESSION_IDLE_MAX_MS`; and #128's
 `MAX_AWAKE_MINUTES` then a DC charge with people in the car (no sleep path while held, the backstop at the unplug), a
 flagged car still backstopped, the rail drop and the charge end sleeping through the ladder, a phone connected past
 `MAX_AWAKE_MINUTES` (not backstopped with a DC charge, backstopped without one) and leaving mid-charge, and a
-drive-away ending the hold at its first poll; a promoted held poke keeps the charge trusted), the ABD1 frame fitted to MTU−3 (`ble-frame`: compact 2 dp numbers, key filtering, priority trimming, MTU 23, and the `BLE tlm` log cadence), telemetry serialization and energy/temperature CSV columns under
+drive-away ending the hold at its first poll; a promoted held poke keeps the charge trusted), #131's silent retry
+(`silent-retry`: the real retry helpers in time on that ladder with the poke's end block, at `OBD_SILENT_RETRY_SECONDS`
+45 and 0: one retry 45 s later whose result is the only poll that counts, compared with a single poll; the arming
+conditions and rail vetoes; motion, a DC answer and a serial session during and after the wait), the ABD1 frame fitted to MTU−3 (`ble-frame`: compact 2 dp numbers, key filtering, priority trimming, MTU 23, and the `BLE tlm` log cadence), telemetry serialization and energy/temperature CSV columns under
 ASan/UBSan. Add `--profiles /path/to/profiles` to exercise actual Scenic/iX3 production/developer
 equations with the firmware parser (optional: the ABRP backend profiles are not public). The runner extracts the current charging and logging code;
 hardware is fake, not on-device verification. DataLogger schema rotation is owned by the diagnostics runner.
