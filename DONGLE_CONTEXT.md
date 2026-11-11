@@ -179,6 +179,10 @@ Check the rail before powering peripherals or issuing bus traffic.
   follow-up and post-drive window state (#25); the gate's poll decision and the next-wake cadence are not yet its.
 - `Helpers/wake_gate.h` is setup()'s wake gate: a pure poll decision (`gateDecide`) and the only writer of the skip/poll
   counters, the heartbeat back-off, the last-poll stamp and the weak-rail cold boot flag (#26).
+- `Helpers/state_machine.h` is the awake ladder: pure rung and backstop decisions (`ladderStep`, `backstopDue`) over
+  the session holds and the phone, each read once per pass (`AwakeHolds`: OTA, log dump, console; `AwakePhone`), and
+  the only writer of the ladder state (#29). Both ladder sleeps arm the post-drive window first; `enterDeepSleep`
+  still refuses any sleep during an OTA update or a log dump.
 - Bring BLE up before slow modem initialization. Suppress cellular only while `bleRelaying()` says
   the phone is the transport—not merely connected or, in v1, authenticated.
 - Normal sleep flushes/saves uploads, deinitializes BLE, powers down peripherals and arms wake sources.

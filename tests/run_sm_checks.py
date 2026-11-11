@@ -748,7 +748,7 @@ if code_only(tree("baseLogger/Helpers/mems.h")).count("last_active = g_last_moti
     sys.exit("FAIL: mems.h's detectMovement() must stamp last_active = g_last_motion_ms = millis() once, as the adapter does")
 # Two wires the adapter bypasses (it sets the inputs directly): the sampled motion windows must reach the
 # accumulator, and an OBD answer must stamp the car-on evidence.
-if not re.search(r"motion_sampled = !g_ota_active && !g_logdump_active && current_state != UNINITIALIZED;\s*"
+if not re.search(r"motion_sampled = !h\.ota && !h\.dump && current_state != UNINITIALIZED;\s*"
                  r"noteDriveMotionWindow\(motion_sampled, active\);", cur_src["machine"]):
     sys.exit("FAIL: state_machine.h must feed every sampled detectMovement window to noteDriveMotionWindow()")
 if not re.search(r"if \(obd_count > 0\) \{[^}]*g_last_obd_answer_ms = millis\(\);", cur_src["logger"]):

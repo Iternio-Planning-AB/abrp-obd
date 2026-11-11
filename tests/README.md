@@ -141,7 +141,9 @@ pass); then every 5-event sequence over 18 ladder symbols and 2500 random ones, 
 each rung, the backstop, a refused sleep, the DC hold, a relayed handoff and the console's release. The runner fails if
 anything outside `state_machine.h` assigns `current_state`, `g_ble_session_relayed`, `g_ble_disconnect_ms`,
 `g_dc_logged`, `g_dc_refused_logged` or `config_message_printed` (fixtures: a chained assignment, a write in another
-helper, a shadowing local), or if a ladder call sits outside the compared blocks and its named sites.
+helper, a shadowing local), or if a ladder call sits outside the compared blocks and its named sites. The module's
+`ladderStep` and `backstopDue` are pure, over the holds and the phone read once per pass; `run_energy_checks.py` asks
+`ladderStep` for its CHARGING rung and slices the backstop and the glue from its clock read on, as before.
 
 Since #83 the fast-cadence budget is checked as properties on both sides, against the adapter's own record: a poll on
 the charging branch (a fast tier, no cadence reason) never comes with the budget already at `WAKE_CHARGING_MAX_MINUTES`;
