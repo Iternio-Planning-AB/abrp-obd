@@ -44,8 +44,8 @@ Flash/monitor with `pio run -e esp32dev -t upload -t monitor`, 115200 baud.
 - `OTA_FW_VERSION` and `FW_BUILD_TAG` come from `tools/pio_version.py` and the newest `vX.Y.Z`
   tag. Fetch GitHub tags; never hand-edit these values. Use the manual Release workflow;
   see [RELEASING.md](../RELEASING.md).
-- CI's `variants` job links the default image and logging-off, BLE-off, and network-off
-  (`ENABLE_CELL 0`) variants using `tools/check_variants.sh`. WiFi-on/cell-off only compiles:
+- CI's `variants` job links the default image and logging-off, BLE-off, network-off
+  (`ENABLE_CELL 0`) and DC-rollback (`DC_EARLY_HOLD 0`) variants using `tools/check_variants.sh`. WiFi-on/cell-off only compiles:
   it overflows IRAM and its TLS is unverified, so it remains bench-only.
 
 ## Hardware verification

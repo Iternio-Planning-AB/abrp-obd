@@ -39,7 +39,7 @@ set `GIT_CLIFF`); without it, it is skipped, and with `CI` set it fails.
 
 ## State-machine differential harness
 
-Run `python3 tests/run_sm_checks.py` (groups `scenarios`, `random`, `enumerate`, `crash`, `rules`; `--depth N`, default 5) for
+Run `python3 tests/run_sm_checks.py` (groups `scenarios`, `random`, `enumerate`, `crash`, `rules`, `composition`, `dc`; `--depth N`, default 5) for
 the park/drive decision. The differential covers the drive region; shared context comes from the working
 tree. The blocks that write drive state (the poll-time unlatch and re-latch, the `is_parked` publish, the
 OTA/dump hold, `changeState`, the buffer block and the pre-sleep marker) come from the pinned `main` commit
@@ -61,7 +61,7 @@ drive region in `Helpers/drive_state.h`, and the runner fails if anything outsid
 `is_currently_parked`, `g_last_speed_ms`, `park_marker_owed`, `drive_unconfirmed` or `g_drive_gnss_refused`, if `alarm_gate.h` names drive state, or if
 a call into the drive region sits outside the blocks it extracts. The pin rule and what the harness
 cannot prove (32-bit `millis()` wrap, other flag sets, code outside the extracted blocks) are in the
-runner's header. The `rules` group (#6) also runs CUR alone, as absolute checks: the named driving-rule scenarios (desk drift, late-fix drive, discharge, charge block, UNCONFIRMED exit) over Poll inputs for the car, motion, sustained motion, power and charge latch, whose defaults make CUR agree with OLD.
+runner's header. The `rules` group (#6) runs both sides and asserts absolute checks on CUR: the named driving-rule scenarios (desk drift, late-fix drive, discharge, charge block, UNCONFIRMED exit) over Poll inputs for the car, motion, sustained motion, power and charge latch.
 Since #124 they also pin that a fix holds DRIVING only while the car is on: with the car off (a low rail and no
 OBD answer within `ACTIVE_TIMER`, never answered or a speed-key drive whose answers stopped) a fix no longer
 refreshes the hold, one `hold refused` line carries the rail, the answer's age and a clamped speed, the drive
@@ -89,14 +89,13 @@ compared; a sample poke the DC hold does not keep sleeps after its one poll. An 
 group mixes charge polls in, and named scenarios cover an AC charge and its release, DC by power through a taper and
 the car's `is_dcfc=0`, the silent hold and parked-held, the stale reset after `CHARGE_STALE_RESET_MINUTES` (held, on
 an answered poke and on a skip wake), the post-drive window's polls and expiry, the stream-trust delay, the fast-budget cap,
-corroboration, and a DC session released silent on a streaming wake. The post-drive window at the ladder end and the
-poke's sleep stay shared context. A CUR-asserted scenario (#22) parks with the rail healthy but low (12.42 V) and checks
+corroboration, and a DC session released silent on a streaming wake. The poke's sleep stays shared context; the
+post-drive window at the ladder end is pinned with the rest of `energy_state.h`. A CUR-asserted scenario (#22) parks with the rail healthy but low (12.42 V) and checks
 the one `POST_DRIVE_RECHECK_MINUTES` sleep (`pdw-recheck`), then each re-check wake: a low rail skips to the parked
 cadence with no second re-check, a high rail with a charging answer takes the charging cadence, and a silent one gets
-the window's bounded 3-minute retries, then parked. Its RAM flag `g_pdw_recheck` is newer than `SM_PIN`, so like
-`maintenance_mode` its initialiser is checked in the tree only, and the runner fails if a pinned block names it.
-Since step 3 (#25) the CUR side is `Helpers/energy_state.h`: `energyOnPoll` (the block, verbatim, whose returned
-SAMPLE_POLL values are compared with OLD's locals) and the gate's calls, and the runner fails if anything outside it
+the window's bounded 3-minute retries, then parked.
+Since step 3 (#25) the energy region is `Helpers/energy_state.h`, inlined on both sides: `energyOnPoll` (the block,
+verbatim, whose returned SAMPLE_POLL values are compared) and the gate's calls, and the runner fails if anything outside it
 assigns the charging state or if an energy call sits outside the extracted blocks and its named sites.
 
 Since 0b-2 (#82) it also covers the `setup()` wake: the whole ATRV gate block (the ATRV
@@ -108,8 +107,8 @@ rail, the ATRV read, the alarm flag and an optional charge latch; the RTC epoch 
 zeroes the clock. A wake alphabet (17 symbols, about 1.4 M sequences at depth 5: each gate threshold, latched wakes in
 every give-up band, the ATRV threshold, a weak cold boot, an alarm-enforced poke) is enumerated beside the other two,
 and named scenarios cover the taper budget to its give-up, the charge-end read once per latch, a weak cold boot's BLE
-window and its modem-off expiry, and the counters and `since_poll` across wakes. Since step 4a (#26) the CUR side is
-`Helpers/wake_gate.h`'s `wakeGateRun` and `gateStampPoll` (setup()'s last-poll stamp, now pinned for OLD too), and the
+window and its modem-off expiry, and the counters and `since_poll` across wakes. Since step 4a (#26) the gate is
+`Helpers/wake_gate.h`'s `wakeGateRun` and `gateStampPoll` (setup()'s last-poll stamp), on both sides, and the
 runner fails if anything outside it assigns the gate's persisted state or if a gate call sits outside the compared
 blocks and its named sites. The weak-rail window's expiry and the sleep's modem override for it are shared context. So is `loop()`'s poll condition (#104): a
 poll reaches the car only when it holds, so the property "a poll ran on a weak-rail wake" holds a weak cold boot to the
@@ -148,8 +147,7 @@ the phone leaving, each boundary to the millisecond; random
 adds 500 sequences on an enforced car with fix ages around the bound. The per-PID guard inside `readPIDs` is not covered.
 
 Run `python3 tests/run_sm_checks.py composition` for #83's composed drive/energy sequences (also included in
-the default run). This group runs CUR only: #6 intentionally changed the drive rules relative to `SM_PIN`,
-which remains unchanged. Before each event, `playComposed` resolves the adapter's `charge_block` input from
+the default run). It runs both sides, equal throughout, and asserts on CUR. Before each event, `playComposed` resolves the adapter's `charge_block` input from
 the real energy latch, making its temporary substitution a no-op. Drive therefore reads the previous poll's
 energy state; energy reads this poll's drive state. The runner checks the production blocks' order.
 Existing isolated `rules` tests and historical differential groups retain their scripted input semantics.
@@ -179,10 +177,9 @@ by a newly buffered charging frame.
 These are bounded generated tests, not exhaustive combined-state coverage or a second implementation of the
 energy controller. Transport, actual motion sampling, firmware-width clocks and hardware remain outside this group.
 
-Run `python3 tests/run_sm_checks.py dc` for #128's early DC release (also in the default run). `sm_checks.cpp`
-compiles the tree a third time, as `sm_dc`, with `DC_EARLY_HOLD 1`; both differential sides compile with 0, so the
-differential stays exact equality with `SM_PIN` and the other CUR groups never run the release. Like `composition`,
-`playDc` feeds the drive region the real charge latch. Named cases: the field shapes (-125 A at 358 V; -184 A then
+Run `python3 tests/run_sm_checks.py dc` for #128's early DC release (also in the default run). Both sides build
+config.h's `DC_EARLY_HOLD 1`, so every group runs the release; the rollback (`DC_EARLY_HOLD 0`) is not compiled here.
+Like `composition`, this group runs both sides, equal throughout, asserts on CUR, and `playDc` feeds the drive region the real charge latch. Named cases: the field shapes (-125 A at 358 V; -184 A then
 -129 A) on a speed-PID car, a GNSS-only car and one with neither, each PARKED on the third poll with is_charging,
 is_dcfc and the DC hold in that frame, then the DC session on the next; a speed > 0 or moving fix on each of the
 three polls restarting the count; regen with speed or a moving fix never releasing; GNSS drift and the once-per-wake

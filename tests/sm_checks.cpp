@@ -54,8 +54,8 @@ struct SmEvent {
   bool alarm = false;  // WAKE: the OBD-alarm gate is enforced for this car
   bool dump = false;  // HOLD: the log dump rather than an OTA update
   bool on = false;    // MAINT: the console's maintenance_mode
-  // POLL inputs to the driving rules (#6). The defaults make CUR agree with OLD: car on, motion this poll, no
-  // sustained motion, no power, no charge latch. Charge and Silent polls keep the wake's rail and motion instead.
+  // POLL inputs to the driving rules (#6). The defaults: car on, motion this poll, no sustained motion, no power, no
+  // charge latch. Charge and Silent polls keep the wake's rail and motion instead.
   int car = SM_CAR_RAIL;
   int motion = SM_MOVE_NOW;
   bool sustained = false;  // the accumulator holds 20 s of motion
@@ -64,7 +64,7 @@ struct SmEvent {
   bool silent = false;
   double soc_step = 0, kwh_step = NAN, soe_step = NAN;
   double power = NAN, current = NAN, voltage = NAN, dcfc = NAN;
-  OBDVector extra;  // further PIDs exactly as the car sends them, NaN included (#95's car flags); the differential never sets it
+  OBDVector extra;  // further PIDs exactly as the car sends them, NaN included (#95's car flags)
   double poll_rail = NAN;  // the rail this cycle read; NaN keeps the last
   unsigned long fix_age_ms = 0;  // POLL: how old the GNSS fix is
 };
@@ -183,19 +183,10 @@ SmEvent Setup() {
 }
 SmEvent Leave() { return SmEvent{SmKind::SETUP, "PHONE-LEFT"}; }
 
-// #128's early DC hold (config.h DC_EARLY_HOLD) is off on both differential sides, so OLD and CUR stay equal on every
-// sequence; sm_dc is the tree again with it on, as config.h builds it, for the dc group's absolute checks.
-#undef DC_EARLY_HOLD
-#define DC_EARLY_HOLD 0
 namespace sm_old {
 #include "old_side.inc"
 }
 namespace sm_cur {
-#include "cur_side.inc"
-}
-#undef DC_EARLY_HOLD
-#define DC_EARLY_HOLD 1
-namespace sm_dc {
 #include "cur_side.inc"
 }
 
@@ -1091,9 +1082,9 @@ void crashes(int depth) {
 }
 
 
-// ---- the driving rules (#6), on CUR only ----
-// The differential only proves CUR equals SM_PIN; these are the absolute checks: the named cases of the issue,
-// each asserting the state, what a frame publishes, the marker debt, the freezes and the LEASH lines.
+// ---- the driving rules (#6): equality throughout, plus the absolute checks on CUR ----
+// The differential only proves CUR equals SM_PIN; these also assert the named cases of the issue: the state, what a
+// frame publishes, the marker debt, the freezes and the LEASH lines.
 int parkKey(const OBDVector& frame) {
   for (const auto& res : frame) if (res.first == "is_parked") return (int)res.second;
   return -1;
@@ -1106,12 +1097,12 @@ bool logged(const std::string& text) {
 void rules() {
   std::vector<SmEvent> t;
   using namespace sm_cur;
-  auto begin = [&] { startCur(t); playCur(Advance(60000), t); };
+  auto begin = [&] { start(t); play(Advance(60000), t); };
   const SmEvent quiet = Poll(SM_NONE, 0);
   auto fix = [](double kmh = 6.0) { return Poll(SM_NONE, 0, true, kmh); };
   auto enterUnconfirmed = [&] {
     begin();
-    playCur(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, true), t);
+    play(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, true), t);
     check(is_currently_parked && drive_unconfirmed, "sustained motion on a car that is on is UNCONFIRMED", t);
   };
   // A frame whose current says discharging (30 A at 400 V), the proof a charge-latch override needs (#95).
@@ -1123,15 +1114,15 @@ void rules() {
   // 1. Desk drift: fresh moving fixes with no accelerometer motion stay PARKED, car on or off.
   begin();
   for (int i = 0; i < 3; ++i) {
-    playCur(Rules(fix(), SM_CAR_RAIL, SM_MOVE_NONE, false), t);
-    playCur(Advance(5000), t);
+    play(Rules(fix(), SM_CAR_RAIL, SM_MOVE_NONE, false), t);
+    play(Advance(5000), t);
   }
   check(is_currently_parked && !drive_unconfirmed && parkKey(obd_result_vector.back()) == 1 &&
         countLog("LEASH driving") == 0 && !park_marker_owed, "drift without motion stays PARKED and says PARK", t);
   check(countLog("LEASH gnss=") == 1 && logged("LEASH gnss=6.0km/h refused reason=motion"),
         "one refusal line for the whole streak", t);
   begin();
-  playCur(Rules(fix(), SM_CAR_OFF, SM_MOVE_NOW, false), t);
+  play(Rules(fix(), SM_CAR_OFF, SM_MOVE_NOW, false), t);
   check(is_currently_parked && countLog("LEASH driving") == 0 && logged("LEASH gnss=6.0km/h refused reason=car-off"),
         "a moving fix on a car that is off is refused", t);
 
@@ -1141,80 +1132,80 @@ void rules() {
         "UNCONFIRMED frames carry no is_parked and owe no marker", t);
   check(logged("LEASH unconfirmed accel act=100% rail=13.50 obd=1 -> live location, no drivingState"),
         "the UNCONFIRMED line", t);
-  playCur(Advance(MAX_AWAKE_MS), t);
-  playCur(Ladder(SmTo::ACTIVE), t);
+  play(Advance(MAX_AWAKE_MS), t);
+  play(Ladder(SmTo::ACTIVE), t);
   check(sm_asleep && sm_sleep_reason == "backstop", "the max-awake backstop still applies to UNCONFIRMED", t);
   enterUnconfirmed();
-  playCur(Advance(5000), t);
-  playCur(Rules(fix(40.0), SM_CAR_RAIL, SM_MOVE_NOW, false), t);
+  play(Advance(5000), t);
+  play(Rules(fix(40.0), SM_CAR_RAIL, SM_MOVE_NOW, false), t);
   check(!is_currently_parked && !drive_unconfirmed && parkKey(obd_result_vector.back()) == 0 && park_marker_owed &&
         logged("LEASH driving gnss=40.0km/h -> unlatch parked (no OBD speed needed)"),
         "a moving fix with motion confirms DRIVING from UNCONFIRMED: frames say DRIVE, the marker is owed", t);
   begin();
   SmEvent rail_only = Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, true);
   rail_only.silent = true;
-  playCur(rail_only, t);
+  play(rail_only, t);
   check(drive_unconfirmed && logged("LEASH unconfirmed accel act=100% rail=13.50 obd=0 -> live location, no drivingState"),
         "the rail alone counts as the car being on", t);
   begin();
-  playCur(Rules(quiet, SM_CAR_OBD, SM_MOVE_NOW, true), t);
+  play(Rules(quiet, SM_CAR_OBD, SM_MOVE_NOW, true), t);
   check(drive_unconfirmed && logged("LEASH unconfirmed accel act=100% rail=12.00 obd=1 -> live location, no drivingState"),
         "an OBD answer within ACTIVE_TIMER counts as the car being on", t);
   begin();
-  playCur(Rules(quiet, SM_CAR_OFF, SM_MOVE_NOW, true, 12.5), t);
+  play(Rules(quiet, SM_CAR_OFF, SM_MOVE_NOW, true, 12.5), t);
   check(is_currently_parked && !drive_unconfirmed && countLog("LEASH") == 0, "sustained motion on a car that is off does nothing", t);
 
   // 3. Discharge confirms DRIVING without a fix: the power key, else current x voltage; neither cannot confirm.
   begin();
-  playCur(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, true, 12.5), t);
+  play(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, true, 12.5), t);
   check(!is_currently_parked && !drive_unconfirmed && parkKey(obd_result_vector.back()) == 0 && park_marker_owed &&
         logged("LEASH driving accel act=100% power=12.5kW -> unlatch parked"), "power > 4 kW is DRIVING", t);
   begin();
-  playCur(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, true, 4.0), t);
+  play(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, true, 4.0), t);
   check(drive_unconfirmed, "exactly 4.0 kW is not above the limit", t);
   begin();
-  playCur(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, true, -20.0), t);
+  play(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, true, -20.0), t);
   check(drive_unconfirmed, "charging power is not a discharge", t);
   begin();
   SmEvent iv = Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, true);
   iv.current = 30, iv.voltage = 400;
-  playCur(iv, t);
+  play(iv, t);
   check(!is_currently_parked && logged("LEASH driving accel act=100% power=12.0kW -> unlatch parked"),
         "current x voltage over 4 kW is DRIVING when the frame has no power key", t);
   begin();
   iv.current = 30, iv.voltage = NAN;
-  playCur(iv, t);
+  play(iv, t);
   check(drive_unconfirmed, "a current with no voltage cannot confirm", t);
   enterUnconfirmed();
-  playCur(Advance(5000), t);
-  playCur(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, true, 10.0), t);
+  play(Advance(5000), t);
+  play(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, true, 10.0), t);
   check(!is_currently_parked && !drive_unconfirmed && park_marker_owed, "UNCONFIRMED + discharge + sustained motion is DRIVING", t);
 
   // A drive confirmed by accel + discharge alone (no speed PID, no fix) is held by sustained motion while it
   // lasts, whatever the power: cruising at 2.5 kW must not re-latch it.
   begin();
-  playCur(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, true, 12.5), t);
+  play(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, true, 12.5), t);
   for (int i = 0; i < 11; ++i) {
-    playCur(Advance(60000), t);
-    playCur(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, true, 2.5), t);
+    play(Advance(60000), t);
+    play(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, true, 2.5), t);
   }
   check(!is_currently_parked && sm_freezes == 0 && countLog("LEASH no speed") == 0 && countLog("LEASH driving") == 1,
         "sustained motion holds DRIVING past ACTIVE_TIMER at 2.5 kW: no flap, no freeze, one LEASH line", t);
-  playCur(Advance(AT), t);
-  playCur(Rules(quiet, SM_CAR_RAIL, SM_MOVE_KEEP, false), t);
+  play(Advance(AT), t);
+  play(Rules(quiet, SM_CAR_RAIL, SM_MOVE_KEEP, false), t);
   check(!is_currently_parked, "the hold ends ACTIVE_TIMER after the last sustained-motion poll", t);
-  playCur(Advance(1), t);
-  playCur(Rules(quiet, SM_CAR_RAIL, SM_MOVE_KEEP, false), t);
+  play(Advance(1), t);
+  play(Rules(quiet, SM_CAR_RAIL, SM_MOVE_KEEP, false), t);
   check(is_currently_parked && sm_freezes == 1 && countLog("LEASH no speed for 300s") == 1,
         "then the normal re-latch fires, with one freeze", t);
 
   // A speed-less drive confirmed by GNSS + motion keeps going on fresh moving fixes alone: no new gate on continuation.
   begin();
-  playCur(Rules(fix(40.0), SM_CAR_RAIL, SM_MOVE_NOW, false), t);
+  play(Rules(fix(40.0), SM_CAR_RAIL, SM_MOVE_NOW, false), t);
   check(!is_currently_parked, "GNSS with motion starts the drive", t);
   for (int i = 0; i < 11; ++i) {
-    playCur(Advance(60000), t);
-    playCur(Rules(fix(40.0), SM_CAR_RAIL, SM_MOVE_NONE, false), t);
+    play(Advance(60000), t);
+    play(Rules(fix(40.0), SM_CAR_RAIL, SM_MOVE_NONE, false), t);
   }
   check(!is_currently_parked && sm_freezes == 0 && countLog("LEASH gnss=") == 0 && countLog("LEASH no speed") == 0,
         "fresh moving fixes without motion keep a drive going past ACTIVE_TIMER while the car is on", t);
@@ -1230,56 +1221,56 @@ void rules() {
   // Car off, never answered: the first fix is refused once, with the evidence; the drive re-latches ACTIVE_TIMER after
   // the start, with one freeze; a fix after that is the PARKED refusal, once. Two refusal lines in the episode.
   begin();
-  playCur(railFix(13.5, SM_MOVE_NOW), t);
+  play(railFix(13.5, SM_MOVE_NOW), t);
   check(!is_currently_parked && countLog("LEASH driving gnss=40.0km/h") == 1, "a rail-only GNSS start drives", t);
   const unsigned long started = g_last_speed_ms;
   for (int i = 0; i < 4; ++i) {
-    playCur(Advance(60000), t);
-    playCur(off_fix, t);
+    play(Advance(60000), t);
+    play(off_fix, t);
   }
   check(!is_currently_parked && sm_freezes == 0 && g_last_speed_ms == started && countLog("LEASH gnss=") == 1 &&
         logged("LEASH gnss=40.0km/h hold refused reason=car-off rail=12.00 obd=-1s"),
         "car off: a fix no longer refreshes the hold; the DRIVING refusal logs once, with the rail and no OBD answer", t);
-  playCur(Advance(started + AT - sm_now), t);
-  playCur(off_fix, t);
+  play(Advance(started + AT - sm_now), t);
+  play(off_fix, t);
   check(!is_currently_parked, "ACTIVE_TIMER after the last accepted hold is still DRIVING", t);
-  playCur(Advance(1), t);
-  playCur(off_fix, t);
+  play(Advance(1), t);
+  play(off_fix, t);
   check(is_currently_parked && !drive_unconfirmed && sm_freezes == 1 && countLog("LEASH no speed for 300s") == 1,
         "one ms later the drive re-latches: one freeze, one LEASH line", t);
   for (int i = 0; i < 3; ++i) {
-    playCur(Advance(60000), t);
-    playCur(off_fix, t);
+    play(Advance(60000), t);
+    play(off_fix, t);
   }
   check(is_currently_parked && sm_freezes == 1 && countLog("LEASH gnss=") == 2 &&
         logged("LEASH gnss=40.0km/h refused reason=car-off"),
         "then today's PARKED refusal, once: two refusal lines for the episode", t);
   // A speed-key drive whose car stopped answering: the obd= field is the age of the last answer.
   begin();
-  playCur(Poll(SM_SPEED, 30), t);
+  play(Poll(SM_SPEED, 30), t);
   const unsigned long speed_hold = g_last_speed_ms;
-  playCur(Advance(AT), t);
-  playCur(off_fix, t);
+  play(Advance(AT), t);
+  play(off_fix, t);
   check(g_last_speed_ms == speed_hold && logged("LEASH gnss=40.0km/h hold refused reason=car-off rail=12.00 obd=300s"),
         "an OBD answer ACTIVE_TIMER old no longer counts, and the line says how old", t);
-  playCur(Advance(1), t);
-  playCur(off_fix, t);
+  play(Advance(1), t);
+  play(off_fix, t);
   check(is_currently_parked && sm_freezes == 1, "the speed hold ends on time", t);
   // The line's speed is clamped, so its worst case (run_energy_checks.py) holds for any parsed fix.
   begin();
-  playCur(railFix(13.5, SM_MOVE_NOW), t);
-  playCur(Advance(60000), t);
-  playCur(Rules(fix(5000.0), SM_CAR_OFF, SM_MOVE_NONE, false), t);
+  play(railFix(13.5, SM_MOVE_NOW), t);
+  play(Advance(60000), t);
+  play(Rules(fix(5000.0), SM_CAR_OFF, SM_MOVE_NONE, false), t);
   check(logged("LEASH gnss=999.9km/h hold refused reason=car-off rail=12.00 obd=-1s"), "the logged speed is clamped", t);
   // Car on keeps the hold: the rail alone, an OBD answer on a low rail, an OBD answer with no rail at all (0.0, as a
   // build without ENABLE_IO36_RAIL reads), and a rail dip for one silent poll.
   const auto keepsDriving = [&](SmEvent start, SmEvent hold, const char* what) {
     begin();
-    playCur(start, t);
+    play(start, t);
     check(!is_currently_parked, std::string(what) + ": the drive starts", t);
     for (int i = 0; i < 11; ++i) {
-      playCur(Advance(60000), t);
-      playCur(hold, t);
+      play(Advance(60000), t);
+      play(hold, t);
     }
     check(!is_currently_parked && sm_freezes == 0 && countLog("LEASH no speed") == 0, what, t);
   };
@@ -1295,10 +1286,10 @@ void rules() {
   keepsDriving(no_rail_start, no_rail, "OBD answers with no rail reading (0.0) hold DRIVING past ACTIVE_TIMER");
   check(countLog("LEASH gnss=") == 0 && g_last_io36 == 0.0f, "no rail reading: never refused", t);
   begin();
-  playCur(railFix(13.5, SM_MOVE_NOW), t);
+  play(railFix(13.5, SM_MOVE_NOW), t);
   for (int i = 0; i < 11; ++i) {
-    playCur(Advance(60000), t);
-    playCur(railFix(i == 2 ? 13.2 : 13.5), t);
+    play(Advance(60000), t);
+    play(railFix(i == 2 ? 13.2 : 13.5), t);
   }
   check(!is_currently_parked && sm_freezes == 0 && countLog("LEASH no speed") == 0 && countLog("LEASH gnss=") == 1 &&
         logged("LEASH gnss=40.0km/h hold refused reason=car-off rail=13.20 obd=-1s"),
@@ -1307,19 +1298,19 @@ void rules() {
   // 4. Charge block: the charge latch keeps sustained motion and GNSS out unless this frame discharges over
   // DRIVE_DISCHARGE_KW (#95), and drops UNCONFIRMED to PARKED.
   begin();
-  playCur(amps(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, true, 2.5, true)), t);
+  play(amps(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, true, 2.5, true)), t);
   check(is_currently_parked && !drive_unconfirmed && countLog("LEASH") == 0, "sustained motion while charging stays PARKED", t);
   begin();
-  playCur(amps(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, true, 12.5, true)), t);
+  play(amps(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, true, 12.5, true)), t);
   check(!is_currently_parked && !drive_unconfirmed && parkKey(obd_result_vector.back()) == 0 && park_marker_owed &&
         countLog("LEASH") == 1 && logged("LEASH driving accel act=100% power=12.5kW -> unlatch parked"),
         "a discharge this frame overrides the charge latch: sustained motion at 12.5 kW is DRIVING", t);
   begin();
-  playCur(Rules(fix(), SM_CAR_RAIL, SM_MOVE_NOW, false, NAN, true), t);
+  play(Rules(fix(), SM_CAR_RAIL, SM_MOVE_NOW, false, NAN, true), t);
   check(is_currently_parked && logged("LEASH gnss=6.0km/h refused reason=charging"), "a moving fix while charging is refused", t);
   enterUnconfirmed();
-  playCur(Advance(5000), t);
-  playCur(Rules(quiet, SM_CAR_RAIL, SM_MOVE_KEEP, false, NAN, true), t);
+  play(Advance(5000), t);
+  play(Rules(quiet, SM_CAR_RAIL, SM_MOVE_KEEP, false, NAN, true), t);
   check(is_currently_parked && !drive_unconfirmed && sm_freezes == 0 && !park_marker_owed &&
         logged("LEASH unconfirmed charging -> parked"), "the charge latch drops UNCONFIRMED to PARKED, no freeze", t);
 
@@ -1327,8 +1318,8 @@ void rules() {
   for (bool discharge : {false, true}) {
     const double kw = discharge ? 12.5 : 2.5;
     enterUnconfirmed();
-    playCur(Advance(5000), t);
-    playCur(amps(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, true, kw, true)), t);
+    play(Advance(5000), t);
+    play(amps(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, true, kw, true)), t);
     if (discharge)
       check(!is_currently_parked && !drive_unconfirmed && park_marker_owed && countLog("LEASH unconfirmed charging") == 0 &&
             logged("LEASH driving accel act=100% power=12.5kW -> unlatch parked"),
@@ -1338,16 +1329,16 @@ void rules() {
             "UNCONFIRMED + charge latch without a discharge drops to PARKED", t);
 
     begin();
-    playCur(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, true, 12.5), t);
-    playCur(Advance(60000), t);
+    play(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, true, 12.5), t);
+    play(Advance(60000), t);
     const unsigned long hold = g_last_speed_ms;
-    playCur(amps(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, true, kw, true)), t);
+    play(amps(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, true, kw, true)), t);
     check(!is_currently_parked && (discharge ? g_last_speed_ms >= hold + 60000 : g_last_speed_ms == hold),
           discharge ? "DRIVING + charge latch + a discharge this frame refreshes the hold"
                     : "DRIVING + charge latch without a discharge leaves the hold alone", t);
 
     begin();
-    playCur(amps(Rules(fix(), SM_CAR_RAIL, SM_MOVE_NOW, false, kw, true)), t);
+    play(amps(Rules(fix(), SM_CAR_RAIL, SM_MOVE_NOW, false, kw, true)), t);
     if (discharge)
       check(!is_currently_parked && park_marker_owed && countLog("LEASH gnss=") == 0 &&
             logged("LEASH driving gnss=6.0km/h -> unlatch parked (no OBD speed needed)"),
@@ -1390,7 +1381,7 @@ void rules() {
     if (v.key) e.extra.emplace_back(v.key, v.value);
     e.current = v.amps;
     if (!std::isnan(v.amps)) e.voltage = 400;
-    playCur(named(e, std::string(",") + v.name), t);
+    play(named(e, std::string(",") + v.name), t);
     const std::string what = std::string(v.name) + (v.latch ? ", charge latch" : "") + ", " +
                              (v.gnss ? "a moving fix" : "sustained motion") + ": ";
     if (v.drive)
@@ -1405,24 +1396,24 @@ void rules() {
 
   // 5. UNCONFIRMED exit: ACTIVE_TIMER without motion, each motion refreshing it; the idle stage; never a freeze.
   enterUnconfirmed();
-  playCur(Advance(AT + 1), t);
-  playCur(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, false), t);
+  play(Advance(AT + 1), t);
+  play(Rules(quiet, SM_CAR_RAIL, SM_MOVE_NOW, false), t);
   check(drive_unconfirmed, "a motion hit near the end of the timer keeps UNCONFIRMED", t);
-  playCur(Advance(AT), t);
-  playCur(Rules(quiet, SM_CAR_RAIL, SM_MOVE_KEEP, false), t);
+  play(Advance(AT), t);
+  play(Rules(quiet, SM_CAR_RAIL, SM_MOVE_KEEP, false), t);
   check(drive_unconfirmed, "ACTIVE_TIMER after the last motion is still UNCONFIRMED", t);
-  playCur(Advance(1), t);
-  playCur(Rules(quiet, SM_CAR_RAIL, SM_MOVE_KEEP, false), t);
+  play(Advance(1), t);
+  play(Rules(quiet, SM_CAR_RAIL, SM_MOVE_KEEP, false), t);
   check(is_currently_parked && !drive_unconfirmed && sm_freezes == 0 && !park_marker_owed &&
         logged("LEASH unconfirmed no motion for 300s -> parked") && parkKey(obd_result_vector.back()) == 1,
         "one ms past ACTIVE_TIMER without motion: PARKED, no PARK marker, no refreeze", t);
   enterUnconfirmed();
-  playCur(Ladder(SmTo::CHARGING), t);
+  play(Ladder(SmTo::CHARGING), t);
   check(is_currently_parked && !drive_unconfirmed && sm_freezes == 0 && !park_marker_owed &&
         logged("LEASH unconfirmed idle -> parked"),
         "the idle stage drops UNCONFIRMED to PARKED without a freeze", t);
-  playCur(Advance(AT), t);
-  playCur(Sleep(), t);
+  play(Advance(AT), t);
+  play(Sleep(), t);
   check(obd_result_vector.size() == 1, "a parked heartbeat after UNCONFIRMED queues no marker", t);
 }
 
@@ -1431,7 +1422,7 @@ void playComposed(SmEvent e, std::vector<SmEvent>& trace) {
   const Snap pre = save(false);
   const size_t frames = obd_result_vector.size();
   e.charge_block = pre.recently_charging;
-  playCur(e, trace);
+  play(e, trace);
   if (e.k != SmKind::POLL || pre.sm_asleep) return;
   const bool speed = sm_polls != pre.sm_polls && !e.silent &&
     ((e.key != SM_NONE && e.speed > 0) || (e.key == SM_BOTH && e.speed2 > 0));
@@ -1471,7 +1462,7 @@ void playComposed(SmEvent e, std::vector<SmEvent>& trace) {
 void composition() {
   using namespace sm_cur;
   std::vector<SmEvent> t;
-  auto begin = [&] { startCur(t); playComposed(Advance(CONFIRM_MS), t); };
+  auto begin = [&] { start(t); playComposed(Advance(CONFIRM_MS), t); };
   auto has = [&](const char* key, double value) {
     if (obd_result_vector.empty()) return false;
     for (const auto& kv : obd_result_vector.back()) if (kv.first == key) return kv.second == value;
@@ -1576,7 +1567,7 @@ void composition() {
     check(sm_asleep && sm_sleep_reason == "backstop", "composition: and the max-awake backstop applies again", t);
   }
 
-  startCur(t);
+  start(t);
   playComposed(charge, t);
   check(!recently_charging && !has("is_charging", 1), "composition: an untrusted stream cannot latch charge", t);
   begin();
@@ -1672,10 +1663,10 @@ void composition() {
   check(blocked && speed_override && parked_charge, "composition: generated traces reach both feedback directions", t);
 }
 
-// ---- the early DC release (#128), on sm_dc: the tree with DC_EARLY_HOLD on ----
+// ---- the early DC release (#128), with DC_EARLY_HOLD on as config.h builds it: equality throughout ----
 // A drive that stops at a fast charger re-latches PARKED after DC_RELEASE_POLLS polls in a row at DC power with no
 // speed above 0 and no moving fix, so the charge is seen within a minute rather than after ACTIVE_TIMER. Absolute
-// checks: the issue's named cases, then generated traces against an oracle kept from the trace's inputs.
+// checks on CUR: the issue's named cases, then generated traces against an oracle kept from the trace's inputs.
 SmEvent Amps(SmEvent e, double amps, double volts) {
   e.current = amps, e.voltage = volts;
   std::ostringstream name;
@@ -1711,32 +1702,29 @@ bool dcEvidence(const SmEvent& e) {
 int dcState(bool parked, bool unconfirmed) { return !parked ? 2 : unconfirmed ? 1 : 0; }  // PARKED, UNCONFIRMED, DRIVING
 size_t dcCount(const std::string& prefix) {
   size_t n = 0;
-  for (const auto& line : sm_dc::sm_log) n += line.compare(0, prefix.size(), prefix) == 0;
+  for (const auto& line : sm_cur::sm_log) n += line.compare(0, prefix.size(), prefix) == 0;
   return n;
 }
 bool dcLogged(const std::string& text) {
-  for (const auto& line : sm_dc::sm_log) if (line == text) return true;
+  for (const auto& line : sm_cur::sm_log) if (line == text) return true;
   return false;
 }
 bool dcFrameHas(const char* key, double value) {
-  if (sm_dc::obd_result_vector.empty()) return false;
-  for (const auto& kv : sm_dc::obd_result_vector.back()) if (kv.first == key) return kv.second == value;
+  if (sm_cur::obd_result_vector.empty()) return false;
+  for (const auto& kv : sm_cur::obd_result_vector.back()) if (kv.first == key) return kv.second == value;
   return false;
 }
 
 unsigned dc_run = 0;  // the oracle: vetted DC polls in a row within one drive state
 unsigned long dc_releases = 0;
-// One event on sm_dc, the drive region reading the real charge latch, then its properties and the oracle: a release
+// One event through both sides, the drive region reading the real charge latch, then the oracle on CUR: a release
 // only on the DC_RELEASE_POLLS-th vetted poll in a row from DRIVING or UNCONFIRMED, and always on it.
 void playDc(SmEvent e, std::vector<SmEvent>& trace) {
-  using namespace sm_dc;
+  using namespace sm_cur;
   const Snap pre = save(false);
   const size_t frames = obd_result_vector.size();
   e.charge_block = pre.recently_charging;
-  trace.push_back(e);
-  step(e);
-  events++;
-  if (const char* broken = propertyBroken(pre, e)) fail(std::string("DC property: ") + broken, trace);
+  play(e, trace);
   const int before = dcState(pre.is_currently_parked, pre.drive_unconfirmed);
   const int after = dcState(is_currently_parked, drive_unconfirmed);
   size_t releases = 0;
@@ -1768,19 +1756,18 @@ void playDc(SmEvent e, std::vector<SmEvent>& trace) {
   else dc_run++;
 }
 void startDc(std::vector<SmEvent>& trace) {
-  trace.clear();
-  const SmEvent boot = Wake(SM_COLD, 12.6f);
-  trace.push_back(boot);
-  sm_dc::powerOn(boot);
+  start(trace);
   dc_run = 0;
 }
 unsigned long dc_leaves = 0;
 void enumerateDc(int depth, const std::vector<SmEvent>& alphabet, std::vector<SmEvent>& trace) {
   if (depth == 0) { dc_leaves++; return; }
-  const sm_dc::Snap node = sm_dc::save();
+  const sm_old::Snap old_node = sm_old::save();
+  const sm_cur::Snap cur_node = sm_cur::save();
   const unsigned run = dc_run;
   for (const auto& e : alphabet) {
-    sm_dc::restore(node);
+    sm_old::restore(old_node);
+    sm_cur::restore(cur_node);
     dc_run = run;
     playDc(e, trace);
     enumerateDc(depth - 1, alphabet, trace);
@@ -1789,7 +1776,7 @@ void enumerateDc(int depth, const std::vector<SmEvent>& alphabet, std::vector<Sm
 }
 
 void dcRules(int depth) {
-  using namespace sm_dc;
+  using namespace sm_cur;
   std::vector<SmEvent> t;
   auto begin = [&] { startDc(t); playDc(Advance(60000), t); };
   // The three kinds of car: a speed PID, a GNSS fix and no speed PID, neither (accelerometer and discharge).
@@ -2025,11 +2012,11 @@ int main(int argc, char** argv) {
   }
   if (group == "all" || group == "rules") {
     rules();
-    std::cout << "PASS: rules (CUR only: the #6 driving-rule scenarios)\n";
+    std::cout << "PASS: rules (the #6 driving-rule scenarios)\n";
   }
   if (group == "all" || group == "composition") {
     composition();
-    std::cout << "PASS: composition (CUR only: real drive/energy feedback, named transitions and 5 seeds x 100 x 40)\n";
+    std::cout << "PASS: composition (real drive/energy feedback, named transitions and 5 seeds x 100 x 40)\n";
   }
   if (group == "all" || group == "dc") {
     dcRules(depth);
