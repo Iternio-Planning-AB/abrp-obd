@@ -74,7 +74,8 @@
 // Harness-only state: the trace's inputs and what the stubs recorded. Not firmware globals, so not checked.
 // sm_store_marker is the RTC_NOINIT debt copy (wdt_streak.h; its own semantics are the energy wdt-streak
 // group's). The buffer stands for RAM and the upload backlog together, except during the gate, which runs before
-// the backlog loads: there it is the file (sm_backlog_file) and RAM is empty.
+// the backlog loads: there it is the file (sm_backlog_file) and RAM is empty. sm_ep_* are what the energy poll
+// hands the SAMPLE_POLL line.
 enum SmReset { ESP_RST_POWERON = 1, ESP_RST_PANIC = 4, ESP_RST_TASK_WDT = 6, ESP_RST_DEEPSLEEP = 8 };
 #define SM_STUB(X) \
   X(SmReset, sm_reset, ESP_RST_POWERON) \
@@ -112,7 +113,10 @@ enum SmReset { ESP_RST_POWERON = 1, ESP_RST_PANIC = 4, ESP_RST_TASK_WDT = 6, ESP
   X(uint32_t, sm_run_budget, 0) \
   X(const char*, sm_budget_broken, nullptr) \
   X(const char*, sm_alarm_broken, nullptr) \
-  X(unsigned long, sm_fix_age, 0)
+  X(unsigned long, sm_fix_age, 0) \
+  X(bool, sm_ep_charging, false) \
+  X(bool, sm_ep_progress, false) \
+  X(bool, sm_ep_silent, false)
 // Harness state for one wake, reset by every boot as RAM is: the car's command counter (obd.tx_count), an
 // authenticated phone, and the alarm permit's oracle, kept from the trace's inputs rather than the gate's state.
 #define SM_WAKE(X) \
