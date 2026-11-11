@@ -445,12 +445,12 @@ EnergyPoll energyOnPoll(OBDVector& current_frame, int obd_count) {
       charge_corr_last_us = now_us;
     } else {
       // Charging within budget -> dense sampling, denser still on DC. Once this charge has been DC (dc_session)
-      // it stays DC through the taper under DC_CHARGING_MIN_KW and through the silent hold, with the rail up;
-      // the car's own is_dcfc=0 ends it. g_dc_confirmed asks to stay awake (DC_CHARGING_AWAKE_SECONDS).
+      // it stays DC through the taper under DC_CHARGING_MIN_KW and through the silent hold, with the rail at
+      // DC_HOLD_RAIL_VOLTS; the car's own is_dcfc=0 ends it. g_dc_confirmed asks to stay awake (DC_CHARGING_AWAKE_SECONDS).
       if (is_dcfc && (dcfc_from_car || g_dc_inferred_polls >= 2)) dc_session = true;
       else if (dcfc_from_car) dc_session = false;
       g_dc_confirmed = is_dcfc ||
-        (dc_session && g_last_io36 >= RAIL_AWAKE_VOLTS && (charge_evidence || silent_hold));
+        (dc_session && g_last_io36 >= DC_HOLD_RAIL_VOLTS && (charge_evidence || silent_hold));
       g_next_wake_minutes = g_dc_confirmed ? WAKE_DC_CHARGING_MINUTES : WAKE_CHARGING_MINUTES;
       // A held poke keeps its other one-shot inputs (see dcPromotePoke), but is no longer a taper confirm:
       // its later polls must not spend the stall budget.

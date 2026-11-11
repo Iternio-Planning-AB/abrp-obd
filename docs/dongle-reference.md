@@ -418,7 +418,7 @@ awake.** Polling a sleeping EV wakes its ECUs, which then stay awake on the *car
 - **A confirmed DC fast charge stays awake** (issue #51). A poll that reads DC (the car's `is_dcfc`, else at least
   `DC_CHARGING_MIN_KW` inferred) holds the wake, and the car's `is_dcfc`, or two inferred DC polls in a row (one garbage
   frame must not do it), latch `dc_session` (RTC) for that charge. While the rail
-  is at least `RAIL_AWAKE_VOLTS`, each poll that still shows charge evidence (the taper under 40 kW included), or
+  is at least `DC_HOLD_RAIL_VOLTS` (13.2 V; `RAIL_AWAKE_VOLTS` with `DC_EARLY_HOLD 0`), each poll that still shows charge evidence (the taper under 40 kW included), or
   comes within `CHARGE_SILENT_HOLD_POLLS` x `WAKE_DC_CHARGING_MINUTES` (4 min) of unbroken silence, sets
   `g_dc_confirmed`. Silence is counted by time, not by its 30 s polls: that is the tolerance a 1-minute DC wake had,
   and a car silent on ~60 % of polls would otherwise drop to `parked-held` several times an hour. The dongle then stays awake and polls

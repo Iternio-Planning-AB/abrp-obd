@@ -2004,7 +2004,8 @@ void dcAwakeChecks() {
   Dongle rail = held();
   check(!rail.hold(dcFrame(31, -60), 13.1f) && rail.next == WAKE_CHARGING_MINUTES,
         "a rail drop ends the session's hold and sleeps as before");
-  // A fresh DC reading holds down to DC_HOLD_RAIL_VOLTS, under RAIL_AWAKE_VOLTS (an MEB rail sat at 13.31 V on DC).
+  // A DC session holds down to DC_HOLD_RAIL_VOLTS, under RAIL_AWAKE_VOLTS (an MEB rail sat at 13.31 V on DC):
+  // a fresh DC reading, and the taper under DC_CHARGING_MIN_KW.
   for (const float rail_v : {13.25f, 13.15f}) {
     const bool up = rail_v >= 13.2f;
     Dongle rail_dc = held();
@@ -2014,6 +2015,10 @@ void dcAwakeChecks() {
           rail_dc.next == WAKE_DC_CHARGING_MINUTES,
           up ? "a DC reading at 13.25 V is held" : "a DC reading at 13.15 V is vetoed (rail), and keeps the 1-minute DC wake");
     check(rail_dc.g_rail_before_poke == rail_v, "a held poke judges silence on the latest rail, not the wake's");
+    Dongle taper = held();
+    check(taper.hold(dcFrame(31, -60), rail_v) == up && taper.g_dc_confirmed == up &&
+          taper.next == (up ? WAKE_DC_CHARGING_MINUTES : WAKE_CHARGING_MINUTES),
+          up ? "the taper at 13.25 V stays DC" : "the taper at 13.15 V ends the hold");
   }
   Dongle car_ac = held();
   check(!car_ac.hold(dcFrame(31, -150, 0)) && !car_ac.dc_session && car_ac.next == WAKE_CHARGING_MINUTES,

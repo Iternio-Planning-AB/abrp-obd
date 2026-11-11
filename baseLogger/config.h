@@ -603,10 +603,10 @@
 #define DC_EARLY_HOLD 1
 #endif
 #define DC_RELEASE_POLLS           3
-// The DC hold's rail veto only (dcAwakeVeto). FIELD: an MEB DC-DC ran at ~13.3-13.5 V through DC fast charges (low
-// 13.31 V), at the edge of RAIL_AWAKE_VOLTS. Under RAIL_AWAKE_VOLTS only a fresh DC verdict holds (the car's is_dcfc
-// or >= DC_CHARGING_MIN_KW), so the rail here says only that the DC-DC is up. Kept above the AC-taper and
-// full-battery rest band (~13.18-13.2 V). The rollback (DC_EARLY_HOLD 0) keeps RAIL_AWAKE_VOLTS.
+// The DC hold's rail veto (dcAwakeVeto) and a latched DC session's taper/silent hold (g_dc_confirmed). FIELD: an
+// MEB DC-DC ran at ~13.3-13.5 V through DC fast charges (low 13.31 V), at the edge of RAIL_AWAKE_VOLTS. The rail
+// here says only that the DC-DC is up; the DC verdict comes from the car's is_dcfc or the latched session. Kept above
+// the AC-taper and full-battery rest band (~13.18-13.2 V). The rollback (DC_EARLY_HOLD 0) keeps RAIL_AWAKE_VOLTS.
 #ifndef DC_HOLD_RAIL_VOLTS
 #define DC_HOLD_RAIL_VOLTS         (DC_EARLY_HOLD ? 13.2f : RAIL_AWAKE_VOLTS)
 #endif
