@@ -5,7 +5,8 @@
 #
 # ENABLE_LOGGING 0, ENABLE_BLE 0 (a cellular-only build) and ENABLE_NETWORK 0 (no transport: ENABLE_CELL 0, with
 # WiFi off by default) are built and linked: a link-only break (an unguarded call to a function the flag removes)
-# shows up there. The WiFi variants compile the sketch alone (logger.ino.cpp.o), where the flags act, because
+# shows up there. DC_EARLY_HOLD 0 is #128's rollback; nothing else compiles it since the differential runs the shipped
+# value. The WiFi variants compile the sketch alone (logger.ino.cpp.o), where the flags act, because
 # with the Arduino WiFi stack beside BLE the image overflows iram0_0_seg by a few hundred bytes and cannot link.
 set -u
 cd "$(dirname "$0")/.." || exit 1
@@ -22,7 +23,8 @@ run() {
 for flags in \
   "-DENABLE_LOGGING=0" \
   "-DENABLE_BLE=0" \
-  "-DENABLE_CELL=0"; do
+  "-DENABLE_CELL=0" \
+  "-DDC_EARLY_HOLD=0"; do
   run "$flags"
 done
 for flags in \

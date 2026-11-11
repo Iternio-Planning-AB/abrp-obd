@@ -219,10 +219,9 @@ void alarmNoteSpeed(double kmh) {
 bool alarmEnforced() { return g_alarm_flag == 1; }
 // No phone holds the ladder in this harness, except where a scenario connects one (sm_ble_connected, reset at
 // power-on): the extracted blocks see it only through bleConnected(). An authenticated one is the setup permit's
-// "human still here"; the pin asked bleRelaying(), which a phone with no relay session cannot tell apart from it.
+// "human still here".
 bool bleConnected() { return sm_ble_connected; }
 bool bleAuthenticated() { return sm_ble_auth; }
-bool bleRelaying() { return sm_ble_auth; }
 // The silent retry's rail term of loop()'s poll condition (#131): it vetoes only an armed retry, and this harness
 // never arms one (the provisional poll's exit is not extracted; tests/run_energy_checks.py runs the retry in time).
 bool silentRetryRailOk() { return true; }
