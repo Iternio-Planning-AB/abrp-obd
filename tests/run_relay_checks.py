@@ -138,10 +138,7 @@ if not find(loop_head, "authGateService();", what="loop()") < find(loop_head, "r
 # Presence keys on authentication; the transport (and the session's relay latch) on relaying.
 if "bleRelaying()" in code((helpers / "alarm_gate.h").read_text()):
     fail("the alarm gate's 'human is here' must key on bleAuthenticated(), not the transport")
-if "if (bleAuthenticated()) {\n      last_active = now;" not in (helpers / "state_machine.h").read_text():
-    fail("the BLE awake leash must key on bleAuthenticated()")
-if "if (bleRelaying()) g_ble_session_relayed = true;" not in (helpers / "state_machine.h").read_text():
-    fail("the session's relay latch must key on bleRelaying()")
+# The ladder's leash and relay latch (#29) are checked by behaviour in run_sm_checks.py's ladder group.
 
 # ABD5 carries no relay_ack (versions are negotiated in the handshake, never advertised there), and the info JSON
 # still fits its buffer at its worst.
