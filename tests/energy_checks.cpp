@@ -2004,10 +2004,17 @@ void dcAwakeChecks() {
   Dongle rail = held();
   check(!rail.hold(dcFrame(31, -60), 13.1f) && rail.next == WAKE_CHARGING_MINUTES,
         "a rail drop ends the session's hold and sleeps as before");
-  Dongle rail_dc = held();
-  check(!rail_dc.hold(dcFrame(31), 13.1f) && rail_dc.g_dc_confirmed && rail_dc.next == WAKE_DC_CHARGING_MINUTES,
-        "a DC reading at a low rail is not held, and keeps the 1-minute DC wake");
-  check(rail_dc.g_rail_before_poke == 13.1f, "a held poke judges silence on the latest rail, not the wake's");
+  // A fresh DC reading holds down to DC_HOLD_RAIL_VOLTS, under RAIL_AWAKE_VOLTS (an MEB rail sat at 13.31 V on DC).
+  for (const float rail_v : {13.25f, 13.15f}) {
+    const bool up = rail_v >= 13.2f;
+    Dongle rail_dc = held();
+    const bool is_held = rail_dc.hold(dcFrame(31), rail_v);
+    const char* veto = rail_dc.dcAwakeVeto(CHARGING);
+    check(is_held == up && (up ? !veto : veto && !strcmp(veto, "rail")) && rail_dc.g_dc_confirmed &&
+          rail_dc.next == WAKE_DC_CHARGING_MINUTES,
+          up ? "a DC reading at 13.25 V is held" : "a DC reading at 13.15 V is vetoed (rail), and keeps the 1-minute DC wake");
+    check(rail_dc.g_rail_before_poke == rail_v, "a held poke judges silence on the latest rail, not the wake's");
+  }
   Dongle car_ac = held();
   check(!car_ac.hold(dcFrame(31, -150, 0)) && !car_ac.dc_session && car_ac.next == WAKE_CHARGING_MINUTES,
         "the car's is_dcfc=0 ends the session, over 60 kW");

@@ -192,8 +192,8 @@ power key playing no part (V x I decides, as the DC inference does); a 60 kW dis
 change never releasing early; and UNCONFIRMED releasing without a freeze. Generated traces (depth 5 over 13
 drive/charge symbols, and 5 seeds x 1000 x 30 random events with DC currents mixed in) run against an oracle kept from
 the inputs: a release only on the third vetted poll in a row in one drive state, always on it, ending PARKED, its
-frame publishing the charge. The adapter's backstop property exempts a DC charge the hold would keep (in BLE too)
-under `DC_EARLY_HOLD` and fails if the backstop sleeps one. The timed ladder (acceptance 3) is in the energy runner's `dc-awake` group.
+frame publishing the charge. The adapter's backstop property exempts a DC charge the hold would keep (in BLE too, rail at
+`DC_HOLD_RAIL_VOLTS`) under `DC_EARLY_HOLD` and fails if the backstop sleeps one. The timed ladder (acceptance 3) is in the energy runner's `dc-awake` group.
 
 ## Diagnostic host checks
 
@@ -378,7 +378,7 @@ never reconnecting the modem, plus the extracted startup slice verifying the thr
 before `sys.begin()`; RTC retention and actual peripheral power remain hardware gates), the DC fast-charge hold
 (`dc-awake`: entry on the car's `is_dcfc` or inferred power, the per-charge DC latch through the taper, the
 time-based silent hold (a seeded hour of 60 % silence) and the backstop sleep, budget by elapsed time on motion wakes, the 30 s cadence outside BLE, the CHARGING hold and the sample-poke stay, the
-live rail/alarm vetoes, motion keeping the hold and promoting a held poke, every exit and its sleep tier, a new AC
+live rail/alarm vetoes (a fresh DC reading held at 13.25 V, vetoed `rail` at 13.15 V: `DC_HOLD_RAIL_VOLTS`), motion keeping the hold and promoting a held poke, every exit and its sleep tier, a new AC
 charge not latched, and the cadence kept under `SESSION_IDLE_MAX_MS`; and #128's timed awake ladder: the real
 `handleActivityState()` from its clock read on, ticked every 500 ms with loop()'s poll gate, through a drive past
 `MAX_AWAKE_MINUTES` then a DC charge with people in the car (no sleep path while held, the backstop at the unplug), a

@@ -123,7 +123,7 @@ bool dcMotionRecent() { return g_last_motion_ms && millis() - g_last_motion_ms <
 // Why a confirmed DC charge does not hold the wake awake right now, read live on every use; null when it does.
 const char* dcAwakeVeto(ActivityState state) {
   if (state == BLE) return "ble";                           // the phone's session keeps its own cadence
-  if (g_last_io36 < RAIL_AWAKE_VOLTS) return "rail";        // the DC-DC is not up
+  if (g_last_io36 < DC_HOLD_RAIL_VOLTS) return "rail";      // the DC-DC is not up
 #if OBD_ALARM_GATE
   if (alarmEnforced()) return "alarm";                      // a flagged car is never held awake parked
 #endif

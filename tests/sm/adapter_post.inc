@@ -340,7 +340,7 @@ const char* propertyBroken(const Snap& pre, const SmEvent& e) {
   // The backstop runs at the top of a ladder tick, so the state it judges is the one before the tick. With
   // DC_EARLY_HOLD (#128) a DC charge the hold would keep is exempt, in the BLE state too: the rail and alarm terms, read
   // from the state before the tick.
-  const bool dc_held = DC_EARLY_HOLD && pre.g_dc_confirmed && pre.g_last_io36 >= RAIL_AWAKE_VOLTS && pre.g_alarm_flag != 1;
+  const bool dc_held = DC_EARLY_HOLD && pre.g_dc_confirmed && pre.g_last_io36 >= DC_HOLD_RAIL_VOLTS && pre.g_alarm_flag != 1;
   if (e.k == SmKind::LADDER && !pre.sm_asleep && pre.is_currently_parked && !pre.maintenance_mode &&
       pre.current_state != UNINITIALIZED && sm_now > (unsigned long)MAX_AWAKE_MINUTES * 60UL * 1000UL && !dc_held &&
       !(sm_asleep && sm_sleep_reason == "backstop"))

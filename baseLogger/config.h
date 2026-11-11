@@ -603,6 +603,13 @@
 #define DC_EARLY_HOLD 1
 #endif
 #define DC_RELEASE_POLLS           3
+// The DC hold's rail veto only (dcAwakeVeto). FIELD: an MEB DC-DC ran at ~13.3-13.5 V through DC fast charges (low
+// 13.31 V), at the edge of RAIL_AWAKE_VOLTS. Under RAIL_AWAKE_VOLTS only a fresh DC verdict holds (the car's is_dcfc
+// or >= DC_CHARGING_MIN_KW), so the rail here says only that the DC-DC is up. Kept above the AC-taper and
+// full-battery rest band (~13.18-13.2 V). The rollback (DC_EARLY_HOLD 0) keeps RAIL_AWAKE_VOLTS.
+#ifndef DC_HOLD_RAIL_VOLTS
+#define DC_HOLD_RAIL_VOLTS         (DC_EARLY_HOLD ? 13.2f : RAIL_AWAKE_VOLTS)
+#endif
 #define WAKE_PARKED_MINUTES        30    // FIELD: parked voltage-watch. Each wake is a cheap ~5s rail check
                                          // (no modem, no poll, no BLE on a skip) ~ a few mAh/day. 30 min
                                          // bounds how late we catch a charge start with no awake dongle: a
@@ -646,6 +653,8 @@ static_assert(POST_DRIVE_RECHECK_MINUTES < POST_DRIVE_WINDOW_MINUTES ||
 #define RAIL_TAPER_FLOOR        13.0f  // confirm-poll only if rail >= this. NOT a charge signal (taper ~13.18
                                        // and parked-rest ~13.19 both sit above it) - purely a safety floor so
                                        // we never confirm-poll a weak/collapsing battery. Current sign decides.
+static_assert(DC_HOLD_RAIL_VOLTS <= RAIL_AWAKE_VOLTS && DC_HOLD_RAIL_VOLTS > RAIL_TAPER_FLOOR,
+              "the DC hold's rail veto sits between the taper floor and the awake rail");
 // Charge-end read: when the rail falls below RAIL_TAPER_FLOOR with the latch still up, the charge has most
 // likely just ended, and without one more poll ABRP keeps the last CHARGING point until the next drive. FIELD
 // (Scenic, 2026-10-09): rail 13.17 -> 12.70 three minutes after a 20kW AC charge, the latch dropped silently,

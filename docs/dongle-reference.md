@@ -424,7 +424,7 @@ awake.** Polling a sleeping EV wakes its ECUs, which then stay awake on the *car
   and a car silent on ~60 % of polls would otherwise drop to `parked-held` several times an hour. The dongle then stays awake and polls
   and uploads every `DC_CHARGING_AWAKE_SECONDS` (30) over one reused session, and the ladder holds in `CHARGING`.
   - `dcAwakeHeld()` vetoes the hold live, not only at a poll: the BLE state (it keeps its own cadence), a rail under
-    `RAIL_AWAKE_VOLTS`, or an alarm-flagged car (§7). Motion is no veto (#128): people sit in the car while it charges,
+    `DC_HOLD_RAIL_VOLTS` (13.2 V; `RAIL_AWAKE_VOLTS` with `DC_EARLY_HOLD 0`), or an alarm-flagged car (§7). Motion is no veto (#128): people sit in the car while it charges,
     and a drive-away ends the hold at its first poll (speed or discharge), up to one 30 s poll late. A promoted poke
     keeps the charge trusted. The `MAX_AWAKE_MINUTES` backstop skips a charge the hold would keep, in the BLE state
     too; `WAKE_CHARGING_MAX_MINUTES` bounds it. `DC_EARLY_HOLD 0` is the rollback to the motion veto and the backstop.
@@ -1012,7 +1012,7 @@ order and decline detection → Appendix A §7b; OTA → Appendix B §4, Appendi
   veto (`ble`, `rail`, `alarm`, `motion` with the window's `peak=`/`axmax=`), else the cadence label (`parked-cap`,
   `parked-uncorroborated`, `parked-held`), else `not-dc`; a sleep that ends a hold logs its own reason (`backstop`,
   `net-recover`). `DC_AWAKE refused reason=<veto>`, once per wake, is a DC poll that could not hold: a car whose DC-DC
-  sits under `RAIL_AWAKE_VOLTS` shows `rail`, charger vibration over the 0.1 g `detectMovement` threshold shows
+  sits under `DC_HOLD_RAIL_VOLTS` shows `rail`, charger vibration over the 0.1 g `detectMovement` threshold shows
   `motion` (read the `MOTION` lines; `DC_EARLY_HOLD 0` only). `DC_AWAKE poke promoted` is motion on a held sample
   poke. `AWAKE_BACKSTOP` comes only after the hold ends.
 - **`LEASH dc charge <kW>kW x<n> -> re-latch parked`** is the early DC release (§6, #128): the charge power of the
