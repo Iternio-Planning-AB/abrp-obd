@@ -139,9 +139,17 @@ inline DriveRegion driveRegion() {
 }
 inline void driveStore(const DriveRegion& r) {
   if (driveRegion().state != r.state) g_drive_gnss_refused = false, g_dc_release_polls = 0;  // a run is within one state
+  // The wake's parked time (#133): a drive start closes the parked interval, a re-latch opens the next.
+  if (is_currently_parked && r.state == DRIVE_DRIVING) g_parked_ms_total += millis() - g_parked_since_ms;
+  if (!is_currently_parked && r.state != DRIVE_DRIVING) g_parked_since_ms = millis();
   is_currently_parked = r.state != DRIVE_DRIVING;
   drive_unconfirmed = r.state == DRIVE_UNCONFIRMED;
   g_last_speed_ms = r.last_hold_ms;
+}
+
+// Time parked this wake, every parked interval added up (UNCONFIRMED is parked): what the max-awake backstop counts.
+inline unsigned long driveParkedMs() {
+  return g_parked_ms_total + (is_currently_parked ? millis() - g_parked_since_ms : 0UL);
 }
 
 // The evidence as of now, with the numbers the log lines quote. Discharge reads the frame's power (kW, positive

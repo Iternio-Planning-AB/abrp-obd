@@ -112,6 +112,10 @@ RTC_DATA_ATTR bool park_marker_owed = false;
 // is_charging (parked-gated). A phone forgotten in the car could then hold the device + the car's ECUs awake
 // indefinitely - the exact 12V-drain scenario the backstop exists to prevent.
 unsigned long g_last_speed_ms = 0;
+// The wake's parked time (#133), for the max-awake backstop: millis() of the last re-latch from DRIVING (0: boot), and
+// the parked intervals before it. Written only by the drive region.
+unsigned long g_parked_since_ms = 0;
+unsigned long g_parked_ms_total = 0;
 // Last sample whose current was above CHARGE_DISCHARGE_AMPS. Plain RAM: 0 at every wake, so a streaming wake
 // confirms a charge only after CHARGE_STREAM_CONFIRM_SECONDS of its own samples.
 unsigned long g_last_discharge_ms = 0;

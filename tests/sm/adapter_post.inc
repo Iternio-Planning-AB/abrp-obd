@@ -21,7 +21,7 @@ void enterDeepSleep(bool modem_on, const char* reason) {
 
 struct Snap {
 #define SM_FIELD(T, name, value) T name;
-  SM_RAM(SM_FIELD) SM_RTC(SM_FIELD) SM_STUB(SM_FIELD) SM_WAKE(SM_FIELD) SM_LOCAL(SM_FIELD)
+  SM_RAM(SM_FIELD) SM_RAM_NEW(SM_FIELD) SM_RTC(SM_FIELD) SM_STUB(SM_FIELD) SM_WAKE(SM_FIELD) SM_LOCAL(SM_FIELD)
 #undef SM_FIELD
   float gps_speed;
   std::vector<OBDVector> frames;
@@ -34,7 +34,7 @@ struct Snap {
 Snap save(bool frames = true) {
   Snap s;
 #define SM_SAVE(T, name, value) s.name = name;
-  SM_RAM(SM_SAVE) SM_RTC(SM_SAVE) SM_STUB(SM_SAVE) SM_WAKE(SM_SAVE) SM_LOCAL(SM_SAVE)
+  SM_RAM(SM_SAVE) SM_RAM_NEW(SM_SAVE) SM_RTC(SM_SAVE) SM_STUB(SM_SAVE) SM_WAKE(SM_SAVE) SM_LOCAL(SM_SAVE)
 #undef SM_SAVE
   s.gps_speed = sm_gps.speed;
   if (frames) s.frames = obd_result_vector;
@@ -45,7 +45,7 @@ Snap save(bool frames = true) {
 
 void restore(const Snap& s) {
 #define SM_LOAD(T, name, value) name = s.name;
-  SM_RAM(SM_LOAD) SM_RTC(SM_LOAD) SM_STUB(SM_LOAD) SM_WAKE(SM_LOAD) SM_LOCAL(SM_LOAD)
+  SM_RAM(SM_LOAD) SM_RAM_NEW(SM_LOAD) SM_RTC(SM_LOAD) SM_STUB(SM_LOAD) SM_WAKE(SM_LOAD) SM_LOCAL(SM_LOAD)
 #undef SM_LOAD
   sm_gps.speed = s.gps_speed;
   obd_result_vector = s.frames;
@@ -142,6 +142,7 @@ void alarmCheck(unsigned long tx, bool oracle, size_t log_n) {
 void boot(const SmEvent& e, SmReset reset) {
   sm_rtc_ms += sm_now;
   SM_RAM(SM_RESET)
+  SM_RAM_NEW(SM_RESET)
   upload_capped = upload_heap_dropped = 0;
   SM_WAKE(SM_RESET)
   SM_LOCAL(SM_RESET)
@@ -350,6 +351,25 @@ void step(const SmEvent& e) {
   }
 }
 
+const unsigned long SM_MAX_AWAKE_MS = (unsigned long)MAX_AWAKE_MINUTES * 60UL * 1000UL;
+const unsigned long SM_ABSOLUTE_MS = (unsigned long)MAX_AWAKE_ABSOLUTE_MINUTES * 60UL * 1000UL;
+// The wake's parked time at `now`, from the adapter's own record of its edges (#133).
+unsigned long smParked(const Snap& s, unsigned long now) {
+  return s.sm_parked_total + (s.is_currently_parked ? now - s.sm_parked_at : 0UL);
+}
+
+// #133, CUR only until SM_PIN has the fix. The backstop takes a tick only past a ceiling, judged at the tick's end
+// (after its own clock read, so this loosens it by the tick's few milliseconds).
+const char* fixPropertyBroken(const Snap& pre, const SmEvent& e) {
+  // The firmware's parked time is the adapter's, after every event: a missed or extra stamp shows at once.
+  if (g_parked_ms_total != sm_parked_total || (is_currently_parked && g_parked_since_ms != sm_parked_at))
+    return "the firmware's parked time differs from the adapter's record of the re-latches and unlatches";
+  if (e.k == SmKind::TICK && !pre.sm_asleep && sm_asleep && sm_sleep_reason == "backstop" &&
+      !(smParked(pre, sm_now) > SM_MAX_AWAKE_MS || sm_now > SM_ABSOLUTE_MS))
+    return "the backstop slept a wake parked under MAX_AWAKE_MINUTES and awake under MAX_AWAKE_ABSOLUTE_MINUTES";
+  return nullptr;
+}
+
 // Properties of one side after event e, against its state before it. Null when they hold.
 const char* propertyBroken(const Snap& pre, const SmEvent& e) {
   if (sm_budget_broken) return sm_budget_broken;
@@ -362,14 +382,15 @@ const char* propertyBroken(const Snap& pre, const SmEvent& e) {
   if (!pre.sm_asleep && sm_asleep && pre.g_weak_rail_cold_boot && sm_sleep_modem)
     return "a weak-rail cold boot slept with the modem on (marker, flush)";
   // The backstop runs in every tick after the motion window, so the state it judges is the one before the tick, and a
-  // tick that starts past the ceiling is past it there. With DC_EARLY_HOLD (#128) a DC charge the hold would keep is
+  // tick that starts past the ceiling is past it there. The ceiling counts the wake's parked time (#133), or its
+  // time since boot past MAX_AWAKE_ABSOLUTE_MINUTES. With DC_EARLY_HOLD (#128) a DC charge the hold would keep is
   // exempt, in the BLE state too: the rail and alarm terms, read from the state before the tick.
   const bool dc_held = DC_EARLY_HOLD && pre.g_dc_confirmed && pre.g_last_io36 >= DC_HOLD_RAIL_VOLTS && pre.g_alarm_flag != 1;
   const bool transfer_starts = e.k == SmKind::TICK && (e.phone == 1 || e.phone == 2);  // inside the motion window
   if (e.k == SmKind::TICK && !transfer_starts && !pre.sm_asleep && pre.is_currently_parked && !pre.maintenance_mode &&
-      pre.current_state != UNINITIALIZED && pre.sm_now > (unsigned long)MAX_AWAKE_MINUTES * 60UL * 1000UL && !dc_held &&
-      !(sm_asleep && sm_sleep_reason == "backstop"))
-    return "awake past MAX_AWAKE_MINUTES while parked, and the next ladder tick did not take the backstop sleep";
+      pre.current_state != UNINITIALIZED && (smParked(pre, pre.sm_now) > SM_MAX_AWAKE_MS || pre.sm_now > SM_ABSOLUTE_MS) &&
+      !dc_held && !(sm_asleep && sm_sleep_reason == "backstop"))
+    return "parked past MAX_AWAKE_MINUTES, and the next ladder tick did not take the backstop sleep";
   if (e.k == SmKind::TICK && !pre.sm_asleep && dc_held && sm_asleep && sm_sleep_reason == "backstop")
     return "the backstop slept a held DC charge";
   // Nor may the ladder sleep under a transfer (the OTA/dump block refuses it), and the backstop must never take a
