@@ -2428,21 +2428,20 @@ duty cycle between 86 and 130 mA. A TLS POST occupies roughly 0.5–2 s of each 
 
 From `handleActivityState()` and `config.h`:
 
-- `ACTIVE_TIMER` = 5 min, `CHARGING_TIMER` = 5 min, `MAX_AWAKE_MINUTES` = 60
+- `ACTIVE_TIMER` = 5 min, `MAX_AWAKE_MINUTES` = 60
 - `WAKE_PARKED_MINUTES` = 30, `ENABLE_PARKED_HEARTBEAT` = 0, `ATRV_GATE_ENFORCE` = 1
 
-**Idle-to-sleep is ~5 minutes, not ~10.** Both timers are compared against the *same*
-`last_active` stamp, which is refreshed only by motion/speed (logger.ino:1081, 1102):
+**Idle-to-sleep is ~5 minutes.** Both idle stages are timed by one `last_active` leash, refreshed by
+motion and speed:
 
 ```
-ACTIVE  -> CHARGING  when now - last_active > ACTIVE_TIMER    (5 min)
-CHARGING-> STANDBY   when now - last_active > CHARGING_TIMER  (5 min)
+ACTIVE  -> CHARGING  when now - last_active > ACTIVE_TIMER  (5 min)
+CHARGING-> STANDBY   when now - last_active > ACTIVE_TIMER  (unless the DC hold keeps CHARGING)
 ```
 
-By the time CHARGING is entered, its own exit condition is already true, so CHARGING and STANDBY
-are traversed in one or two loop iterations and the device sleeps. The bench observation was
-about five minutes after motion stopped. The old ten-minute comment has since been corrected;
-the five-minute tail was deliberately retained, not left as an unresolved timer choice.
+CHARGING is entered with the leash already expired, so it is a pass-through: STANDBY and sleep follow
+on the next loop pass. The bench observation was about five minutes after motion stopped. The
+five-minute tail is deliberate; a second stage would double what the 12 V battery pays after a drive.
 
 **Parked cycle.** Deep sleep → 30-min timer wake → ATRV gate reads both voltages → parked rail
 (not `rail_awake`, not motion, not cold, heartbeat disabled) → skip → straight back to sleep,
@@ -2876,7 +2875,7 @@ needs a board revision (`POWER_MANAGEMENT.md`).
    `OBDWrapper::pollStandardFallback` — converts the brick-class panic loop into a graceful failure, and also
    covers a genuinely dead/damaged co-processor. (`getVoltage()` and `init(protocol)` were already guarded.)
 5. **Comment corrections:** the idle-to-sleep timer comment in `config.h` (it is ~5 min, not ~10 — with the
-   reasoning for *not* raising `CHARGING_TIMER`), and the stale NITZ claim in `cellwrapper.cpp` (NITZ pushes
+   reasoning for keeping the five-minute tail), and the stale NITZ claim in `cellwrapper.cpp` (NITZ pushes
    *are* now arriving on this unit, and they are the ~50 bytes that could overrun the old CPOWD buffer).
 
 Earlier in the same cycle (already in the tree): the ABD7 log-dump `readfail` guard and idempotent re-START,

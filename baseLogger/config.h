@@ -50,7 +50,6 @@
 // WAKE_CHARGING_MINUTES       3
 // MAX_AWAKE_MINUTES          60
 // ACTIVE_TIMER                5  // Minutes
-// CHARGING_TIMER              5  // Minutes
 
 // ------------------------------------------------------------------------------------
 // 5. DEVELOPER MAINTAINED (Check these before compiling!)
@@ -974,20 +973,10 @@ static_assert(CELL_WEAK_MAX_POST_BYTES <= CELL_MAX_POST_BYTES, "the weak-signal 
 #define NETWORK_TEST 0
 #endif
 
-// FIELD/SHIP values. Idle-to-sleep is ~5 min of no motion AND no reported speed - NOT the sum of the two
-// timers. Both transitions are measured against the SAME `last_active` stamp (refreshed only by motion or
-// reported speed), so by the time ACTIVE -> CHARGING fires at last_active+5min, CHARGING's own exit test
-// (now - last_active > CHARGING_TIMER) is ALREADY true and STANDBY -> deep sleep follows within one or two
-// loop iterations. Bench-confirmed: the device sleeps ~5 min after motion stops.
-// Deliberately NOT "corrected" by raising CHARGING_TIMER to 10 min: that would double the post-drive awake
-// tail - the one part of a drive the 12V battery actually pays for - for no functional gain, since parked
-// charge monitoring runs on the rail-awake sample-poke path, not on the CHARGING state (which a parked car
-// traverses instantly anyway).
-// Long enough that a drawbridge / drive-through / long red light doesn't fragment the trip (the
-// speed>0 leash covers normal stops; WOM self-heals if we do sleep early), short enough that a parked car
-// stops being polled quickly. Test values were 2+1 min.
+// FIELD/SHIP value. One leash times both idle stages: CHARGING is a pass-through to STANDBY -> deep sleep ~5 min
+// after the last motion or speed. No second timer: it would double the post-drive awake tail the 12V battery pays
+// for. Long enough not to fragment a trip at a long red light. Rationale and the DC hold: DONGLE_CONTEXT.md §6.
 #define ACTIVE_TIMER 5*60*1000   // 5 min: driving/idle stage (speed>0 or accel refreshes this leash)
-#define CHARGING_TIMER 5*60*1000 // 5 min: second idle stage before STANDBY -> deep sleep
 
 // Setup makes ONE init attempt: 30s registration search for multi-poll wakes, the field-proven 45s for
 // single-poll parked wakes; begin/SIM/config/diagnostics are separate. Background scans survive expiry.
@@ -1102,6 +1091,5 @@ static_assert(CELL_WEAK_MAX_POST_BYTES <= CELL_MAX_POST_BYTES, "the weak-signal 
   Testing
 */
 // #define ACTIVE_TIMER 10*1000 //10 seconds
-// #define CHARGING_TIMER 30*1000 //30 seconds
 
 #endif

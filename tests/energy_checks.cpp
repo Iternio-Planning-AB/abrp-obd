@@ -1908,7 +1908,7 @@ void dcAwakeChecks() {
   ChargingRung ladder;
   ladder.g_dc_confirmed = true;
   ladder.tick();
-  check(ladder.current_state == CHARGING, "the hold keeps the ladder in CHARGING past CHARGING_TIMER");
+  check(ladder.current_state == CHARGING, "the hold keeps the ladder in CHARGING past its pass-through tick");
   ladder.g_last_io36 = 13.1f;
   ladder.tick();
   check(ladder.current_state == STANDBY, "a rail drop between polls ends it at the next tick");

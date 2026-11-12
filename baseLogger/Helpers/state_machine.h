@@ -229,7 +229,7 @@ LadderStep ladderStep(ActivityState state, const AwakeHolds& h, const AwakePhone
     // peer that never authorizes can read and write nothing - so letting it refresh this leash only
     // lets a stranger (or a phone whose user declined the pairing dialog) hold the car awake for the
     // full MAX_AWAKE_MINUTES backstop for no benefit. Keying on bleAuthenticated() drops that to
-    // ACTIVE_TIMER + CHARGING_TIMER (~10 min) and then sleeps normally. Not bleRelaying(): an app whose
+    // ~ACTIVE_TIMER and then sleeps normally. Not bleRelaying(): an app whose
     // relay acks lapsed (#90) is still a person at the car, and only the transport moves to cellular.
     //
     // Deliberately NOT the vestibule idea of dropping such a connection: the dongle cannot tell a
@@ -257,10 +257,10 @@ LadderStep ladderStep(ActivityState state, const AwakeHolds& h, const AwakePhone
     }
     break;
   case CHARGING:
-    // A connection ALONE must not pull us back to the awake state; real motion revives, otherwise progress to sleep.
-    // A confirmed DC charge holds here, awake (DC_CHARGING_AWAKE_SECONDS); WAKE_CHARGING_MAX_MINUTES bounds it.
+    // A pass-through on ACTIVE's expired leash: the DC hold or a restamp (transfer, speed, GNSS) keeps it here;
+    // motion revives ACTIVE, a connection ALONE never does.
     if (motion) s.change(ACTIVE);
-    else if (idle_ms > CHARGING_TIMER && !dc_held) s.change(STANDBY);
+    else if (idle_ms > ACTIVE_TIMER && !dc_held) s.change(STANDBY);
     break;
   case STANDBY:
     // Motion revives; otherwise sleep, dropping BLE. Not during a serial maintenance session, so a USB dump isn't
