@@ -207,7 +207,7 @@ with tempfile.TemporaryDirectory(prefix="obd-energy-checks-") as temporary:
     start = sleep.index("  if (modem_down) network.powerOff();")
     (build / "sleep_modem.inc").write_text(sleep[start:sleep.index("\n", start) + 1])
     (build / "reconnect.inc").write_text(block(logger, "if (!g_weak_rail_cold_boot && !bleRelaying() && !g_ota_active"))
-    (build / "backstop_sleep.inc").write_text(block(state_machine, "if (!maintenance_mode && !g_ota_active && !g_logdump_active"))
+    (build / "backstop_sleep.inc").write_text(block(state_machine, "  if (backstopDue("))
     (build / "ble_frame_log.inc").write_text(block(logger, "if (ble_mtu != g_logged_ble_mtu"))
     (build / "activity_state.inc").write_text(block(logger, "enum ActivityState {").rstrip() + ";\n")
     (build / "dc_delay.inc").write_text("".join(block(state_machine, f) for f in (
@@ -216,10 +216,14 @@ with tempfile.TemporaryDirectory(prefix="obd-energy-checks-") as temporary:
     (build / "dc_promote.inc").write_text(block(logger, "void dcPromotePoke() {"))
     (build / "dc_rail_refresh.inc").write_text(line(logger, "    if (g_sample_poke && g_dc_confirmed) g_rail_before_poke"))
     (build / "dc_sleep_log.inc").write_text(line(sleep, "  if (g_dc_logged) logEvent(\"DC_AWAKE off"))
-    start = state_machine.index("  case CHARGING:\n", state_machine.index("void handleActivityState() {"))
-    end = state_machine.index("    break;\n", start) + len("    break;\n")
-    (build / "charging_case.inc").write_text(state_machine[start:end])
-    # The awake ladder in time (#128): handleActivityState() from its clock read on (the backstop and the switch), whole.
+    # The ladder's pure decisions (#29), whole: the holds, the rung and the backstop.
+    (build / "ladder_step.inc").write_text(
+        "".join(block(state_machine, f).rstrip() + ";\n" for f in ("struct AwakeHolds {", "struct AwakePhone {",
+                                                                    "struct LadderStep {")) +
+        block(state_machine, "LadderStep ladderStep(") + block(state_machine, "bool backstopDue("))
+    (build / "awake_holds.inc").write_text(block(state_machine, "AwakeHolds awakeHolds() {") +
+                                           block(state_machine, "AwakePhone awakePhone() {"))
+    # The awake ladder in time (#128): handleActivityState() from its clock read on (the backstop and the rung), whole.
     ladder_fn = block(state_machine, "void handleActivityState() {")
     start = ladder_fn.index("  auto now = millis();\n")
     (build / "awake_ladder.inc").write_text(ladder_fn[start:ladder_fn.rindex("}")])

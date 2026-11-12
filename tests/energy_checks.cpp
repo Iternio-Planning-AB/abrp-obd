@@ -23,6 +23,7 @@
 #include "../libraries/OBDWrapper/obd_vector.h"
 #include "charge_config.inc"
 #include "activity_state.inc"
+#include "ladder_step.inc"
 
 void check(bool condition, const std::string& message) {
   if (!condition) {
@@ -440,12 +441,13 @@ void wdtSleep() {
 #include "wdt_streak_sleep.inc"
 }
 bool maintenance_mode = false, g_ota_active = false, g_logdump_active = false, is_currently_parked = true;
-enum { UNINITIALIZED, ACTIVE, STANDBY } current_state = STANDBY;
+ActivityState current_state = STANDBY;
 unsigned long millis() { return (MAX_AWAKE_MINUTES + 1) * 60UL * 1000UL; }
 struct { void printf(const char*, ...) {} } Serial;
 bool g_dc_confirmed = true;  // a DC charge whose hold has ended (here: no rail) is bounded by the backstop
 bool dcAwakeHeld(decltype(current_state)) { return false; }  // not held (no rail)
 void backstopSleep() {
+  const AwakeHolds h{g_ota_active, g_logdump_active, maintenance_mode};
 #include "backstop_sleep.inc"
 }
 bool has(const std::string& text) { return slept.find(text) != std::string::npos; }
@@ -1706,16 +1708,15 @@ OBDVector dcFrame(double soc, double amps = -150.0, int car_dcfc = -1) {
   return frame;
 }
 
-// The CHARGING ladder step, extracted whole.
-struct LadderStep : ChargePoll {
+// The CHARGING rung: the ladder's own decision (ladderStep), with this state's DC hold.
+struct ChargingRung : ChargePoll {
   bool active = false;
-  LadderStep() { now = 20UL * 60000UL; g_last_io36 = 14.9f; }
-  void changeState(ActivityState next) { current_state = next; }
+  ChargingRung() { now = 20UL * 60000UL; g_last_io36 = 14.9f; }
   void tick() {
-    switch (current_state) {
-#include "charging_case.inc"
-    default: break;
-    }
+    const unsigned long idle = now - last_active;
+    const LadderStep step = ladderStep(current_state, AwakeHolds{}, AwakePhone{}, active, idle, dcAwakeHeld(current_state),
+                                       true);
+    if (step.move == LadderStep::MOVE_CHANGE) current_state = step.to;
   }
 };
 
@@ -1751,7 +1752,9 @@ struct Awake : Dongle {
     if (s == CHARGING || s == STANDBY) is_currently_parked = true;  // driveIdle
     polling_delay = getPollingDelay(s);
   }
+#include "awake_holds.inc"
   void ladder() {
+    AwakeHolds h = awakeHolds();
 #define ENABLE_SLEEP 1
 #define ENABLE_MEMS 1
 #include "awake_ladder.inc"
@@ -1902,14 +1905,14 @@ void dcAwakeChecks() {
   check(cadence.dcAwakeDelay(BLE, 3000) == 3000 && cadence.dcAwakeDelay(BLE, 0) == 0, "a BLE session keeps its own cadence");
   cadence.g_dc_confirmed = false;
   check(cadence.dcAwakeDelay(CHARGING, 60000) == 60000, "without the hold each state keeps its cadence");
-  LadderStep ladder;
+  ChargingRung ladder;
   ladder.g_dc_confirmed = true;
   ladder.tick();
   check(ladder.current_state == CHARGING, "the hold keeps the ladder in CHARGING past CHARGING_TIMER");
   ladder.g_last_io36 = 13.1f;
   ladder.tick();
   check(ladder.current_state == STANDBY, "a rail drop between polls ends it at the next tick");
-  LadderStep moved;
+  ChargingRung moved;
   moved.g_dc_confirmed = moved.active = true;
   moved.tick();
   check(moved.current_state == ACTIVE, "motion still revives ACTIVE under the hold");

@@ -11,7 +11,7 @@ These rules supplement the [root guidance](../AGENTS.md). Domain details are in
 - Include order is by dependency: users of `logEvent` follow `logging.h`; users of `gzipBody`
   follow `gzip_body.h`. A symbol is not visible before its declaration/include.
 - `logger.ino`: `setup()` is the wake ladder, `loop()` is the poll/upload cycle.
-  `Helpers/state_machine.h` owns activity/cadence, `Helpers/drive_state.h` the drive region,
+  `Helpers/state_machine.h` owns the awake ladder and its cadences, `Helpers/drive_state.h` the drive region,
   `Helpers/energy_state.h` the charging state, `Helpers/wake_gate.h` setup()'s wake gate,
   `Helpers/sleep_power.h` normal sleep, and `Helpers/auth_gate.h` ABD8 authentication.
 - `build_src_filter` excludes Freematics reference copies (`stanleyhuangyc*`, `*telelogger*`,
@@ -29,7 +29,7 @@ These rules supplement the [root guidance](../AGENTS.md). Domain details are in
   ABD9 accepts at most 64 B into a locked mailbox and never logs or calls `ble`.
 - Tunables and their rationale belong in `config.h`. Preserve measured field constraints.
   The SIM7070's `SHCONF BODYLEN=1024` is a hard limit; the key-reset window starts at power-on.
-- Drive-, energy- and gate-state ownership and extraction boundaries are checked by `tests/run_sm_checks.py`.
+- Drive-, energy-, gate- and ladder-state ownership and extraction boundaries are checked by `tests/run_sm_checks.py`.
   Other runners also use source/comment anchors: run relevant checks after comment-only edits.
 
 ## Build and release

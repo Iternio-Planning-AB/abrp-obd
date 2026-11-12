@@ -136,7 +136,7 @@ order and share its globals. See [`baseLogger/AGENTS.md`](../baseLogger/AGENTS.m
 
 | File | What it does |
 |---|---|
-| `state_machine.h` | The activity state machine (BLE / ACTIVE / CHARGING / STANDBY). |
+| `state_machine.h` | The awake ladder (BLE / ACTIVE / CHARGING / STANDBY): the session holds, the max-awake backstop, the DC hold and each state's poll and upload cadence. |
 | `sleep_power.h` | Deep sleep (the one `enterDeepSleep` primitive), the IO36 12 V rail read, wake-cause decoding, wake-on-motion arming. |
 | `wdt_streak.h` | The consecutive panic/WDT/brownout reset count behind the crash-loop escalation, whether the modem may still be powered, and whether a trip's closing PARK may be unsent, kept in `RTC_NOINIT` memory so the resets they track don't wipe them. |
 | `mems.h` | ICM-42627 motion sensor: movement detection and wake-on-motion. |
