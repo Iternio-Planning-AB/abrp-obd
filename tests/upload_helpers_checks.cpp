@@ -5,7 +5,9 @@
 #include <ctime>
 #include <algorithm>
 #include <limits>
+#include <random>
 #include <sstream>
+#include <sanitizer/allocator_interface.h>
 #include <type_traits>
 #include "networkwrapper.h"
 #include "cellwrapper.h"
@@ -73,6 +75,7 @@ enum ResetReason { ESP_RST_POWERON, ESP_RST_DEEPSLEEP };
 ResetReason reset_reason = ESP_RST_POWERON;
 ResetReason esp_reset_reason() { return reset_reason; }
 #include "telemetry_format.h"
+#include "support/bulk_v2_tree_oracle.h"
 #include "geo_backlog.h"
 #include "gzip_fake.h"
 int gzip_calls = 0;
@@ -1553,8 +1556,169 @@ void backlogAppend() {
 }
 #endif
 
+// #136: the v2 body is serialised one point at a time. batchBodyEquivalence holds it byte-identical to the whole-tree
+// oracle (support/bulk_v2_tree_oracle.h); batchBodyPeak bounds the heap it holds while it runs.
+struct V2Run { std::string body; GeoMarks marks; unsigned dups; };
+template <typename Serialiser>
+V2Run v2Run(Serialiser serialise, const std::vector<OBDVector>& frames, double send_utc, const GeoMarks* start, bool count) {
+    V2Run run{{}, start ? *start : GeoMarks{}, 0xdeadu};
+    run.body = serialise(frames, send_utc, start ? &run.marks : nullptr, count ? &run.dups : nullptr);
+    return run;
+}
+V2Run batchBodySame(const std::vector<OBDVector>& frames, double send_utc, const GeoMarks* start, const std::string& what) {
+    V2Run counted;
+    for (bool count : {false, true}) {
+        const auto want = v2Run(bulkStringV2Tree, frames, send_utc, start, count);
+        const auto got = v2Run(bulkStringV2, frames, send_utc, start, count);
+        check(got.body == want.body, what + ": body byte-identical to the whole-tree serialiser\n  want " + want.body + "\n  got  " + got.body);
+        check(std::memcmp(&got.marks, &want.marks, sizeof(GeoMarks)) == 0, what + ": same marks at the end of the body");
+        check(got.dups == want.dups, what + ": same location_dups");
+        counted = got;
+    }
+    return counted;
+}
+void batchBodyEquivalence() {
+    const double now = 1791112000, seen = now - 60, inf = std::numeric_limits<double>::infinity(),
+                 nan = std::numeric_limits<double>::quiet_NaN();
+    const GeoMarks seen_marks{{59.32, 18.06, seen}, {90, seen}};
+    auto fixtures = [&](const std::vector<OBDVector>& frames, const std::string& what) {
+        for (double send_utc : {0.0, now})
+            for (const GeoMarks* start : {(const GeoMarks*)nullptr, &seen_marks})
+                batchBodySame(frames, send_utc, start, what);
+    };
+    fixtures({}, "empty batch");
+    fixtures({{{"utc", 0}, {"soc", 50}}, {{"soc", 50}}, {{"utc", -5}, {"soc", 50}}}, "every frame skipped");
+    fixtures({{{"utc", now}, {"_private", 1}}}, "a frame that reduces to provider");
+    std::vector<OBDVector> plain, rich, weak, dedup, geo;
+    for (unsigned i = 0; i < 12; ++i) {
+        plain.push_back(frame(i * 10));
+        rich.push_back(richUploadFrame(now + i, i));
+        weak.push_back(weakSignalFrame(i, 14));
+        dedup.push_back(dedupFix(now - 12 + i, i < 6 ? seen : seen + 1, seen));
+        geo.push_back(geoFrame(now - 12 + i, i % 3 ? seen : now + 60, i % 2 ? seen : 0, i % 4 != 0));
+    }
+    fixtures(plain, "frame()"); fixtures(rich, "richUploadFrame"); fixtures(weak, "weakSignalFrame");
+    fixtures(dedup, "dedupFix"); fixtures(geo, "geoFrame"); fixtures({oversizedFrame(), frame(0)}, "oversizedFrame");
+    fixtures({battery(now), frame(0), battery(0), battery(now - 1)}, "battery() with a skipped frame between");
+
+    // Seeded random batches. Raw mt19937 words only: its sequence is fixed by the standard, the distributions are not.
+    std::mt19937 rng(136);
+    auto pick = [&](auto const& pool) { return pool[rng() % pool.size()]; };
+    const std::vector<const char*> keys = {"soc", "soh", "soe", "capacity", "kwh_charged", "power", "hvac_power",
+        "voltage", "current", "batt_temp", "batt_temp_min", "batt_temp_max", "ext_temp", "cabin_temp", "odometer",
+        "est_battery_range", "speed", "elevation", "heading", "is_charging", "is_dcfc", "is_parked", "lat", "lon",
+        "__geo_loc_utc", "__geo_head_utc", "__geo_other", "__relay_seq", "_soh", "_bms_soc", "p0", "Unknown"};
+    const std::vector<double> values = {0, -0.0, 1, -1, 0.005, 1e-7, 42.5, 99.999, 100, 123456.789012, -273.15, 359.99,
+        360, 360.0001, -0.0001, 65535, 1999.99, 2000, -2000, -1999.5, 1e15, 1e300, -1e300,
+        std::numeric_limits<double>::max(), std::numeric_limits<double>::lowest(), std::numeric_limits<double>::min(),
+        std::numeric_limits<double>::denorm_min(), nan, inf, -inf};
+    // A frame's utc is cast to time_t, so only values the firmware can hold there: 0 and negatives are skipped frames.
+    const std::vector<double> utcs = {0, -1, now - 3, now - 2, now - 1, now, now + 0.5, now + 1, 978307200, seen};
+    const std::vector<std::pair<double, double>> places = {{59.32, 18.06}, {59.33, 18.06}, {-90, -180}, {90, 180},
+        {91, 0}, {nan, 18.06}, {59.32, inf}, {0, 0}};
+    const std::vector<double> geo_utcs = {seen, seen, seen + 1, seen + 0.5, now, now + 60, 0, 978307199, 4294967296.0,
+        now - GEO_MAX_SEND_AGE_SECONDS - 1, nan, inf};
+    const std::vector<double> headings = {0, 90, 90, 180, 359.5, 360, 361, -1, 65535, nan};
+    const std::vector<double> send_utcs = {0, now, now, now + 30, now + 0.5, now - 1000, 999999999,
+        double(CLOCK_MAX_EPOCH) + 1, nan, inf, -inf};
+    struct { unsigned empty = 0, dups = 0, location = 0, heading = 0, charging = 0, null = 0, many = 0; } reached;
+    for (unsigned batch = 0; batch < 4000; ++batch) {
+        std::vector<OBDVector> frames(rng() % 17);
+        for (size_t i = 0; i < frames.size(); ++i) {
+            OBDVector& f = frames[i];
+            if (rng() % 8) f.emplace_back("utc", pick(utcs));
+            for (unsigned n = rng() % 14; n; --n) f.emplace_back(pick(keys), pick(values));
+            if (i && rng() % 2) { // the previous frame's fix again
+                for (const auto& kv : frames[i - 1])
+                    if (isGeoMetaKey(kv.first) || isGeoValueKey(kv.first)) f.push_back(kv);
+            } else if (rng() % 4) {
+                const auto place = pick(places);
+                if (rng() % 8) f.emplace_back("lat", place.first);
+                if (rng() % 8) f.emplace_back("lon", place.second);
+                if (rng() % 4) f.emplace_back("__geo_loc_utc", pick(geo_utcs));
+                if (rng() % 2) { f.emplace_back("heading", pick(headings)); f.emplace_back("__geo_head_utc", pick(geo_utcs)); }
+            }
+            if (rng() % 3) f.emplace_back("is_parked", rng() % 2);
+            if (rng() % 3) f.emplace_back("current", pick(values));
+            if (rng() % 3) f.emplace_back("is_charging", rng() % 3 ? double(rng() % 2) : pick(values));
+            if (f.size() > 1) std::swap(f[rng() % f.size()], f[rng() % f.size()]);
+        }
+        const GeoMarks start = rng() % 2 ? seen_marks : GeoMarks{{pick(places).first, pick(places).second, pick(geo_utcs)},
+                                                                 {pick(headings), pick(geo_utcs)}};
+        const auto run = batchBodySame(frames, pick(send_utcs), rng() % 4 ? &start : nullptr, "random batch " + std::to_string(batch));
+        reached.empty += run.body == "[]";
+        reached.dups += run.dups > 0;
+        reached.location += run.body.find("\"location\"") != std::string::npos;
+        reached.heading += run.body.find("\"heading\"") != std::string::npos;
+        reached.charging += run.body.find("\"chargingState\"") != std::string::npos;
+        reached.null += run.body.find("null") != std::string::npos;
+        reached.many += std::count(run.body.begin(), run.body.end(), '{') > 40;
+    }
+    check(reached.empty > 100 && reached.dups > 100 && reached.location > 100 && reached.heading > 100 &&
+          reached.charging > 100 && reached.null > 100 && reached.many > 100,
+          "random batches reach empty bodies, location dedupe, heading, chargingState, non-finite values and big bodies");
+    std::cout << "INFO random v2 batches: " << reached.empty << " empty, " << reached.dups << " with location_dups, "
+              << reached.heading << " with a heading, " << reached.null << " with a null\n";
+    std::cout << "PASS v2 body byte-identical to the whole-tree serialiser over fixtures and 4000 random batches\n";
+}
+
+// Live heap through ASan's allocation hooks (the runner always builds with ASan): what a call holds at its peak.
+struct HeapWatch { bool armed = false; long long live = 0, peak = 0; } heap_watch;
+void heapWatchMalloc(const volatile void*, size_t size) {
+    if (!heap_watch.armed) return;
+    heap_watch.live += (long long)size;
+    heap_watch.peak = std::max(heap_watch.peak, heap_watch.live);
+}
+void heapWatchFree(const volatile void* p) {
+    if (heap_watch.armed && p) heap_watch.live -= (long long)__sanitizer_get_allocated_size((const void*)p);
+}
+// Peak bytes held during the call beyond the body it returns.
+template <typename Serialiser>
+long long heapPeakBeyondBody(Serialiser serialise, const std::vector<OBDVector>& frames, double send_utc) {
+    GeoMarks marks{};
+    unsigned dups = 0;
+    heap_watch = {true, 0, 0};
+    std::string body = serialise(frames, send_utc, &marks, &dups);
+    heap_watch.armed = false;
+    const long long kept = (long long)__sanitizer_get_allocated_size(body.data());
+    check(heap_watch.live == kept, "the heap watch accounts every block: only the body is left");
+    return heap_watch.peak - kept;
+}
+void batchBodyPeak() {
+    static bool hooked = __sanitizer_install_malloc_and_free_hooks(heapWatchMalloc, heapWatchFree) != 0;
+    check(hooked, "ASan malloc/free hooks installed");
+    const double now = 1791112000;
+    // A full driving frame with a fresh fix each poll. Every point has the same text length (only fixed-width times,
+    // two-decimal coordinates and two-digit headings vary): string growth steps at powers of two differ between
+    // libstdc++ and libc++, so points of unequal length would make the comparison below platform noise.
+    auto drive = [&](unsigned i) {
+        OBDVector f = {{"utc", now - 60 + 5 * i}, {"soc", 70.5}, {"soh", 97}, {"soe", 52000}, {"capacity", 77.4},
+            {"power", 18.2}, {"voltage", 371.5}, {"current", 49.1}, {"batt_temp", 24}, {"ext_temp", 11},
+            {"odometer", 41234.5}, {"speed", 90}, {"est_battery_range", 301}, {"elevation", 42}, {"is_parked", 0},
+            {"lat", (5931 + i) / 100.0}, {"lon", (1801 + i) / 100.0}, {"heading", 10.0 + i},
+            {"__geo_loc_utc", now - 60 + 5 * i}, {"__geo_head_utc", now - 60 + 5 * i}};
+        return f;
+    };
+    std::vector<OBDVector> batch;
+    for (unsigned i = 0; i < MAX_FRAMES_PER_POST; ++i) batch.push_back(drive(i));
+    const std::vector<OBDVector> pair(batch.begin(), batch.begin() + 2);
+    // Two frames and a full batch take the same path (a reserved body): what the full batch holds beyond its body must
+    // not grow with the frame count. The whole tree grows by one point's tree per frame, ~10 of them here.
+    const long long two = heapPeakBeyondBody(bulkStringV2, pair, now), all = heapPeakBeyondBody(bulkStringV2, batch, now);
+    const long long tree_two = heapPeakBeyondBody(bulkStringV2Tree, pair, now);
+    const long long tree_all = heapPeakBeyondBody(bulkStringV2Tree, batch, now);
+    const std::string numbers = "beyond the body: 2 points " + std::to_string(two) + " B, " + std::to_string(batch.size()) +
+        " points " + std::to_string(all) + " B (whole tree " + std::to_string(tree_two) + " B and " +
+        std::to_string(tree_all) + " B), body " + std::to_string(bulkStringV2(batch, now).size()) + " B";
+    std::cout << "INFO v2 body heap " << numbers << '\n';
+    check(tree_all - tree_two > 4 * two, "the whole tree grows by a point's tree per frame, so the bound below has a margin: " + numbers);
+    check(two > 0 && all - two <= two / 8, "a full batch holds what two frames hold beyond the body, one point's tree: " + numbers);
+    std::cout << "PASS v2 body holds one point at a time\n";
+}
+
 int main(int argc, char** argv) {
     const std::string group = argc > 1 ? argv[1] : "all";
+    if (group == "all" || group == "batch-body") { batchBodyEquivalence(); batchBodyPeak(); }
 #if ENABLE_LOGGING
     if (group == "all" || group == "fingerprint") fingerprint();
     if (group == "all" || group == "errors") safeErrors();
