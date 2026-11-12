@@ -240,7 +240,7 @@ probe completes data setup without another power-key pulse or network-mode/band 
 | `BLE_ENABLE_BONDING` | `1` | LE Secure Connections: every value and CCCD needs an encrypted link, so an unpaired phone can read and write nothing. Pairing is Just Works, so any phone can pair; the ABD8 handshake decides who gets a session. Flipping it needs every paired phone to forget the dongle first. |
 | `PROFILE_REQUIRE_SIGNATURE` | `0` | `1` = profile values must arrive inside a verified JWS. `0` = raw packages accepted too. |
 | `OTA_REQUIRE_SIGNATURE` | `1` | Firmware images must be ECDSA-signed. Leave on. |
-| `BLE_MAX_BONDS` | `10` | Soft cap under Bluedroid's hard limit of 15; pruned at BLE bring-up. |
+| `BLE_MAX_BONDS` | `4` | Soft cap on stored bonds (each costs ~1.3 KB of internal heap). At BLE bring-up a full table is pruned until one slot is free: bonds that never authenticated go first, then other authenticated phones, least recently connected first. The authenticated owner's bond is kept (`AUTHCLEAR` and the in-app key reset forget which phone that is). An evicted phone must forget the dongle before it reconnects. Bluedroid's hard limit is 15. |
 
 The ABD8 HMAC handshake is **unconditional**: it is the only thing that grants a session, and there
 is no flag for it. `PROFILE_REQUIRE_SIGNATURE` stays `0` until the signed-profile path has been seen

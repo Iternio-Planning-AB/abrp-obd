@@ -1537,9 +1537,13 @@ there is no backend authorization call or cached ticket.
 > LE pairing) — use the bond count delta. And `fail_reason` is BTA-offset into ~`0x53`–`0x6B`, not a raw SMP
 > status.
 >
-> Bond-table pressure — prereq 4's underlying problem — is now handled proactively too: `BLE_MAX_BONDS 10`
+> Bond-table pressure — prereq 4's underlying problem — is now handled proactively too: `BLE_MAX_BONDS 4`
 > against Bluedroid's hard `CONFIG_BT_SMP_MAX_BONDS=15`, pruned at BLE bring-up (loop task, nothing
-> connected). Eviction is arbitrary and frees a single slot; an evicted phone re-pairs silently.
+> connected). Each ABD8 grant records the peer's bond (NVS `auth/bondpeers`, newest first, the first is the
+> owner). Pruning frees one slot, evicting bonds that never authenticated first, then other recorded peers, least
+> recently connected first (Bluedroid lists bonds newest first), and never the owner's; with no owner listed it
+> keeps the newest bond instead. An evicted phone holds a one-sided bond (above), so the order
+> matters.
 
 Gives confidentiality: the profile (and its PID list), the provisioning
 secret, the firmware image in flight, and the telemetry values all stop being readable by a bystander.

@@ -11,7 +11,7 @@
 // 1. SECURITY & ACCESS CONTROL (All locked, do not change for production)
 // ------------------------------------------------------------------------------------
 // BLE_ENABLE_BONDING          1  // Link encrypted (LE Secure Connections). 0 = plaintext link
-// BLE_MAX_BONDS              10  // Soft cap under Bluedroid's hard 15; prunes at bring-up
+// BLE_MAX_BONDS               4  // Soft cap (~1.3 KB heap each); pruned at bring-up, owner kept
 //                                // (the ABD8 HMAC proof is the ONLY session grant - not switchable)
 // PROFILE_REQUIRE_SIGNATURE   1  // Profile values must arrive in a verified JWS
 // OTA_REQUIRE_SIGNATURE       1  // Firmware images must be ECDSA-signed
@@ -195,14 +195,16 @@
 #define BLE_ENABLE_BONDING 1
 #endif
 
-// Soft cap on stored bonds, pruned at BLE bring-up. Bluedroid's HARD limit is CONFIG_BT_SMP_MAX_BONDS=15 and
-// hitting it makes NEW phones fail to pair, so we stay well under it and evict eagerly instead. Eviction is
-// arbitrary (whatever order the stack lists bonds in) - an evicted phone just re-pairs silently on its next
-// connect, so "oldest first" would be cosmetic. 10 is far more than a dev fleet needs while leaving 5 slots
-// of slack for several phones pairing inside one awake window (the next wake prunes them back).
+// Soft cap on stored bonds. At BLE bring-up a table at the cap is pruned until one slot is free, keeping the
+// authenticated owner's bond (libraries/BLEWrapper/bond_prune.h has the order). Each bond costs Bluedroid ~1.3 KB
+// of INTERNAL heap at init (#138: cost= 98,288 B with 1 bond, 108,368 with 7), which cellular uploads need (#136).
+// One owner phone per dongle; the IRK keeps address rotation from adding bonds and an app reinstall keeps the OS
+// bond, so 4 leaves the owner, two other phones and a free slot. Bluedroid's HARD limit is 15
+// (CONFIG_BT_SMP_MAX_BONDS), past which new phones fail to pair.
 #ifndef BLE_MAX_BONDS
-#define BLE_MAX_BONDS 10
+#define BLE_MAX_BONDS 4
 #endif
+static_assert(2 <= BLE_MAX_BONDS && BLE_MAX_BONDS < 15, "BLE_MAX_BONDS must leave the newest bond and a free slot, under Bluedroid's 15");
 
 // The phase-2 auth gate (ABD8 nonce + HMAC, see Helpers/auth_gate.h) is UNCONDITIONAL - there is no
 // AUTH_ENFORCE switch any more. The legacy {"AUTH":"<tlm_push_token>"} write only unlocks the ABD2

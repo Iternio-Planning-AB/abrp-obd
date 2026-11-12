@@ -91,11 +91,15 @@ static volatile bool g_auth_cmd_present = false;
 */
 static uint8_t g_auth_cmd[160];
 static volatile size_t g_auth_cmd_len = 0;
+static volatile uint32_t g_auth_cmd_conn = 0; // the connection that wrote it (BLEWrapper::connection_gen)
 
 void authGateHook(const uint8_t* d, size_t n) {
   if (!d || n == 0 || n >= sizeof(g_auth_cmd) || g_auth_cmd_present) return;
   memcpy(g_auth_cmd, d, n);
   g_auth_cmd_len = n;
+#if ENABLE_BLE
+  g_auth_cmd_conn = ble.connection_gen();
+#endif
   g_auth_cmd_present = true;
 }
 
@@ -322,6 +326,7 @@ void authGateService() {
   if (!g_auth_cmd_present) return;
 
   json j = json::parse(std::string((const char*)g_auth_cmd, g_auth_cmd_len), nullptr, false);
+  uint32_t cmd_conn = g_auth_cmd_conn;
   g_auth_cmd_present = false;
   if (j.is_discarded() || !j.is_object()) return;
 
@@ -356,7 +361,10 @@ void authGateService() {
     g_auth_nonce_valid = false;
     // The next owner pushes their own profile. This session can still finish a push it had under way.
     // No key is not a failure: a repeated reset, after a reply lost on a slow erase, still answers reset.
-    if (!forgetProfile("authreset") || (p.isKey("secret") && !p.remove("secret"))) {
+    // The owner record goes with the key, as AUTHCLEAR's namespace wipe takes it (bond_prune.h); before the key, so a
+    // failure keeps the key and the reset can be repeated.
+    if (!forgetProfile("authreset") || (p.isKey(BOND_AUTH_PEERS_KEY) && !p.remove(BOND_AUTH_PEERS_KEY)) ||
+        (p.isKey("secret") && !p.remove("secret"))) {
       p.end();
       logEvent("AUTH2 reset failed - key kept, repeat the reset"); // with no forget FAILED line before it: NVS
       authNotifyJson("{\"auth\":\"error\"}");
@@ -484,6 +492,8 @@ void authGateService() {
     char reply[48];
     bleProtoAccept(j, reply, sizeof(reply));
     authNotifyJson(reply);
+    // After the reply, so the NVS write never delays it. Pruning keeps this peer's bond (bond_prune.h).
+    if (ble.get_authenticated()) ble.rememberAuthenticatedPeer(cmd_conn);
     return;
   }
 }

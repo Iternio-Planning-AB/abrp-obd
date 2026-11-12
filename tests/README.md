@@ -432,7 +432,7 @@ checks that `otaFinalize` and `bleDeinitForSleep` drop a push still pending, aft
 
 Run `python3 tests/run_relay_checks.py` (groups `old-app`, `acking`, `stall`, `never-ack`, `resume`, `disconnect`,
 `presence`, `hold`, `sessions`, `persistence`, `negotiation`, `grant`, `nonce`, `stop-resume`, `mailbox`, `state`,
-`subscribed-seq`, `seq-frame`, `dump-cellular`, `unsubscribed`, `fixtures`, `enumerate` with `--depth N`, default 4; and
+`subscribed-seq`, `seq-frame`, `dump-cellular`, `unsubscribed`, `fixtures`, `bonds`, `enumerate` with `--depth N`, default 4; and
 `no-protocol`)
 for the protocol version a session negotiates and whether a connected phone is the transport. It compiles the real
 `Helpers/ble_relay.h` (the session state machine and the ABD9 session channel), `ble_protocol.h` (negotiation and the
@@ -465,7 +465,9 @@ live, subscribed session keeps it until then (a wait 2 s short of the timeout; a
 must not lapse on its next frame). The model keeps each grant's ack clock (session start, forward ack, a resume or
 resubscribe ending a lapse, every pass with nothing outstanding or a log dump running); a failure names its sequence. `fixtures`
 replays every file under `protocol/fixtures/` the firmware owns (see its README) and checks the main-firmware nonce
-frames against `authSendNonce` from the pinned main commit. Checked by position: the ABD2 handler (its `PROTO` gate
+frames against `authSendNonce` from the pinned main commit. `bonds` (#138) runs `bond_prune.h`: the victim order and the authenticated-peer record; Bluedroid's list order and
+the owner's address match need a dongle.
+Checked by position: the ABD2 handler (its `PROTO` gate
 right after `NOAUTH`, no `relay_ack` case left), a connection starting with no grant (`onConnect` clears it), the GATT table (ABD1-ABD8 as on the pinned main commit, ABD9/ABDA
 with notify and an encrypted CCCD, 30 of 32 handles, the ABD1/ABD8/ABD9 CCCDs cleared on disconnect, the boot handle
 log), auth_gate.h around `bleProtoAccept` (after the HMAC check, the only grant, its reply notified straight after), version numbers outside
