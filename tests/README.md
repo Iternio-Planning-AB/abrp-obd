@@ -66,8 +66,12 @@ Since #124 they also pin that a fix holds DRIVING only while the car is on: with
 OBD answer within `ACTIVE_TIMER`, never answered or a speed-key drive whose answers stopped) a fix no longer
 refreshes the hold, one `hold refused` line carries the rail, the answer's age and a clamped speed, the drive
 re-latches the first poll end past `ACTIVE_TIMER` after the last accepted hold with one freeze, and a later fix logs
-today's PARKED refusal once (two refusal lines per episode); the rail alone, OBD answers on a 12.0 V rail, OBD
-answers with no rail reading (0.0, as a build without `ENABLE_IO36_RAIL`) and a one-poll rail dip keep the drive.
+today's PARKED refusal once (two refusal lines per episode); the rail alone and a one-poll rail dip keep the drive.
+Since #141 GNSS's car-on is the rail alone (an OBD answer on a 12.0 V rail no longer starts or holds a GNSS drive,
+and the field case takes the backstop sleep). The cases that differ from `SM_PIN` by design run on CUR alone
+(`playCur`, `playComposed(..., true)`), with a CUR-only depth-5 enumeration adding low-rail OBD fixes to the drive
+alphabet, whose polls all read 13.5 V; every other group stays equal to the pin. The composition oracle's GNSS start
+also needs the rail.
 No restored-DRIVING case exists to test: drive state is RAM, reset to PARKED on every boot, and the crash copy
 (`wdt_streak.h`) restores only the PARK marker debt. The line's worst case is in `run_energy_checks.py`'s table.
 Since #95 it also covers this frame's discharge overriding the charge latch on each path (PARKED and UNCONFIRMED

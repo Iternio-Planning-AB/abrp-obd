@@ -174,7 +174,7 @@ Check the rail before powering peripherals or issuing bus traffic.
   a discharging current in the frame (#95; cars without a current PID keep the latch; vetoes in `drive_state.h`).
   Risk: plugged-in preconditioning or V2L while the car is moved reads as a drive, which forces `is_charging` to 0
   (the latch releases, the CHARGING exit and DC hold are lost, the parked-only backstop is off), and GNSS drift can
-  hold it past `ACTIVE_TIMER`. The car-on requirement for a DRIVING GNSS hold should land before or with this.
+  hold it past `ACTIVE_TIMER` only while the rail is at `RAIL_AWAKE_VOLTS` (#141).
 - `Helpers/energy_state.h` is the only writer of the charge latch, DC session, fast budget/cap, corroboration,
   follow-up and post-drive window state (#25); the gate's poll decision and the next-wake cadence are not yet its.
 - `Helpers/wake_gate.h` is setup()'s wake gate: a pure poll decision (`gateDecide`) and the only writer of the skip/poll
@@ -223,12 +223,14 @@ and its session-idle check. Offline wakes append without loading; bounded compac
 The PSRAM-first queue, heap/flash reserves and cap can discard oldest frames; losing a trip-end marker
 must re-arm its debt. Changing to a different or unknown token discards the old vehicle's backlog.
 
-**Drive and geo:** `drive_state.h` owns PARKED/DRIVING/UNCONFIRMED. GNSS needs car/motion evidence and
-no charge latch to start driving, and a fix holds a drive under way only while the car is on (rail at
-`RAIL_AWAKE_VOLTS` or an OBD answer within `ACTIVE_TIMER`, #124): with the car off, GNSS drift no longer keeps
-DRIVING, so the time re-latch returns it to PARKED and the max-awake backstop and `is_charging` apply again. One
-`LEASH gnss=... hold refused reason=car-off rail= obd=` line per episode (`obd=-1s`: no answer this wake). Speed-key
-holds and the OTA/log-dump session hold are unaffected. Sustained motion without sufficient driving evidence can be
+**Drive and geo:** `drive_state.h` owns PARKED/DRIVING/UNCONFIRMED. GNSS needs the rail at `RAIL_AWAKE_VOLTS`
+(the DC-DC on), motion evidence and no charge latch to start driving, and a fix holds a drive under way only with
+the rail up (#124, #141; an OBD answer is not enough, reason and accepted risk in `drive_state.h`). With the rail
+down the time re-latch returns it to PARKED and the max-awake backstop and `is_charging` apply again. One
+`LEASH gnss=... hold refused reason=rail|car-off rail= obd=` line per episode (`rail`: the car answered, `car-off`: it
+did not; `obd=-1s`: no answer this wake). Speed-key holds, the accelerometer's car-on (rail or OBD answer) and the
+OTA/log-dump session hold are unaffected.
+A garbled speed > 0 within every `ACTIVE_TIMER` can still hold DRIVING (left open by #141). Sustained motion without sufficient driving evidence can be
 UNCONFIRMED. That state omits the frame's `is_parked`, uses live location and owes no PARK marker,
 but remains parked to other readers. A discharge in the poll's own frame overrides the charge latch (§6).
 The alarm gate is independent.

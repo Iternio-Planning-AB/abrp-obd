@@ -20,11 +20,11 @@
 
     moment        from                  condition                                       to           effects
     speed         any                   a speed key > 0.0                               DRIVING      hold, leash; LEASH line if it was parked
-    gnss          PARKED, UNCONFIRMED   gpsMovingFresh, car on, motion within           DRIVING      hold, leash, LEASH line
+    gnss          PARKED, UNCONFIRMED   gpsMovingFresh, rail up**, motion within        DRIVING      hold, leash, LEASH line
                                         DRIVE_MOTION_RECENT_MS, no charge latch*
     gnss          PARKED, UNCONFIRMED   gpsMovingFresh, any of those missing            same         one LEASH refused line per streak
-    gnss          DRIVING               gpsMovingFresh, car on                          DRIVING      hold, leash (#124)
-    gnss          DRIVING               gpsMovingFresh, car off                         same         no hold; one LEASH hold refused line
+    gnss          DRIVING               gpsMovingFresh, rail up**                       DRIVING      hold, leash (#124, #141)
+    gnss          DRIVING               gpsMovingFresh, rail down                       same         no hold; one LEASH hold refused line
     accel         PARKED                car on, sustained motion, no charge latch*      UNCONFIRMED  hold = now, LEASH line
     accel         PARKED, UNCONFIRMED   ... and discharge > DRIVE_DISCHARGE_KW          DRIVING      hold, LEASH line
     accel         DRIVING               car on, sustained motion, no charge latch*      DRIVING      hold (continuation, no log)
@@ -46,9 +46,14 @@
     Two things veto the override, and neither creates a latch: the car's own is_charging or is_dcfc in the frame
     (the profile's; loop() appends its derived ones later) at any value but 0, a garbled one included, and a
     current below CHARGING_CURRENT_THRESHOLD, the sign the latch is set from. Without a veto, a plugged-in car
-    drawing that much (preconditioning, V2L) while it is moved reads as a drive, and that is not bounded by
-    ACTIVE_TIMER: once DRIVING, every gpsMovingFresh fix refreshes the hold, car on or off, so GNSS drift can keep it
-    DRIVING with the parked-only backstop off. Requiring car_on for that GNSS hold is a separate follow-up.
+    drawing that much (preconditioning, V2L) while it is moved reads as a drive, and while the rail is up (**) GNSS
+    fixes can hold it past ACTIVE_TIMER.
+  ** Rail up is g_last_io36 >= RAIL_AWAKE_VOLTS, the DC-DC on (#141). An OBD answer is car-on for the accelerometer but
+    not for GNSS: a parked car's ECUs can answer with the DC-DC off, the dongle's own polls keep that answer fresh, and
+    drift fixes plus a jolt every few minutes then held DRIVING, which turns off the parked-only backstop, so the ladder
+    never slept. Speed-key holds are unchanged; on a low rail their fixes no longer extend them. Accepted risk: a car
+    with no speed PID whose driving rail sits under 13.3 V loses its GNSS-only drives. Without ENABLE_IO36_RAIL the
+    rail reads 0.0, so GNSS never starts or holds a drive (fail safe: speed and the accelerometer still do).
 
   Still elsewhere: the awake ladder and its last_active leash (state_machine.h, #29), the charge latch
   (#25), the wake gates and RTC boot (#26).
@@ -67,18 +72,22 @@ struct DriveRegion {
 };
 struct DriveEvidence {
   bool car_on;            // the 12 V rail is up, or the car answered an OBD poll within ACTIVE_TIMER
+  bool rail_up;           // the 12 V rail is at RAIL_AWAKE_VOLTS: the DC-DC is on (GNSS's car-on, #141)
   bool motion_recent;     // a detectMovement hit within DRIVE_MOTION_RECENT_MS
   bool motion_sustained;  // the rolling window shows motion on enough of its sampled time
   bool discharge;         // the battery is discharging above DRIVE_DISCHARGE_KW
   bool charge_latched;    // the charge latch (recently_charging) is set, and this frame does not override it (#95)
 };
-// Why a fresh moving GNSS fix may not start a drive or hold one, or nullptr when it may. A drive under way
-// continues on it while the car is on, as the accelerometer's continuation does (#124): drift on a parked car
-// must not hold DRIVING, which turns off the max-awake backstop and is_charging.
+// Why a fresh moving GNSS fix may not start a drive or hold one, or nullptr when it may. Both need the rail up (**).
+// "rail": the car answered OBD but the rail is down; "car-off": neither.
+inline const char* driveGnssRailRefusal(const DriveEvidence& e) {
+  if (e.rail_up) return nullptr;
+  return e.car_on ? "rail" : "car-off";
+}
 inline const char* driveGnssRefusal(const DriveRegion& r, const DriveEvidence& e) {
-  if (r.state == DRIVE_DRIVING) return e.car_on ? nullptr : "car-off";
+  if (r.state == DRIVE_DRIVING) return driveGnssRailRefusal(e);
   if (e.charge_latched) return "charging";
-  if (!e.car_on) return "car-off";
+  if (const char* rail = driveGnssRailRefusal(e)) return rail;
   if (!e.motion_recent) return "motion";
   return nullptr;
 }
@@ -173,7 +182,8 @@ inline DriveSample driveSample(const OBDVector* frame) {
   const unsigned long now = millis();
   DriveSample s = {};
   s.obd_recent = g_last_obd_answer_ms && now - g_last_obd_answer_ms < (unsigned long)ACTIVE_TIMER;
-  s.evidence.car_on = g_last_io36 >= RAIL_AWAKE_VOLTS || s.obd_recent;
+  s.evidence.rail_up = g_last_io36 >= RAIL_AWAKE_VOLTS;
+  s.evidence.car_on = s.evidence.rail_up || s.obd_recent;
   s.evidence.motion_recent = g_last_motion_ms && now - g_last_motion_ms <= (unsigned long)DRIVE_MOTION_RECENT_MS;
 #if ENABLE_MEMS
   s.evidence.motion_sustained = motionSustained(g_drive_motion, now, &s.act_pct);
