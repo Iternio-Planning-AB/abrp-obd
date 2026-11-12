@@ -159,7 +159,11 @@ parked modem-off sleep, both weak-rail sleeps and the poke's refused under a dum
 reboot's minute, its two per outage, its re-arm and its refusal; then every 5-event sequence over 17 symbols from a
 weak-rail power-on and every 4-event one from a normal boot, and 2500 random ones, with reachability counters. The
 energy scenarios also assert the `reason=` text of each cadence (charging, parked, pdw, pdw-recheck, parked-held,
-parked-cap, followup, parked-uncorroborated).
+parked-cap, followup, parked-uncorroborated). The CUR side is `Helpers/sleep_paths.h`, inlined whole (`loop()` keeps
+three calls and the reboot one), and the runner fails if anything outside it assigns `g_next_wake_minutes` or
+`g_cadence_reason` (fixtures: a chained assignment in another helper, a `++` in the gate, a shadowing local), or if a
+call into it sits outside the compared blocks and the crash streak's named site. `run_energy_checks.py` slices its
+cadence writer, its texts, the non-tier sleep and the reboot into its fakes.
 
 Since #83 the fast-cadence budget is checked as properties on both sides, against the adapter's own record: a poll on
 the charging branch (a fast tier, no cadence reason) never comes with the budget already at `WAKE_CHARGING_MAX_MINUTES`;

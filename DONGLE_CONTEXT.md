@@ -27,7 +27,7 @@ the generic `'obdble'` lane must remain unaffected by its protocol changes.
 | BLE telemetry | Enabled | ABD1, `Helpers/ble.h` |
 | Flash logging / BLE retrieval | Enabled | `DataLogger`, ABD7 |
 | OTA updates | Signature required | ABD5/ABD6, `Helpers/ota_update.h` |
-| Sleep/wake management | Enabled | `Helpers/sleep_power.h`, `state_machine.h` |
+| Sleep/wake management | Enabled | `Helpers/sleep_power.h`, `sleep_paths.h`, `state_machine.h` |
 | BLE bonding | `BLE_ENABLE_BONDING 1` | `BLEWrapper` |
 | HMAC authentication | Required, no bypass flag | ABD8, `Helpers/auth_gate.h` |
 | Signed vehicle profiles | Verification built; `PROFILE_REQUIRE_SIGNATURE 0` | `profile_sig.h`, `jws_verify.h` |
@@ -176,13 +176,17 @@ Check the rail before powering peripherals or issuing bus traffic.
   (the latch releases, the CHARGING exit and DC hold are lost, the parked-only backstop is off), and GNSS drift can
   hold it past `ACTIVE_TIMER`. The car-on requirement for a DRIVING GNSS hold should land before or with this.
 - `Helpers/energy_state.h` is the only writer of the charge latch, DC session, fast budget/cap, corroboration,
-  follow-up and post-drive window state (#25); the gate's poll decision and the next-wake cadence are not yet its.
+  follow-up and post-drive window state (#25); it decides the next-wake cadence on a poll and at the ladder end.
 - `Helpers/wake_gate.h` is setup()'s wake gate: a pure poll decision (`gateDecide`) and the only writer of the skip/poll
   counters, the heartbeat back-off, the last-poll stamp and the weak-rail cold boot flag (#26).
 - `Helpers/state_machine.h` is the awake ladder: pure rung and backstop decisions (`ladderStep`, `backstopDue`) over
   the session holds and the phone, each read once per pass (`AwakeHolds`: OTA, log dump, console; `AwakePhone`), and
   the only writer of the ladder state (#29). Both ladder sleeps arm the post-drive window first; `enterDeepSleep`
   still refuses any sleep during an OTA update or a log dump.
+- `Helpers/sleep_paths.h` is the only writer of the next-wake cadence: its minutes and `CadenceReason` (the
+  `reason=` texts are unchanged), armed by energy and the gate's skip through `cadenceArm`. It also holds
+  `loop()`'s own sleeps as pure decisions plus glue: the weak-rail window's recovery and expiry, a sample poke's
+  sleep after its poll and the net-recover reboot (#29). A refused sleep returns and the loop runs on.
 - Bring BLE up before slow modem initialization. Suppress cellular only while `bleRelaying()` says
   the phone is the transport—not merely connected or, in v1, authenticated.
 - Normal sleep flushes/saves uploads, deinitializes BLE, powers down peripherals and arms wake sources.

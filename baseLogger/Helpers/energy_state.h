@@ -2,11 +2,11 @@
 /*
   Energy region of the state machine (#23, step 3 #25): the charge latch and its release, the taper bridge, the DC
   session, the fast budget and cap, corroboration, the follow-up and the post-drive window. Their storage stays in
-  logger.ino until #27; only the functions here assign it (tests/run_sm_checks.py enforces it). Not owned yet:
-  g_next_wake_minutes and g_cadence_reason (step 4b-ii, #29; set here too), the poke-lifetime flags g_taper_confirm and
-  g_rail_before_poke (#27), g_dc_logged and g_dc_refused_logged (state_machine.h). One #pragma once and no project
-  include, as the harness inlines it. Included before sleep_power.h: it relies on logEvent's declaration and declares
-  the later files' calls.
+  logger.ino until #27; only the functions here assign it (tests/run_sm_checks.py enforces it). Not owned: the next-wake
+  cadence, which the poll and the ladder end decide here and arm through sleep_paths.h's cadenceArm (#29), the
+  poke-lifetime flags g_taper_confirm and g_rail_before_poke (#27), g_dc_logged and g_dc_refused_logged
+  (state_machine.h). One #pragma once and no project include, as the harness inlines it. Included before
+  sleep_power.h: it relies on logEvent's declaration and declares the later files' calls.
 */
 #if ENABLE_IO36_RAIL && ENABLE_SLEEP && ENABLE_MEMS
 float readIO36Rail();  // Helpers/sleep_power.h
@@ -85,8 +85,8 @@ bool pdwOpenWindow() {
 // End of the awake ladder: an open window comes back on the charging cadence, a re-check's once a little later.
 void pdwArmAtLadderEnd() {
   if (!pdwOpenWindow()) return;
-  g_next_wake_minutes = g_pdw_recheck ? POST_DRIVE_RECHECK_MINUTES : WAKE_CHARGING_MINUTES;
-  g_cadence_reason = g_pdw_recheck ? "pdw-recheck" : "pdw";
+  cadenceArm(g_pdw_recheck ? POST_DRIVE_RECHECK_MINUTES : WAKE_CHARGING_MINUTES,
+             g_pdw_recheck ? CADENCE_PDW_RECHECK : CADENCE_PDW);
 }
 
 /*
@@ -385,7 +385,6 @@ EnergyPoll energyOnPoll(OBDVector& current_frame, int obd_count) {
     // corroboration until its last evidence is stale; a stuck current must not get a fresh budget each time.
     // A streaming wake (a drive) always resets.
     const bool charge_state_stale = chargeStateStale(now_us);
-    g_cadence_reason = nullptr;
     // A DC session lives inside one unbroken charge latch: a fresh latch, a drive or an answered poll with no
     // charge evidence (the charge end, or a DC plug swapped for AC) ends it.
     if (!was_recently_charging || !is_currently_parked ||
@@ -398,7 +397,7 @@ EnergyPoll energyOnPoll(OBDVector& current_frame, int obd_count) {
     if (!cadence_charging) {
       // Not charging -> long cadence, and clear BOTH the budget and the cap latch (the charge genuinely
       // ended / rail dropped). Only here and in the high-rail hold below does the cap latch clear.
-      g_next_wake_minutes = WAKE_PARKED_MINUTES;
+      cadenceArm(WAKE_PARKED_MINUTES, CADENCE_TIER);
       if (!g_sample_poke || charge_state_stale) {
         charging_fast_minutes = 0;
         charging_cap_latched = false;
@@ -408,12 +407,10 @@ EnergyPoll energyOnPoll(OBDVector& current_frame, int obd_count) {
       // times: inside the post-drive window (POST_DRIVE_*), else once after a charge (charge_followup).
       if (high_rail_unanswered && pdwActive(now_us)) {
         pdw_polls++;
-        g_next_wake_minutes = WAKE_CHARGING_MINUTES;
-        g_cadence_reason = "pdw";
+        cadenceArm(WAKE_CHARGING_MINUTES, CADENCE_PDW);
       } else if (high_rail_unanswered && charge_followup) {
         charge_followup = 0;
-        g_next_wake_minutes = WAKE_CHARGING_MINUTES;
-        g_cadence_reason = "followup";
+        cadenceArm(WAKE_CHARGING_MINUTES, CADENCE_FOLLOWUP);
 #if ENABLE_LOGGING
         logEvent("FOLLOWUP spent rail=%.2f -> %dmin", g_rail_before_poke, WAKE_CHARGING_MINUTES);
 #endif
@@ -422,8 +419,7 @@ EnergyPoll energyOnPoll(OBDVector& current_frame, int obd_count) {
       // Latched, silent past the hold, rail still high: wait at the parked cadence so the car can sleep
       // between polls. No budget accrues; once stale, a car whose rail never drops leaves no budget, cap or
       // high-water mark for the next charge.
-      g_next_wake_minutes = WAKE_PARKED_MINUTES;
-      g_cadence_reason = "parked-held";
+      cadenceArm(WAKE_PARKED_MINUTES, CADENCE_PARKED_HELD);
       if (charge_state_stale) {
         charging_fast_minutes = 0;
         charging_cap_latched = false;
@@ -435,13 +431,11 @@ EnergyPoll energyOnPoll(OBDVector& current_frame, int obd_count) {
       // Charging, but we've spent the cumulative fast-cadence budget -> latch slow and STAY slow (don't
       // reset the budget here - that's what previously let it bounce straight back to fast).
       charging_cap_latched = true;
-      g_next_wake_minutes = WAKE_PARKED_MINUTES;
-      g_cadence_reason = "parked-cap";
+      cadenceArm(WAKE_PARKED_MINUTES, CADENCE_PARKED_CAP);
     } else if (uncorroborated) {
       // Current says charging, counters say not. Slow, not latched: a later counter rise resets the
       // count above and restores fast cadence.
-      g_next_wake_minutes = WAKE_PARKED_MINUTES;
-      g_cadence_reason = "parked-uncorroborated";
+      cadenceArm(WAKE_PARKED_MINUTES, CADENCE_PARKED_UNCORROBORATED);
       charge_corr_last_us = now_us;
     } else {
       // Charging within budget -> dense sampling, denser still on DC. Once this charge has been DC (dc_session)
@@ -451,7 +445,7 @@ EnergyPoll energyOnPoll(OBDVector& current_frame, int obd_count) {
       else if (dcfc_from_car) dc_session = false;
       g_dc_confirmed = is_dcfc ||
         (dc_session && g_last_io36 >= DC_HOLD_RAIL_VOLTS && (charge_evidence || silent_hold));
-      g_next_wake_minutes = g_dc_confirmed ? WAKE_DC_CHARGING_MINUTES : WAKE_CHARGING_MINUTES;
+      cadenceArm(g_dc_confirmed ? WAKE_DC_CHARGING_MINUTES : WAKE_CHARGING_MINUTES, CADENCE_TIER);
       // A held poke keeps its other one-shot inputs (see dcPromotePoke), but is no longer a taper confirm:
       // its later polls must not spend the stall budget.
       if (g_dc_confirmed) g_taper_confirm = false;

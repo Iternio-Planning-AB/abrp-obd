@@ -32,6 +32,7 @@ drive_state = (root / "baseLogger/Helpers/drive_state.h").read_text()
 energy = (root / "baseLogger/Helpers/energy_state.h").read_text()
 streak = (root / "baseLogger/Helpers/wdt_streak.h").read_text()
 wake_gate_h = (root / "baseLogger/Helpers/wake_gate.h").read_text()
+sleep_paths = (root / "baseLogger/Helpers/sleep_paths.h").read_text()
 ota = (root / "baseLogger/Helpers/ota_update.h").read_text()
 
 
@@ -56,7 +57,7 @@ WORST_EVENT_ARGS = {
     "OBD retry armed ": (15.99, -99.99, 4294967295),
     "OBD retry after ": (4294967295, "x" * 23),
 }
-event_sources = logger + state_machine + energy + sleep + drive_state + wake_gate_h
+event_sources = logger + state_machine + energy + sleep + drive_state + wake_gate_h + sleep_paths
 # The host stand-in for the streak store keeps its bytes across boots, as RTC_NOINIT_ATTR does and
 # RTC_DATA_ATTR (reloaded on every reset but a deep-sleep wake) does not.
 if not re.search(r"^RTC_NOINIT_ATTR WdtStreakStore wdt_streak_store;", streak, re.MULTILINE):
@@ -100,9 +101,13 @@ for gate in ("( millis() - last_poll ) > dcAwakeDelay(current_state, polling_del
              "const bool dc_first_upload = dcAwakeHeld(current_state) && last_broadcast == 0;",
              "(ble_handoff_fire || dc_first_upload || ",
              "  handleActivityState();\n  dcPromotePoke();\n  dcAwakeTrack();\n",
-             "    dcPromotePoke();\n    if (g_sample_poke && !maintenance_mode"):
+             "    dcPromotePoke();\n    loopSamplePokeSleep(ep, obd_count);\n"):
     if logger.count(gate) != 1:
         raise SystemExit(f"FAIL: the loop's upload and poll gates must take the DC hold exactly once: {gate}")
+# The poke's sleep (sleep_paths.h, #29) takes it once too.
+POKE_SLEEPS = "  if (!samplePokeSleeps(g_sample_poke, maintenance_mode, dcAwakeHeld(current_state))) return;\n"
+if sleep_paths.count(POKE_SLEEPS) != 1:
+    raise SystemExit(f"FAIL: the sample poke's sleep must take the DC hold exactly once: {POKE_SLEEPS!r}")
 # #131: a silent first poll of a high-rail poke is provisional. Its exit sits after the poll's log lines and ahead of
 # everything that counts a poll (the heartbeat back-off, the frame, energyOnPoll, the upload and the poke's sleep);
 # the retry's rail term vetoes the second request in both poll conditions.
@@ -165,7 +170,7 @@ with tempfile.TemporaryDirectory(prefix="obd-energy-checks-") as temporary:
     end = energy.index("\n}\n", energy.index("void chargeWakeStateSanitize(", start)) + 3
     (build / "charge_wake_state.inc").write_text(energy[start:end])
     (build / "charge_stale.inc").write_text(block(energy, "bool chargeStateStale(uint64_t now_us) {"))
-    start = find(wake_gate_h, "    g_next_wake_minutes = WAKE_PARKED_MINUTES; // skip = parked", what="wake_gate.h")
+    start = find(wake_gate_h, "    cadenceArm(WAKE_PARKED_MINUTES, CADENCE_TIER); // skip = parked", what="wake_gate.h")
     end = find(wake_gate_h, "    enterDeepSleep(false);", start, "wake_gate.h")
     (build / "gate_skip.inc").write_text(wake_gate_h[start:end])
     machine = state_machine
@@ -185,7 +190,15 @@ with tempfile.TemporaryDirectory(prefix="obd-energy-checks-") as temporary:
     end = sleep.index("WOM_THRESHOLD_G);\n", start) + len("WOM_THRESHOLD_G);\n")
     (build / "sleep_log.inc").write_text(sleep[start:end])
     (build / "reset_reason.inc").write_text(block(sleep, "static const char* resetReasonStr() {"))
-    (build / "net_recover_sleep.inc").write_text(block(logger, "if (g_recovers_since_ok >= 2 && net_reboot_count < 2) {"))
+    # The next sleep's cadence (sleep_paths.h, #29): the enum, its texts and the pure decisions at file scope; the one
+    # writer and the non-tier sleep inside each fake that holds the cadence; the net-recover reboot whole.
+    (build / "cadence.inc").write_text(
+        block(logger, "enum CadenceReason : uint8_t {").rstrip() + ";\n" +
+        "".join(block(sleep_paths, f) for f in ("const char* cadenceReasonName(", "const char* sleepReasonText(",
+                                                 "bool samplePokeSleeps(")))
+    (build / "cadence_arm.inc").write_text(block(sleep_paths, "void cadenceArm("))
+    (build / "sleep_for.inc").write_text(block(sleep_paths, "void sleepFor("))
+    (build / "net_recover_sleep.inc").write_text(block(sleep_paths, "void netRecoverSleep() {"))
     start = logger.index("  wdt_reset_count = wdtStreakAdvance(")
     (build / "wdt_streak_wake.inc").write_text(logger[start:logger.index("\n", start) + 1])
     (build / "wdt_streak_sleep.inc").write_text(
@@ -231,9 +244,9 @@ with tempfile.TemporaryDirectory(prefix="obd-energy-checks-") as temporary:
                                             block(logger, "bool silentRetryRailOk() {") +
                                             block(logger, "bool silentRetryArm(bool attempted, int obd_count) {"))
     (build / "polling_delay.inc").write_text(block(state_machine, "unsigned long getPollingDelay("))
-    start = logger.index("    if (g_sample_poke && !maintenance_mode") + len("    if (")
-    end = logger.index(") {\n", start)
-    (build / "poke_sleeps.inc").write_text(f"bool sleeps() {{ return {logger[start:end]}; }}\n")
+    start = sleep_paths.index(POKE_SLEEPS) + len("  if (!")
+    end = sleep_paths.index(") return;\n", start)
+    (build / "poke_sleeps.inc").write_text(f"bool sleeps() {{ return {sleep_paths[start:end]}; }}\n")
     executable = build / "energy_checks"
     compile_cpp(executable,
                 [root / "tests/energy_checks.cpp", root / "libraries/mathparser/parser.cpp",

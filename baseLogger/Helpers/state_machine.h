@@ -157,7 +157,8 @@ void dcAwakeTrack() {
     logEvent("DC_AWAKE on rail=%.2f fast=%lumin", g_last_io36, (unsigned long)charging_fast_minutes);
   } else if (!held && g_dc_logged) {
     g_dc_refused_logged = true;
-    const char* why = veto ? veto : g_cadence_reason ? g_cadence_reason : "not-dc";
+    const char* cadence = cadenceReasonName(g_cadence_reason);
+    const char* why = veto ? veto : cadence ? cadence : "not-dc";
 #if ENABLE_MEMS
     if (veto && !strcmp(veto, "motion"))
       logEvent("DC_AWAKE off reason=motion rail=%.2f peak=%.3f axmax=%.3f", g_last_io36, motion_window_peak,
