@@ -443,6 +443,7 @@ void wdtSleep() {
 bool maintenance_mode = false, g_ota_active = false, g_logdump_active = false, is_currently_parked = true;
 ActivityState current_state = STANDBY;
 unsigned long millis() { return (MAX_AWAKE_MINUTES + 1) * 60UL * 1000UL; }
+unsigned long driveParkedMs() { return millis(); }  // parked since boot (#133)
 struct { void printf(const char*, ...) {} } Serial;
 bool g_dc_confirmed = true;  // a DC charge whose hold has ended (here: no rail) is bounded by the backstop
 bool dcAwakeHeld(decltype(current_state)) { return false; }  // not held (no rail)
@@ -1737,6 +1738,16 @@ struct Awake : Dongle {
   bool config_initialized = true, config_message_printed = false, g_ble_session_relayed = false, ble = false;
   bool is_currently_parked = true, asleep = false;
   unsigned long maintenance_since = 0, polling_delay = 5000, last_poll = 0;
+  // The wake's parked time as driveStore keeps it (#133). The rule itself is the sm runner's: it checks the firmware's
+  // stamps against its own record of every re-latch and unlatch.
+  unsigned long g_parked_since_ms = 0, g_parked_ms_total = 0;
+  void relatch() {
+    if (!is_currently_parked) is_currently_parked = true, g_parked_since_ms = now;
+  }
+  void unlatch() {
+    if (is_currently_parked) is_currently_parked = false, g_parked_ms_total += now - g_parked_since_ms;
+  }
+  unsigned long driveParkedMs() const { return g_parked_ms_total + (is_currently_parked ? now - g_parked_since_ms : 0UL); }
   int stopped_polls = 0;
   const char* sleep_reason = nullptr;
   struct Poll { unsigned long at; bool held; };
@@ -1749,7 +1760,7 @@ struct Awake : Dongle {
 #include "polling_delay.inc"
   void changeState(ActivityState s) {
     current_state = s;
-    if (s == CHARGING || s == STANDBY) is_currently_parked = true;  // driveIdle
+    if (s == CHARGING || s == STANDBY) relatch();  // driveIdle
     polling_delay = getPollingDelay(s);
   }
 #include "awake_holds.inc"
@@ -1772,8 +1783,8 @@ struct Awake : Dongle {
       ladder();
       if (asleep || now - last_poll <= dcAwakeDelay(current_state, polling_delay)) continue;
       last_poll = now;
-      if (driving) is_currently_parked = false, last_active = now, stopped_polls = 0;
-      else if (!is_currently_parked && ++stopped_polls >= DC_RELEASE_POLLS) is_currently_parked = true, energyOnDcRelease();
+      if (driving) unlatch(), last_active = now, stopped_polls = 0;
+      else if (!is_currently_parked && ++stopped_polls >= DC_RELEASE_POLLS) relatch(), energyOnDcRelease();
       poll(frame, is_currently_parked);
       polls.push_back({now, dcAwakeHeld(current_state)});
     }
@@ -1814,17 +1825,21 @@ void dcLadderChecks() {
         road.polls[held].at - stopped <= CHARGE_STREAM_CONFIRM_SECONDS * 1000UL + dc_ms + 5000 && road.heldFrom(held),
         "the hold starts once the charge is trusted and holds every poll, DC_CHARGING_AWAKE_SECONDS apart, motion or not");
   const unsigned long unplugged = road.now;
-  road.run(5 * 60000UL, UNPLUGGED);
-  check(road.asleep && road.sleep_reason && !strcmp(road.sleep_reason, "backstop") && road.now - unplugged <= dc_ms + 1000,
-        "the unplug ends the hold at its next poll and the backstop sleeps at once");
-  // The OBD-alarm veto keeps the backstop: a flagged car is never held, so it sleeps right after the stop.
+  road.run(15 * 60000UL, UNPLUGGED);
+  // The backstop times the parked part of the wake (#133): the drive does not count, so the ladder ends this wake.
+  check(road.asleep && !road.sleep_reason && road.now - unplugged <= (unsigned long)ACTIVE_TIMER + 5000,
+        "the unplug ends the hold, and after an hour's drive the ladder, not the backstop, sleeps the wake");
+  // The OBD-alarm veto keeps the backstop: a flagged car is never held, so with people in the car it sleeps
+  // MAX_AWAKE_MINUTES after the stop's re-latch.
+  const unsigned long max_ms = MAX_AWAKE_MINUTES * 60000UL;
   Awake flagged;
   flagged.alarm = true;
   flagged.run((MAX_AWAKE_MINUTES + 5) * 60000UL, DRIVING, 14.9f, 0, true);
   const unsigned long flagged_stop = flagged.now;
-  flagged.charge(10);
-  check(flagged.asleep && !strcmp(flagged.sleep_reason, "backstop") && flagged.now - flagged_stop <= 60000,
-        "an alarm-flagged car is not held: the backstop sleeps it after the stop");
+  flagged.charge(MAX_AWAKE_MINUTES + 10, motion_ms);
+  check(flagged.asleep && flagged.sleep_reason && !strcmp(flagged.sleep_reason, "backstop") &&
+        flagged.now - flagged_stop > max_ms && flagged.now - flagged_stop <= max_ms + 60000,
+        "an alarm-flagged car is not held: the backstop sleeps it MAX_AWAKE_MINUTES after the stop");
 
   // A short drive: the rail drop ends the hold at the next pass, and the ladder sleeps ACTIVE_TIMER after the last motion.
   for (const bool rail_drop : {true, false}) {
@@ -1858,9 +1873,11 @@ void dcLadderChecks() {
   Awake idle_phone;
   idle_phone.run((MAX_AWAKE_MINUTES + 5) * 60000UL, DRIVING, 14.9f, 0, true);
   idle_phone.ble = true;
-  idle_phone.run(10 * 60000UL, UNPLUGGED, 14.9f, motion_ms);
-  check(idle_phone.asleep && idle_phone.sleep_reason && !strcmp(idle_phone.sleep_reason, "backstop"),
-        "a connected phone with no DC charge past MAX_AWAKE_MINUTES is backstopped");
+  const unsigned long idle_stop = idle_phone.now;
+  idle_phone.run((MAX_AWAKE_MINUTES + 10) * 60000UL, UNPLUGGED, 14.9f, motion_ms);
+  check(idle_phone.asleep && idle_phone.sleep_reason && !strcmp(idle_phone.sleep_reason, "backstop") &&
+        idle_phone.now - idle_stop > max_ms && idle_phone.now - idle_stop <= max_ms + 60000,
+        "a connected phone with no DC charge, parked past MAX_AWAKE_MINUTES, is backstopped");
 
   // Unplug and drive away: the hold ends at the first poll after the drive starts, at most one DC poll late.
   Awake away;

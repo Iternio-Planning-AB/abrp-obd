@@ -49,6 +49,11 @@
   X(unsigned long, g_alarm_speed_hold_until, 0) \
   X(unsigned long, g_alarm_rail_low_since, 0) \
   X(bool, g_no_profile, false)
+// SM_RAM_NEW: RAM globals of a fix not yet on main (#133), reset every wake but not compared (OLD never touches them).
+// run_sm_checks.py fails once SM_PIN has one: the re-pin moves it into SM_RAM.
+#define SM_RAM_NEW(X) \
+  X(unsigned long, g_parked_since_ms, 0) \
+  X(unsigned long, g_parked_ms_total, 0)
 #define SM_RTC(X) \
   X(bool, park_marker_owed, false) \
   X(bool, recently_charging, false) \
@@ -123,9 +128,12 @@ enum SmReset { ESP_RST_POWERON = 1, ESP_RST_PANIC = 4, ESP_RST_TASK_WDT = 6, ESP
   X(bool, sm_ep_charging, false) \
   X(bool, sm_ep_progress, false) \
   X(bool, sm_ep_silent, false) \
-  X(std::string, sm_windows, "")
+  X(std::string, sm_windows, "") \
+  X(bool, sm_parted, false)
 // Harness state for one wake, reset by every boot as RAM is: the car's command counter (obd.tx_count), an
-// authenticated phone, and the alarm permit's oracle, kept from the trace's inputs rather than the gate's state.
+// authenticated phone, the alarm permit's oracle, kept from the trace's inputs rather than the gate's state, and the
+// wake's parked time (#133), from its observable edges: sm_parked_at, the last re-latch's freeze (0: boot), and
+// sm_parked_total, the parked intervals that ended at an unlatch's `LEASH driving` line.
 #define SM_WAKE(X) \
   X(unsigned long, sm_tx, 0) \
   X(bool, sm_ble_auth, false) \
@@ -138,10 +146,13 @@ enum SmReset { ESP_RST_POWERON = 1, ESP_RST_PANIC = 4, ESP_RST_TASK_WDT = 6, ESP
   X(unsigned long, sm_setup_ms, 0) \
   X(bool, sm_seen_on, false) \
   X(unsigned long, sm_seen_ms, 0) \
-  X(long, sm_deny_tx, -1)
+  X(long, sm_deny_tx, -1) \
+  X(unsigned long, sm_parked_at, 0) \
+  X(unsigned long, sm_parked_total, 0)
 
 #define SM_DEFINE(T, name, value) T name = value;
 SM_RAM(SM_DEFINE)
+SM_RAM_NEW(SM_DEFINE)
 SM_RTC(SM_DEFINE)
 SM_STUB(SM_DEFINE)
 SM_WAKE(SM_DEFINE)
@@ -188,6 +199,7 @@ void logEvent(const char* fmt, ...) {
   va_end(args);
   sm_log.emplace_back(text);
   sm_now += SM_IO_MS;
+  if (!strncmp(text, "LEASH driving", 13)) sm_parked_total += sm_now - sm_parked_at;  // an unlatch: one line each
 }
 struct {
   void printf(const char* fmt, ...) {
@@ -207,10 +219,12 @@ bool gpsMovingFresh(unsigned long max_age_ms) {
   return sm_gnss_fresh && sm_fix_age <= max_age_ms;
 }
 // Into the logEvent stream, so the order of the freeze against the LEASH lines is compared too.
+// Every DRIVING -> parked flip freezes once (a property below), so it also marks when the wake became parked.
 void freezeParkedLocation() {
   sm_freezes++;
   sm_now += SM_IO_MS;
   logEvent("PARKED_LOC (harness)");
+  sm_parked_at = sm_now;
 }
 // The speed note runs alarm_gate.h's own body, after the adapter has recorded it.
 void alarmNoteSpeedBody(double kmh);

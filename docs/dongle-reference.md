@@ -448,7 +448,7 @@ awake.** Polling a sleeping EV wakes its ECUs, which then stay awake on the *car
   - Each held poll of a sample poke counts a whole `WAKE_DC_CHARGING_MINUTES` toward the cap, so it trips sooner (the
     safe way). A streaming wake (motion, a promoted poke) counts its elapsed time, at most a tier per poll, so somebody
     moving about the car for an hour costs an hour of budget, not a tier per 5 s poll. The
-    max-awake backstop is not exempt: after `MAX_AWAKE_MINUTES` of awake time the wake sleeps 1 min and the session's
+    max-awake backstop is not exempt: after `MAX_AWAKE_MINUTES` parked the wake sleeps 1 min and the session's
     next sample poke holds again, about a 1-minute gap per awake hour.
   - BLE keeps its rules, but its windows move: a held motion wake keeps advertising up to the backstop instead of about
     10 minutes, and a held sample poke has no BLE until something moves and promotes it.
@@ -1002,8 +1002,9 @@ order and decline detection → Appendix A §7b; OTA → Appendix B §4, Appendi
   crash-streak timer sleep, the OTA reboot and `ESP.restart()` skip it. A scheduler-gap proxy, not BLE latency.
 - **`SLEEP enter ... reason=<r>`** names why the dongle slept. `dc-charge`, `charging` and `parked` are the
   cadence tiers, read back from the armed timer (1, 3, 30 min). `net-recover` is the modem-recovery
-  reboot (1 min), `wdt-streak` the WDT-streak escalation (below), `backstop` the parked MAX_AWAKE ceiling. Charge
-  cadence decisions the timer can't tell apart name themselves: `parked-held`, `parked-cap`,
+  reboot (1 min), `wdt-streak` the WDT-streak escalation (below), `backstop` the parked MAX_AWAKE ceiling:
+  the wake's parked minutes added up, or `MAX_AWAKE_ABSOLUTE_MINUTES` since boot (#133). `AWAKE_BACKSTOP awake=<s>
+  parked=<s>` gives both; after a drive `awake=` exceeds `parked=` by the driving. Charge cadence decisions the timer can't tell apart name themselves: `parked-held`, `parked-cap`,
   `parked-uncorroborated`, `pdw` and `followup` (below). An explicit sleep reason wins over a cadence
   label, which wins over the timer.
 - **`DC_AWAKE on rail=<v> fast=<min>`** and **`DC_AWAKE off reason=<r> rail=<v>`** bracket a DC charge held
