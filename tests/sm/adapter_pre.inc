@@ -5,6 +5,7 @@
 // The firmware globals the extracted blocks touch, with their initialisers. run_sm_checks.py checks every
 // entry against its definition line in logger.ino (pin and tree), so a reset here is the firmware's own.
 // SM_RAM is reset on every wake (deep sleep is a reboot); SM_RTC survives a wake and is reset on power-on.
+// g_cadence_reason's type and initialiser are each side's own (SmCadence, run_sm_checks.py's cadence slot).
 #define SM_RAM(X) \
   X(bool, is_currently_parked, true) \
   X(bool, drive_unconfirmed, false) \
@@ -38,7 +39,8 @@
   X(unsigned long, g_dc_silent_since_ms, 0) \
   X(bool, g_pdw_ladder_done, false) \
   X(bool, g_pdw_recheck, false) \
-  X(const char*, g_cadence_reason, nullptr) \
+  X(SmCadence, g_cadence_reason, SM_CADENCE_INIT) \
+  X(int, g_recovers_since_ok, 0) \
   X(bool, g_dc_logged, false) \
   X(bool, g_dc_refused_logged, false) \
   X(unsigned long, g_last_motion_ms, 0) \
@@ -76,7 +78,8 @@
   X(uint32_t, skips_count, 0) \
   X(uint32_t, polls_count, 0) \
   X(time_t, last_poll_epoch, 0) \
-  X(uint32_t, heartbeat_asleep_streak, 0)
+  X(uint32_t, heartbeat_asleep_streak, 0) \
+  X(uint32_t, net_reboot_count, 0)
 // Harness-only state: the trace's inputs and what the stubs recorded. Not firmware globals, so not checked.
 // sm_store_marker is the RTC_NOINIT debt copy (wdt_streak.h; its own semantics are the energy wdt-streak
 // group's). The buffer stands for RAM and the upload backlog together, except during the gate, which runs before
@@ -109,6 +112,8 @@ enum SmReset { ESP_RST_POWERON = 1, ESP_RST_PANIC = 4, ESP_RST_TASK_WDT = 6, ESP
   X(double, sm_published, -1) \
   X(unsigned, sm_sleeps, 0) \
   X(std::string, sm_sleep_reason, "") \
+  X(std::string, sm_sleep_said, "") \
+  X(unsigned, sm_delays, 0) \
   X(bool, sm_sleep_modem, false) \
   X(float, sm_atrv, 13.5f) \
   X(int, g_alarm_flag, -1) \
@@ -273,6 +278,16 @@ bool detectMovement(unsigned long duration) {
 }
 void noteDriveMotionWindow(bool sampled, bool active) { sm_windows += sampled ? (active ? 'S' : 's') : '-'; }
 void noteMotionWindow(bool sampled, bool active) { sm_windows += sampled ? (active ? 'A' : 'a') : '_'; }
-// enterDeepSleep never returns on the device: inside a tick the adapter's throws this, and the tick catches it.
+// enterDeepSleep never returns on the device: inside a tick, a poll's sleeps or the net-recover block the adapter's
+// throws this, and the event catches it.
 struct SmSlept {};
-bool sm_in_tick = false;
+bool sm_unwind = false;
+// The sample poke's wait for the ECUs (loop()'s poke sleep): it takes the time.
+void delay(unsigned long ms) {
+  sm_delays++;
+  sm_now += ms;
+}
+// Not modelled (run_energy_checks.py's Dongle runs it whole): a poke the DC hold promotes stays a poke here.
+void dcPromotePoke() {}
+// The compared view of a field: itself, or a side's own text for it (the cadence reason, where a side names it by enum).
+template <class T> const T& smShow(const T& v) { return v; }

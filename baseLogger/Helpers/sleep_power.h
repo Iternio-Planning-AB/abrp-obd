@@ -222,20 +222,11 @@ void enterDeepSleep(bool modem_on, const char* reason = nullptr) {
     (unsigned long)g_loop_gap.max_ms, (unsigned long)g_loop_gap.max_at, (unsigned long)g_loop_gap.n);
 #if ENABLE_PERIODIC_WAKE
   // Log the chosen cadence + why, so the adaptive behavior is auditable: timer tightens during a charge and
-  // relaxes when parked. (g_next_wake_minutes == WAKE_CHARGING_MINUTES => we observed an active charge.)
-  // Three tiers now, so the reason has to name which: dc-charge (1 min), charging (3), parked (30).
-  // Reading the cadence back out like this keeps one source of truth - the value that was actually
-  // armed - rather than a second copy of the decision that could disagree with it. A sleep that is not a
-  // cadence tier passes its own reason: the recovery reboot's 1 min would otherwise read as dc-charge. Next,
-  // the cadence decision names itself (g_cadence_reason) where the minutes alone are ambiguous: a 3-minute
-  // pdw or followup wake is not a charge, and parked-held / parked-cap / parked-uncorroborated are a charge
-  // held slow.
+  // relaxes when parked. Three tiers, so the reason has to name which: dc-charge (1 min), charging (3), parked (30);
+  // sleepReasonText (sleep_paths.h) reads it back from what was armed.
   logEvent("SLEEP enter -> %s+GPS off, timer=%dmin reason=%s rail=%.2f (WOM %.3fg)",
     modem_down ? "modem" : "(modem already off)", g_next_wake_minutes,
-    reason ? reason
-      : g_cadence_reason ? g_cadence_reason
-      : (g_next_wake_minutes == WAKE_DC_CHARGING_MINUTES) ? "dc-charge"
-      : (g_next_wake_minutes == WAKE_CHARGING_MINUTES) ? "charging" : "parked",
+    sleepReasonText(reason, g_cadence_reason, g_next_wake_minutes),
     g_last_io36, WOM_THRESHOLD_G);
 #else
   logEvent("SLEEP enter -> %s+GPS off, deep sleep (WOM %.3fg only)",

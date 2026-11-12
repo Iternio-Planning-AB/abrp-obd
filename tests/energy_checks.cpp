@@ -23,6 +23,7 @@
 #include "../libraries/OBDWrapper/obd_vector.h"
 #include "charge_config.inc"
 #include "activity_state.inc"
+#include "cadence.inc"
 #include "ladder_step.inc"
 
 void check(bool condition, const std::string& message) {
@@ -72,13 +73,17 @@ struct ChargePoll {
   float g_rail_before_poke = 13.1f;
   uint8_t charge_followup = 0, pdw_open = 0, pdw_polls = 0;
   uint64_t pdw_open_us = 0, charge_last_evidence_us = 0;
-  const char* g_cadence_reason = nullptr;
-  bool reason(const char* r) const { return g_cadence_reason && std::strcmp(g_cadence_reason, r) == 0; }
+  CadenceReason g_cadence_reason = CADENCE_TIER;
+  bool reason(const char* r) const {
+    const char* name = cadenceReasonName(g_cadence_reason);
+    return name && std::strcmp(name, r) == 0;
+  }
   uint32_t taper_confirm_wakes = 0, charging_fast_minutes = 0, charge_uncorroborated_s = 0;
   double prev_parked_soc = -1, prev_parked_kwh = -1, prev_parked_soe = -1, prev_charge_soc = 0;
   double charge_corr_soc_hw = -1, charge_corr_kwh_hw = -1, charge_corr_soe_hw = -1;
   uint64_t charge_corr_last_us = 0;
   int g_next_wake_minutes = 0;
+#include "cadence_arm.inc"
   unsigned long g_last_discharge_ms = 0, now = 0;
   // The DC hold: the session latch (RTC), and the decision and its veto inputs (RAM).
   bool dc_session = false, g_dc_confirmed = false, g_dc_logged = false, g_dc_refused_logged = false, alarm = false;
@@ -410,13 +415,13 @@ void logEvent(const char* format, ...) {
 int g_next_wake_minutes = WAKE_PARKED_MINUTES, g_recovers_since_ok = 0;
 unsigned long net_reboot_count = 0, wdt_reset_count = 0;
 float g_last_io36 = 12.6f;
-const char* g_cadence_reason = nullptr;
+CadenceReason g_cadence_reason = CADENCE_TIER;
 bool window_opened = false;
 bool pdwOpenWindow() { return window_opened = true; }
 // A window opened at the backstop names its 3-minute cadence; the explicit reason must still win.
 void pdwArmAtLadderEnd() {
   g_next_wake_minutes = WAKE_CHARGING_MINUTES;
-  g_cadence_reason = "pdw";
+  g_cadence_reason = CADENCE_PDW;
 }
 std::vector<OBDVector> obd_result_vector;
 std::string slept, dc_off;
@@ -432,9 +437,9 @@ void enterDeepSleep(bool modem_on, const char* reason = nullptr) {
   logSleep(modem_on, reason);
   slept = last_log;
 }
-void recoverSleep() {
+#include "sleep_for.inc"
 #include "net_recover_sleep.inc"
-}
+void recoverSleep() { netRecoverSleep(); }
 bool wdtStreakModemMayBeOn() { return true; }
 #include "wdt_streak_action.inc"
 void wdtSleep() {
@@ -468,11 +473,11 @@ void checks() {
   check(dc_off.find("DC_AWAKE off reason=backstop ") == 0, "a backstop after a DC hold closes its DC_AWAKE line");
   g_dc_logged = false;
   check(g_next_wake_minutes == WAKE_CHARGING_MINUTES, "the backstop still ends the ladder with the post-drive window");
-  g_cadence_reason = "parked-held";
+  g_cadence_reason = CADENCE_PARKED_HELD;
   g_next_wake_minutes = WAKE_PARKED_MINUTES;
   enterDeepSleep(true);
   check(has("reason=parked-held "), "a named cadence decision beats the reason derived from the timer");
-  g_cadence_reason = nullptr;
+  g_cadence_reason = CADENCE_TIER;
   g_next_wake_minutes = WAKE_DC_CHARGING_MINUTES;
   enterDeepSleep(true);
   check(has("reason=dc-charge "), "a cadence sleep still names its tier from the armed timer");
@@ -500,7 +505,7 @@ ActivityState current_state = CHARGING;
 bool g_dc_confirmed = false, g_dc_logged = false, g_dc_refused_logged = false;
 float g_last_io36 = 14.9f, motion_window_peak = 0.21f, motion_window_axmax = 0.12f;
 uint32_t charging_fast_minutes = 7;
-const char* g_cadence_reason = nullptr;
+CadenceReason g_cadence_reason = CADENCE_TIER;
 bool alarmEnforced() { return false; }
 #include "dc_delay.inc"
 #undef ENABLE_MEMS
@@ -523,7 +528,7 @@ void checks() {
   g_last_motion_ms = now;
   check(edge(nullptr), "motion does not end it (#128): people sit in the car while it charges");
   g_dc_confirmed = false;
-  g_cadence_reason = "parked-cap";
+  g_cadence_reason = CADENCE_PARKED_CAP;
   check(edge("DC_AWAKE off reason=parked-cap "), "a cadence decision names itself");
 }
 }  // namespace dc_track
@@ -652,6 +657,7 @@ void enterDeepSleep(bool modem_on, const char* reason = nullptr) {
   sleep_reason = reason ? reason : "?";
   slept_modem_on = modem_on;
 }
+#include "sleep_for.inc"
 #define ENABLE_SLEEP 1
 #define ENABLE_MEMS 1
 #define ENABLE_PERIODIC_WAKE 0
@@ -1364,9 +1370,9 @@ struct Dongle : ChargePoll {
   std::vector<OBDVector> obd_result_vector;
   const char* slept_reason = nullptr;
   void enterDeepSleep(bool, const char* reason) { slept_reason = reason; }
-  void netRecover() {
+#include "sleep_for.inc"
 #include "net_recover_sleep.inc"
-  }
+  void netRecover() { netRecoverSleep(); }
   bool gate(float rail, bool is_cold, bool is_motion, bool awake = true, bool heartbeat_due = false) {
 #include "wake_gate.inc"
     charge_end = charge_end_poll;
@@ -1377,7 +1383,7 @@ struct Dongle : ChargePoll {
     g_sample_poke = g_taper_confirm = g_pdw_ladder_done = g_pdw_recheck = false;
     g_rail_before_poke = 0;
     g_next_wake_minutes = WAKE_PARKED_MINUTES;
-    g_cadence_reason = nullptr;
+    g_cadence_reason = CADENCE_TIER;
     g_dc_confirmed = g_dc_logged = g_dc_refused_logged = ble_up = false;
     g_dc_inferred_polls = 0;
     g_dc_silent_since_ms = g_fast_anchor_ms = 0;
@@ -1620,7 +1626,7 @@ void postDriveChecks() {
   stale.pdw_open = 0;
   stale.g_pdw_ladder_done = false;
   stale.g_next_wake_minutes = WAKE_PARKED_MINUTES;
-  stale.g_cadence_reason = nullptr;
+  stale.g_cadence_reason = CADENCE_TIER;
   stale.last_active = stale.now - (POST_DRIVE_WINDOW_MINUTES + 5) * 60000UL;
   stale.pdwArmAtLadderEnd();
   check(!stale.pdw_open && stale.g_next_wake_minutes == WAKE_PARKED_MINUTES && !stale.g_cadence_reason,
@@ -2215,8 +2221,7 @@ struct Poke : Awake {
 template <class A, class B>
 bool sameOutcome(const A& a, const B& b) {
   return a.asleep && b.asleep && a.g_next_wake_minutes == b.g_next_wake_minutes &&
-         ((!a.g_cadence_reason && !b.g_cadence_reason) ||
-          (a.g_cadence_reason && b.g_cadence_reason && !strcmp(a.g_cadence_reason, b.g_cadence_reason))) &&
+         a.g_cadence_reason == b.g_cadence_reason &&
          a.recently_charging == b.recently_charging && a.charge_followup == b.charge_followup &&
          a.pdw_polls == b.pdw_polls && a.charge_silent_polls == b.charge_silent_polls &&
          a.charge_release_polls == b.charge_release_polls && a.charging_fast_minutes == b.charging_fast_minutes &&

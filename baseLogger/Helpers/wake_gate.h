@@ -6,9 +6,9 @@
   assign the gate's persisted state (skips_count, polls_count, heartbeat_asleep_streak, last_poll_epoch,
   g_weak_rail_cold_boot; tests/run_sm_checks.py enforces it); its storage stays in logger.ino and sleep_power.h until
   #27. Not owned: the poke-lifetime flags g_sample_poke, g_taper_confirm and g_rail_before_poke, which the poll and the
-  DC hold also write (#27), and the next-wake cadence (step 4b). One #pragma once and no project include, as the
-  harness inlines it. Included after alarm_gate.h: it uses sleep_power.h's statics and enterDeepSleep, logEvent and
-  g_alarm_flag.
+  DC hold also write (#27), and the next-wake cadence, which the skip arms through sleep_paths.h (#29). One #pragma
+  once and no project include, as the harness inlines it. Included after alarm_gate.h: it uses sleep_power.h's
+  statics and enterDeepSleep, logEvent and g_alarm_flag.
 */
 
 struct GateInputs {
@@ -56,7 +56,8 @@ GateDecision gateDecide(const GateInputs& in) {
   // Decide whether to poll. A plain TIMER wake on a PARKED car (rail ~12.6) does NOT poll - polling a parked
   // Scenic returns nothing useful and only costs a voltage sag. We poll only for a real reason, never on a
   // weak rail:  cold boot | motion + awake (a drive) | rail high (charging/climate) | taper bridge (confirm
-  // a tapering charge whose rail dropped) | charge end | optional parked heartbeat. ATRV's 8V threshold is just a collapse detector.
+  // a tapering charge whose rail dropped) | charge end | optional parked heartbeat. ATRV's 8V threshold is just a
+  // collapse detector.
   d.wants_poke = d.rail_awake || d.taper_bridge || d.charge_end_poll || in.heartbeat_due;
   d.should_poll = !d.weak_rail && (in.is_cold || (in.is_motion && in.awake) || d.wants_poke);
   return d;
@@ -184,8 +185,7 @@ void wakeGateRun(esp_sleep_wakeup_cause_t wake_cause) {
 #if ENABLE_LOGGING
     logEvent("ATRVGATE skip -> deep sleep (%s, modem never powered)", weak_rail ? "WEAK RAIL" : "asleep");
 #endif
-    g_next_wake_minutes = WAKE_PARKED_MINUTES; // skip = parked: long cadence
-    g_cadence_reason = nullptr;
+    cadenceArm(WAKE_PARKED_MINUTES, CADENCE_TIER); // skip = parked: long cadence
     energyOnSkip();
     enterDeepSleep(false); // modem_on=false: never powered it this wake - never returns
   }

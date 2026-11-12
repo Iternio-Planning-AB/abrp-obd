@@ -210,9 +210,9 @@ unsigned long g_silent_retry_ms = 0;
   IO36 rail ADC and the co-processor's ATRV.
 
   The veto never lifts within the wake, so the wake ends one of two ways, both in loop()'s poll block after the
-  poll: the window expires with nobody connected (parked cadence), or a cycle's rail reaches RAIL_AWAKE_VOLTS,
-  the car switched on (WEAK_RAIL_RECOVERED_WAKE_MINUTES, so the normal wake follows), which a connected phone
-  holds off only inside the key-reset window.
+  poll (Helpers/sleep_paths.h's loopWeakRailSleep): the window expires with nobody connected (parked cadence), or
+  a cycle's rail reaches RAIL_AWAKE_VOLTS, the car switched on (WEAK_RAIL_RECOVERED_WAKE_MINUTES, so the normal
+  wake follows), which a connected phone holds off only inside the key-reset window.
 */
 bool g_weak_rail_cold_boot = false;
 // Must outlive the key-reset window itself (AUTH_RESET_WINDOW_MS, timed from this same boot) plus the
@@ -271,7 +271,8 @@ RTC_DATA_ATTR uint32_t skips_count = 0;
 RTC_DATA_ATTR uint32_t polls_count = 0;
 
 // Adaptive wake cadence (Feature B): the interval (minutes) the NEXT deep sleep will arm, chosen per-sleep
-// from what this wake observed (short while charging, long while parked). Default long.
+// from what this wake observed (short while charging, long while parked). Default long. Only Helpers/sleep_paths.h
+// assigns it, with g_cadence_reason below.
 int g_next_wake_minutes = WAKE_PARKED_MINUTES;
 // Cumulative MINUTES already spent on a fast (charging) cadence, against the WAKE_CHARGING_MAX_MINUTES
 // anti-runaway cap. Counted in minutes rather than wakes because there are now two fast tiers (1 min on
@@ -366,7 +367,17 @@ RTC_DATA_ATTR uint8_t pdw_polls = 0;
 RTC_DATA_ATTR uint64_t charge_last_evidence_us = 0;
 bool g_pdw_ladder_done = false;          // pdwOpenWindow() decides once per wake
 bool g_pdw_recheck = false;              // its window is the low-rail re-check's (POST_DRIVE_RECHECK_MINUTES)
-const char* g_cadence_reason = nullptr;  // names an ambiguous cadence for SLEEP enter; null = derive from minutes
+// Why the next sleep's cadence is what it is where its minutes alone are ambiguous (SLEEP enter's reason=);
+// CADENCE_TIER: the minutes name it. Helpers/sleep_paths.h names each and is the only writer.
+enum CadenceReason : uint8_t {
+  CADENCE_TIER, CADENCE_PDW, CADENCE_PDW_RECHECK, CADENCE_FOLLOWUP, CADENCE_PARKED_HELD, CADENCE_PARKED_CAP,
+  CADENCE_PARKED_UNCORROBORATED
+};
+CadenceReason g_cadence_reason = CADENCE_TIER;
+// Helpers/sleep_paths.h, for the headers included before it.
+void cadenceArm(int minutes, CadenceReason why);
+const char* cadenceReasonName(CadenceReason why);
+const char* sleepReasonText(const char* reason, CadenceReason why, int minutes);
 
 // Test B (brownout vs clean sleep): set true immediately before esp_deep_sleep_start(); checked on the next
 // boot. If we wake and it's NOT set, we did NOT go through our own sleep path -> an uncommanded reset
@@ -494,6 +505,7 @@ void changeState(ActivityState new_state);     // Helpers/state_machine.h
 #include "Helpers/ota_update.h"   // last: uses ble, logEvent, the rail sense and the globals above
 #include "Helpers/log_dump.h"     // BLE log retrieval (ABD7): uses ble, datalogger, logEvent, g_ota_active
 #include "Helpers/auth_gate.h"    // phase-2 auth gate (ABD8): uses ble, logEvent, json - the ONLY session grant
+#include "Helpers/sleep_paths.h"  // the next sleep's cadence and loop()'s own sleeps: uses authResetWindowOpen
 #include "Helpers/jws_verify.h"    // phase-B RS256 profile signature verification (self-contained, mbedTLS)
 #include "Helpers/profile_sig.h"   // phase-B signed-profile transport/apply (ABD2 {"JWS":...}), uses ble + logEvent
 #include "Helpers/dummy_test.h"
@@ -882,12 +894,12 @@ void setup() {
   // A restored marker debt is not paid here: these boots zeroed the clock, which keeps enterDeepSleep's marker
   // block shut, so the backlog this boot never loaded is not overwritten.
   if (wdtStreakAction(wdt_reset_count) != WDT_STREAK_CONTINUE) {
-    g_next_wake_minutes = wdtStreakSleepMinutes(g_last_io36);
+    const int minutes = wdtStreakSleepMinutes(g_last_io36);
 #if ENABLE_LOGGING
     logEvent("WDT streak=%lu -> skip init, sleep %dmin (retry fresh next wake)",
-      (unsigned long)wdt_reset_count, g_next_wake_minutes);
+      (unsigned long)wdt_reset_count, minutes);
 #endif
-    enterDeepSleep(wdtStreakModemMayBeOn(), "wdt-streak"); // never returns
+    sleepFor(minutes, wdtStreakModemMayBeOn(), "wdt-streak"); // never returns
   }
 #endif
 
@@ -1874,21 +1886,9 @@ void loop() {
             }
 #endif
 #endif
-            // Escalation: a wedged modem has survived 3 consecutive power-cycles in the field - the only
-            // recovery that has EVER worked is a fresh ESP32 boot. Take it deliberately through the normal
-            // sleep path: the flush gets one last try, the BACKLOG persists every frame, and WOM re-wakes
-            // within ~a second while driving (timer backstop 1 min when parked). Bounded by net_reboot_count
-            // (RTC) so a genuine dead-coverage drive reboots at most twice, then just buffers.
-            if (g_recovers_since_ok >= 2 && net_reboot_count < 2) {
-              net_reboot_count++;
-#if ENABLE_LOGGING
-              logEvent("NET recover exhausted -> reboot via deep sleep (#%lu, %d frames to backlog)",
-                (unsigned long)net_reboot_count, (int)obd_result_vector.size());
+#if ENABLE_SLEEP && ENABLE_MEMS
+            netRecoverSleep(); // a wedged modem: reboot through the normal sleep, twice an outage (sleep_paths.h)
 #endif
-              pdwOpenWindow(); // the reboot ends this awake period
-              g_next_wake_minutes = 1;
-              enterDeepSleep(true, "net-recover"); // never returns - fresh boot restores the backlog and re-inits everything
-            }
           }
         }
         last_broadcast = millis();
@@ -1900,70 +1900,11 @@ void loop() {
     last_poll = millis();
 
 #if ATRV_GATE_ENFORCE && ENABLE_SLEEP && ENABLE_MEMS
-#if ENABLE_IO36_RAIL
-    // Weak-rail cold boot, and the car has since been switched on: this cycle's rail (read at the top of the cycle)
-    // says the DC-DC is charging the 12V, so the lockout protects nothing, but the veto would keep every cycle off
-    // the car for as long as a phone holds the window open (#104). End the wake and let the next one take the
-    // normal path: gate, modem, GNSS and profile init. A connected phone holds it off only inside the key-reset
-    // window (authResetWindowOpen): the reset needs a power-on boot, so sleeping under a phone mid-reset would
-    // refuse it for good (see the static_assert on WEAK_RAIL_COLD_BOOT_AWAKE_MS); after the window a phone cannot
-    // block it. RAIL_AWAKE_VOLTS, not IO36_LOCKOUT_HIGH: a bench supply sitting around 11 V is exactly the wake the
-    // BLE window exists for, and must not end it.
-    if (g_weak_rail_cold_boot && !maintenance_mode && g_last_io36 >= RAIL_AWAKE_VOLTS && !(bleConnected() && authResetWindowOpen())) {
-#if ENABLE_LOGGING
-      logEvent("WEAK-RAIL cold boot ended: rail=%.2f (car awake) -> deep sleep %dmin", g_last_io36,
-        WEAK_RAIL_RECOVERED_WAKE_MINUTES);
-#endif
-      g_next_wake_minutes = WEAK_RAIL_RECOVERED_WAKE_MINUTES;
-      enterDeepSleep(false, "weak-rail-recovered"); // modem was never powered this wake - never returns
-    }
-#endif
-    // Parked-poke fast-path: this wake was a deliberate HEARTBEAT poke of an asleep car (not a drive/charge).
-    // We've now taken the one reading; before sleeping, run the Test C before/after experiment: did the poll
-    // wake the car? Wait a few seconds for any ECU power-up, re-read the true rail, and log it beside the
-    // pre-poll rail + the running tallies. Then sleep IMMEDIATELY instead of idling ACTIVE->CHARGING->STANDBY.
-    // Weak-rail cold boot: the window this wake exists for has expired. Sleep on the parked cadence, the
-    // same as the skip path would have done immediately - the only difference is that a person had a couple
-    // of minutes to reach the dongle first. A connected phone holds it open (the BLE state refreshes
-    // last_active, and maintenance_mode covers a serial session), so this only fires when nobody came.
-    if (g_weak_rail_cold_boot && !maintenance_mode && !bleConnected() &&
-        millis() > WEAK_RAIL_COLD_BOOT_AWAKE_MS) {
-#if ENABLE_LOGGING
-      logEvent("WEAK-RAIL cold-boot BLE window expired (nobody connected) -> deep sleep %dmin",
-        WAKE_PARKED_MINUTES);
-#endif
-      g_next_wake_minutes = WAKE_PARKED_MINUTES;
-      enterDeepSleep(false); // modem was never powered this wake - never returns
-    }
-
+    // loop()'s own sleeps (Helpers/sleep_paths.h): the weak-rail cold boot's window, then a sample poke's after its
+    // one poll, once dcPromotePoke() has had its say.
+    loopWeakRailSleep();
     dcPromotePoke();
-    if (g_sample_poke && !maintenance_mode && !dcAwakeHeld(current_state)) {
-#if ENABLE_IO36_RAIL
-      delay(5000);                       // give ECUs time to power up IF the poll woke the car
-      float rail_after = readIO36Rail(); // local only - do NOT overwrite g_last_io36, or the SLEEP-enter log
-                                         // and cadence decision (top-of-cycle rail) would disagree with it
-#else
-      float rail_after = 0.0f;
-#endif
-#if ENABLE_LOGGING
-      // SAMPLE_POLL: did the one-shot read of an awake/charging car return real data, and did the rail move?
-      // is_charging here lets us confirm the current-sign verdict tracks the rail/SoC; the adjacent telemetry
-      // row carries the full soc/power/current values for this same poll.
-      // prog/rel are what make the two charge signals separable in a field log: prog=1 is_charging=0 is the
-      // exact case this exists for (counters moving, current sample says otherwise), and rel counts down the
-      // unconfirmed-release window, so a cadence that relaxed can be traced to which signal gave up when.
-      // No running tallies: logEvent keeps 119 characters, and the dump counts these lines and pids=0 itself.
-      // Fields: DONGLE_CONTEXT §9.
-      const uint64_t pdw_now_us = esp_rtc_get_time_us();
-      const unsigned pdw_left = pdwActive(pdw_now_us)
-        ? (unsigned)((POST_DRIVE_WINDOW_US - (pdw_now_us - pdw_open_us) + 59999999ULL) / 60000000ULL) : 0;
-      logEvent("SAMPLE_POLL pids=%d is_charging=%d prog=%d rel=%u taper=%d stall=%lu rail=%.2f->%.2f hold=%d sil=%u fu=%u pdw=%u",
-        obd_count, ep.is_charging ? 1 : 0, ep.charge_progress ? 1 : 0, (unsigned)charge_release_polls,
-        g_taper_confirm ? 1 : 0, (unsigned long)taper_confirm_wakes, g_rail_before_poke, rail_after,
-        ep.high_rail_silent ? 1 : 0, (unsigned)charge_silent_polls, (unsigned)charge_followup, pdw_left);
-#endif
-      enterDeepSleep(true); // modem was powered this wake; flush + sleep
-    }
+    loopSamplePokeSleep(ep, obd_count);
 #endif
   }
 }
