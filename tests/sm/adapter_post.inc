@@ -6,6 +6,7 @@
 void enterDeepSleep(bool modem_on, const char* reason) {
   if (sm_sleep_refused()) return;  // the tree's OTA/dump block: a refused sleep returns to its caller
   sm_modem_override(modem_on);
+  sm_sleep_said = sm_sleep_text(reason);  // the SLEEP enter line's reason=
   sm_sleep_modem = modem_on;
   if (modem_on) sm_marker();
   if (modem_on && sm_flush_ok) obd_result_vector.clear();  // the pre-sleep flush sent everything
@@ -16,7 +17,16 @@ void enterDeepSleep(bool modem_on, const char* reason) {
   sm_asleep = true;
   sm_sleeps++;
   sm_sleep_reason = reason ? reason : "";
-  if (sm_in_tick) throw SmSlept{};
+  if (sm_unwind) throw SmSlept{};
+}
+// Runs f as code after which a sleep never returns: a sleep ends it.
+template <class F> void unwind(F f) {
+  sm_unwind = true;
+  try {
+    f();
+  } catch (const SmSlept&) {
+  }
+  sm_unwind = false;
 }
 
 struct Snap {
@@ -70,13 +80,15 @@ bool mayBeStale(const BudgetBefore& b) { return staleAt(esp_rtc_get_time_us(), b
 bool mustBeStale(const BudgetBefore& b) {
   return staleAt(b.now_us, b.evidence_us) && (charge_last_evidence_us == b.evidence_us || !charge_last_evidence_us);
 }
-bool reasonIs(const char* r) { return g_cadence_reason && !strcmp(g_cadence_reason, r); }
+// The cadence reason as its text, null where the minutes say it.
+const char* sm_cadence() { return smShow(g_cadence_reason); }
+bool reasonIs(const char* r) { return sm_cadence() && !strcmp(sm_cadence(), r); }
 // After the energy block. The charging branch is the one that arms a fast tier with no cadence reason: the follow-up
 // and the post-drive window arm WAKE_CHARGING_MINUTES too, past the cap by design (once per charge; POST_DRIVE_*).
 void budgetCheck(const BudgetBefore& b, unsigned long energy_ms) {
-  const bool charging = !g_cadence_reason &&
+  const bool charging = !sm_cadence() &&
     (g_next_wake_minutes == WAKE_CHARGING_MINUTES || g_next_wake_minutes == WAKE_DC_CHARGING_MINUTES);
-  const bool released = (!g_cadence_reason && g_next_wake_minutes == WAKE_PARKED_MINUTES) || reasonIs("pdw") ||
+  const bool released = (!sm_cadence() && g_next_wake_minutes == WAKE_PARKED_MINUTES) || reasonIs("pdw") ||
                         reasonIs("followup");
   if (charging && b.fast >= (uint32_t)WAKE_CHARGING_MAX_MINUTES)
     sm_budget_broken = "a charging poll armed a fast cadence with the fast budget spent";
@@ -271,22 +283,32 @@ void poll(const SmEvent& e) {
   budgetCheck(budget, energy_ms);
   sm_buffer(current_frame, e.has_data);
   sm_marker_set();
-  sm_weak_recovered();  // the car switched on during a weak-rail cold boot (#104)
-  if (!sm_asleep) sm_weak_expiry();  // the device's sleep never returns
-  if (sm_asleep) return;
-  if (sm_poke_sleeps()) enterDeepSleep(true);  // a poke the DC hold does not keep sleeps after its one poll
+  // loop()'s own sleeps: the weak-rail window's (the car switched on, #104, or nobody came) and a poke's after its one
+  // poll, unless the DC hold keeps it. A log dump the BLE task starts during the cycle refuses them, and the cycle runs on.
+  if (e.transfer) g_logdump_active = true;
+  unwind([&] { sm_loop_sleeps(obd_count); });
+  if (e.transfer) g_logdump_active = false;
+}
+
+// The modem's power-cycles since the last upload reach e.recovers, then the escalation runs: a reboot through the
+// normal sleep, at most twice per outage. -1: an upload succeeds, which re-arms it (loop() zeroes both).
+void recover(const SmEvent& e) {
+  if (e.recovers < 0) {
+    g_recovers_since_ok = 0;
+    net_reboot_count = 0;
+    return;
+  }
+  g_recovers_since_ok = e.recovers;
+  if (e.transfer) g_logdump_active = true;
+  unwind([] { sm_net_recover(); });
+  if (e.transfer) g_logdump_active = false;
 }
 
 // One loop pass's handleActivityState(), from the event's motion. A sleep inside it ends the pass, as on the device.
 void tick(bool motion, int during = 0) {
   sm_tick_motion = motion;
   sm_tick_during = during;
-  sm_in_tick = true;
-  try {
-    handleActivityState();
-  } catch (const SmSlept&) {
-  }
-  sm_in_tick = false;
+  unwind([] { handleActivityState(); });
   sm_tick_during = 0;
 }
 
@@ -315,6 +337,7 @@ void step(const SmEvent& e) {
   if (sm_asleep) return;  // nothing runs between a sleep and the next wake
   switch (e.k) {
   case SmKind::POLL: poll(e); break;
+  case SmKind::RECOVER: recover(e); break;
   case SmKind::MAINT:  // a console command, or RESUME (off)
     maintenance_mode = e.on;
     if (e.on) maintenance_since = sm_now;
@@ -376,6 +399,11 @@ const char* propertyBroken(const Snap& pre, const SmEvent& e) {
   // driving car to sleep.
   if ((e.k == SmKind::HOLD || transfer_starts) && !pre.sm_asleep && sm_asleep)
     return "the ladder slept under an OTA update or a log dump";
+  // Nor any of loop()'s own sleeps under a dump that starts during the cycle (#29, 4b-ii).
+  if (e.transfer && !pre.sm_asleep && sm_asleep) return "a poll cycle or the net-recover reboot slept under a log dump";
+  // The net-recover reboot takes at most two per outage (net_reboot_count).
+  if (!pre.sm_asleep && sm_asleep && sm_sleep_reason == "net-recover" && net_reboot_count > 2)
+    return "a third net-recover reboot in one outage";
   if (e.k == SmKind::TICK && !pre.sm_asleep && !pre.is_currently_parked && sm_asleep && sm_sleep_reason == "backstop")
     return "the backstop slept while driving";
   const bool crashed = !pre.sm_asleep && (e.k == SmKind::CRASH || (e.k == SmKind::SLEEP && e.crash));
