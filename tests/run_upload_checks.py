@@ -52,7 +52,7 @@ if sorted(samples) != ["g_upload_csq", "g_upload_csq_ms"]:
 compiler = shlex.split(os.environ.get("CXX", "clang++"))
 print(subprocess.check_output([*compiler, "--version"], text=True).splitlines()[0], flush=True)
 group = sys.argv[1] if len(sys.argv) > 1 else "all"
-if group not in {"all", "body-ack", "stages", "responses", "unknown", "fingerprint", "errors", "queue", "backlog-append", "geo-expiry", "geo-retry", "geo-sizing", "geo-dedup", "logging-off", "tls-ca", "signing", "gzip-fallback", "session", "weak-signal"}:
+if group not in {"all", "body-ack", "stages", "responses", "unknown", "fingerprint", "errors", "queue", "backlog-append", "geo-expiry", "geo-retry", "geo-sizing", "geo-dedup", "logging-off", "tls-ca", "signing", "gzip-fallback", "session", "weak-signal", "batch-body"}:
     sys.exit("Unknown upload test group: " + group)
 environment = dict(os.environ)
 environment["UBSAN_OPTIONS"] = environment.get("UBSAN_OPTIONS", "") + ":halt_on_error=1"
@@ -104,7 +104,7 @@ with tempfile.TemporaryDirectory(prefix="obd-upload-checks-") as temporary:
     targets = []
     if group in {"all", "body-ack", "stages", "responses"}:
         targets.append(("upload_checks", "upload_checks.cpp", [], group))
-    if group in {"all", "fingerprint", "errors", "queue", "backlog-append", "geo-expiry", "geo-retry", "geo-sizing", "geo-dedup", "signing", "gzip-fallback", "weak-signal"}:
+    if group in {"all", "fingerprint", "errors", "queue", "backlog-append", "geo-expiry", "geo-retry", "geo-sizing", "geo-dedup", "signing", "gzip-fallback", "weak-signal", "batch-body"}:
         targets.append(("upload_helpers_checks", "upload_helpers_checks.cpp", [], group))
     if group in {"all", "tls-ca", "signing", "session"}:
         targets.append(("tls_ca_checks", "tls_ca_checks.cpp", [], group))

@@ -523,6 +523,17 @@ covers a frozen fix not buffered again behind an unread file while a live fix an
 `geo-downgrade` the `eacc642` loader on an appended file. Real LittleFS append time and a parked offline night remain
 hardware gates.
 
+Upload group `batch-body` (#136) covers the v2 body serialised one point at a time. It compares `bulkStringV2` with
+the whole-tree serialiser it replaced (`tests/support/bulk_v2_tree_oracle.h`, verbatim but for the name; a mapping
+change goes in both) over the existing frame fixtures and 4000 seeded random batches of 0-16 frames: random key
+subsets with duplicates, non-finite, huge, negative and denormal values, skipped utc, repeated fixes, `__geo_*` and
+`__relay_seq` keys, valid and invalid send times, with and without start marks and `location_dups`. Body bytes, end
+marks and `location_dups` must be equal, and the batches must reach empty bodies, location dedupe, headings,
+`chargingState` and non-finite values. ASan's malloc/free hooks then check that the heap a driving batch holds
+beyond its body does not grow from 2 frames to 12 (macOS: 7.3 KB both, where the whole tree grew from 11 to 60 KB);
+the points have equal text lengths, so libstdc++ and libc++ string growth cannot tell them apart. Host sizes are 64-bit; where
+the body lands (PSRAM from the reserve) and the internal minimum during an upload need a dongle.
+
 `python3 tests/run_sm_checks.py` keeps the extracted queue helper on the CUR side under high heap and compares
 the drive/marker behavior with the pinned side. It does not prove low-heap admission, LittleFS behavior or
 hardware heap characteristics.

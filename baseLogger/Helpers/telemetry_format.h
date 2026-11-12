@@ -238,12 +238,26 @@ struct GeoMark { double lat, lon, utc; };
 struct HeadingMark { double degrees, utc; };
 struct GeoMarks { GeoMark location; HeadingMark heading; };
 
+// The body is serialised one point at a time, so at most one point's json tree is alive (#136). Built whole, a
+// 12-point batch held ~59 KB of small blocks, mostly internal: the 8-bit internal minimum fell to ~0 B during uploads,
+// where internal-only allocations (FreeRTOS, esp_timer, BT controller, mbedTLS) fail. A multi-frame body is reserved
+// whole, never below malloc's PSRAM threshold (CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL), so it is one PSRAM block.
+// A full point is ~1 KB.
+static const size_t V2_POINT_RESERVE_BYTES = 1024;
+static const size_t V2_BODY_MIN_RESERVE = 4096;
+#ifdef CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL
+static_assert(V2_BODY_MIN_RESERVE >= CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL, "a reserved body must land in PSRAM");
+#endif
+
 // A location or heading equal to *marks (the last one sent, then each earlier frame of this batch) is omitted,
 // so a parked car's fix goes up once and not on every point. Frames must stay in FIFO order for that to mean
 // "last". On return *marks holds the marks as of the end of the body; *location_dups counts the omissions.
+// The body is byte-identical to dumping all points as one json array (tests/run_upload_checks.py batch-body).
 std::string bulkStringV2(const std::vector<OBDVector>& frames, double send_utc = 0, GeoMarks* marks = nullptr,
                          unsigned* location_dups = nullptr) {
-  json points = json::array();
+  std::string body;
+  if (frames.size() > 1) body.reserve(std::max(frames.size() * V2_POINT_RESERVE_BYTES, V2_BODY_MIN_RESERVE));
+  body += '[';
   GeoMarks none{};
   GeoMarks& last = marks ? *marks : none;
   if (location_dups) *location_dups = 0;
@@ -370,10 +384,14 @@ std::string bulkStringV2(const std::vector<OBDVector>& frames, double send_utc =
     // provider alone is not a telemetry point. Frames that reduce to nothing (every key unmapped, or a
     // dongle-derived-only frame) are skipped so a POST is never spent on a payload the server will
     // count and discard.
-    if (p.size() > 1) points.push_back(p);
+    if (p.size() > 1) {
+      if (body.size() > 1) body += ',';
+      body += p.dump();
+    }
   }
 
-  return points.dump();
+  body += ']';
+  return body;
 }
 
 // Would this frame produce a v2 point? Asked before is_parked is added, so drivingState cannot count.
