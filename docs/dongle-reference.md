@@ -559,12 +559,16 @@ phone supplies its own position — so a BLE frame is smaller than the cellular 
 *only* position (no PID answered) serialises to `{"tlm":{"is_parked":…,"is_charging":…}}`.
 
 **Park / drive / unconfirmed** (`Helpers/drive_state.h`, #6). The drive latch has three states. A speed key above 0
-is DRIVING, as always. A fresh moving GNSS fix starts DRIVING only with the car on (rail ≥ `RAIL_AWAKE_VOLTS`, or an
-OBD answer within `ACTIVE_TIMER`), an accelerometer hit within `DRIVE_MOTION_RECENT_MS` and no charge latch; a fix
-without them (desk drift, a garage) is refused and logged once per streak (`LEASH gnss=… refused reason=motion|car-off|charging`).
-Once DRIVING, a fix holds the drive only while the car is on (#124); with it off the fix is refused once per drive
-(`LEASH gnss=… hold refused reason=car-off rail=… obd=…s`, the last OBD answer's age, `-1s` if none this wake) and the
+is DRIVING, as always. A fresh moving GNSS fix starts DRIVING only with the rail ≥ `RAIL_AWAKE_VOLTS` (the DC-DC on;
+an OBD answer is not enough, #141), an accelerometer hit within `DRIVE_MOTION_RECENT_MS` and no charge latch; a fix
+without them (desk drift, a garage) is refused and logged once per streak (`LEASH gnss=… refused reason=motion|rail|car-off|charging`;
+`rail`: the car answered OBD within `ACTIVE_TIMER` but the rail is down, `car-off`: neither).
+Once DRIVING, a fix holds the drive only with the rail up (#124, #141); without it the fix is refused once per drive
+(`LEASH gnss=… hold refused reason=rail|car-off rail=… obd=…s`, the last OBD answer's age, `-1s` if none this wake) and the
 time re-latch parks it `ACTIVE_TIMER` after the last hold, so drift cannot keep the backstop and `is_charging` off.
+Accepted risk (#141): a car with no speed PID whose driving rail dips under 13.3 V (the calibration car's driving
+band reached 13.25 V) can miss GNSS-only drives or parts of them. A speed-PID car on a low rail logs one
+`hold refused reason=rail` line per drive, which records that car's driving rail.
 Sustained motion (`DRIVE_SUSTAINED_ACT_PCT` of at least `DRIVE_SUSTAINED_MIN_SAMPLED_MS` sampled, over
 `DRIVE_SUSTAINED_WINDOW_MS`) on a car that is on, with no charge latch, is UNCONFIRMED; with a discharge above
 `DRIVE_DISCHARGE_KW` (the frame's `power`, else current × voltage) it is DRIVING. That discharge also overrides

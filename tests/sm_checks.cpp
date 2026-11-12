@@ -1262,29 +1262,16 @@ void rules() {
   play(Advance(60000), t);
   play(Rules(fix(5000.0), SM_CAR_OFF, SM_MOVE_NONE, false), t);
   check(logged("LEASH gnss=999.9km/h hold refused reason=car-off rail=12.00 obd=-1s"), "the logged speed is clamped", t);
-  // Car on keeps the hold: the rail alone, an OBD answer on a low rail, an OBD answer with no rail at all (0.0, as a
-  // build without ENABLE_IO36_RAIL reads), and a rail dip for one silent poll.
-  const auto keepsDriving = [&](SmEvent start, SmEvent hold, const char* what) {
-    begin();
-    play(start, t);
-    check(!is_currently_parked, std::string(what) + ": the drive starts", t);
-    for (int i = 0; i < 11; ++i) {
-      play(Advance(60000), t);
-      play(hold, t);
-    }
-    check(!is_currently_parked && sm_freezes == 0 && countLog("LEASH no speed") == 0, what, t);
-  };
-  keepsDriving(railFix(13.5, SM_MOVE_NOW), railFix(13.5), "the rail alone holds DRIVING past ACTIVE_TIMER");
-  check(countLog("LEASH gnss=") == 0, "the rail alone: never refused", t);
-  keepsDriving(Rules(fix(40.0), SM_CAR_OBD, SM_MOVE_NOW, false), Rules(fix(40.0), SM_CAR_OBD, SM_MOVE_NONE, false),
-               "OBD answers on a 12.0 V rail hold DRIVING past ACTIVE_TIMER");
-  check(countLog("LEASH gnss=") == 0, "OBD answers: never refused", t);
-  SmEvent no_rail = Rules(fix(40.0), SM_CAR_OBD, SM_MOVE_NONE, false);
-  no_rail.poll_rail = 0.0;
-  SmEvent no_rail_start = no_rail;
-  no_rail_start.motion = SM_MOVE_NOW;
-  keepsDriving(no_rail_start, no_rail, "OBD answers with no rail reading (0.0) hold DRIVING past ACTIVE_TIMER");
-  check(countLog("LEASH gnss=") == 0 && g_last_io36 == 0.0f, "no rail reading: never refused", t);
+  // The rail keeps the hold, and a rail dip for one silent poll does not lose it.
+  begin();
+  play(railFix(13.5, SM_MOVE_NOW), t);
+  check(!is_currently_parked, "the rail alone: the drive starts", t);
+  for (int i = 0; i < 11; ++i) {
+    play(Advance(60000), t);
+    play(railFix(13.5), t);
+  }
+  check(!is_currently_parked && sm_freezes == 0 && countLog("LEASH no speed") == 0 && countLog("LEASH gnss=") == 0,
+        "the rail alone holds DRIVING past ACTIVE_TIMER, never refused", t);
   begin();
   play(railFix(13.5, SM_MOVE_NOW), t);
   for (int i = 0; i < 11; ++i) {
@@ -1294,6 +1281,81 @@ void rules() {
   check(!is_currently_parked && sm_freezes == 0 && countLog("LEASH no speed") == 0 && countLog("LEASH gnss=") == 1 &&
         logged("LEASH gnss=40.0km/h hold refused reason=car-off rail=13.20 obd=-1s"),
         "a one-poll rail dip on a silent car is refused once but does not lose the hold", t);
+
+  // #141: GNSS starts or holds a drive only with the rail at RAIL_AWAKE_VOLTS (the DC-DC on). A parked car's ECUs can
+  // answer OBD with the DC-DC off, and the dongle's own polls keep that answer fresh, so an answer is no longer car-on
+  // for GNSS. These differ from SM_PIN by design and run on CUR alone; the accelerometer still takes the answer.
+  const SmEvent obd_fix = Rules(fix(40.0), SM_CAR_OBD, SM_MOVE_NONE, false);
+  const SmEvent obd_fix_jolt = Rules(fix(40.0), SM_CAR_OBD, SM_MOVE_NOW, false);
+  auto beginCur = [&] { startCur(t); playCur(Advance(60000), t); };
+  // The field case: parked, rail under RAIL_AWAKE_VOLTS, answering every poll, drift fixes and a jolt every few minutes.
+  beginCur();
+  for (unsigned long awake = 60000; awake <= MAX_AWAKE_MS; awake += 180000) {
+    playCur(obd_fix_jolt, t);
+    playCur(Advance(60000), t);
+    playCur(obd_fix, t);
+    playCur(Advance(120000), t);
+    check(is_currently_parked && !drive_unconfirmed, "drift on a 12.0 V rail answering OBD never drives", t);
+  }
+  check(countLog("LEASH driving") == 0 && countLog("LEASH gnss=") == 1 &&
+        logged("LEASH gnss=40.0km/h refused reason=rail"), "one refusal line for the whole streak, reason=rail", t);
+  playCur(Ladder(SmTo::ACTIVE), t);
+  check(sm_asleep && sm_sleep_reason == "backstop", "and the max-awake backstop sleeps it", t);
+  // The same answering car, no rail reading at all (0.0, as a build without ENABLE_IO36_RAIL reads): no GNSS-only
+  // drive, the fail-safe side.
+  beginCur();
+  SmEvent no_rail = obd_fix_jolt;
+  no_rail.poll_rail = 0.0;
+  playCur(no_rail, t);
+  check(is_currently_parked && g_last_io36 == 0.0f && logged("LEASH gnss=40.0km/h refused reason=rail"),
+        "no rail reading: GNSS cannot start a drive", t);
+  // UNCONFIRMED from the accelerometer on the OBD answer (unchanged), but its fix needs the rail to confirm.
+  beginCur();
+  playCur(Rules(quiet, SM_CAR_OBD, SM_MOVE_NOW, true), t);
+  check(drive_unconfirmed, "sustained motion on an answering car is still UNCONFIRMED", t);
+  playCur(Advance(5000), t);
+  playCur(obd_fix_jolt, t);
+  check(drive_unconfirmed && logged("LEASH gnss=40.0km/h refused reason=rail"), "its fix on a 12.0 V rail is refused", t);
+  // A drive started on the rail, whose rail then falls with the car still answering: the fixes no longer hold it, and
+  // it re-latches ACTIVE_TIMER after the last rail-backed hold.
+  beginCur();
+  playCur(railFix(13.5, SM_MOVE_NOW), t);
+  const unsigned long rail_hold = g_last_speed_ms;
+  for (int i = 0; i < 4; ++i) {
+    playCur(Advance(60000), t);
+    playCur(obd_fix, t);
+  }
+  playCur(Advance(rail_hold + AT - sm_now), t);
+  playCur(obd_fix, t);
+  check(!is_currently_parked && g_last_speed_ms == rail_hold &&
+        logged("LEASH gnss=40.0km/h hold refused reason=rail rail=12.00 obd=0s"),
+        "a fix on a 12.0 V rail does not hold DRIVING, and says the car answered", t);
+  playCur(Advance(1), t);
+  playCur(obd_fix, t);
+  check(is_currently_parked && sm_freezes == 1 && countLog("LEASH no speed for 300s") == 1, "then it re-latches", t);
+  // A speed-PID car on a 12.0 V rail: speed > 0 drives and holds as before; the fixes beside it no longer extend the
+  // hold past the last speed.
+  beginCur();
+  const SmEvent speed_fix = Rules(Poll(SM_SPEED, 30, true, 40.0), SM_CAR_OBD, SM_MOVE_NONE, false);
+  for (int i = 0; i < 6; ++i) {
+    playCur(speed_fix, t);
+    playCur(Advance(60000), t);
+  }
+  check(!is_currently_parked && g_last_speed_ms == sm_now - 60000 && sm_freezes == 0, "speed > 0 holds DRIVING", t);
+  const unsigned long last_speed = g_last_speed_ms;
+  playCur(Advance(last_speed + AT - sm_now), t);
+  playCur(Rules(Poll(SM_SPEED, 0, true, 40.0), SM_CAR_OBD, SM_MOVE_NONE, false), t);
+  check(!is_currently_parked, "still DRIVING ACTIVE_TIMER after the last speed > 0", t);
+  playCur(Advance(1), t);
+  playCur(Rules(Poll(SM_SPEED, 0, true, 40.0), SM_CAR_OBD, SM_MOVE_NONE, false), t);
+  check(is_currently_parked && sm_freezes == 1, "and the speed hold ends on time, fixes or not", t);
+  // The drive alphabet's polls all read 13.5 V, so the differential never reaches the rail refusal: CUR's properties
+  // (the backstop above all) over every 5-event sequence with an answering car's fix on a 12.0 V rail added.
+  std::vector<SmEvent> low_rail = ALPHABET;
+  low_rail.push_back(Rules(Poll(SM_NONE, 0, true, 7.25), SM_CAR_OBD, SM_MOVE_NOW, false));
+  low_rail.push_back(Rules(Poll(SM_NONE, 0, true, 7.25), SM_CAR_OBD, SM_MOVE_NONE, false));
+  startCur(t);
+  enumerateCur(5, low_rail, t);
 
   // 4. Charge block: the charge latch keeps sustained motion and GNSS out unless this frame discharges over
   // DRIVE_DISCHARGE_KW (#95), and drops UNCONFIRMED to PARKED.
@@ -1417,19 +1479,21 @@ void rules() {
   check(obd_result_vector.size() == 1, "a parked heartbeat after UNCONFIRMED queues no marker", t);
 }
 
-void playComposed(SmEvent e, std::vector<SmEvent>& trace) {
+// cur_only: a case that differs from SM_PIN by design runs on CUR alone, with the same oracle.
+void playComposed(SmEvent e, std::vector<SmEvent>& trace, bool cur_only = false) {
   using namespace sm_cur;
   const Snap pre = save(false);
   const size_t frames = obd_result_vector.size();
   e.charge_block = pre.recently_charging;
-  play(e, trace);
+  if (cur_only) playCur(e, trace);
+  else play(e, trace);
   if (e.k != SmKind::POLL || pre.sm_asleep) return;
   const bool speed = sm_polls != pre.sm_polls && !e.silent &&
     ((e.key != SM_NONE && e.speed > 0) || (e.key == SM_BOTH && e.speed2 > 0));
   // #95: an answered frame discharging over DRIVE_DISCHARGE_KW overrides the latch only with a current in range that
   // is not charging by its sign, and no car is_dcfc/is_charging (any value but 0); with the start's other evidence
-  // (car on: it answered) it is DRIVING, without it still PARKED. The bounds are the firmware's: power only within
-  // +-1000 kW, else current x voltage.
+  // (car on: it answered; a GNSS start also needs the rail, #141) it is DRIVING, without it still PARKED. The
+  // bounds are the firmware's: power only within +-1000 kW, else current x voltage.
   auto within = [](double v, double lo, double hi) { return v > lo && v < hi; };  // false for NaN and infinities
   const bool has_amps = within(e.current, -2000, 2000);
   const bool by_power = within(e.power, -1000, 1000);
@@ -1442,7 +1506,7 @@ void playComposed(SmEvent e, std::vector<SmEvent>& trace) {
                          e.current >= CHARGING_CURRENT_THRESHOLD && !car_flag;
   const bool motion_recent = g_last_motion_ms && sm_now - g_last_motion_ms <= (unsigned long)DRIVE_MOTION_RECENT_MS;
   const bool moving_fix = e.gnss && e.fix_age_ms <= GPS_MOVING_MAX_AGE_MS && e.gnss_kmh >= GPS_MOVING_MIN_KMH;
-  const bool start = discharge && (e.sustained || (moving_fix && motion_recent));
+  const bool start = discharge && (e.sustained || (moving_fix && motion_recent && g_last_io36 >= RAIL_AWAKE_VOLTS));
   if (pre.is_currently_parked && pre.recently_charging && !speed)
     check(start ? !is_currently_parked && !drive_unconfirmed : is_currently_parked && !drive_unconfirmed,
           start ? "composition: this poll's discharge overrides the previous charge latch and starts the drive"
@@ -1478,6 +1542,10 @@ void composition() {
   SmEvent gnss = Poll(SM_NONE, 0, true, 20);
   gnss.current = 30;
   gnss.voltage = 400;
+  auto amps30 = [](SmEvent e) {
+    e.current = 30, e.voltage = 400;
+    return e;
+  };
   SmEvent accel = Rules(Poll(SM_NONE, 0), SM_CAR_RAIL, SM_MOVE_NOW, true, 12);
   accel.current = 30;
   accel.voltage = 400;
@@ -1535,37 +1603,42 @@ void composition() {
     check(!is_currently_parked && g_last_speed_ms > hold && sm_freezes == 0 && sm_published == 0,
           "composition: the residual charge latch cannot block GNSS continuing an established drive", t);
   }
-  // #124: a false DRIVING while plugged in, then the car goes off with the fixes drifting on: PARKED within
-  // ACTIVE_TIMER of the last hold, after which a charge is seen again and the max-awake backstop applies.
+  // #124, #141: a false DRIVING while plugged in, then the rail falls with the fixes drifting on: PARKED ACTIVE_TIMER
+  // after the speed hold (the speed poll's fresh OBD answer no longer lets a fix hold), after which a charge is seen
+  // again and the max-awake backstop applies. Differs from SM_PIN by design (#141): CUR alone.
   {
     charged();
     playComposed(Poll(SM_SPEED, 25), t);
     check(!is_currently_parked && recently_charging, "composition: a false drive while plugged in", t);
-    const SmEvent off_fix = Rules(Poll(SM_NONE, 0, true, 20), SM_CAR_OFF, SM_MOVE_NONE, false);
-    // The speed poll's answer keeps the car on for ACTIVE_TIMER: the fixes at 1-4 min still hold, the 5-min one is refused.
-    for (int i = 0; i < 4; ++i) {
-      playComposed(Advance(60000), t);
-      playComposed(off_fix, t);
-    }
     const unsigned long held = g_last_speed_ms;
-    check(held == sm_now, "composition: an OBD answer within ACTIVE_TIMER still lets a fix hold", t);
-    playComposed(Advance(60000), t);
-    playComposed(off_fix, t);
-    check(g_last_speed_ms == held, "composition: once it is ACTIVE_TIMER old, a fix no longer holds", t);
-    playComposed(Advance(held + AT - sm_now), t);
-    playComposed(off_fix, t);
-    check(!is_currently_parked, "composition: ACTIVE_TIMER after the last accepted hold is still DRIVING", t);
-    playComposed(Advance(1), t);
-    playComposed(off_fix, t);
+    const SmEvent off_fix = Rules(Poll(SM_NONE, 0, true, 20), SM_CAR_OFF, SM_MOVE_NONE, false);
+    for (int i = 0; i < 4; ++i) {
+      playComposed(Advance(60000), t, true);
+      playComposed(off_fix, t, true);
+    }
+    check(g_last_speed_ms == held && logged("LEASH gnss=20.0km/h hold refused reason=rail rail=12.00 obd=60s"),
+          "composition: a fix on a 12.0 V rail does not hold, even with an OBD answer within ACTIVE_TIMER", t);
+    playComposed(Advance(held + AT - sm_now), t, true);
+    playComposed(off_fix, t, true);
+    check(!is_currently_parked, "composition: ACTIVE_TIMER after the speed hold is still DRIVING", t);
+    playComposed(Advance(1), t, true);
+    playComposed(off_fix, t, true);
     check(is_currently_parked && sm_freezes == 1,
-          "composition: car off, drifting fixes no longer hold the drive past ACTIVE_TIMER", t);
-    playComposed(charge, t);
+          "composition: drifting fixes do not hold the drive past ACTIVE_TIMER", t);
+    playComposed(charge, t, true);
     check(is_currently_parked && has("is_charging", 1) && recently_charging,
-          "composition: after the car-off re-latch a charge is seen again", t);
-    playComposed(Advance(MAX_AWAKE_MS), t);
-    playComposed(Ladder(SmTo::ACTIVE), t);
+          "composition: after the re-latch a charge is seen again", t);
+    playComposed(Advance(MAX_AWAKE_MS), t, true);
+    playComposed(Ladder(SmTo::ACTIVE), t, true);
     check(sm_asleep && sm_sleep_reason == "backstop", "composition: and the max-awake backstop applies again", t);
   }
+
+  // #141: the latch, overridden by this poll's discharge, with a moving fix and motion on a 12.0 V rail the car
+  // answers on: GNSS needs the rail, so it stays PARKED (the oracle's rail term). Differs from SM_PIN: CUR alone.
+  charged();
+  playComposed(amps30(Rules(Poll(SM_NONE, 0, true, 20), SM_CAR_OBD, SM_MOVE_NOW, false)), t, true);
+  check(is_currently_parked && !drive_unconfirmed && logged("LEASH gnss=20.0km/h refused reason=rail"),
+        "composition: a discharge overriding the latch cannot start a GNSS drive on a low rail", t);
 
   start(t);
   playComposed(charge, t);
