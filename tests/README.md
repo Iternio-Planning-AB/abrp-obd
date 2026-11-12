@@ -39,7 +39,7 @@ set `GIT_CLIFF`); without it, it is skipped, and with `CI` set it fails.
 
 ## State-machine differential harness
 
-Run `python3 tests/run_sm_checks.py` (groups `scenarios`, `random`, `enumerate`, `crash`, `rules`, `composition`, `dc`, `ladder`; `--depth N`, default 5) for
+Run `python3 tests/run_sm_checks.py` (groups `scenarios`, `random`, `enumerate`, `crash`, `rules`, `composition`, `dc`, `ladder`, `sleeps`; `--depth N`, default 5) for
 the park/drive decision. The differential covers the drive region; shared context comes from the working
 tree. The blocks that write drive state (the poll-time unlatch and re-latch, the `is_parked` publish, the buffer
 block and the pre-sleep marker) come from the pinned `main` commit (`SM_PIN`, via `git show`) for OLD and from the
@@ -89,7 +89,7 @@ compared; a sample poke the DC hold does not keep sleeps after its one poll. An 
 group mixes charge polls in, and named scenarios cover an AC charge and its release, DC by power through a taper and
 the car's `is_dcfc=0`, the silent hold and parked-held, the stale reset after `CHARGE_STALE_RESET_MINUTES` (held, on
 an answered poke and on a skip wake), the post-drive window's polls and expiry, the stream-trust delay, the fast-budget cap,
-corroboration, and a DC session released silent on a streaming wake. The poke's sleep stays shared context; the
+corroboration, and a DC session released silent on a streaming wake. The poke's sleep is compared since 4b-ii; the
 post-drive window at the ladder end is pinned with the rest of `energy_state.h`. A CUR-asserted scenario (#22) parks with the rail healthy but low (12.42 V) and checks
 the one `POST_DRIVE_RECHECK_MINUTES` sleep (`pdw-recheck`), then each re-check wake: a low rail skips to the parked
 cadence with no second re-check, a high rail with a charging answer takes the charging cadence, and a silent one gets
@@ -110,13 +110,14 @@ and named scenarios cover the taper budget to its give-up, the charge-end read o
 window and its modem-off expiry, and the counters and `since_poll` across wakes. Since step 4a (#26) the gate is
 `Helpers/wake_gate.h`'s `wakeGateRun` and `gateStampPoll` (setup()'s last-poll stamp), on both sides, and the
 runner fails if anything outside it assigns the gate's persisted state or if a gate call sits outside the compared
-blocks and its named sites. The weak-rail window's expiry and the sleep's modem override for it are shared context. So is `loop()`'s poll condition (#104): a
+blocks and its named sites. The sleep's modem override for the weak-rail window is shared context; the window's expiry
+and `loop()`'s poll condition (#104) are compared since 4b-ii. A
 poll reaches the car only when it holds, so the property "a poll ran on a weak-rail wake" holds a weak cold boot to the
 firmware's own veto (`!g_weak_rail_cold_boot`), and the named scenario checks that its window's cycles ask the car
 nothing. The veto never lifts within the wake, which ends when the window expires with no phone connected or when a
 cycle's rail reaches `RAIL_AWAKE_VOLTS` (the car switched on), sleeping `WEAK_RAIL_RECOVERED_WAKE_MINUTES` with the
 modem off; a connected phone holds that recovery off only inside the key-reset window (`authResetWindowOpen()`,
-extracted from `auth_gate.h` as shared context with the recovery block). A named scenario covers it with no phone, and
+extracted from `auth_gate.h` as shared context). A named scenario covers it with no phone, and
 with a connected phone (`sm_ble_connected`, the harness's only phone) inside the key-reset window, holding the BLE
 window open past its length, and after the key-reset window, when the rail ends it. The
 runner fails if the condition loses that term or stops guarding the lazy init and `readPIDs()`, if any
@@ -144,6 +145,21 @@ anything outside `state_machine.h` assigns `current_state`, `g_ble_session_relay
 helper, a shadowing local), or if a ladder call sits outside the compared blocks and its named sites. The module's
 `ladderStep` and `backstopDue` are pure, over the holds and the phone read once per pass; `run_energy_checks.py` asks
 `ladderStep` for its CHARGING rung and slices the backstop and the glue from its clock read on, as before.
+
+Since 4b-ii (#29) `loop()`'s own sleeps are pinned and compared instead of shared: the block after a poll cycle's stamp
+(the weak-rail window's recovery and expiry, `dcPromotePoke()`, a stub here, and the sample poke's sleep with its 5 s
+wait and the `SAMPLE_POLL` line), the net-recover reboot, `loop()`'s poll condition and the `SLEEP enter` line's
+`reason=` expression, whose text each sleep names is compared (`sm_sleep_said`). A sleep in a poll cycle or the
+reboot ends it, as a tick's does. `RECOVER(n)` sets the modem's power-cycles since the last upload and runs the
+reboot block, `UPLOAD(ok)` re-arms it as a successful upload does, and `DUMP-STARTS:` on a poll or a recover starts a
+log dump during it (a property: none of these sleeps under a dump). The cadence reason is compared as its text, each
+side's own type read from its definition. The `sleeps` group asserts on CUR a poke's wait, `SAMPLE_POLL` line and
+modem-on sleep, the console and the DC hold keeping a poke awake, the DC tier's `dc-charge`, the weak-rail expiry's
+parked modem-off sleep, both weak-rail sleeps and the poke's refused under a dump with the cycle running on, and the
+reboot's minute, its two per outage, its re-arm and its refusal; then every 5-event sequence over 17 symbols from a
+weak-rail power-on and every 4-event one from a normal boot, and 2500 random ones, with reachability counters. The
+energy scenarios also assert the `reason=` text of each cadence (charging, parked, pdw, pdw-recheck, parked-held,
+parked-cap, followup, parked-uncorroborated).
 
 Since #83 the fast-cadence budget is checked as properties on both sides, against the adapter's own record: a poll on
 the charging branch (a fast tier, no cadence reason) never comes with the budget already at `WAKE_CHARGING_MAX_MINUTES`;

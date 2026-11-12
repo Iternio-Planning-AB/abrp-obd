@@ -1,7 +1,7 @@
-"""Differential checks for the park/drive decision, the poll-side energy block, the setup() wake gate and the awake
-ladder (state machine #23, steps 0a #28, 0b-1 #81, 0b-2 #82 and 4b #29).
+"""Differential checks for the park/drive decision, the poll-side energy block, the setup() wake gate, the awake
+ladder and loop()'s own sleeps (state machine #23, steps 0a #28, 0b-1 #81, 0b-2 #82 and 4b #29).
 
-Four regions are compared. The drive region is drive_state.h and the blocks that call it: the speed loop, the
+Five regions are compared. The drive region is drive_state.h and the blocks that call it: the speed loop, the
 GNSS branch and the time re-latch, the is_parked publish, the frame_has_data buffer block with the queue helper, the
 pre-sleep marker and the setup() marker restore. The awake ladder (#29) is all of state_machine.h: the delays,
 changeState, the DC hold's helpers and handleActivityState() whole, with its OTA/dump hold, maintenance release,
@@ -11,11 +11,13 @@ the release latch and silent hold, the taper stall count, the DC session, the ne
 and cap, corroboration and the stale guard, with the helpers it calls (resetChargeCorroboration, pdwActive,
 chargeStateStale). The wake region is setup()'s RTC sanitize and the whole ATRV gate block:
 the ATRV read, the taper bridge and its give-up, the charge-end read, the follow-up, the poll decision, the alarm
-suppression, the counters and log lines, the weak-rail cold boot and the skip path. All are extracted with the same
-anchors from two places: OLD from the pinned commit (git show), CUR from the working tree. The context around them
-(a sample poke's sleep after its poll, the weak-rail window's expiry and the recovery ahead of it, every sleep's
-OTA/dump refusal and modem override for that wake, loop()'s poll condition that decides whether a poll asks the car)
-comes from the working tree for both sides, so a deliberate change there cannot fail the differential. Since #25 the energy region is energy_state.h: energyOnPoll (the block, verbatim) with the
+suppression, the counters and log lines, the weak-rail cold boot and the skip path. The sleep region (4b-ii) is
+loop()'s block after a poll cycle (the weak-rail window's recovery and expiry, and a sample poke's sleep with its
+SAMPLE_POLL line), the net-recover reboot, loop()'s poll condition that decides whether a poll asks the car, the SLEEP
+enter line's reason= and the cadence reason's type. All are extracted with the same anchors from two places: OLD from
+the pinned commit (git show), CUR from the working tree. The context around them (every sleep's OTA/dump refusal and
+modem override for that wake, the key-reset window) comes from the working tree for both sides, so a deliberate change
+there cannot fail the differential. Since #25 the energy region is energy_state.h: energyOnPoll (the block, verbatim) with the
 helpers beside it, the RTC sanitize and the ladder end's post-drive window. Each side inlines its copy and runs loop()'s
 call site, and the three values the poll returns for the SAMPLE_POLL line are compared. Likewise (#26) the gate block
 and setup()'s last-poll stamp are wake_gate.h's wakeGateRun and gateStampPoll, inlined and run from both call sites.
@@ -24,11 +26,13 @@ tests/sm_checks.cpp compiles each side into its own namespace around the same ha
 every event: the ladder state and its motion windows, the latch, the leash and hold times, the marker debt and its
 crash copy, published is_parked,
 buffered frames, alarm speed notes, freezes, every energy and gate RTC field and RAM output, the next-wake
-minutes, and the exact logEvent and Serial sequences; the gate's poll or skip shows in its counters. It also checks
+minutes and the cadence reason's text, the reason= each sleep names, and the exact logEvent and Serial sequences; the
+gate's poll or skip shows in its counters. It also checks
 the weak-rail gate, the weak-rail cold boot's modem-off sleep, the max-awake backstop (never a driving car or a held DC
-charge), no ladder sleep under a transfer and the fast-cadence budget (#83) as properties.
+charge), no ladder or loop() sleep under a transfer, at most two net-recover reboots an outage and the fast-cadence
+budget (#83) as properties.
 The OBD-alarm permit (#83) is alarm_gate.h from the setup grant through alarmGateAllowsPoll(), pinned for OLD; it is
-the last term of loop()'s poll condition (from the tree, after the weak-rail veto), and this runner fails unless loop()
+the last term of loop()'s poll condition (compared since 4b-ii, after the weak-rail veto), and this runner fails unless loop()
 asks the car (readPIDs and the deferred obd.initialize) only inside that condition, compiled in the default build,
 after the cycle's rail and GNSS refresh. On an enforced car a poll asks
 the car (obd.tx_count moves) exactly when an oracle kept from the trace's inputs permits it: the setup window with an
@@ -40,7 +44,8 @@ also inside the pre-sleep flush, never loses the marker debt; an absolute proper
 (the #6 driving rules' named cases), composition (#83, below), dc (#128's early DC release, as config.h builds it with
 DC_EARLY_HOLD on: named cases and generated traces, also against an oracle kept from the inputs), or all; rules,
 ladder (#29: the rungs in time, a phone at each level, the holds, the backstop and UNINITIALIZED, enumerated and random),
-composition, dc and ladder compare the two sides throughout and assert their cases on CUR. A Charge or Silent poll keeps the
+sleeps (#29, 4b-ii: each of loop()'s sleeps, refused under a dump, and the net-recover bound, enumerated and random),
+composition, dc, ladder and sleeps compare the two sides throughout and assert their cases on CUR. A Charge or Silent poll keeps the
 wake's rail and motion; any answered poll stamps the last OBD answer. A wake carries the rail, the ATRV read, the alarm flag and an
 optional charge latch; the RTC clock and epoch run through sleeps, and a cold boot zeroes the clock until a poll.
 Before compiling, it checks that only drive_state.h assigns the park/drive storage, that alarm_gate.h names no
@@ -57,7 +62,7 @@ rail at RAIL_AWAKE_VOLTS ends the wake, held by a phone only inside the key-rese
 predicate is shared context) sits under #if ENABLE_IO36_RAIL directly ahead of the window's expiry. A phone
 exists only where a scenario or a PHONE event connects one (sm_ble_connected, read through bleConnected(), dropped at
 every sleep). A tick's detectMovement() is the event's motion with mems.h's stamp (a transfer or a phone may start
-inside it), and a sleep inside a tick ends it.
+inside it), and a sleep inside a tick, a poll cycle's sleeps or the net-recover block ends it.
 
 The pin. SM_PIN is the main commit a step is measured against: a refactor step must leave both regions equal to
 it. Re-pin only when a behaviour change to a compared region lands on main between steps, to the merge-base of
@@ -66,9 +71,8 @@ never a skip.
 
 What it cannot prove: 32-bit millis() wrap (the host unsigned long is 64-bit); any feature-flag set other
 than the config.h defaults with PRINT 0 (lines under #if PRINT and other branches are not compiled); code
-outside the extracted blocks (dcPromotePoke and motion inside a wake, the console's own effects beyond its flag and
-stamp, the
-SAMPLE_POLL line, the silent retry (#131, see the stub in sm/adapter_pre.inc), the modem, detectMovement timing,
+outside the extracted blocks (dcPromotePoke, a no-op stub here, and motion inside a wake, the console's own effects
+beyond its flag and stamp, the upload that counts the net-recover power-cycles, the silent retry (#131, see the stub in sm/adapter_pre.inc), the modem, detectMovement timing,
 RTC retention, hardware); the wdt-streak sleeps before and after
 the gate; resets other than a deep-sleep wake, a power loss, a panic and a WDT (a brownout or software reset reloads
 RTC as those do, so the sanitize cannot show); the heartbeat (ENABLE_PARKED_HEARTBEAT 0, so the branch is not
@@ -142,6 +146,16 @@ STAMP_CALL = "  gateStampPoll();"
 WEAK_EXPIRY = "    if (g_weak_rail_cold_boot && !maintenance_mode && !bleConnected() &&"
 WEAK_RECOVERED = ("    if (g_weak_rail_cold_boot && !maintenance_mode && g_last_io36 >= RAIL_AWAKE_VOLTS && "
                   "!(bleConnected() && authResetWindowOpen())) {")
+# loop()'s own sleeps after a poll cycle (#29, 4b-ii): the weak-rail window's recovery and expiry, dcPromotePoke() and the
+# sample poke's sleep, from the #if after the poll stamp through its #endif.
+LOOP_SLEEPS = "    last_poll = millis();\n\n#if ATRV_GATE_ENFORCE && ENABLE_SLEEP && ENABLE_MEMS\n"
+# The net-recover reboot (#29, 4b-ii): everything between the modem-restart diagnostics and the end of the http=0 block.
+NET_RECOVER_START = ('logEvent("NET recover radio %s", diag.second.c_str());\n            }\n'
+                     "#endif\n#endif\n")
+NET_RECOVER_END = "          }\n        }\n        last_broadcast = millis();"
+# The SLEEP enter line's reason= argument (sleep_power.h), compared as the text each sleep names.
+SLEEP_TEXT_START = '    modem_down ? "modem" : "(modem already off)", g_next_wake_minutes,\n'
+SLEEP_TEXT_END = ",\n    g_last_io36, WOM_THRESHOLD_G);"
 BOOT_RESYNC = '  if (!g_weak_rail_cold_boot && clockNeedsSync() && !clockResync("boot")) clockNtpNoClock();'
 # loop()'s poll condition (the OBD_ALARM_GATE branch, the one config.h builds): whether a poll cycle asks the car.
 POLL_IF = "    if (!g_no_profile && "
@@ -199,6 +213,24 @@ def recipe(src, side):
     alarm = src["alarm"][alarm_start:find(src["alarm"], ALARM_END, alarm_start, where["alarm"]) + 1]
     if alarm.count(ALARM_STATICS) != 1 or alarm.count(ALARM_NOTE) != 1:
         sys.exit(f"FAIL: expected alarmGateAllowsPoll's three statics together and one alarmNoteSpeed in {where['alarm']}")
+    # loop()'s own sleeps, the net-recover reboot and the SLEEP enter reason (#29, 4b-ii), each by the same anchors on
+    # both sides.
+    if logger.count(LOOP_SLEEPS) != 1 or logger.count(NET_RECOVER_START) != 1 or src["sleep"].count(SLEEP_TEXT_START) != 1:
+        sys.exit(f"FAIL: expected one loop() sleep block, one net-recover block and one SLEEP enter reason ({side})")
+    sleeps_at = find(logger, LOOP_SLEEPS, what=where["logger"]) + LOOP_SLEEPS.index("#if")
+    sleeps_end = find(logger, "#endif\n  }\n", sleeps_at, where["logger"]) + len("#endif\n")
+    recover_at = find(logger, NET_RECOVER_START, what=where["logger"]) + len(NET_RECOVER_START)
+    recover_end = find(logger, NET_RECOVER_END, recover_at, where["logger"])
+    text_at = find(src["sleep"], SLEEP_TEXT_START, what=where["sleep"]) + len(SLEEP_TEXT_START)
+    text_end = find(src["sleep"], SLEEP_TEXT_END, text_at, where["sleep"])
+    # loop()'s poll condition (the OBD_ALARM_GATE branch config.h builds): a plain && chain on one line.
+    poll_match = re.fullmatch(r"    if \((.*)\) \{\n", line(logger, POLL_IF, where["logger"]))
+    if not poll_match or "||" in poll_match.group(1):
+        sys.exit(f"FAIL: loop()'s poll condition must be one line, `if (a && b && ...) {{`, a plain && chain ({side})")
+    # g_cadence_reason's type and initialiser, from this side's definition: the adapter declares it as SmCadence.
+    cadence = re.findall(r"^(\w[\w :*]*?) ?\bg_cadence_reason = ([^;]+);", logger, re.M)
+    if len(cadence) != 1:
+        sys.exit(f"FAIL: expected one g_cadence_reason definition in {where['logger']}")
     if not (start < find(logger, DRIVE_END, start, where["logger"]) <
             find(logger, '    if (!drive_unconfirmed) current_frame.emplace_back("is_parked"', what=where["logger"]) <
             energy_start < energy_end <=
@@ -229,10 +261,17 @@ def recipe(src, side):
         "energy_state": energy_state.replace("#pragma once\n", "").replace(LOGGED_DCFC, ""),
         # Inlined, never #included, as drive_state.h.
         "machine": machine.replace("#pragma once\n", ""),
+        "loop_sleeps": logger[sleeps_at:sleeps_end],
+        "net_recover": logger[recover_at:recover_end],
+        "sleep_text": src["sleep"][text_at:text_end],
+        "poll_condition": poll_match.group(1),
+        "cadence": (f"using SmCadence = {cadence[0][0]};\n"
+                    f"constexpr SmCadence SM_CADENCE_INIT = {cadence[0][1]};\n"),
     }
 
 
 SIDE = """{enum}
+{cadence}
 {buffer_cap}
 {weak_awake_ms}
 {maint_idle}
@@ -265,15 +304,19 @@ void sm_wake_gate(SmWakeCause wake_cause) {{
 #pragma GCC diagnostic pop
 void sm_stamp() {{
 {stamp}}}
-{auth_window}void sm_weak_recovered() {{
-#if ENABLE_IO36_RAIL
-{weak_recovered}#endif
+{auth_window}void sm_loop_sleeps(int obd_count) {{
+  const EnergyPoll ep{{sm_ep_charging, sm_ep_progress, sm_ep_silent}};
+  (void)ep;
+  (void)obd_count;
+{loop_sleeps}}}
+void sm_net_recover() {{
+{net_recover}}}
+const char* sm_sleep_text(const char* reason) {{
+  return
+{sleep_text};
 }}
-void sm_weak_expiry() {{
-{weak_expiry}}}
 void sm_modem_override(bool& modem_on) {{
 {modem_override}}}
-bool sm_poke_sleeps() {{ return {poke_sleep}; }}
 bool sm_poll_reaches_car() {{ return {poll_condition}; }}
 void sm_buffer(OBDVector& current_frame, bool frame_has_data) {{
   int g_geo_queued = 0, poll_geo = 0;
@@ -318,20 +361,17 @@ cur["restore"] = line(logger, RESTORE, PATHS["logger"])
 pin["restore"] = line(old_src["logger"], RESTORE, f"{PATHS['logger']} (SM_PIN)")
 if advance + cur["restore"] not in logger:
     sys.exit("FAIL: the marker restore must directly follow the streak advance in setup(), ahead of every sleep")
-cur["poke_sleep"] = line(logger, POKE_SLEEP, PATHS["logger"]).strip()[len("if ("):-len(") {")]
 cur["marker_set"] = line(logger, "    if (park_marker_owed) wdtStreakMarker(true);", PATHS["logger"])
-# Around the gate, from the tree for both sides: the weak-rail cold boot's window expiry (inside the poll block, after
-# the poll and before the poke's sleep) and every sleep's modem override for that wake.
-cur["weak_expiry"] = block(logger, WEAK_EXPIRY, PATHS["logger"])
+# loop()'s own sleeps (#29, 4b-ii) are pinned and compared (recipe, loop_sleeps): the weak-rail cold boot's window
+# expiry, inside the poll block after the poll and before the poke's sleep, ...
 if not logger.index(cur["marker_set"]) < find(logger, WEAK_EXPIRY, what=PATHS["logger"]) < logger.index(POKE_SLEEP):
     sys.exit("FAIL: the weak-rail window expiry must follow the poll's buffer and marker set, before the poke's sleep")
-# Its sibling (#104): a weak-rail cold boot whose cycle reads a rail at RAIL_AWAKE_VOLTS (the car switched on) sleeps,
-# so the next wake takes the normal path; a connected phone holds it only inside the key-reset window. Shared context
-# from the tree too. It must sit alone under #if ENABLE_IO36_RAIL (sm_weak_recovered keeps the guard) and directly
-# ahead of the expiry: only #endif and comments between, so it runs on every cycle the expiry does, after the poll, and
-# before the expiry can take the parked sleep.
+# ... and its sibling (#104): a weak-rail cold boot whose cycle reads a rail at RAIL_AWAKE_VOLTS (the car switched on)
+# sleeps, so the next wake takes the normal path; a connected phone holds it only inside the key-reset window. It must
+# sit alone under #if ENABLE_IO36_RAIL and directly ahead of the expiry: only #endif and comments between, so it runs on
+# every cycle the expiry does, after the poll, and before the expiry can take the parked sleep.
 recovered = find(logger, WEAK_RECOVERED, what=PATHS["logger"])
-cur["weak_recovered"] = block(logger, WEAK_RECOVERED, PATHS["logger"])
+weak_recovered = block(logger, WEAK_RECOVERED, PATHS["logger"])
 # The key-reset window that recovery waits out under a connected phone: the production predicate and its constant, from
 # the tree (auth_gate.h), over the harness's reset reason and millis().
 auth = tree("baseLogger/Helpers/auth_gate.h")
@@ -340,18 +380,16 @@ cur["auth_window"] = (line(auth, "static const uint32_t AUTH_RESET_WINDOW_MS = "
 lead_in = logger[:recovered].splitlines()
 while lead_in and lead_in[-1].lstrip().startswith("//"):
     lead_in.pop()
-gap = logger[recovered + len(cur["weak_recovered"]):find(logger, WEAK_EXPIRY, what=PATHS["logger"])].splitlines()
+gap = logger[recovered + len(weak_recovered):find(logger, WEAK_EXPIRY, what=PATHS["logger"])].splitlines()
 if (logger.count(WEAK_RECOVERED) != 1 or not lead_in or lead_in[-1] != "#if ENABLE_IO36_RAIL" or not gap
         or gap[0] != "#endif" or any(not l.lstrip().startswith("//") for l in gap[1:])):
     sys.exit("FAIL: the weak-rail recovery block must be the only one, under #if ENABLE_IO36_RAIL, directly ahead of "
              "the weak-rail window expiry (only #endif and comments between)")
-# loop()'s poll condition, from the tree for both sides too: the adapter counts a poll as reaching the car only when it
+# loop()'s poll condition, pinned and compared (recipe): the adapter counts a poll as reaching the car only when it
 # holds (sm_poll_reaches_car), so "a poll ran on a weak-rail wake" tests the firmware's own veto (#104), not a copy.
-# A plain && chain whose terms include the veto, guarding the lazy init and the bus read; see also the checks below.
+# In the tree, a plain && chain whose terms include the veto, guarding the lazy init and the bus read; see also below.
 poll_if = line(logger, POLL_IF, PATHS["logger"])
 poll_match = re.fullmatch(r"    if \((.*)\) \{\n", poll_if)
-if not poll_match or "||" in poll_match.group(1):
-    sys.exit(f"FAIL: loop()'s poll condition must be one line, `if (a && b && ...) {{`, a plain && chain: {poll_if!r}")
 if POLL_VETO not in [term.strip() for term in poll_match.group(1).split("&&")]:
     sys.exit(f"FAIL: loop()'s poll condition has no `{POLL_VETO}` term: a weak-rail cold boot would poll the car "
              f"during its BLE window (#104): {poll_if.strip()!r}")
@@ -359,7 +397,6 @@ poll_block = block(logger, poll_if, PATHS["logger"])
 for call in ("obd.initialize();", "current_frame = obd.readPIDs(PRINT);"):
     if call not in poll_block:
         sys.exit(f"FAIL: loop()'s poll condition must guard {call!r} (#104): the veto would not cover it")
-cur["poll_condition"] = poll_match.group(1)
 cur["modem_override"] = line(sleep, "  if (g_weak_rail_cold_boot) modem_on = false;", PATHS["sleep"])
 if SLEEP_REFUSAL + cur["modem_override"] not in sleep or sleep.count(SLEEP_REFUSAL) != 1:
     sys.exit("FAIL: enterDeepSleep's weak-rail modem override must directly follow the OTA/dump guard, ahead of every "
@@ -404,7 +441,11 @@ ALARM_BLOCKS = ("alarm",)
 # and the DC hold's helpers (pinned before, as drive and energy blocks) with the backstop and the delays (shared before)
 # into one compared block. The maintenance idle constant must match, as WEAK_RAIL_COLD_BOOT_AWAKE_MS does.
 LADDER_BLOCKS = ("machine",)
-PIN_BLOCKS = DRIVE_BLOCKS + ENERGY_BLOCKS + WAKE_BLOCKS + ALARM_BLOCKS + LADDER_BLOCKS
+# Step 4b-ii (#29) adds loop()'s own sleeps: the weak-rail window's recovery and expiry and the sample poke's sleep with
+# its SAMPLE_POLL line (shared before), the net-recover reboot, the SLEEP enter line's reason and loop()'s poll condition
+# (shared before), and the cadence reason's type.
+SLEEP_BLOCKS = ("loop_sleeps", "net_recover", "sleep_text", "poll_condition", "cadence")
+PIN_BLOCKS = DRIVE_BLOCKS + ENERGY_BLOCKS + WAKE_BLOCKS + ALARM_BLOCKS + LADDER_BLOCKS + SLEEP_BLOCKS
 old = dict(cur)
 for name in PIN_BLOCKS:
     old[name] = pin[name]
@@ -444,14 +485,16 @@ for macro in sorted(used):
 
 # The harness resets each firmware global to a literal; that literal must be the firmware's initialiser: in
 # the tree for all of them, and at SM_PIN too except those only the shared context reads (none since #29).
+# g_cadence_reason's type and initialiser come from each side's own definition (recipe's cadence), so it is exempt.
 SHARED_ONLY = ()
+OWN_DEFINITION = ("g_cadence_reason",)
 adapter = tree("tests/sm/adapter_pre.inc")
 for region, prefix in (("SM_RAM", ""), ("SM_RTC", "RTC_DATA_ATTR ")):
     body = re.search(rf"^#define {region}\(X\) \\\n((?:.*\\\n)*.*)", adapter, re.M).group(1)
     for type_, name, value in re.findall(r"X\(([\w ]+), (\w+), ([^)]+)\)", body):
         pattern = rf"^{prefix}(?:static )?(?:volatile )?{re.escape(type_)} {name} = {re.escape(value)};"
         for label, src in (("SM_PIN", old_src), ("tree", cur_src)):
-            if label == "SM_PIN" and name in SHARED_ONLY:
+            if (label == "SM_PIN" and name in SHARED_ONLY) or name in OWN_DEFINITION:
                 continue
             if not re.search(pattern, src["logger"] + src["sleep"] + src["alarm"], re.M):
                 sys.exit(f"FAIL: {region} {name} = {value} does not match its definition in logger.ino, "
@@ -634,10 +677,6 @@ ENERGY_CALL = (r"\b(?:energy[A-Z]\w*|resetChargeCorroboration|pdwActive|chargeSt
 ENERGY_UNEXTRACTED = (
     # setup()'s RTC sanitize: run_energy_checks.py pins it ahead of the streak advance; the adapter boots through it.
     ("logger", "chargeWakeStateSanitize(esp_reset_reason() == ESP_RST_DEEPSLEEP);", 1),
-    # The net-recover reboot: energy_checks runs that block whole.
-    ("logger", "pdwOpenWindow(); // the reboot ends this awake period", 1),
-    # The SAMPLE_POLL line's window minutes, a log field.
-    ("logger", "const unsigned pdw_left = pdwActive(pdw_now_us)", 1),
     # dcPromotePoke: run_energy_checks.py's Dongle runs it whole.
     ("logger", "energyOnPromote();", 1),
     ("logger", "if (!g_last_discharge_ms) energyOnDcRelease();", 1),
@@ -695,8 +734,6 @@ LADDER_UNEXTRACTED = (
     ("logger", "( millis() - last_poll ) > dcAwakeDelay(current_state, polling_delay)) {", 1),
     ("logger", "? getTransmissionDelay(ACTIVE) : dcAwakeDelay(current_state, transmission_delay);\n", 1),
     ("logger", "const bool dc_first_upload = dcAwakeHeld(current_state) && last_broadcast == 0;\n", 1),
-    # The sample poke's sleep: shared context (sm_poke_sleeps) until the sleep paths move (4b-ii).
-    ("logger", "    if (g_sample_poke && !maintenance_mode && !dcAwakeHeld(current_state)) {\n", 1),
     # The console's wake-up from an idle rung: review only.
     ("logging", "  if (current_state == CHARGING || current_state == STANDBY) {\n    changeState(ACTIVE);\n", 1),
 )
