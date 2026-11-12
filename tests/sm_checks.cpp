@@ -1,6 +1,7 @@
 // Differential checks for the park/drive decision and the poll-side energy block; built and run by
 // run_sm_checks.py, which writes the old_side.inc / cur_side.inc / field.inc files from the pinned commit and the
 // working tree.
+#include <algorithm>
 #include <cmath>
 #include <cstdarg>
 #include <cstdint>
@@ -236,9 +237,23 @@ template <class T> std::string text(const T& v) {
   else if constexpr (std::is_same<T, const char*>::value) return v ? '"' + std::string(v) + '"' : "(null)";
   else { std::ostringstream s; s.precision(17); s << +v; return s.str(); }  // + prints a uint8_t as a number
 }
+// #133 adds parked=<s> to CUR's backstop lines, where OLD has a bare "parked"; until the re-pin they compare without it.
+std::string unparked(std::string l) {
+  if (l.rfind("AWAKE_BACKSTOP ", 0) != 0 && l.rfind("MAX_AWAKE backstop:", 0) != 0) return l;
+  const size_t at = l.find("parked="), end = at == std::string::npos ? at : l.find('s', at);
+  if (end != std::string::npos) l.erase(at + 6, end + 1 - (at + 6));
+  return l;
+}
+bool sameLines(const std::vector<std::string>& a, const std::vector<std::string>& b) {
+  if (a == b) return true;
+  if (a.size() != b.size()) return false;
+  for (size_t i = 0; i < a.size(); ++i)
+    if (a[i] != b[i] && a[i] != unparked(b[i])) return false;
+  return true;
+}
 std::string firstLineDiff(const char* what, const std::vector<std::string>& a, const std::vector<std::string>& b) {
   for (size_t i = 0; i < std::max(a.size(), b.size()); ++i) {
-    const std::string x = i < a.size() ? a[i] : "<none>", y = i < b.size() ? b[i] : "<none>";
+    const std::string x = i < a.size() ? a[i] : "<none>", y = i < b.size() ? unparked(b[i]) : "<none>";
     if (x != y) return std::string(what) + "[" + std::to_string(i) + "]: OLD " + x + " | CUR " + y;
   }
   return {};
@@ -260,23 +275,52 @@ std::string difference(const sm_old::Snap& a, const sm_cur::Snap& b) {
       frames = fa[i][j].first == fb[i][j].first && same(fa[i][j].second, fb[i][j].second);
   }
   if (!frames) return "buffered frames: OLD " + std::to_string(fa.size()) + " | CUR " + std::to_string(fb.size());
-  if (sm_old::sm_log != sm_cur::sm_log) return firstLineDiff("logEvent", sm_old::sm_log, sm_cur::sm_log);
-  if (sm_old::sm_serial != sm_cur::sm_serial) return firstLineDiff("Serial", sm_old::sm_serial, sm_cur::sm_serial);
+  if (!sameLines(sm_old::sm_log, sm_cur::sm_log)) return firstLineDiff("logEvent", sm_old::sm_log, sm_cur::sm_log);
+  if (!sameLines(sm_old::sm_serial, sm_cur::sm_serial)) return firstLineDiff("Serial", sm_old::sm_serial, sm_cur::sm_serial);
   return {};
 }
 
 unsigned long events = 0;
 
-// One event through both sides, then equality and both sides' properties.
+/*
+  #133 is not on main, so SM_PIN still times the backstop from boot. The one difference accepted: a tick where OLD
+  takes the backstop and CUR, parked and awake under its ceilings, does not, with both sides' log and Serial lines
+  equal up to OLD's backstop lines. From there the trace runs CUR alone (sm_parted), under CUR's properties. The
+  re-pin that takes #133 deletes this.
+*/
+unsigned long parted_traces = 0;
+bool linesUpTo(const std::vector<std::string>& a, const std::vector<std::string>& b, size_t from, const char* marker) {
+  size_t i = from;
+  while (i < a.size() && a[i].rfind(marker, 0) != 0) ++i;
+  if (i == a.size() || b.size() < i || !std::equal(a.begin() + from, a.begin() + i, b.begin() + from)) return false;
+  return std::none_of(b.begin() + from, b.end(), [&](const std::string& l) { return l.rfind(marker, 0) == 0; });
+}
+bool intendedDifference(const SmEvent& e, const sm_old::Snap& old_pre, const sm_cur::Snap& cur_pre) {
+  const unsigned long parked = cur_pre.sm_parked_total + (cur_pre.is_currently_parked ? cur_pre.sm_now - cur_pre.sm_parked_at : 0);
+  return e.k == SmKind::TICK && !old_pre.sm_asleep && old_pre.sm_now > sm_cur::SM_MAX_AWAKE_MS &&
+         cur_pre.is_currently_parked && parked <= sm_cur::SM_MAX_AWAKE_MS && cur_pre.sm_now <= sm_cur::SM_ABSOLUTE_MS && sm_old::sm_asleep &&
+         sm_old::sm_sleep_reason == "backstop" && !(sm_cur::sm_asleep && sm_cur::sm_sleep_reason == "backstop") &&
+         linesUpTo(sm_old::sm_log, sm_cur::sm_log, old_pre.log_n, "AWAKE_BACKSTOP") &&
+         linesUpTo(sm_old::sm_serial, sm_cur::sm_serial, old_pre.serial_n, "MAX_AWAKE backstop:");
+}
+
+// One event through both sides, then equality and both sides' properties; once parted, CUR alone.
 void play(const SmEvent& e, std::vector<SmEvent>& trace, const sm_old::Snap& old_pre, const sm_cur::Snap& cur_pre) {
+  const bool parted = cur_pre.sm_parted;
   trace.push_back(e);
-  sm_old::step(e);
+  if (!parted) sm_old::step(e);
   sm_cur::step(e);
   events++;
-  if (const char* broken = sm_old::propertyBroken(old_pre, e)) fail(std::string("OLD property: ") + broken, trace);
+  if (!parted)
+    if (const char* broken = sm_old::propertyBroken(old_pre, e)) fail(std::string("OLD property: ") + broken, trace);
   if (const char* broken = sm_cur::propertyBroken(cur_pre, e)) fail(std::string("CUR property: ") + broken, trace);
+  if (const char* broken = sm_cur::fixPropertyBroken(cur_pre, e)) fail(std::string("CUR property: ") + broken, trace);
+  if (parted) return;
   const std::string diff = difference(sm_old::save(false), sm_cur::save(false));
-  if (!diff.empty()) fail("OLD and CUR differ at " + diff, trace);
+  if (diff.empty()) return;
+  if (!intendedDifference(e, old_pre, cur_pre)) fail("OLD and CUR differ at " + diff, trace);
+  sm_cur::sm_parted = true;
+  parted_traces++;
 }
 void play(const SmEvent& e, std::vector<SmEvent>& trace) { play(e, trace, sm_old::save(), sm_cur::save()); }
 
@@ -1035,6 +1079,7 @@ void playCur(const SmEvent& e, std::vector<SmEvent>& trace) {
   sm_cur::step(e);
   events++;
   if (const char* broken = sm_cur::propertyBroken(pre, e)) fail(std::string("CUR property: ") + broken, trace);
+  if (const char* broken = sm_cur::fixPropertyBroken(pre, e)) fail(std::string("CUR property: ") + broken, trace);
 }
 void startCur(std::vector<SmEvent>& trace) {
   trace.clear();
@@ -1171,9 +1216,10 @@ void rules() {
         "UNCONFIRMED frames carry no is_parked and owe no marker", t);
   check(logged("LEASH unconfirmed accel act=100% rail=13.50 obd=1 -> live location, no drivingState"),
         "the UNCONFIRMED line", t);
-  play(Advance(MAX_AWAKE_MS), t);
+  // Timed from boot: UNCONFIRMED is parked, so entering it from PARKED does not restart the ceiling (#133).
+  play(Advance(MAX_AWAKE_MS + 1000 - sm_now), t);
   play(Tick(), t);
-  check(sm_asleep && sm_sleep_reason == "backstop", "the max-awake backstop still applies to UNCONFIRMED", t);
+  check(sm_asleep && sm_sleep_reason == "backstop", "the max-awake backstop still applies to UNCONFIRMED, from boot", t);
   enterUnconfirmed();
   play(Advance(5000), t);
   play(Rules(fix(40.0), SM_CAR_RAIL, SM_MOVE_NOW, false), t);
@@ -2072,18 +2118,84 @@ void ladderGroup(int depth) {
   play(Advance(MAX_AWAKE_MS), t);
   play(Tick(), t);
   check(!sm_asleep && current_state == CHARGING, "the backstop exempts a held DC charge", t);
-  // An hour's drive that stops is slept by the backstop at its first parked tick, without waiting for the ladder.
-  start(t);
-  play(Poll(SM_SPEED, 50), t);
-  play(Advance(MAX_AWAKE_MS), t);
-  play(Poll(SM_SPEED, 50), t);
-  play(Tick(), t);
-  check(!sm_asleep, "the backstop never sleeps a driving car", t);
-  play(Advance(AT + 1), t);
-  play(Poll(SM_NONE, 0), t);
-  play(Tick(), t);
-  // #133: the backstop counts millis() since boot; its fix counts time parked and changes this.
-  check(sm_asleep && sm_sleep_reason == "backstop", "after a long drive the first parked tick takes the backstop (#133)", t);
+  // #133: the backstop counts the wake's parked time, every parked interval added up, and caps its time since boot at
+  // MAX_AWAKE_ABSOLUTE_MINUTES. CUR alone until SM_PIN has the fix. Noise is a motion tick a minute, which holds the
+  // leash in ACTIVE; the ceiling is judged a second either side.
+  const auto noiseUntil = [&](unsigned long until) {
+    while (!sm_asleep && sm_now + 60000 < until) {
+      playCur(Advance(60000), t);
+      playCur(Tick(true), t);
+    }
+    playCur(Advance(until - sm_now), t);
+    playCur(Tick(true), t);
+  };
+  const auto longDrive = [&] {
+    startCur(t);
+    playCur(Poll(SM_SPEED, 50), t);
+    playCur(Advance(MAX_AWAKE_MS), t);
+    playCur(Poll(SM_SPEED, 50), t);
+    playCur(Tick(), t);
+    check(!sm_asleep && !is_currently_parked, "the backstop never sleeps a driving car", t);
+    playCur(Advance(AT + 1), t);
+    playCur(Poll(SM_NONE, 0), t);
+    check(is_currently_parked && sm_freezes == 1, "an hour's drive re-latches parked", t);
+    return sm_now;
+  };
+  // (a) An hour's drive that stops runs the ladder to its own sleep.
+  longDrive();
+  for (int i = 0; i < 30 && !sm_asleep; ++i) {
+    playCur(Tick(), t);
+    playCur(Advance(60000), t);
+  }
+  check(sm_asleep && sm_sleep_reason.empty() && countLog("AWAKE_BACKSTOP") == 0,
+        "after an hour's drive the ladder runs to its own sleep, with no backstop (#133)", t);
+  // (b) A wake parked from boot, its leash refreshed by noise, still sleeps at the ceiling.
+  startCur(t);
+  noiseUntil(MAX_AWAKE_MS - 1000);
+  check(!sm_asleep && current_state == ACTIVE, "noise holds a wake parked from boot awake up to the ceiling", t);
+  noiseUntil(MAX_AWAKE_MS + 1000);
+  check(sm_asleep && sm_sleep_reason == "backstop", "and the backstop sleeps it at MAX_AWAKE_MINUTES from boot", t);
+  // (c) After a drive, noise: the backstop comes MAX_AWAKE_MINUTES after the re-latch, not after boot.
+  const unsigned long relatch = longDrive();
+  noiseUntil(relatch + MAX_AWAKE_MS - 1000);
+  check(!sm_asleep && current_state == ACTIVE && countLog("AWAKE_BACKSTOP") == 0,
+        "after a drive, noise holds the wake awake up to the ceiling from the re-latch (#133)", t);
+  noiseUntil(relatch + MAX_AWAKE_MS + 1000);
+  check(sm_asleep && sm_sleep_reason == "backstop", "and the backstop sleeps it MAX_AWAKE_MINUTES after the re-latch", t);
+  // (d) A DRIVING that is not a drive, about every 50 min, cannot restart the ceiling: a garbled speed poll, or GNSS
+  // drift on a car that answers OBD with a jolt. The parked minutes add up to the backstop; the DRIVING ones do not.
+  const unsigned long absolute_ms = (unsigned long)MAX_AWAKE_ABSOLUTE_MINUTES * 60000UL;
+  const auto flipping = [&](const SmEvent& flip, bool flip_when_parked, unsigned long& driving_ms) {
+    startCur(t);
+    unsigned long flipped_at = 0, flips = 0;
+    driving_ms = 0;
+    for (int m = 1; m <= 8 * 60 && !sm_asleep; ++m) {
+      playCur(Advance(60000), t);
+      const bool was_parked = is_currently_parked;
+      playCur(was_parked && (flip_when_parked || m % 50 == 0) ? flip : Poll(SM_NONE, 0), t);
+      if (was_parked && !is_currently_parked) flips++, flipped_at = sm_now;
+      if (!was_parked && is_currently_parked) driving_ms += sm_now - flipped_at;
+      if (!sm_asleep) playCur(Tick(true), t);
+    }
+    return flips;
+  };
+  const SmEvent speed_blip = Poll(SM_SPEED, 0.5);
+  const SmEvent gnss_blip = Rules(Poll(SM_NONE, 0, true, 40.0), SM_CAR_OBD, SM_MOVE_NOW, false);
+  for (const SmEvent* flip : {&speed_blip, &gnss_blip}) {
+    unsigned long driving_ms = 0;
+    const unsigned long flips = flipping(*flip, false, driving_ms);
+    check(flips >= 1 && driving_ms > 0 && sm_asleep && sm_sleep_reason == "backstop" && sm_now - driving_ms > MAX_AWAKE_MS &&
+          sm_now - driving_ms <= MAX_AWAKE_MS + 2 * 60000,
+          "a brief DRIVING every 50 min cannot restart the backstop: it sleeps at MAX_AWAKE_MINUTES of parked time", t);
+    check(countLog("AWAKE_BACKSTOP awake=") == 1 && std::any_of(sm_log.begin(), sm_log.end(), [](const std::string& l) {
+            return l.rfind("AWAKE_BACKSTOP awake=", 0) == 0 && l.find(" parked=") != std::string::npos;
+          }), "the backstop line gives the parked time beside the time awake", t);
+  }
+  // (e) A DRIVING after every parked minute keeps the parked total low: the absolute ceiling sleeps it, parked.
+  unsigned long driving_ms = 0;
+  check(flipping(speed_blip, true, driving_ms) > 10 && sm_asleep && sm_sleep_reason == "backstop" &&
+        sm_now - driving_ms < MAX_AWAKE_MS && sm_now > absolute_ms && sm_now <= absolute_ms + 8 * 60000,
+        "flips after every parked minute end at MAX_AWAKE_ABSOLUTE_MINUTES since boot", t);
   // A transfer or a phone that starts inside the motion window counts in the same pass: no backstop and no STANDBY
   // sleep under the transfer, the window counted as bypassed, and a phone connecting in it enters BLE at once.
   for (int during : {1, 2}) {
@@ -2239,5 +2351,11 @@ int main(int argc, char** argv) {
     std::cout << "PASS: ladder (handleActivityState whole: named rungs, depth " << depth << " over "
               << LADDER_ALPHABET.size() << " symbols, " << ladder_leaves << " sequences, 5 seeds x 500 x 40)\n";
   }
-  std::cout << "events compared: " << events << '\n';
+  std::cout << "events compared: " << events << ", traces parted at an intended difference (#133): " << parted_traces
+            << '\n';
+  // Exercised, and not so often that the differential's coverage is quietly lost (1330 of ~10 M events at 76b08ff).
+  if (group == "all" && depth == 5 && !(parted_traces > 0 && parted_traces < 5000)) {
+    std::cerr << "FAIL: traces parted at #133's difference out of bounds: " << parted_traces << '\n';
+    return 1;
+  }
 }

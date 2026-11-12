@@ -175,6 +175,9 @@ Check the rail before powering peripherals or issuing bus traffic.
   Risk: plugged-in preconditioning or V2L while the car is moved reads as a drive, which forces `is_charging` to 0
   (the latch releases, the CHARGING exit and DC hold are lost, the parked-only backstop is off), and GNSS drift can
   hold it past `ACTIVE_TIMER`. The car-on requirement for a DRIVING GNSS hold should land before or with this.
+- The max-awake backstop counts a wake's parked time, every parked interval added up (`driveParkedMs`, #133): a drive
+  does not count and a brief DRIVING cannot restart it. A parked check past `MAX_AWAKE_ABSOLUTE_MINUTES` (3 h)
+  since boot also trips it, which bounds a wake that keeps flipping to DRIVING.
 - `Helpers/energy_state.h` is the only writer of the charge latch, DC session, fast budget/cap, corroboration,
   follow-up and post-drive window state (#25); the gate's poll decision and the next-wake cadence are not yet its.
 - `Helpers/wake_gate.h` is setup()'s wake gate: a pure poll decision (`gateDecide`) and the only writer of the skip/poll

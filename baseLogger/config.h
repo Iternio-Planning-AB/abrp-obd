@@ -1009,9 +1009,17 @@ static_assert(CELL_WEAK_MAX_POST_BYTES <= CELL_MAX_POST_BYTES, "the weak-signal 
 // is held by the motion+speed leash; if something keeps it awake past this while the car is actually PARKED
 // (accel noise refreshing the leash, a wedged state, a connected-but-idle phone), force deep sleep so the 12V
 // can't drain. Gated on is_parked, so a genuinely long DRIVE (speed keeps us unlatched) is NEVER cut off; a
-// moving car re-wakes via WOM within a second. Raise if legit parked BLE sessions get cut; lower for a tighter
-// guard. This is the safety net behind the whole awake-latch/BLE design.
+// moving car re-wakes via WOM within a second. It counts the wake's parked minutes, every parked interval added
+// up (#133): a drive does not count, and a brief DRIVING (a garbled speed poll, GNSS drift on a car that answers)
+// cannot restart it. Raise if legit parked BLE sessions get cut; lower for a tighter guard. This is the safety
+// net behind the whole awake-latch/BLE design.
 #define MAX_AWAKE_MINUTES 60
+// The same backstop on minutes since boot, when parked at the check (same exemptions). The parked total bounds
+// the parked minutes but not the DRIVING ones between them, and each false DRIVING lasts ACTIVE_TIMER: a car that
+// flips every few minutes would stay up ~7x MAX_AWAKE_MINUTES, polled, with its ECUs awake. 3x caps that at 3 h
+// (~250 mAh of dongle at ~85 mA, plus the car) and spares any parked stop after up to ~2 h of driving; a stop
+// after a longer awake stretch (drive plus any DC hold) gets the backstop at its first parked check.
+#define MAX_AWAKE_ABSOLUTE_MINUTES (3 * MAX_AWAKE_MINUTES)
 
 #define API_KEY "e23e7564-b703-4ea5-b91b-de85e27717ee"
 

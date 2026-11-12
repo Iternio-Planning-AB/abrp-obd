@@ -292,17 +292,21 @@ LadderStep ladderStep(ActivityState state, const AwakeHolds& h, const AwakePhone
   it stays awake past MAX_AWAKE_MINUTES while the car is PARKED (accel noise refreshing the leash, a wedged state, or a
   connected-but-idle phone), force deep sleep so the 12V can't drain. Gated on the parked latch so a genuinely long
   DRIVE (speed keeps us unlatched) is NEVER cut off; a moving car re-wakes via WOM within a second.
-  Not during an OTA update or a log dump: awake_ms is time since boot, not idle time, so a transfer started late in a
-  long awake window (parked at a charger, or sitting in the car after a >55min drive) would be force-slept mid-flash /
-  mid-dump. It restricts nothing - a driving car is already exempt - and both transfers carry their own inactivity
-  timeouts (plus the OTA session cap) to bound the exposure.
+  parked_ms is the wake's parked time, every parked interval added up (driveParkedMs, #133): a drive does not count,
+  and a brief DRIVING cannot restart it. awake_ms (millis()) past MAX_AWAKE_ABSOLUTE_MINUTES also trips it, which
+  bounds a wake that flips between parked and DRIVING.
+  Not during an OTA update or a log dump: parked_ms is not idle time, so a transfer started late in a long parked
+  window (at a charger, or sitting in the car) would be force-slept mid-flash / mid-dump. It restricts nothing - a
+  driving car is already exempt - and both transfers carry their own inactivity timeouts (plus the OTA session cap)
+  to bound the exposure.
   A DC charge the hold would keep (DC_EARLY_HOLD, #128) is exempt, read as ACTIVE so the BLE state is too (its cadence
-  stays the app's): it often follows an hour's drive, and WAKE_CHARGING_MAX_MINUTES bounds it.
-  awake_ms: millis(), time awake this wake (a deep-sleep reboot resets it).
+  stays the app's); WAKE_CHARGING_MAX_MINUTES bounds it.
 */
-bool backstopDue(const AwakeHolds& h, ActivityState state, bool parked, bool dc_held, unsigned long awake_ms) {
+bool backstopDue(const AwakeHolds& h, ActivityState state, bool parked, bool dc_held, unsigned long parked_ms,
+                 unsigned long awake_ms) {
   return !h.maintenance && !h.ota && !h.dump && state != UNINITIALIZED && parked && !(DC_EARLY_HOLD && dc_held) &&
-         awake_ms > (unsigned long)MAX_AWAKE_MINUTES * 60UL * 1000UL;
+         (parked_ms > (unsigned long)MAX_AWAKE_MINUTES * 60UL * 1000UL ||
+          awake_ms > (unsigned long)MAX_AWAKE_ABSOLUTE_MINUTES * 60UL * 1000UL);
 }
 
 /*
@@ -347,11 +351,12 @@ void handleActivityState() {
   }
 
 #if ENABLE_SLEEP && ENABLE_MEMS
-  if (backstopDue(h, current_state, is_currently_parked, dcAwakeHeld(ACTIVE), millis())) {
-    Serial.printf("MAX_AWAKE backstop: awake %lus while parked -> forcing deep sleep\n", millis() / 1000UL);
+  if (backstopDue(h, current_state, is_currently_parked, dcAwakeHeld(ACTIVE), driveParkedMs(), millis())) {
+    Serial.printf("MAX_AWAKE backstop: awake %lus while parked=%lus -> forcing deep sleep\n", millis() / 1000UL,
+      driveParkedMs() / 1000UL);
 #if ENABLE_LOGGING
-    logEvent("AWAKE_BACKSTOP awake=%lus parked -> force deep sleep (ceiling=%dmin)",
-      millis() / 1000UL, MAX_AWAKE_MINUTES);
+    logEvent("AWAKE_BACKSTOP awake=%lus parked=%lus -> force deep sleep (ceiling=%dmin)",
+      millis() / 1000UL, driveParkedMs() / 1000UL, MAX_AWAKE_MINUTES);
 #endif
     pdwArmAtLadderEnd();
     enterDeepSleep(true, "backstop");

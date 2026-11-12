@@ -60,9 +60,11 @@ every sleep). A tick's detectMovement() is the event's motion with mems.h's stam
 inside it), and a sleep inside a tick ends it.
 
 The pin. SM_PIN is the main commit a step is measured against: a refactor step must leave both regions equal to
-it. Re-pin only when a behaviour change to a compared region lands on main between steps, to the merge-base of
-the step being measured; it is a commit on main, so it stays reachable. A clone without it fails with a message,
-never a skip.
+it. A behaviour fix not yet on main differs from it by design: sm_checks.cpp's intendedDifference() names each such
+difference exactly (#133), the trace runs CUR alone from there, and the fix's new RAM globals (SM_RAM_NEW) are not
+compared until the re-pin that takes it, after which this runner fails until they move into SM_RAM. Re-pin only when
+a behaviour change to a compared region lands on main between steps, to the merge-base of the step being measured;
+it is a commit on main, so it stays reachable. A clone without it fails with a message, never a skip.
 
 What it cannot prove: 32-bit millis() wrap (the host unsigned long is 64-bit); any feature-flag set other
 than the config.h defaults with PRINT 0 (lines under #if PRINT and other branches are not compiled); code
@@ -456,6 +458,10 @@ for region, prefix in (("SM_RAM", ""), ("SM_RTC", "RTC_DATA_ATTR ")):
             if not re.search(pattern, src["logger"] + src["sleep"] + src["alarm"], re.M):
                 sys.exit(f"FAIL: {region} {name} = {value} does not match its definition in logger.ino, "
                          f"sleep_power.h or alarm_gate.h ({label})")
+# The re-pin tripwire (#133): once SM_PIN defines a SM_RAM_NEW global, it moves into SM_RAM, to be compared.
+for name in re.findall(r"X\([\w ]+, (\w+), ", re.search(r"^#define SM_RAM_NEW\(X\) \\\n((?:.*\\\n)*.*)", adapter, re.M).group(1)):
+    if re.search(rf"\b{name}\b", old_src["logger"]):
+        sys.exit(f"FAIL: SM_PIN defines SM_RAM_NEW's {name}: move it into SM_RAM, where it is compared")
 
 
 
@@ -509,7 +515,7 @@ if (terms[-1] != "alarmGateAllowsPoll()" or len(reads) != 2 or len(outside) != 1
 # Blind spot: passing a field to a non-const reference parameter writes it unseen, as chargeCounterRose does inside
 # the energy owner; review must catch one outside it.
 DRIVE_STORAGE = ("is_currently_parked", "g_last_speed_ms", "park_marker_owed", "drive_unconfirmed", "g_drive_gnss_refused",
-                 "g_dc_release_polls", "g_dc_reset_logged")
+                 "g_dc_release_polls", "g_dc_reset_logged", "g_parked_since_ms", "g_parked_ms_total")
 ENERGY_STORAGE = ("charging_fast_minutes", "dc_session", "charging_cap_latched", "charge_uncorroborated_s",
                   "charge_corr_last_us", "charge_corr_soc_hw", "charge_corr_kwh_hw", "charge_corr_soe_hw",
                   "recently_charging", "taper_confirm_wakes", "charge_end_polled", "prev_charge_soc", "prev_parked_soc",

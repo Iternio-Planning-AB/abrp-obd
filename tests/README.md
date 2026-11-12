@@ -133,10 +133,9 @@ inside a tick ends it, as the device's never returns. `HOLD` is a tick under the
 tree's `enterDeepSleep` guard refuses (a property: the ladder never sleeps under a transfer); `LADDER` only forces a
 state change; `PHONE` connects a phone at a level (connected, authenticated, relaying); `MAINT` stamps
 `maintenance_since` as a console command does. The backstop properties run on ticks. The `ladder` group asserts the
-rungs in time on CUR (CHARGING lasting one tick, #129, and the backstop timed from boot, #133, pinned as they are until
-their fixes), a held DC charge in CHARGING and past the backstop, a phone at each level with the relayed handoff and
-a non-relaying reconnect, the ACTIVE -> BLE handshake grace, a console session holding STANDBY, and UNINITIALIZED
-past the ceiling, and an OTA update, a log dump or a phone starting inside a tick's motion window (counted in that
+rungs in time on CUR (CHARGING lasting one tick, #129, pinned as it is until its fix), a held DC charge in CHARGING
+and past the backstop, a phone at each level with the relayed handoff and a non-relaying reconnect, the ACTIVE -> BLE
+handshake grace, a console session holding STANDBY, and UNINITIALIZED past the ceiling, and an OTA update, a log dump or a phone starting inside a tick's motion window (counted in that
 pass); then every 5-event sequence over 18 ladder symbols and 2500 random ones, with reachability counters for
 each rung, the backstop, a refused sleep, the DC hold, a relayed handoff and the console's release. The runner fails if
 anything outside `state_machine.h` assigns `current_state`, `g_ble_session_relayed`, `g_ble_disconnect_ms`,
@@ -144,6 +143,12 @@ anything outside `state_machine.h` assigns `current_state`, `g_ble_session_relay
 helper, a shadowing local), or if a ladder call sits outside the compared blocks and its named sites. The module's
 `ladderStep` and `backstopDue` are pure, over the holds and the phone read once per pass; `run_energy_checks.py` asks
 `ladderStep` for its CHARGING rung and slices the backstop and the glue from its clock read on, as before.
+
+Since #133 the backstop counts the wake's parked time, all parked intervals added up, or time since boot past
+`MAX_AWAKE_ABSOLUTE_MINUTES`. The adapter records the re-latches and unlatches itself (`sm_parked_at`, `sm_parked_total`);
+CUR's firmware stamps must match it after every event (`fixPropertyBroken`). SM_PIN still has the old backstop, so
+`intendedDifference()` in `sm_checks.cpp` accepts that one difference and the trace runs CUR alone from there; the
+run fails if no trace or too many part. The re-pin moves `SM_RAM_NEW` into `SM_RAM` and deletes both.
 
 Since #83 the fast-cadence budget is checked as properties on both sides, against the adapter's own record: a poll on
 the charging branch (a fast tier, no cadence reason) never comes with the budget already at `WAKE_CHARGING_MAX_MINUTES`;
