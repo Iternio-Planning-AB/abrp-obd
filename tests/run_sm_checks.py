@@ -428,13 +428,23 @@ def defines(config):
     return found
 
 
-# Both sides compile against the tree's config.h, so every macro OLD uses must be byte-identical at the pin.
+# Both sides compile against the tree's config.h, so every macro OLD uses must be byte-identical at the pin. A macro
+# the tree removed, if allowlisted in PIN_ONLY_ALLOWED, is defined for OLD alone from its pinned config.h, around OLD's
+# side; a guard fails the compile if anything else still defines it there.
 old_defines, cur_defines = defines(old_src["config"]), defines(cur_src["config"])
 NAME = r"\b[A-Z][A-Z0-9_]{2,}\b"
-used, pending = set(), set(re.findall(NAME, "".join(pin[name] for name in PIN_BLOCKS)))
+PIN_ONLY_ALLOWED = {"CHARGING_TIMER"}
+used, pin_only, pending = set(), set(), set(re.findall(NAME, "".join(pin[name] for name in PIN_BLOCKS)))
 while pending:  # through the macros' own bodies: ENABLE_NETWORK is (ENABLE_CELL || ENABLE_WIFI)
     macro = pending.pop()
-    if macro in used or macro not in cur_defines:
+    if macro in used or macro in pin_only:
+        continue
+    if macro not in cur_defines:
+        if macro in old_defines:
+            if macro not in PIN_ONLY_ALLOWED:
+                sys.exit(f"FAIL: config.h {macro} is used at SM_PIN but gone from the tree; allowlist it in PIN_ONLY_ALLOWED or re-pin")
+            pin_only.add(macro)
+            pending |= set(re.findall(NAME, re.sub(r"^#define \w+", "", old_defines[macro])))
         continue
     used.add(macro)
     pending |= set(re.findall(NAME, re.sub(r"^#define \w+", "", cur_defines[macro])))
@@ -760,7 +770,10 @@ field = "".join(block(energy, f"const std::vector<Sample> {n} = ", "tests/energy
 compiler = shlex.split(os.environ.get("CXX", "clang++"))
 with tempfile.TemporaryDirectory(prefix="obd-sm-checks-") as temporary:
     build = Path(temporary)
-    (build / "old_side.inc").write_text(SIDE.format(motion_inputs=MOTION_INPUTS, **old))
+    (build / "old_side.inc").write_text("".join(f"#ifdef {m}\n#error {m} defined outside config.h\n#endif\n"
+                                                + old_defines[m] + "\n" for m in sorted(pin_only))
+                                        + SIDE.format(motion_inputs=MOTION_INPUTS, **old)
+                                        + "".join(f"#undef {m}\n" for m in sorted(pin_only)))
     (build / "cur_side.inc").write_text(SIDE.format(motion_inputs=MOTION_INPUTS, **cur))
     (build / "field.inc").write_text(field)
     executable = build / "sm_checks"

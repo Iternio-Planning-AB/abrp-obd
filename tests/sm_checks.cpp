@@ -2022,7 +2022,7 @@ void playLadder(const SmEvent& e, std::vector<SmEvent>& trace) {
   ladder_reach.backstop += sm_asleep && sm_sleep_reason == "backstop";
   ladder_reach.refused += e.k == SmKind::HOLD && pre.current_state == STANDBY && !sm_asleep;
   ladder_reach.held += pre.current_state == CHARGING && current_state == CHARGING && g_dc_confirmed &&
-                       sm_now - last_active > (unsigned long)(CHARGING_TIMER);
+                       sm_now - last_active > (unsigned long)(ACTIVE_TIMER);
   ladder_reach.relayed += pre.current_state == BLE && current_state != BLE && g_ble_disconnect_ms != pre.g_ble_disconnect_ms;
   ladder_reach.released += pre.maintenance_mode && !maintenance_mode;
 }
@@ -2049,8 +2049,8 @@ void ladderGroup(int depth) {
   play(Tick(), t);
   check(current_state == CHARGING && is_currently_parked, "ACTIVE_TIMER idle steps to CHARGING", t);
   play(Tick(), t);
-  // #129: CHARGING_TIMER is timed from ACTIVE_TIMER's leash; its fix times it from CHARGING's entry and changes this.
-  check(current_state == STANDBY, "CHARGING_TIMER runs from the same leash: STANDBY one tick later (#129)", t);
+  // CHARGING is a pass-through on ACTIVE_TIMER's leash.
+  check(current_state == STANDBY, "CHARGING passes through: STANDBY on the next tick", t);
   play(Hold(), t);
   check(!sm_asleep && current_state == STANDBY, "an OTA transfer refuses STANDBY's sleep, and the ladder waits", t);
   play(Tick(true), t);
@@ -2060,7 +2060,7 @@ void ladderGroup(int depth) {
   play(Tick(), t);
   play(Tick(), t);
   check(sm_asleep && sm_sleep_reason.empty() && sm_sleeps == 1, "STANDBY sleeps without a reason of its own", t);
-  // A held DC charge keeps CHARGING past CHARGING_TIMER; the backstop exempts it (DC_EARLY_HOLD).
+  // A held DC charge keeps CHARGING past its pass-through tick; the backstop exempts it (DC_EARLY_HOLD).
   start(t);
   play(DC_POLL, t);
   play(Advance(AT + 1), t);

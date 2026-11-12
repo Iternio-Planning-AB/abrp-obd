@@ -183,6 +183,10 @@ Check the rail before powering peripherals or issuing bus traffic.
   the session holds and the phone, each read once per pass (`AwakeHolds`: OTA, log dump, console; `AwakePhone`), and
   the only writer of the ladder state (#29). Both ladder sleeps arm the post-drive window first; `enterDeepSleep`
   still refuses any sleep during an OTA update or a log dump.
+- One leash times both idle stages: ACTIVE -> CHARGING after `ACTIVE_TIMER` (5 min) without motion or speed, and
+  CHARGING -> STANDBY -> sleep on the next pass. CHARGING is a pass-through that matters only for the DC hold (#129);
+  a second timer from its entry would double the post-drive awake tail the 12 V battery pays for, with more polls
+  of a switched-off car.
 - Bring BLE up before slow modem initialization. Suppress cellular only while `bleRelaying()` says
   the phone is the transport—not merely connected or, in v1, authenticated.
 - Normal sleep flushes/saves uploads, deinitializes BLE, powers down peripherals and arms wake sources.

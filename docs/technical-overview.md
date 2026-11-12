@@ -94,7 +94,7 @@ stateDiagram-v2
     BLE --> CHARGING : not relaying + idle for ACTIVE_TIMER
 
     CHARGING --> ACTIVE : motion returns
-    CHARGING --> STANDBY : idle for CHARGING_TIMER (5 min)
+    CHARGING --> STANDBY : next pass, unless a DC charge holds it
 
     STANDBY --> ACTIVE : motion returns
     STANDBY --> [*] : deep sleep until wake-on-motion or timer
@@ -278,7 +278,7 @@ during setup, and parked charge sampling is suppressed. The remaining limits for
 | `WAKE_CHARGING_MINUTES` / `WAKE_DC_CHARGING_MINUTES` | `3` / `1` | Faster cadence while AC / DC charging. |
 | `DC_CHARGING_AWAKE_SECONDS` | `30` s | Once a charge is confirmed DC, stay awake while the rail is up and poll and upload this often over one reused session instead of the 1-minute wake, through the taper and short silences. BLE, a low rail or the alarm flag pause it; the charge end, the cap or corroboration end it. Must stay under `SESSION_IDLE_MAX_MS` with a slow poll's margin. |
 | `MAX_AWAKE_MINUTES` | `60` | Hard backstop: force sleep after this even if something is holding it awake. |
-| `ACTIVE_TIMER` / `CHARGING_TIMER` | 5 / 5 min | Inactivity leashes between state transitions. |
+| `ACTIVE_TIMER` | 5 min | Idle this long: CHARGING, then STANDBY and sleep. A DC charge holds CHARGING. |
 | `CHARGE_END_POLL_FLOOR` | `12.2` V | After a charge, a rail between this and 13.0 V gets one final read, so the charge end and final SoC reach ABRP. |
 | `CHARGE_STREAM_CONFIRM_SECONDS` / `CHARGE_DISCHARGE_AMPS` | `180` s / `2.0` A | While awake and polling continuously, a charging reading counts only after this long without a discharge sample, so regen at the start of a drive is not reported as charging. |
 | `CHARGE_SILENT_HOLD_POLLS` | `4` | Polls the car doesn't answer that keep the charging latch, so the end of a charge is still read when the rail drops. With the rail high, silence never releases the latch. After this many polls it waits at the parked cadence instead. |
