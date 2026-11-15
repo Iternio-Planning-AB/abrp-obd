@@ -593,6 +593,42 @@
 // idle ~60 s dies); the runner and logger.ino assert it. Needs ENABLE_IO36_RAIL: without the rail it never holds.
 #define DC_CHARGING_AWAKE_SECONDS  30
 #define DC_CHARGING_POLL_MARGIN_MS 20000UL  // a slow poll: readPIDs timeouts plus the CSV row and log lines
+// An AC charge with the DC-DC up (rail at AC_HOLD_RAIL_VOLTS) stays awake too, polling this often and uploading every
+// AC_CHARGING_UPLOAD_SECONDS over one reused session. FIELD (Hologram, 11-14, Scenic AC): the 3-minute sleep loop paid a modem attach and a fresh TLS
+// open every wake, ~6.8 KB and one carrier session per 22 s wake, almost all of it handshake. A longer interval
+// cannot reuse the session (a cellular flow idle ~60 s dies, #8: SESSION_IDLE_MAX_MS), so it matches the 50 s driving
+// cadence, where reuse was measured: cycles land at 50-57 s. A slow poll can push one past SESSION_IDLE_MAX_MS and
+// reopen it (one handshake), as it can when driving, which is why this has no DC_CHARGING_POLL_MARGIN_MS bound. The
+// hold, its vetoes and its ends are the DC hold's; on a sample poke its fast budget counts elapsed time, not a
+// WAKE_CHARGING_MINUTES tier per poll, so an overnight charge reaches WAKE_CHARGING_MAX_MINUTES on the wall clock.
+// Unlike DC it does not skip the MAX_AWAKE_MINUTES backstop: one sleep of WAKE_CHARGING_MINUTES an hour is cheap
+// and keeps the glitch guard. 0 is the rollback to the 3-minute sleep loop, exactly as before.
+#ifndef AC_CHARGING_AWAKE_SECONDS
+#define AC_CHARGING_AWAKE_SECONDS  50
+#endif
+// A held AC charge polls every AC_CHARGING_AWAKE_SECONDS but uploads only this often, its points in one gzip batch
+// (an extra point costs ~100 B; the request around it ~1.2 KB). FIELD (11-14): the 50 s upload ran ~87 KB/h, close
+// to driving, for a charge that runs every night and is rarely watched live. Bench (11-14, Hologram, parked): a reused
+// SH session survived 110 s idle 3/3 and 70 s 3/3, raw TCP 100 s with no keepalive; the server closes an idle session
+// at 125-200 s. #8's failures past ~60 s were mostly driving, so the longer limit (AC_SESSION_IDLE_MAX_MS) applies only
+// to a held AC upload. About 40 KB/h. Set it to AC_CHARGING_AWAKE_SECONDS to upload every poll.
+#ifndef AC_CHARGING_UPLOAD_SECONDS
+#define AC_CHARGING_UPLOAD_SECONDS 110
+#endif
+// The session reuse limit for a held AC upload, in place of SESSION_IDLE_MAX_MS: one cycle plus a slow loop pass,
+// under the server's measured idle close (>= 125 s). A pass that runs past it reopens (one handshake) instead.
+#ifndef AC_SESSION_IDLE_MAX_MS
+#define AC_SESSION_IDLE_MAX_MS     120000UL
+#endif
+// The AC hold's rail floor (entry and veto), under DC_HOLD_RAIL_VOLTS. FIELD (11-14, Scenic AC 6.3 kW): the hold ran
+// on a depleted 12 V battery (DC-DC pushing above 13.2 V), but after a drive left it full the DC-DC floated at
+// 13.13-13.16 V through the same full-power charge, and a 13.2 V floor sent every poke back to sleep. With charge
+// evidence the voltage cannot tell float from a full battery at rest (~13.18-13.2 V), so this is only a safety floor:
+// a 12 V battery losing support while polls keep the car's ECUs awake falls below it within minutes, ending the hold.
+// The taper (~13.18 V) stays held; CHARGE_END reads the drop below RAIL_TAPER_FLOOR as before.
+#ifndef AC_HOLD_RAIL_VOLTS
+#define AC_HOLD_RAIL_VOLTS         RAIL_TAPER_FLOOR
+#endif
 // Charge power (kW) at or above which a session is treated as DC when the car does not say so itself.
 // Only consulted if the vehicle profile has no is_dcfc PID - the car's own word always wins.
 // Far above any AC session: three-phase 22 kW is the practical ceiling and a measured Scenic AC charge
@@ -665,6 +701,8 @@ static_assert(POST_DRIVE_RECHECK_MINUTES < POST_DRIVE_WINDOW_MINUTES ||
                                        // we never confirm-poll a weak/collapsing battery. Current sign decides.
 static_assert(DC_HOLD_RAIL_VOLTS <= RAIL_AWAKE_VOLTS && DC_HOLD_RAIL_VOLTS > RAIL_TAPER_FLOOR,
               "the DC hold's rail veto sits between the taper floor and the awake rail");
+static_assert(AC_HOLD_RAIL_VOLTS >= RAIL_TAPER_FLOOR && AC_HOLD_RAIL_VOLTS <= DC_HOLD_RAIL_VOLTS,
+              "the AC hold never runs below the taper floor, where the charge has most likely ended");
 // Charge-end read: when the rail falls below RAIL_TAPER_FLOOR with the latch still up, the charge has most
 // likely just ended, and without one more poll ABRP keeps the last CHARGING point until the next drive. FIELD
 // (Scenic, 2026-10-09): rail 13.17 -> 12.70 three minutes after a 20kW AC charge, the latch dropped silently,

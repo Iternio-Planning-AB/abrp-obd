@@ -280,10 +280,12 @@ EnergyPoll energyOnPoll(OBDVector& current_frame, int obd_count) {
     // A silent poll (CHARGE_SILENT_HOLD_POLLS) is not evidence the charge ended, so it holds the release. An
     // unconfirmed charging sample restarts it, so only consecutive non-charging samples release. Neither can
     // set the latch.
-    // Polled faster than its tier by a DC charge (g_dc_confirmed from the last poll), silence counts by time:
-    // one poll per WAKE_DC_CHARGING_MINUTES of it, the tolerance a 1-minute DC wake has, not one per 30 s poll.
-    const bool dc_silence = g_dc_confirmed && obd_count == 0;
-    const unsigned long dc_tier_ms = (unsigned long)WAKE_DC_CHARGING_MINUTES * 60000UL;
+    // Polled faster than its tier by a held charge (g_dc_confirmed or g_ac_confirmed from the last poll), silence
+    // counts by time: one poll per tier of it (WAKE_DC_CHARGING_MINUTES, or WAKE_CHARGING_MINUTES on AC), the
+    // tolerance a sleeping wake at that tier has, not one per held poll.
+    const bool dc_silence = (g_dc_confirmed || g_ac_confirmed) && obd_count == 0;
+    const unsigned long dc_tier_ms =
+      (unsigned long)(g_ac_confirmed ? WAKE_CHARGING_MINUTES : WAKE_DC_CHARGING_MINUTES) * 60000UL;
     // Started back-dated by the silent polls already counted (RTC, earlier wakes), so the count never goes down.
     if (!dc_silence) g_dc_silent_since_ms = 0;
     else if (!g_dc_silent_since_ms) g_dc_silent_since_ms = millis() - (unsigned long)charge_silent_polls * dc_tier_ms;
@@ -393,6 +395,8 @@ EnergyPoll energyOnPoll(OBDVector& current_frame, int obd_count) {
     if (!is_dcfc || dcfc_from_car) g_dc_inferred_polls = 0;
     else if (g_dc_inferred_polls < 255) g_dc_inferred_polls++;
     g_dc_confirmed = false;
+    const bool ac_was_held = g_ac_confirmed;
+    g_ac_confirmed = false;
     const unsigned long fast_anchor = g_fast_anchor_ms;
     g_fast_anchor_ms = 0;  // only an unbroken run of fast-cadence polls carries it
     if (!cadence_charging) {
@@ -452,17 +456,25 @@ EnergyPoll energyOnPoll(OBDVector& current_frame, int obd_count) {
       g_dc_confirmed = is_dcfc ||
         (dc_session && g_last_io36 >= DC_HOLD_RAIL_VOLTS && (charge_evidence || silent_hold));
       g_next_wake_minutes = g_dc_confirmed ? WAKE_DC_CHARGING_MINUTES : WAKE_CHARGING_MINUTES;
+#if AC_CHARGING_AWAKE_SECONDS > 0
+      // Not DC: stay awake at AC_CHARGING_AWAKE_SECONDS on the same terms, down to AC_HOLD_RAIL_VOLTS (a DC-DC at float
+      // with a full 12 V battery sits under DC_HOLD_RAIL_VOLTS). A rail under it ends the hold and leaves the 3-minute wake.
+      // Silence keeps a hold already running but never starts one: a silent poke sleeps (and retries, #131) as before.
+      g_ac_confirmed = !g_dc_confirmed && g_last_io36 >= AC_HOLD_RAIL_VOLTS &&
+        (charge_evidence || (silent_hold && ac_was_held));
+#endif
       // A held poke keeps its other one-shot inputs (see dcPromotePoke), but is no longer a taper confirm:
       // its later polls must not spend the stall budget.
-      if (g_dc_confirmed) g_taper_confirm = false;
+      if (g_dc_confirmed || g_ac_confirmed) g_taper_confirm = false;
       // Accumulate MINUTES, not wakes. The budget means "12 hours of fast cadence", and counting
       // wakes x WAKE_CHARGING_MINUTES only expressed that while there was a single fast tier - with a
       // 1-minute DC tier the same count would represent a third of the wall clock, so a long DC
       // session would latch back to the parked cadence three times sooner than intended.
       // A sample poke's poll counts its tier, held awake at DC_CHARGING_AWAKE_SECONDS too (the cap trips sooner).
       // A streaming wake (motion, a promoted poke) polls every few seconds, so after its first fast poll it counts
-      // the time it spent: someone moving about the car must not cap a charge.
-      if (g_sample_poke || !fast_anchor) {
+      // the time it spent: someone moving about the car must not cap a charge. So does a sample poke held by an AC
+      // charge: a tier per AC_CHARGING_AWAKE_SECONDS poll would cap an overnight charge in a few hours.
+      if ((g_sample_poke && !ac_was_held) || !fast_anchor) {
         charging_fast_minutes += (uint32_t)g_next_wake_minutes;
         g_fast_anchor_ms = millis();
       } else {

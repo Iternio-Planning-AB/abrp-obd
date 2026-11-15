@@ -44,7 +44,7 @@ the park/drive decision. The differential covers the drive region; shared contex
 tree. The blocks that write drive state (the poll-time unlatch and re-latch, the `is_parked` publish, the
 OTA/dump hold, `changeState`, the buffer block and the pre-sleep marker) come from the pinned `main` commit
 (`SM_PIN`, via `git show`) for OLD and from the working tree for CUR; the context around them (the
-backstop, the delays) comes from the working tree for both, so a deliberate change there does not fail it. Each
+backstop, the delays) comes from the working tree for both, so a deliberate change there does not fail it. The AC hold is newer than `SM_PIN`, so both sides compile with `-DAC_CHARGING_AWAKE_SECONDS=0`: equality proves its rollback is the old behaviour exactly, and the energy runner checks the hold itself. Drop the flag when re-pinning past it. Each
 side compiles into its own namespace around one harness (`tests/sm/`), and identical event sequences run
 through both: every sequence of 5 events over a
 15-symbol alphabet (about 760 k, a few seconds; `--depth 6` runs about 11 M in under a minute), 5000
@@ -227,7 +227,9 @@ Its `session` group (also part of `tls-ca`) runs the real `CellWrapper::connect(
 open/close/send: the production driving cadence plus one poll must not exceed `SESSION_IDLE_MAX_MS`, and the
 limit plus the measured connect-to-POST time must stay under the 61.3 s idle at which reused sessions failed
 in the field. Idle exactly the limit reuses (logged `reused idle=Ns`), 1 ms more reopens (`idle=Ns <trace>`,
-kept when that reopen fails), and a silent POST is http=0 with `p/a/r=1/1/255` and the retry opens fresh.
+kept when that reopen fails), and a silent POST is http=0 with `p/a/r=1/1/255` and the retry opens fresh. A held AC
+upload (`AC_SESSION_IDLE_MAX_MS`) reuses after an `AC_CHARGING_UPLOAD_SECONDS` cycle and at exactly its limit, and
+the same idle reopens once the driving limit is back.
 Run `python3 tests/run_gzip_container_checks.py` for the real `gzip_body.h` linked with the vendored
 zlib. What it covers:
 - the `libraries/zlib` SHA256SUMS drift check;
@@ -376,7 +378,7 @@ before `sys.begin()`; RTC retention and actual peripheral power remain hardware 
 (`dc-awake`: entry on the car's `is_dcfc` or inferred power, the per-charge DC latch through the taper, the
 time-based silent hold (a seeded hour of 60 % silence) and the backstop sleep, budget by elapsed time on motion wakes, the 30 s cadence outside BLE, the CHARGING hold and the sample-poke stay, the
 live rail/alarm vetoes (a fresh DC reading and the taper held at 13.25 V, vetoed `rail` at 13.15 V: `DC_HOLD_RAIL_VOLTS`), motion keeping the hold and promoting a held poke, every exit and its sleep tier, a new AC
-charge not latched, and the cadence kept under `SESSION_IDLE_MAX_MS`; and #128's timed awake ladder: the real
+charge not latched, and the cadence kept under `SESSION_IDLE_MAX_MS`; the AC hold (`acAwakeChecks`, `AC_CHARGING_AWAKE_SECONDS`): the held AC upload gate (`AC_CHARGING_UPLOAD_SECONDS`, `AC_SESSION_IDLE_MAX_MS`) by anchor, entry on an AC charge at the hold rail and at the field's 13.15 V float (`AC_HOLD_RAIL_VOLTS`) with the taper rail keeping it, a DC session sagging to 13.1 V falling to the AC hold, the 50 s cadence outside BLE, the sample-poke stay, an 8-hour charge held with its fast budget on the wall clock and the cap after it, the rail veto under `AC_HOLD_RAIL_VOLTS`, read live between polls, a running hold riding out silence for the 3-minute tier's tolerance then `parked-held`, a silent poke never starting one, the charge end, a drive and the alarm flag, the backstop still sleeping it, and the `AC_AWAKE` edge lines (the silent-retry acceptance compares a held retry with a held answered poll); and #128's timed awake ladder: the real
 `handleActivityState()` from its clock read on, ticked every 500 ms with loop()'s poll gate, through a drive past
 `MAX_AWAKE_MINUTES` then a DC charge with people in the car (no sleep path while held, the backstop at the unplug), a
 flagged car still backstopped, the rail drop and the charge end sleeping through the ladder, a phone connected past

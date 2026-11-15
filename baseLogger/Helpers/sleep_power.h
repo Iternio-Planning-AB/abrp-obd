@@ -85,8 +85,8 @@ void enterDeepSleep(bool modem_on, const char* reason = nullptr) {
   // teardown. Not "time to sleep": the peripherals' power-down and the sleep itself come after it. Also the loop
   // gap's closing visit (below).
   const uint32_t prep_start_ms = (uint32_t)millis();
-  // A sleep that ends a held DC charge with no poll to end it (the backstop, the NET-recover reboot).
-  if (g_dc_logged) logEvent("DC_AWAKE off reason=%s rail=%.2f", reason ? reason : "sleep", g_last_io36);
+  // A sleep that ends a held charge with no poll to end it (the backstop, the NET-recover reboot).
+  if (g_dc_logged) logEvent("%s off reason=%s rail=%.2f", g_ac_logged ? "AC_AWAKE" : "DC_AWAKE", reason ? reason : "sleep", g_last_io36);
 #endif
   sleepCount++;
   Serial.printf("Entering deep sleep (sleep #%lu). WOM threshold %.4fg (%d LSB), wake on GPIO%d HIGH.\n",

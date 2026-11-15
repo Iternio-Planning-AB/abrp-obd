@@ -155,6 +155,14 @@ Check the rail before powering peripherals or issuing bus traffic.
   A confirmed DC charge can stay awake at a 30 s cadence, bounded by rail, alarm, BLE, silence and
   charge budget/corroboration (`WAKE_CHARGING_MAX_MINUTES`); motion does not suspend it and the max-awake backstop
   skips it, in BLE too (`DC_EARLY_HOLD`, #128). AC does not acquire the DC session latch.
+- An AC charge with the rail at `AC_HOLD_RAIL_VOLTS` (13.0 V) stays awake too, polling every
+  `AC_CHARGING_AWAKE_SECONDS` (50) and uploading every `AC_CHARGING_UPLOAD_SECONDS` (110) as one gzip batch on one
+  reused session (`AC_SESSION_IDLE_MAX_MS` 120 s; driving keeps 57 s), instead of a 3-minute sleep loop that paid a
+  modem attach and a ~5 KB TLS open per sample. About 40 KB/h. Same vetoes and ends as the DC hold, but silence never
+  starts it, its fast budget counts elapsed time, and the `MAX_AWAKE_MINUTES` backstop still applies (one 3-minute
+  sleep an hour). Its rail floor is lower than DC's 13.2 V because a DC-DC floating a full 12 V battery sat at
+  13.13-13.16 V through a full AC charge; a battery losing support falls under 13.0 V and ends it. Lines read
+  `AC_AWAKE`. `0` is the rollback.
 - A DC charge right after a drive (#128): while DRIVING or UNCONFIRMED, `DC_RELEASE_POLLS` (3) polls in a row at DC
   power (a charging current at `DC_CHARGING_MIN_KW` by V x I, or the car's `is_dcfc`) re-latch PARKED and trust that
   poll's charge sample, so it publishes `is_charging`/`is_dcfc` and starts the hold. A speed other than a clean 0 or

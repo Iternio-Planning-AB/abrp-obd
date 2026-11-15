@@ -80,7 +80,9 @@ with tempfile.TemporaryDirectory(prefix="obd-upload-checks-") as temporary:
         section(cell, "bool CellWrapper::connect()", "void CellWrapper::restart()") +
         block(cell, "void CellWrapper::set_api_page(", "cellwrapper.cpp") +
         section(cell, "HttpResponse CellWrapper::sendBulk", "long CellWrapper::upForMs()"))
-    (build / "session_config.inc").write_text(section(config, "#ifndef SESSION_IDLE_MAX_MS", "#endif") + "#endif\n")
+    (build / "session_config.inc").write_text(section(config, "#ifndef SESSION_IDLE_MAX_MS", "#endif") + "#endif\n" +
+                                              section(config, "#ifndef AC_CHARGING_UPLOAD_SECONDS", "#endif") + "#endif\n" +
+                                              section(config, "#ifndef AC_SESSION_IDLE_MAX_MS", "#endif") + "#endif\n")
     (build / "cadence.inc").write_text(block(logger, "enum ActivityState {", "logger.ino").rstrip() + ";\n" +
                                        block(machine, "unsigned long getTransmissionDelay(", "state_machine.h") +
                                        block(machine, "unsigned long getPollingDelay(", "state_machine.h"))

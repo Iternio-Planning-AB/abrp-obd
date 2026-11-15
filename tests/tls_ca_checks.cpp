@@ -547,6 +547,25 @@ void session() {
     check(!cell.connect() && uart.replies.empty() &&
           cell.lastOpenTrace().rfind("idle=" + std::to_string(SESSION_IDLE_MAX_MS / 1000) + "s shconn ", 0) == 0,
           "a reopen that fails keeps its idle prefix: " + cell.lastOpenTrace());
+
+    // A held AC charge uploads every AC_CHARGING_UPLOAD_SECONDS under AC_SESSION_IDLE_MAX_MS (logger.ino sets it per
+    // upload): bench 11-14, a parked session reused after 110 s idle 3/3. Driving keeps SESSION_IDLE_MAX_MS.
+    const unsigned long ac_cycle_ms = (unsigned long)AC_CHARGING_UPLOAD_SECONDS * 1000UL + 5000UL;  // plus a poll
+    check(ac_cycle_ms <= AC_SESSION_IDLE_MAX_MS && AC_SESSION_IDLE_MAX_MS + PRESEND_MS < 125000UL,
+          "a held AC cycle reuses, and its POST goes out before the server's measured idle close");
+    sessionOpen(uart, false);
+    check(cell.connect() && cell.lastOpenTrace().rfind("ok ", 0) == 0, "a fresh session: " + cell.lastOpenTrace());
+    cell.set_session_idle_max_ms(AC_SESSION_IDLE_MAX_MS);
+    check(reusedAfter(cell, uart, ac_cycle_ms), "a held AC upload reuses the session: " + cell.lastOpenTrace());
+    check(reusedAfter(cell, uart, AC_SESSION_IDLE_MAX_MS), "so does one idle exactly the AC limit");
+    cell.set_session_idle_max_ms(SESSION_IDLE_MAX_MS);
+    check(sessionPost(cell, uart, true) == 200, "POST");
+    fake_ms += ac_cycle_ms;
+    push(uart, {OK}); // close()
+    sessionOpen(uart, false);
+    check(cell.connect() && uart.replies.empty() &&
+          cell.lastOpenTrace().rfind("idle=" + std::to_string(ac_cycle_ms / 1000) + "s ok ", 0) == 0,
+          "back on the driving limit, the same idle reopens: " + cell.lastOpenTrace());
 }
 
 int main(int argc, char** argv) {

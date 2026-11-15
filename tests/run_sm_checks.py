@@ -58,6 +58,9 @@ it. Re-pin only when a behaviour change to a compared region lands on main betwe
 the step being measured; it is a commit on main, so it stays reachable. A clone without it fails with a message,
 never a skip.
 
+The AC hold (AC_CHARGING_AWAKE_SECONDS) is compiled out (0, its rollback) on both sides until a re-pin past it; the
+hold's own behaviour is checked by tests/run_energy_checks.py (acAwakeChecks).
+
 What it cannot prove: 32-bit millis() wrap (the host unsigned long is 64-bit); any feature-flag set other
 than the config.h defaults with PRINT 0 (lines under #if PRINT and other branches are not compiled); code
 outside the extracted blocks (the rest of handleActivityState, dcPromotePoke and motion inside a wake, the
@@ -430,13 +433,15 @@ for macro in sorted(used):
 # The harness resets each firmware global to a literal; that literal must be the firmware's initialiser: in
 # the tree for all of them, and at SM_PIN too except maintenance_mode, which only the shared context reads.
 SHARED_ONLY = ("maintenance_mode",)
+# Globals the AC hold added after SM_PIN: checked against the tree only.
+NEW_SINCE_PIN = ("g_ac_confirmed", "g_ac_logged")
 adapter = tree("tests/sm/adapter_pre.inc")
 for region, prefix in (("SM_RAM", ""), ("SM_RTC", "RTC_DATA_ATTR ")):
     body = re.search(rf"^#define {region}\(X\) \\\n((?:.*\\\n)*.*)", adapter, re.M).group(1)
     for type_, name, value in re.findall(r"X\(([\w ]+), (\w+), ([^)]+)\)", body):
         pattern = rf"^{prefix}(?:static )?(?:volatile )?{re.escape(type_)} {name} = {re.escape(value)};"
         for label, src in (("SM_PIN", old_src), ("tree", cur_src)):
-            if label == "SM_PIN" and name in SHARED_ONLY:
+            if label == "SM_PIN" and (name in SHARED_ONLY or name in NEW_SINCE_PIN):
                 continue
             if not re.search(pattern, src["logger"] + src["sleep"] + src["alarm"], re.M):
                 sys.exit(f"FAIL: {region} {name} = {value} does not match its definition in logger.ino, "
@@ -499,7 +504,7 @@ ENERGY_STORAGE = ("charging_fast_minutes", "dc_session", "charging_cap_latched",
                   "charge_corr_last_us", "charge_corr_soc_hw", "charge_corr_kwh_hw", "charge_corr_soe_hw",
                   "recently_charging", "taper_confirm_wakes", "charge_end_polled", "prev_charge_soc", "prev_parked_soc",
                   "prev_parked_kwh", "prev_parked_soe", "charge_release_polls", "charge_silent_polls", "charge_followup",
-                  "pdw_open", "pdw_open_us", "pdw_polls", "charge_last_evidence_us", "g_dc_confirmed",
+                  "pdw_open", "pdw_open_us", "pdw_polls", "charge_last_evidence_us", "g_dc_confirmed", "g_ac_confirmed",
                   "g_dc_inferred_polls", "g_dc_silent_since_ms", "g_fast_anchor_ms", "g_last_discharge_ms",
                   "g_pdw_ladder_done", "g_pdw_recheck")
 # Step 4a (#26): the wake gate's persisted state. Not owned: the poke-lifetime flags g_sample_poke, g_taper_confirm and
@@ -686,7 +691,7 @@ setup_code = re.sub(r"//[^\n]*", "", block(logger, "void setup() {", PATHS["logg
 if setup_code.count("clockResync(") != 1 or "\n" + BOOT_RESYNC + "\n" not in setup_code:
     sys.exit(f"FAIL: setup() must call clockResync exactly once, as {BOOT_RESYNC.strip()!r}: a weak-rail cold boot "
              "must not send AT+CCLK? to a modem it never powered (#104)")
-if "if (!g_sample_poke || !g_dc_confirmed || !dcMotionRecent()) return;" not in promote:
+if "if (!g_sample_poke || !(g_dc_confirmed || g_ac_confirmed) || !dcMotionRecent()) return;" not in promote:
     sys.exit("FAIL: dcPromotePoke() must return unless g_sample_poke: its sys.gpsBegin() is exempt from the weak-rail "
              "veto only because a cold boot is never a sample poke (#104)")
 
@@ -712,6 +717,9 @@ with tempfile.TemporaryDirectory(prefix="obd-sm-checks-") as temporary:
         *compiler, "-std=c++17", "-O1", "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
         "-Wall", "-Wextra", "-Wno-unused-parameter", "-Wno-unused-variable", "-Wno-unused-function",
         "-Wno-unused-but-set-variable",
+        # The AC hold is newer than SM_PIN: both sides run its rollback, so equality proves 0 is the old behaviour
+        # exactly. The hold itself is tests/run_energy_checks.py's acAwakeChecks. Drop this when re-pinning past it.
+        "-DAC_CHARGING_AWAKE_SECONDS=0",
         "-I", str(root / "tests/sm"), "-I", str(root / "baseLogger/Helpers"), "-I", str(build),
         str(root / "tests/sm_checks.cpp"), "-o", str(executable),
     ], check=True)
