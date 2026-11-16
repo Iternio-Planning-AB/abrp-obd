@@ -23,7 +23,7 @@
 
 #include "../libraries/OBDWrapper/obd_vector.h"
 
-enum class SmKind { POLL, ADVANCE, LADDER, HOLD, SLEEP, WAKE, MAINT, CRASH, SETUP, TICK, PHONE };
+enum class SmKind { POLL, ADVANCE, LADDER, HOLD, SLEEP, WAKE, MAINT, CRASH, SETUP, TICK, PHONE, RECOVER };
 enum class SmTo { ACTIVE, BLE, CHARGING, STANDBY };
 enum { SM_NONE, SM_SPEED, SM_VRS, SM_BOTH };  // which speed keys the poll carries (BOTH: speed, then vrs)
 enum { SM_TIMER, SM_MOTION, SM_COLD };   // wake cause
@@ -69,6 +69,8 @@ struct SmEvent {
   OBDVector extra;  // further PIDs exactly as the car sends them, NaN included (#95's car flags)
   double poll_rail = NAN;  // the rail this cycle read; NaN keeps the last
   unsigned long fix_age_ms = 0;  // POLL: how old the GNSS fix is
+  bool transfer = false;  // POLL, RECOVER: a log dump starts during it, so its sleeps are refused
+  int recovers = 0;       // RECOVER: the modem's power-cycles since the last upload; -1 an upload succeeds
 };
 
 SmEvent Poll(int key, double speed, bool gnss = false, double kmh = 0, bool has_data = true, double speed2 = 0) {
@@ -204,6 +206,23 @@ SmEvent Setup() {
   return e;
 }
 SmEvent Leave() { return SmEvent{SmKind::SETUP, "PHONE-LEFT"}; }
+// The modem's power-cycles since the last upload reach n, and the net-recover escalation runs (#29, 4b-ii).
+SmEvent Recover(int n) {
+  SmEvent e{SmKind::RECOVER, "RECOVER(" + std::to_string(n) + ")"};
+  e.recovers = n;
+  return e;
+}
+SmEvent Uploaded() {
+  SmEvent e{SmKind::RECOVER, "UPLOAD(ok)"};
+  e.recovers = -1;
+  return e;
+}
+// A poll or a recover during which the BLE task starts a log dump: the sleeps after it are refused.
+SmEvent Dumping(SmEvent e) {
+  e.transfer = true;
+  e.name = "DUMP-STARTS:" + e.name;
+  return e;
+}
 
 namespace sm_old {
 #include "old_side.inc"
@@ -249,7 +268,9 @@ std::string firstLineDiff(const char* what, const std::vector<std::string>& a, c
 std::string difference(const sm_old::Snap& a, const sm_cur::Snap& b) {
   const auto& fa = sm_old::obd_result_vector;
   const auto& fb = sm_cur::obd_result_vector;
-#define SM_CMP(T, name, value) if (!same(a.name, b.name)) return #name ": OLD " + text(a.name) + " | CUR " + text(b.name);
+#define SM_CMP(T, name, value)                                                         \
+  if (!same(sm_old::smShow(a.name), sm_cur::smShow(b.name)))                           \
+    return #name ": OLD " + text(sm_old::smShow(a.name)) + " | CUR " + text(sm_cur::smShow(b.name));
   SM_RAM(SM_CMP) SM_RTC(SM_CMP) SM_STUB(SM_CMP) SM_WAKE(SM_CMP)
 #undef SM_CMP
   if (a.gps_speed != b.gps_speed) return "gps speed";
@@ -610,6 +631,8 @@ void scenarios() {
       next();
     }
   };
+  // The reason= the SLEEP enter line names for the sleep just taken (the sleep's own, else the cadence's, else its tier).
+  auto said = [&](const char* text) { return sm_asleep && sm_sleep_said == text; };
   auto bufferedHas = [&](const char* key, double value) {
     for (const auto& kv : obd_result_vector.back()) if (kv.first == key) return kv.second == value;
     return false;
@@ -620,13 +643,14 @@ void scenarios() {
   start(t);
   poke(Charge(-50, 380, 0.5));
   check(recently_charging && g_next_wake_minutes == WAKE_CHARGING_MINUTES && bufferedHas("is_charging", 1) &&
-        bufferedHas("is_dcfc", 0) && countLog("CHARGE 19.0kW (380.0V x -50.0A) -> AC") == 1, "an AC charge", t);
+        bufferedHas("is_dcfc", 0) && countLog("CHARGE 19.0kW (380.0V x -50.0A) -> AC") == 1 && said("charging"),
+        "an AC charge", t);
   poke(Charge(0.479));
   check(recently_charging && charge_release_polls == 1 && g_next_wake_minutes == WAKE_CHARGING_MINUTES,
         "one positive sample only starts the release", t);
   poke(Charge(0.479));
   check(!recently_charging && g_next_wake_minutes == WAKE_PARKED_MINUTES && charge_followup == 1 &&
-        countLog("FOLLOWUP armed (latch released)") == 1, "the second releases and arms the follow-up", t);
+        countLog("FOLLOWUP armed (latch released)") == 1 && said("parked"), "the second releases and arms the follow-up", t);
 
   // DC by power: two inferred polls latch the session, which holds DC through a taper below DC_CHARGING_MIN_KW;
   // the car's own is_dcfc=0 ends it.
@@ -660,8 +684,8 @@ void scenarios() {
     check(recently_charging && g_next_wake_minutes == WAKE_CHARGING_MINUTES, "a silent poll holds the charge", t);
   }
   poke(Silent());
-  check(recently_charging && g_next_wake_minutes == WAKE_PARKED_MINUTES && g_cadence_reason &&
-        std::string(g_cadence_reason) == "parked-held" && charge_release_polls == 0, "past the hold: parked-held", t);
+  check(recently_charging && g_next_wake_minutes == WAKE_PARKED_MINUTES && reasonIs("parked-held") && charge_release_polls == 0 &&
+        said("parked-held"), "past the hold: parked-held", t);
   // A pause keeps the charge's budget, cap and soc mark until its last evidence is CHARGE_STALE_RESET_MINUTES old.
   const uint64_t STALE_US = (uint64_t)CHARGE_STALE_RESET_MINUTES * 60000000ULL;
   auto stale = [&] { return esp_rtc_get_time_us() - charge_last_evidence_us >= STALE_US; };
@@ -706,7 +730,7 @@ void scenarios() {
     poke(Silent());
     if (esp_rtc_get_time_us() - pdw_open_us < WINDOW_US)
       check(pdw_open && pdw_polls == ++pdw_expected && g_next_wake_minutes == WAKE_CHARGING_MINUTES &&
-            std::string(g_cadence_reason) == "pdw", "a silent high-rail poke inside the window", t);
+            reasonIs("pdw") && said("pdw"), "a silent high-rail poke inside the window", t);
   }, "the window's end");
   check(pdw_expected >= 2 && g_next_wake_minutes == WAKE_PARKED_MINUTES &&
         countLog("POSTDRIVE window closed reason=expired") == 1, "the window expires, logged once", t);
@@ -725,8 +749,7 @@ void scenarios() {
     play(Advance(AT + 1), t);
     play(Ladder(SmTo::STANDBY), t);
     play(Sleep(), t);
-    check(sm_asleep && is_currently_parked && sm_armed_minutes == POST_DRIVE_RECHECK_MINUTES && g_cadence_reason &&
-          std::string(g_cadence_reason) == "pdw-recheck" && pdw_open &&
+    check(sm_asleep && is_currently_parked && sm_armed_minutes == POST_DRIVE_RECHECK_MINUTES && reasonIs("pdw-recheck") && said("pdw-recheck") && pdw_open &&
           countLog("POSTDRIVE window recheck wake=POWERON rail=12.42") == 1,
           "a ladder ending at a healthy low rail re-checks in POST_DRIVE_RECHECK_MINUTES", t);
     recheck_us = esp_rtc_get_time_us();
@@ -749,7 +772,7 @@ void scenarios() {
   until([&] { return !pdw_open; }, [&] {
     poke(Silent());
     if (pdw_open) {
-      check(sm_armed_minutes == WAKE_CHARGING_MINUTES && pdw_polls == ++recheck_polls && std::string(g_cadence_reason) == "pdw" &&
+      check(sm_armed_minutes == WAKE_CHARGING_MINUTES && pdw_polls == ++recheck_polls && reasonIs("pdw") &&
             esp_rtc_get_time_us() - recheck_us < (uint64_t)POST_DRIVE_WINDOW_MINUTES * 60000000ULL,
             "a silent high-rail re-check wake retries inside the window", t);
     }
@@ -773,7 +796,7 @@ void scenarios() {
   start(t);
   until([&] { return charging_cap_latched; }, [&] { poke(Charge(-50, 380, 0.5)); }, "the cap");
   check(charging_fast_minutes >= (uint32_t)WAKE_CHARGING_MAX_MINUTES && g_next_wake_minutes == WAKE_PARKED_MINUTES &&
-        std::string(g_cadence_reason) == "parked-cap", "the cap latches at the budget", t);
+        reasonIs("parked-cap") && said("parked-cap"), "the cap latches at the budget", t);
   poke(Charge(-50, 380, 0.5));
   check(charging_cap_latched && g_next_wake_minutes == WAKE_PARKED_MINUTES, "and stays latched while charging", t);
   // Answered pokes after the charge keep the cap until its last evidence is stale, then drop it.
@@ -802,8 +825,8 @@ void scenarios() {
   poke(Charge(0.479));
   check(!recently_charging && charging_cap_latched && charge_followup == 1, "released past the cap, follow-up armed", t);
   poke(Silent());
-  check(charging_cap_latched && g_next_wake_minutes == WAKE_CHARGING_MINUTES && g_cadence_reason &&
-        std::string(g_cadence_reason) == "followup" && charge_followup == 0, "one follow-up look past the cap", t);
+  check(charging_cap_latched && g_next_wake_minutes == WAKE_CHARGING_MINUTES && reasonIs("followup") && charge_followup == 0 &&
+        said("followup"), "one follow-up look past the cap", t);
   poke(Silent());
   check(g_next_wake_minutes == WAKE_PARKED_MINUTES, "and only one", t);
 
@@ -815,7 +838,7 @@ void scenarios() {
         "the poll that crosses CHARGE_CORROBORATE_MINUTES logs it, at the charging cadence still", t);
   poke(Charge(-50));
   check(countLog("CHARGE uncorroborated") == 1 && g_next_wake_minutes == WAKE_PARKED_MINUTES &&
-        std::string(g_cadence_reason) == "parked-uncorroborated", "the next one is slow, with no second line", t);
+        reasonIs("parked-uncorroborated") && said("parked-uncorroborated"), "the next one is slow, with no second line", t);
   poke(Charge(-50, NAN, 0.5));
   check(g_next_wake_minutes == WAKE_CHARGING_MINUTES && charge_uncorroborated_s == 0 &&
         countLog("CHARGE corroborated") == 1, "a soc rise restores it", t);
@@ -2171,6 +2194,200 @@ void ladderGroup(int depth) {
         "the console's release", t);
 }
 
+// ---- loop()'s own sleeps and the next sleep's cadence (#29, 4b-ii), equality throughout ----
+// The weak-rail window's recovery and expiry, the sample poke's sleep with its SAMPLE_POLL line, the net-recover reboot
+// and its bound, each refused under a log dump that starts during the cycle, and the reason= every sleep names.
+const SmEvent WEAK_BOOT = Wake(SM_COLD, 10.0f);
+const std::vector<SmEvent> SLEEPS_ALPHABET = {
+  Silent(), Silent(RAIL_AWAKE_VOLTS), Dumping(Silent(RAIL_AWAKE_VOLTS)), Charge(-50, 380, 0.5), DC_POLL,
+  Advance(10000), Advance(sm_cur::WEAK_RAIL_COLD_BOOT_AWAKE_MS), Phone(1), Phone(0), Maint(true), Recover(2),
+  Dumping(Recover(2)), Uploaded(), Sleep(), Wake(SM_TIMER, 13.6f), WEAK_BOOT, Tick(),
+};
+struct SleepsReach { unsigned recovered, expired, poke, held, refused, reboot, bounded; } sleeps_reach{};
+unsigned long sleeps_leaves = 0;
+void playSleeps(const SmEvent& e, std::vector<SmEvent>& trace) {
+  using namespace sm_cur;
+  const Snap pre = save(false);
+  play(e, trace);
+  if (pre.sm_asleep) return;
+  bool refused = false;
+  for (size_t i = pre.log_n; i < sm_log.size(); ++i)
+    refused |= !sm_asleep && (sm_log[i].rfind("WEAK-RAIL", 0) == 0 || sm_log[i].rfind("SAMPLE_POLL", 0) == 0 ||
+                              sm_log[i].rfind("NET recover exhausted", 0) == 0);
+  sleeps_reach.refused += e.transfer && refused;
+  sleeps_reach.recovered += sm_asleep && sm_sleep_reason == "weak-rail-recovered";
+  sleeps_reach.expired += e.k == SmKind::POLL && sm_asleep && pre.g_weak_rail_cold_boot && sm_sleep_reason.empty();
+  sleeps_reach.poke += e.k == SmKind::POLL && sm_asleep && pre.g_sample_poke;
+  sleeps_reach.held += e.k == SmKind::POLL && !sm_asleep && pre.g_sample_poke && g_dc_confirmed;
+  sleeps_reach.reboot += sm_asleep && sm_sleep_reason == "net-recover";
+  sleeps_reach.bounded += e.k == SmKind::RECOVER && e.recovers >= 2 && !e.transfer && !sm_asleep;
+}
+void enumerateSleeps(int depth, std::vector<SmEvent>& trace) {
+  if (depth == 0) { sleeps_leaves++; return; }
+  const sm_old::Snap old_node = sm_old::save();
+  const sm_cur::Snap cur_node = sm_cur::save();
+  for (const auto& e : SLEEPS_ALPHABET) {
+    sm_old::restore(old_node);
+    sm_cur::restore(cur_node);
+    playSleeps(e, trace);
+    enumerateSleeps(depth - 1, trace);
+    trace.pop_back();
+  }
+}
+// A power-on at a weak rail: the weak-rail cold boot's BLE window, with the key-reset window open.
+void startWeak(std::vector<SmEvent>& trace) {
+  trace.clear();
+  trace.push_back(WEAK_BOOT);
+  sm_old::powerOn(WEAK_BOOT);
+  sm_cur::powerOn(WEAK_BOOT);
+  const std::string diff = difference(sm_old::save(false), sm_cur::save(false));
+  if (!diff.empty()) fail("OLD and CUR differ at power-on: " + diff, trace);
+}
+void sleepsGroup(int depth) {
+  std::vector<SmEvent> t;
+  using namespace sm_cur;
+  auto said = [&](const char* text) { return sm_asleep && sm_sleep_said == text; };
+  auto last = [&](const std::string& prefix) {
+    for (size_t i = sm_log.size(); i-- > 0;) if (sm_log[i].rfind(prefix, 0) == 0) return sm_log[i];
+    return std::string();
+  };
+  // A sample poke: its one poll, a 5 s wait for the ECUs, the SAMPLE_POLL line, then the modem-on sleep with no reason
+  // of its own, on the cadence the poll armed.
+  start(t);
+  play(Sleep(), t);
+  play(Wake(SM_TIMER, 13.6f), t);
+  check(g_sample_poke && !sm_asleep, "harness: a high-rail timer wake is a sample poke", t);
+  const unsigned long polled = sm_now;
+  play(Charge(-50, 380, 0.5), t);
+  check(sm_asleep && sm_sleep_modem && sm_sleep_reason.empty() && said("charging") && sm_now >= polled + 5000 &&
+        sm_armed_minutes == WAKE_CHARGING_MINUTES &&
+        last("SAMPLE_POLL") ==
+          "SAMPLE_POLL pids=3 is_charging=1 prog=0 rel=0 taper=0 stall=0 rail=13.60->13.60 hold=0 sil=0 fu=0 pdw=0",
+        "a sample poke logs SAMPLE_POLL after its wait and sleeps, modem on, on the charging cadence", t);
+  check(sm_delays == 1, "the poke waits once", t);
+  // Held awake: by the console, or by a DC charge (dcAwakeHeld), which then sleeps on the DC tier.
+  play(Wake(SM_TIMER, 13.6f), t);
+  play(Maint(true), t);
+  play(Charge(-50, 380, 0.5), t);
+  check(!sm_asleep && countLog("SAMPLE_POLL") == 1, "a console session holds a poke awake, with no SAMPLE_POLL line", t);
+  start(t);
+  play(Sleep(), t);
+  play(Wake(SM_TIMER, 13.6f), t);
+  play(DC_POLL, t);
+  check(!sm_asleep && g_sample_poke && g_dc_confirmed && countLog("SAMPLE_POLL") == 0, "the DC hold keeps a poke awake", t);
+  play(Sleep(), t);
+  check(said("dc-charge") && sm_armed_minutes == WAKE_DC_CHARGING_MINUTES, "and its sleep names the DC tier", t);
+  // A dump the BLE task starts during the poke's poll refuses its sleep: the line is logged and the loop runs on.
+  start(t);
+  play(Sleep(), t);
+  play(Wake(SM_TIMER, 13.6f), t);
+  play(Dumping(Charge(-50, 380, 0.5)), t);
+  check(!sm_asleep && countLog("SAMPLE_POLL") == 1 && !g_logdump_active, "a dump refuses the poke's sleep", t);
+  play(Charge(-50, 380, 0.5), t);
+  check(said("charging") && countLog("SAMPLE_POLL") == 2, "and the next poll's poke sleep is taken", t);
+
+  // The weak-rail window, nobody coming: its expiry sleeps parked, modem off, with no reason of its own.
+  startWeak(t);
+  play(Advance(WEAK_RAIL_COLD_BOOT_AWAKE_MS + 1), t);
+  play(Silent(), t);
+  check(said("parked") && !sm_sleep_modem && sm_armed_minutes == WAKE_PARKED_MINUTES && sm_polls == 0 &&
+        countLog("WEAK-RAIL cold-boot BLE window expired (nobody connected) -> deep sleep 30min") == 1,
+        "the weak-rail window's expiry sleeps parked, modem off", t);
+  // Under a dump both sleeps are refused and the cycle runs on, the recovery's minutes armed; the next cycle sleeps.
+  startWeak(t);
+  play(Advance(10000), t);
+  play(Dumping(Silent(RAIL_AWAKE_VOLTS)), t);
+  check(!sm_asleep && g_next_wake_minutes == WEAK_RAIL_RECOVERED_WAKE_MINUTES &&
+        countLog("WEAK-RAIL cold boot ended: rail=13.30 (car awake) -> deep sleep 1min") == 1,
+        "a dump refuses the weak-rail recovery's sleep", t);
+  play(Advance(WEAK_RAIL_COLD_BOOT_AWAKE_MS), t);
+  play(Dumping(Silent(12.6)), t);
+  check(!sm_asleep && g_next_wake_minutes == WAKE_PARKED_MINUTES && countLog("WEAK-RAIL cold-boot BLE window expired") == 1,
+        "and the expiry's, which arms the parked cadence", t);
+  play(Silent(RAIL_AWAKE_VOLTS), t);
+  check(said("weak-rail-recovered") && !sm_sleep_modem && sm_armed_minutes == WEAK_RAIL_RECOVERED_WAKE_MINUTES &&
+        sm_polls == 0, "the next cycle takes the recovery, modem off, unpolled", t);
+
+  // A serial session (maintenance_mode) holds the weak-rail window open past its length, and the recovery too.
+  startWeak(t);
+  play(Maint(true), t);
+  play(Advance(WEAK_RAIL_COLD_BOOT_AWAKE_MS + 1), t);
+  play(Silent(), t);
+  check(!sm_asleep && countLog("WEAK-RAIL") == 0, "a console session holds the weak-rail window past its length", t);
+  play(Silent(RAIL_AWAKE_VOLTS), t);
+  check(!sm_asleep && countLog("WEAK-RAIL") == 0 && sm_polls == 0, "and the car switching on does not end it", t);
+
+  // A wake whose first poll names its cadence (pdw) and whose next takes the charging branch: the charging tier names
+  // itself again (SLEEP enter reason=charging), and a DC hold that a later charging poll ends says not-dc.
+  start(t);
+  play(Sleep(), t);
+  play(Wake(SM_MOTION, 13.6f), t);
+  play(Sleep(), t);
+  check(pdw_open, "harness: the ladder end opened the post-drive window", t);
+  play(Wake(SM_TIMER, 13.6f), t);
+  play(Maint(true), t);
+  play(Silent(), t);
+  check(!sm_asleep && reasonIs("pdw"), "a silent high-rail poke inside the window arms pdw", t);
+  play(Charge(-50, 380, 0.5), t);
+  check(!sm_asleep && !sm_cadence() && g_next_wake_minutes == WAKE_CHARGING_MINUTES,
+        "a later charging poll in the same wake arms the bare tier", t);
+  play(Sleep(), t);
+  check(said("charging"), "and its sleep says charging, not the earlier pdw", t);
+  play(Wake(SM_TIMER, 13.6f), t);
+  play(Maint(true), t);
+  play(Silent(), t);
+  play(DC_POLL, t);
+  check(!sm_asleep && dcAwakeHeld(current_state) && countLog("DC_AWAKE on") == 1, "harness: a held DC charge", t);
+  play(Charge(-30, NAN, 0.5, 14.4, NAN, 0), t);
+  check(!g_dc_confirmed && !sm_cadence() && countLog("DC_AWAKE off reason=not-dc") == 1,
+        "the car's is_dcfc=0 on a charging poll ends the hold as not-dc", t);
+
+  // The net-recover reboot: two fruitless modem power-cycles reboot through the normal sleep, modem on, in a minute,
+  // with the post-drive window decided first; twice per outage, then it buffers; an upload re-arms it.
+  start(t);
+  play(Recover(1), t);
+  check(!sm_asleep && net_reboot_count == 0, "one power-cycle is not exhausted", t);
+  play(Recover(2), t);
+  check(said("net-recover") && sm_sleep_modem && sm_armed_minutes == 1 && net_reboot_count == 1 &&
+        countLog("NET recover exhausted -> reboot via deep sleep (#1, 0 frames to backlog)") == 1 &&
+        countLog("POSTDRIVE window") == 1, "two power-cycles reboot through the sleep, the window decided first", t);
+  play(Wake(SM_MOTION, 13.6f), t);
+  play(Recover(2), t);
+  check(said("net-recover") && net_reboot_count == 2, "a second reboot in the same outage", t);
+  play(Wake(SM_MOTION, 13.6f), t);
+  play(Recover(2), t);
+  check(!sm_asleep && net_reboot_count == 2 && countLog("NET recover exhausted") == 2, "then no third", t);
+  play(Uploaded(), t);
+  play(Recover(2), t);
+  check(said("net-recover") && net_reboot_count == 1, "an upload re-arms it", t);
+  // Refused under a dump: counted and armed, and the loop runs on.
+  play(Wake(SM_MOTION, 13.6f), t);
+  play(Dumping(Recover(2)), t);
+  check(!sm_asleep && net_reboot_count == 2 && g_next_wake_minutes == 1 && !g_logdump_active,
+        "a dump refuses the reboot, which keeps its count and its minute", t);
+
+  startWeak(t);
+  enumerateSleeps(depth, t);
+  start(t);
+  enumerateSleeps(depth - 1, t);
+  for (uint32_t seed : {29u, 295u, 296u, 297u, 298u}) {
+    std::mt19937 rng(seed);
+    for (int sequence = 0; sequence < 500; ++sequence) {
+      if (sequence % 2) startWeak(t);
+      else start(t);
+      for (int i = 0; i < 40; ++i) {
+        const size_t pick = std::uniform_int_distribution<size_t>(0, SLEEPS_ALPHABET.size())(rng);
+        playSleeps(pick < SLEEPS_ALPHABET.size() ? SLEEPS_ALPHABET[pick]
+                                                 : Advance(std::uniform_int_distribution<unsigned long>(0, 400000)(rng)), t);
+      }
+    }
+  }
+  const SleepsReach& r = sleeps_reach;
+  check(r.recovered && r.expired && r.poke && r.held && r.refused && r.reboot && r.bounded,
+        "sleeps: generated traces reach the weak-rail recovery and expiry, a poke's sleep and its DC hold, a refused "
+        "sleep, the net-recover reboot and its bound", t);
+}
+
 int main(int argc, char** argv) {
   std::string group = "all";
   int depth = 5;  // caught every harness mutant that depth 6 did, in ~3 s; --depth 6 runs the 11 M sequences
@@ -2180,8 +2397,9 @@ int main(int argc, char** argv) {
     else group = arg;
   }
   if (group != "all" && group != "enumerate" && group != "random" && group != "scenarios" && group != "crash" &&
-      group != "rules" && group != "composition" && group != "dc" && group != "ladder") {
-    std::cerr << "unknown group " << group << " (all, enumerate, random, scenarios, crash, rules, composition, dc, ladder)\n";
+      group != "rules" && group != "composition" && group != "dc" && group != "ladder" && group != "sleeps") {
+    std::cerr << "unknown group " << group
+              << " (all, enumerate, random, scenarios, crash, rules, composition, dc, ladder, sleeps)\n";
     return 2;
   }
   using clock = std::chrono::steady_clock;
@@ -2238,6 +2456,12 @@ int main(int argc, char** argv) {
     ladderGroup(depth);
     std::cout << "PASS: ladder (handleActivityState whole: named rungs, depth " << depth << " over "
               << LADDER_ALPHABET.size() << " symbols, " << ladder_leaves << " sequences, 5 seeds x 500 x 40)\n";
+  }
+  if (group == "all" || group == "sleeps") {
+    sleepsGroup(depth);
+    std::cout << "PASS: sleeps (loop()'s sleeps and the net-recover reboot: named cases, depth " << depth << " and "
+              << depth - 1 << " over " << SLEEPS_ALPHABET.size() << " symbols, " << sleeps_leaves
+              << " sequences, 5 seeds x 500 x 40)\n";
   }
   std::cout << "events compared: " << events << '\n';
 }

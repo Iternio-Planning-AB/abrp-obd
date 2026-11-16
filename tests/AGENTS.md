@@ -38,7 +38,7 @@ is unreachable; `--require-live` makes that a failure. Do not mistake a skip for
 | --- | --- |
 | [GNSS parsing, location/heading, geo buffering](README.md#headinggps-and-release-tooling) | `run_heading_checks.py` |
 | [Clock trust, drift, NTP, target time bounds](README.md#send-once-geo-verification) | `run_clock_range_checks.py` |
-| [Drive/energy/wake/ladder differential and safety properties](README.md#state-machine-differential-harness) | `run_sm_checks.py` |
+| [Drive/energy/wake/ladder/sleep differential and safety properties](README.md#state-machine-differential-harness) | `run_sm_checks.py` |
 | [Charge, DC hold, crash streak, telemetry](README.md#energy-and-temperature-host-checks) | `run_energy_checks.py` |
 | [Upload queue/backlog](README.md#adaptive-upload-queue-checks-75), [signing and TLS](README.md#cellular-tls-trust-checks) | `run_upload_checks.py` |
 | [Modem registration, recovery and sleep](README.md#cellular-registration-host-checks) | `run_modem_checks.py` |
