@@ -53,6 +53,9 @@ worked, and what to do if it doesn't.
   30 minutes (more often while charging, and it stays awake on a DC fast charger) or when the car
   moves. It checks whether the car is awake before it asks it anything; the one exception is a single
   read right after a charge, so ABRP sees the charge end.
+- **Drives come from the car's speed.** For a car whose profile has no speed, the dongle uses GPS,
+  but only while the car's 12 V system shows it is switched on (above 13.3 V). Such a car whose 12 V
+  stays lower than that while driving can miss drives.
 - **It keeps a log** on the dongle itself, which the app can download. That log is how problems get
   found. It records where the car has been, so share it privately, never in a public issue.
 - **This is an active project.** The Bluetooth link is encrypted, and once set up only the dongle's
