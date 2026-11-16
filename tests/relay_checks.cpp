@@ -1,4 +1,5 @@
 // Relay acks (#90): run by tests/run_relay_checks.py, which extracts the production pieces this file includes.
+#include <algorithm>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -28,6 +29,7 @@ using json = nlohmann::json;
 using HeaderVector = std::vector<std::pair<std::string, std::string>>;
 #include "header_budget.inc"
 #include "ble_write_summary.h"
+#include "bond_prune.h"
 
 using portMUX_TYPE = int;
 #define portMUX_INITIALIZER_UNLOCKED 0
@@ -1093,6 +1095,65 @@ void replayFixture(const json& doc) {
                doc["steps"].size(), "the session runs " + session.dump());
 }
 
+// Bond pruning (#138). Each table is esp_ble_get_bond_device_list's, newest first (see bond_prune.h); `ranks` are the
+// entries' places in the authenticated-peer record (0 = owner, -1 = never passed ABD8). The result is what survives.
+std::vector<int> pruneTable(int num, int limit, std::vector<int> ranks = {}, const std::vector<int>& refused = {}) {
+  ranks.resize(num, -1);
+  std::vector<int> kept;
+  for (int i = 0; i < num; ++i) kept.push_back(i);
+  int asked = 0;
+  int removed = pruneBondList(num, limit, ranks.data(), [&](int i) {
+    ++asked;
+    check(i >= 0 && i < num, "pruneBondList asked for an entry outside the list");
+    if (std::find(refused.begin(), refused.end(), i) != refused.end()) return false;
+    auto at = std::find(kept.begin(), kept.end(), i);
+    check(at != kept.end(), "pruneBondList must ask for each entry at most once");
+    kept.erase(at);
+    return true;
+  });
+  check(removed == num - (int)kept.size(), "pruneBondList must return how many bonds it removed");
+  check(asked == removed + (int)(asked > removed), "pruneBondList must stop at the first refused removal");
+  return kept;
+}
+
+void bonds() {
+  using V = std::vector<int>;
+  // No peer recorded (the first boot of this build): recency decides, and the newest bond stays.
+  check(pruneTable(7, 4) == V({0, 1, 2}), "a 7-bond table with no record must keep its 3 newest bonds");
+  check(pruneTable(4, 4) == V({0, 1, 2}), "a full table must lose exactly one bond, the oldest");
+  check(pruneTable(3, 4) == V({0, 1, 2}), "a table below the cap must be left alone");
+  check(pruneTable(0, 4).empty(), "an empty table prunes nothing");
+  check(pruneTable(5, 0) == V({0, 1, 2, 3, 4}), "no cap prunes nothing");
+  check(pruneTable(3, 1) == V({0}), "even a cap of 1 keeps the newest bond when no owner is listed");
+  // Three phones that never authenticated bonded after the owner last connected: the owner stays.
+  check(pruneTable(4, 4, {-1, -1, -1, 0}) == V({0, 1, 3}), "a full table must keep the owner over newer unauthenticated bonds");
+  check(pruneTable(7, 4, {-1, -1, -1, 0, -1, -1, -1}) == V({0, 1, 3}), "the 7-bond table must keep the owner, whatever its age");
+  check(pruneTable(4, 1, {-1, -1, -1, 0}) == V({3}), "with the owner listed, recency protects nothing else");
+  // Unauthenticated bonds go before recorded non-owner peers, and those go oldest first.
+  check(pruneTable(6, 4, {1, -1, 0, 2, -1, -1}) == V({0, 2, 3}), "unauthenticated bonds must go before recorded peers");
+  check(pruneTable(5, 3, {2, 1, -1, 0, -1}) == V({0, 3}), "recorded peers must go least recently connected first, never the owner");
+  // The owner's bond is already gone: prune as if nothing were recorded, still preferring unauthenticated bonds.
+  check(pruneTable(5, 4, {-1, 1, -1, -1, 2}) == V({0, 1, 4}), "without the owner listed, unauthenticated bonds still go first");
+  check(pruneTable(3, 3, {-1, 1, 2}) == V({0, 1}), "without the owner listed, the newest bond is still kept");
+  check(pruneTable(3, 2, {1, 2, -1}) == V({0}), "without the owner listed, recorded peers go once the others are gone");
+  // A refused removal stops pruning: it never escalates to a bond ranked higher.
+  check(pruneTable(4, 4, {}, {3}) == V({0, 1, 2, 3}), "a refused removal must stop pruning");
+  check(pruneTable(7, 4, {}, {4}) == V({0, 1, 2, 3, 4}), "a refusal mid-prune keeps what was not yet removed");
+  // The record: newest first, an existing peer moves up, a new one drops the oldest, and only a change asks for a write.
+  BondAddr peers[BOND_AUTH_PEERS] = {};
+  int count = 0;
+  const BondAddr a = {1, 0, 0, 0, 0, 1}, b = {2, 0, 0, 0, 0, 2}, c = {3, 0, 0, 0, 0, 3}, d = {4, 0, 0, 0, 0, 4};
+  check(bondAuthNote(peers, count, a) && count == 1 && bondAuthRank(peers, count, a) == 0, "the first peer must become the owner");
+  check(!bondAuthNote(peers, count, a) && count == 1, "the owner authenticating again must not ask for a write");
+  check(bondAuthNote(peers, count, b) && bondAuthNote(peers, count, c) && count == 3, "new peers must be added");
+  check(bondAuthRank(peers, count, c) == 0 && bondAuthRank(peers, count, b) == 1 && bondAuthRank(peers, count, a) == 2,
+        "the record must be newest first");
+  check(bondAuthNote(peers, count, a) && bondAuthRank(peers, count, a) == 0 && bondAuthRank(peers, count, c) == 1 &&
+        bondAuthRank(peers, count, b) == 2 && count == 3, "a recorded peer authenticating must move to the front");
+  check(bondAuthNote(peers, count, d) && count == 3 && bondAuthRank(peers, count, d) == 0 && bondAuthRank(peers, count, b) == -1,
+        "a new peer on a full record must drop the oldest");
+}
+
 void fixtures() {
   const std::string build = BLE_PROTO_MIN == 0 ? "" : "-DBLE_PROTO_MIN=" + std::to_string(BLE_PROTO_MIN);
   std::vector<std::filesystem::path> files;
@@ -1518,7 +1579,7 @@ int main(int argc, char** argv) {
     {"negotiation", negotiation}, {"grant", grant}, {"nonce", nonce},
     {"stop-resume", stopResume}, {"mailbox", mailbox}, {"state", state}, {"subscribed-seq", subscribedSeq},
     {"seq-frame", seqFrame}, {"dump-cellular", dumpCellular}, {"unsubscribed", unsubscribedBound}, {"fixtures", fixtures},
-    {"enumerate", enumerateGroup},
+    {"bonds", bonds}, {"enumerate", enumerateGroup},
   };
 #else
   const std::vector<std::pair<std::string, void (*)()>> groups{{"no-protocol", noProtocol}, {"fixtures", fixtures}};

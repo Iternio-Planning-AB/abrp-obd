@@ -558,6 +558,8 @@ static void otaFinalize() {
   Serial.printf("OTA: committed, rebooting into new firmware\n");
   Serial.flush();
   delay(600);            // let the COMMITTED notify actually go out over the air before we reset
+  // No BLE deinit first: this wake's bond-recency order is not saved, which costs nothing the owner record keeps
+  // (bond_prune.h). Tearing Bluedroid down here would change the reboot's timing for that alone.
   wdtStreakEnd();
   esp_restart();         // never returns
 }

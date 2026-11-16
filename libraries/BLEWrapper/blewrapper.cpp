@@ -2,15 +2,39 @@
 #include "ble_write_summary.h"
 #include <stdarg.h>
 
-// The GATT interface and connection for ABD1's direct notify, captured on connect. Runs on the Bluedroid
-// task, so two plain stores and nothing else.
+// The GATT interface and connection for ABD1's direct notify, and the peer's address for
+// rememberAuthenticatedPeer, captured on connect. Runs on the Bluedroid task: stores and nothing else.
 static volatile uint16_t s_gatts_if = ESP_GATT_IF_NONE;
 static volatile uint16_t s_conn_id = 0;
+static esp_bd_addr_t s_peer_bda = { 0 };
+static uint32_t s_peer_conn = 0;
+static portMUX_TYPE s_peer_mux = portMUX_INITIALIZER_UNLOCKED;
 static void captureGattsConnection(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
                                    esp_ble_gatts_cb_param_t* param) {
   if (event != ESP_GATTS_CONNECT_EVT) return;
   s_conn_id = param->connect.conn_id;
   s_gatts_if = gatts_if;
+  portENTER_CRITICAL(&s_peer_mux);
+  memcpy(s_peer_bda, param->connect.remote_bda, sizeof(s_peer_bda));
+  s_peer_conn++;
+  portEXIT_CRITICAL(&s_peer_mux);
+}
+
+uint32_t BLEWrapper::connection_gen() {
+  portENTER_CRITICAL(&s_peer_mux);
+  uint32_t conn = s_peer_conn;
+  portEXIT_CRITICAL(&s_peer_mux);
+  return conn;
+}
+
+// The record of bonds whose peers passed ABD8 (bond_prune.h). In the auth namespace, so AUTHCLEAR forgets it with
+// the secret it was proved against.
+static int loadAuthPeers(BondAddr* peers) {
+  Preferences p;
+  if (!p.begin("auth", true)) return 0;
+  size_t n = p.getBytes(BOND_AUTH_PEERS_KEY, peers, sizeof(BondAddr) * BOND_AUTH_PEERS);
+  p.end();
+  return (int)(n / sizeof(BondAddr));
 }
 
 /*  
@@ -48,10 +72,12 @@ void BLEWrapper::init() {
     // "value between 7 and 16", which is a copy-paste error; setStaticPIN() in the same file passes masks.
     sec.setInitEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK); // keys the phone hands us
     sec.setRespEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK); // keys we hand the phone
-    // Prune BEFORE advertising, on the loop task, with nothing connected - see pruneBonds in blewrapper.h
-    // for why that placement removes the need for any "don't evict the active peer" logic.
-    int pruned = pruneBonds(bond_limit);
-    logEvt("SEC on: bonds=%d/%d pruned=%d", esp_ble_get_bond_device_num(), bond_limit, pruned);
+    // Prune BEFORE advertising, with nothing connected - see pruneBonds in blewrapper.h. Removal is queued to the
+    // BTC task, so `bonds` is the count before it.
+    int bonds = esp_ble_get_bond_device_num();
+    bool owner = false;
+    int pruned = pruneBonds(bond_limit, &owner);
+    logEvt("SEC on: bonds=%d/%d pruned=%d (queued) owner=%d", bonds, bond_limit, pruned, (int)owner);
   }
   // Our MTU ceiling, 247 = the largest value where every notification still fits ONE link-layer
   // radio packet (244B ATT payload + L2CAP/ATT headers = the 251B DLE maximum). This is a MEASURED
@@ -360,23 +386,71 @@ void BLEWrapper::deinit() {
   *_ENCRYPTED attribute (ABD7) returns ATT 0x05 and the phone pairs and retries by itself - one dialog.
   Do not reintroduce a peripheral-side push to "help" a phone pair; gate an attribute instead.
 */
-int BLEWrapper::pruneBonds(int limit) {
-  if (limit <= 0) return 0;
+int BLEWrapper::pruneBonds(int limit, bool* owner_listed) {
   int num = esp_ble_get_bond_device_num();
-  if (num < limit) return 0; // room for one more pairing - leave the table alone
+  if (num <= 0) return 0;
   esp_ble_bond_dev_t* list = (esp_ble_bond_dev_t*)malloc(sizeof(esp_ble_bond_dev_t) * num);
-  if (!list) return 0;
+  int* rank = (int*)malloc(sizeof(int) * num);
   int removed = 0;
-  if (esp_ble_get_bond_device_list(&num, list) == ESP_OK) {
-    // Evict from the front of whatever order the stack hands back (arbitrary, deliberately not "oldest
-    // first" - the stack stores no timestamps and an evicted phone just re-pairs silently). Stop as soon
-    // as one slot is free, so a full table costs exactly one eviction, not a wipe.
-    for (int i = 0; i < num && (num - removed) >= limit; i++) {
-      if (esp_ble_remove_bond_device(list[i].bd_addr) == ESP_OK) removed++;
+  if (list && rank && esp_ble_get_bond_device_list(&num, list) == ESP_OK) {
+    BondAddr peers[BOND_AUTH_PEERS];
+    int count = loadAuthPeers(peers);
+    for (int i = 0; i < num; i++) {
+      rank[i] = bondAuthRank(peers, count, list[i].bd_addr);
+      if (rank[i] == 0) *owner_listed = true;
+    }
+    if (num >= limit) {
+      removed = pruneBondList(num, limit, rank, [list](int i) { return esp_ble_remove_bond_device(list[i].bd_addr) == ESP_OK; });
     }
   }
+  free(rank);
   free(list);
   return removed;
+}
+
+void BLEWrapper::rememberAuthenticatedPeer(uint32_t conn) {
+  if (!bonding_enabled) return;
+  esp_bd_addr_t peer;
+  portENTER_CRITICAL(&s_peer_mux);
+  memcpy(peer, s_peer_bda, sizeof(peer));
+  bool same_link = s_peer_conn == conn;
+  portEXIT_CRITICAL(&s_peer_mux);
+  if (!same_link) {
+    logEvt("AUTH proof from an earlier connection - peer not recorded");
+    return;
+  }
+  int num = esp_ble_get_bond_device_num();
+  if (num <= 0) return;
+  esp_ble_bond_dev_t* list = (esp_ble_bond_dev_t*)malloc(sizeof(esp_ble_bond_dev_t) * num);
+  if (!list) return;
+  // The bond is listed under the peer's identity address. The connection reports that address once Bluedroid has
+  // resolved the peer's private address with its IRK; static_addr covers a bond listed under another address. A
+  // phone that pairs in this wake finds no match on any connection until the next BLE bring-up: within one
+  // Bluedroid lifetime its connections keep reporting the private address it paired from.
+  int found = -1;
+  if (esp_ble_get_bond_device_list(&num, list) == ESP_OK) {
+    for (int i = 0; i < num && found < 0; i++) {
+      if (memcmp(list[i].bd_addr, peer, sizeof(peer)) == 0 ||
+          ((list[i].bond_key.key_mask & ESP_LE_KEY_PID) && memcmp(list[i].bond_key.pid_key.static_addr, peer, sizeof(peer)) == 0)) {
+        found = i;
+      }
+    }
+  }
+  if (found < 0) {
+    free(list);
+    logEvt("AUTH peer has no bond listed - not recorded");
+    return;
+  }
+  BondAddr peers[BOND_AUTH_PEERS];
+  int count = loadAuthPeers(peers);
+  bool changed = bondAuthNote(peers, count, list[found].bd_addr);
+  free(list);
+  if (!changed) return; // already the owner: no flash write
+  Preferences p;
+  bool saved = p.begin("auth", false) && p.putBytes(BOND_AUTH_PEERS_KEY, peers, sizeof(BondAddr) * count) == sizeof(BondAddr) * count;
+  p.end();
+  if (saved) logEvt("AUTH peer recorded as owner (%d recorded)", count);
+  else logEvt("AUTH peer record write failed");
 }
 
 /*

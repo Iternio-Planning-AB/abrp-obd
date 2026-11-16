@@ -122,6 +122,26 @@ if "pTelemetryCccd" not in clear or "pSessionCharacteristic" not in clear:
 if not re.search(r'logEvt\("GATT handles', new_init[new_init.index("pService->start();"):]):
     fail("init() must log every characteristic's handle once the service has started")
 
+# Bond pruning (#138): the bonds group tests bond_prune.h; this keeps pruneBonds and the owner record on it.
+prune = code(block(wrapper, "int BLEWrapper::pruneBonds(int limit, bool* owner_listed) {", "blewrapper.cpp"))
+if not re.search(r"rank\[i\] = bondAuthRank\(peers, count, list\[i\]\.bd_addr\);", prune) or \
+        not re.search(r"pruneBondList\(num, limit, rank, \[list\]\(int i\) \{ return esp_ble_remove_bond_device\(list\[i\]\.bd_addr\)", prune) \
+        or "pruneBonds(bond_limit, &owner);" not in code(block(wrapper, "void BLEWrapper::init() {", "blewrapper.cpp")):
+    fail("init() must prune with bond_prune.h's pruneBondList, ranking each listed bond by the authenticated-peer record")
+if not re.search(r"bondAuthNote\(peers, count, list\[found\]\.bd_addr\)", code(block(wrapper, "void BLEWrapper::rememberAuthenticatedPeer(uint32_t conn) {", "blewrapper.cpp"))) \
+        or not re.search(r"authNotifyJson\(reply\);\s*if \(ble\.get_authenticated\(\)\) ble\.rememberAuthenticatedPeer\(cmd_conn\);",
+                         code((helpers / "auth_gate.h").read_text())) \
+        or len(re.findall(r"rememberAuthenticatedPeer\(", code(wrapper))) != 1:
+    fail("the owner record must come from the loop task after an ABD8 grant's reply, never from a Bluedroid callback")
+# ...and only for the connection that wrote the proof: the hook stamps it, and a later connect skips the record.
+hook = code(block((helpers / "auth_gate.h").read_text(), "void authGateHook(", "auth_gate.h"))
+remember = code(block(wrapper, "void BLEWrapper::rememberAuthenticatedPeer(uint32_t conn) {", "blewrapper.cpp"))
+if not find(hook, "g_auth_cmd_conn = ble.connection_gen();", what="authGateHook") < find(hook, "g_auth_cmd_present = true;", what="authGateHook") \
+        or "uint32_t cmd_conn = g_auth_cmd_conn;\n  g_auth_cmd_present = false;" not in code((helpers / "auth_gate.h").read_text()) \
+        or not find(remember, "bool same_link = s_peer_conn == conn;", what="rememberAuthenticatedPeer") < find(remember, "if (!same_link) {", what="rememberAuthenticatedPeer") < find(remember, "bondAuthNote(", what="rememberAuthenticatedPeer") \
+        or "s_peer_conn++;" not in code(block(wrapper, "static void captureGattsConnection(", "blewrapper.cpp")):
+    fail("a proof must record its own connection's peer only: stamp the connection in authGateHook, compare it before recording")
+
 # The cellular block runs whenever the phone is not the transport, relayed frame or not.
 relay_start = find(logger, "    if (ble_relayed) {", what="logger.ino")
 relay_end = find(logger, "\n    }\n", relay_start, "logger.ino")

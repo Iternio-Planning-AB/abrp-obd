@@ -10,6 +10,7 @@
 #include <Preferences.h>
 #include <ESP32Time.h>
 #include "../nlohmann/json.hpp"
+#include "bond_prune.h"
 
 using json = nlohmann::json;
 
@@ -295,6 +296,13 @@ public:
     so shipping these first means recovery is already in the field when the risk appears.
     Kept SEPARATE on purpose: a full bond table is a routine annoyance and must not cost authorization.
   */
+  /* After an ABD8 grant: record the connected peer's bond as the owner's (bond_prune.h), writing NVS only when that
+     changes, and only while connection_gen() is still `conn`, the connection that wrote the proof. Loop task only -
+     it reads the bond list and writes NVS. */
+  void rememberAuthenticatedPeer(uint32_t conn);
+  /* Counts GATT connects; any task may read it. */
+  static uint32_t connection_gen();
+
   /* Forget every bonded phone. Returns how many bonds were removed. The next connect re-pairs. */
   int clearAllBonds();
   /* Wipe the whole auth NVS namespace, returning the dongle to trust-on-first-use so the app can
@@ -338,11 +346,12 @@ private:
   bool bonding_enabled{ false };
   int bond_limit{ 0 };
 
-  /* Evict bonds until the table is below `limit`, returning how many went. Called from init() ONLY, and
-     that placement is what makes it safe: init() runs on the loop task (bond removal writes NVS, which
-     must never happen on the Bluedroid task) and nothing is connected yet, so it cannot possibly evict
-     the peer we are talking to - no exclusion logic needed. */
-  int pruneBonds(int limit);
+  /* Queue the eviction of bonds until the table is below `limit`, in bond_prune.h's order (the owner's bond is
+     kept), and return how many were queued; *owner_listed says whether the recorded owner has a bond. Called from
+     init() ONLY: nothing is connected yet, so it cannot evict the peer of a live session. It reads the record from
+     NVS, so it must not run on the Bluedroid task; the removals themselves run on the BTC task, which flushes
+     bt_config. */
+  int pruneBonds(int limit, bool* owner_listed);
 
   /* used for fast setup if nothing has changed */
   unsigned long crc_hash{ 0 };

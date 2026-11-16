@@ -50,10 +50,11 @@ if find(apply, "ble.commitHash(hash, true);", what="config apply") < find(apply,
 
 # Both key resets forget the stored push; the BLE one after the session grant is revoked.
 gate = code((root / "baseLogger/Helpers/auth_gate.h").read_text(), 'if (j.contains("authreset")) {', "auth_gate.h")
-forget = find(gate, 'if (!forgetProfile("authreset") || (p.isKey("secret") && !p.remove("secret"))) {',
+forget = find(gate, 'if (!forgetProfile("authreset") || (p.isKey(BOND_AUTH_PEERS_KEY) && !p.remove(BOND_AUTH_PEERS_KEY)) ||\n'
+                   '        (p.isKey("secret") && !p.remove("secret"))) {',
              find(gate, "ble.set_authenticated(false);", what="authreset"), "authreset")
-if gate.count('p.remove("secret")') != 1:
-    raise SystemExit("FAIL: the BLE key reset removes the key once, after the forget")
+if gate.count('p.remove("secret")') != 1 or gate.count("p.remove(BOND_AUTH_PEERS_KEY)") != 1:
+    raise SystemExit("FAIL: the BLE key reset removes the owner record and then the key, once each, after the forget")
 failed = find(gate, 'authNotifyJson("{\\"auth\\":\\"error\\"}");', forget, "authreset")
 if failed > find(gate, 'authNotifyJson("{\\"auth\\":\\"reset\\"}");', forget, "authreset"):
     raise SystemExit("FAIL: a key reset whose forget or key removal fails must answer error, not reset")
