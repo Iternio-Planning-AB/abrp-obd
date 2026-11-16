@@ -34,8 +34,9 @@ GateDecision gateDecide(const GateInputs& in) {
   // awake and WILL answer OBD with real data. This is the main parked-period data source. We sample ONCE
   // then sleep (g_sample_poke); the next wake re-checks the rail, so a charge is followed at the wake
   // cadence WITHOUT holding the car awake - we sleep between samples, so the rail can truthfully fall when
-  // the charge ends (a free exit, no rail-drop masking). A confirmed DC charge is the exception: it stays awake
-  // (DC_CHARGING_AWAKE_SECONDS) and every poll re-reads the rail that ends it.
+  // the charge ends (a free exit, no rail-drop masking). A held charge is the exception: a confirmed DC charge,
+  // or an AC charge with the DC-DC up, stays awake (DC_/AC_CHARGING_AWAKE_SECONDS) and every poll re-reads the
+  // rail that ends it.
   d.rail_awake = in.rail >= RAIL_AWAKE_VOLTS;
 
   // TAPER BRIDGE: the last poll saw charging but the rail has since dropped into the taper band (below

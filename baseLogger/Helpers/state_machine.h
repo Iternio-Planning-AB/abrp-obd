@@ -118,12 +118,15 @@ void changeState(ActivityState new_state) {
 bool alarmEnforced(); // alarm_gate.h is included after this file
 #endif
 
-// DC_CHARGING_AWAKE_SECONDS. Without DC_EARLY_HOLD, motion within an ACTIVE_TIMER suspends the hold.
+// The charge hold: a confirmed DC charge (DC_CHARGING_AWAKE_SECONDS) or an AC charge with the DC-DC up
+// (AC_CHARGING_AWAKE_SECONDS) stays awake; the dcAwake* names predate the AC hold. Without DC_EARLY_HOLD, motion
+// within an ACTIVE_TIMER suspends it.
 bool dcMotionRecent() { return g_last_motion_ms && millis() - g_last_motion_ms < (unsigned long)ACTIVE_TIMER; }
-// Why a confirmed DC charge does not hold the wake awake right now, read live on every use; null when it does.
+// Why a confirmed charge does not hold the wake awake right now, read live on every use; null when it does.
 const char* dcAwakeVeto(ActivityState state) {
   if (state == BLE) return "ble";                           // the phone's session keeps its own cadence
-  if (g_last_io36 < DC_HOLD_RAIL_VOLTS) return "rail";      // the DC-DC is not up
+  if (g_last_io36 < (g_ac_confirmed && !g_dc_confirmed ? AC_HOLD_RAIL_VOLTS : DC_HOLD_RAIL_VOLTS))
+    return "rail";                                          // the DC-DC is not up (AC: the battery is losing support)
 #if OBD_ALARM_GATE
   if (alarmEnforced()) return "alarm";                      // a flagged car is never held awake parked
 #endif
@@ -132,34 +135,44 @@ const char* dcAwakeVeto(ActivityState state) {
 #endif
   return nullptr;
 }
-bool dcAwakeHeld(ActivityState state) { return g_dc_confirmed && !dcAwakeVeto(state); }
-// A held charge polls and uploads every DC_CHARGING_AWAKE_SECONDS. Read at the poll and upload gates: the
-// state delays are snapshots taken at changeState(), and the hold changes between transitions.
+bool dcAwakeHeld(ActivityState state) { return (g_dc_confirmed || g_ac_confirmed) && !dcAwakeVeto(state); }
+// A held charge polls and uploads every DC_CHARGING_AWAKE_SECONDS (DC) or AC_CHARGING_AWAKE_SECONDS (AC). Read at
+// the poll and upload gates: the state delays are snapshots taken at changeState(), and the hold changes between
+// transitions.
 unsigned long dcAwakeDelay(ActivityState state, unsigned long state_delay) {
-  return dcAwakeHeld(state) ? (unsigned long)DC_CHARGING_AWAKE_SECONDS * 1000UL : state_delay;
+  if (!dcAwakeHeld(state)) return state_delay;
+  return (unsigned long)(g_dc_confirmed ? DC_CHARGING_AWAKE_SECONDS : AC_CHARGING_AWAKE_SECONDS) * 1000UL;
+  // The upload gate reads AC_CHARGING_UPLOAD_SECONDS for a held AC charge instead (logger.ino).
 }
 // Log the hold's edges: on every loop pass and after every poll, so a live veto is seen when it fires.
 void dcAwakeTrack() {
   const bool held = dcAwakeHeld(current_state);
   const char* veto = dcAwakeVeto(current_state);
 #if ENABLE_LOGGING
-  if (held && !g_dc_logged) {
-    logEvent("DC_AWAKE on rail=%.2f fast=%lumin", g_last_io36, (unsigned long)charging_fast_minutes);
+  // DC_AWAKE or AC_AWAKE: a held charge's kind, else the kind of the hold that just ended, else this poll's.
+  const bool ac = held ? !g_dc_confirmed : g_dc_logged ? g_ac_logged : g_ac_confirmed;
+  const char* tag = ac ? "AC_AWAKE" : "DC_AWAKE";
+  if (held && g_dc_logged && ac != g_ac_logged) {
+    logEvent("%s off reason=%s rail=%.2f", g_ac_logged ? "AC_AWAKE" : "DC_AWAKE", ac ? "ac" : "dc", g_last_io36);
+    logEvent("%s on rail=%.2f fast=%lumin", tag, g_last_io36, (unsigned long)charging_fast_minutes);
+  } else if (held && !g_dc_logged) {
+    logEvent("%s on rail=%.2f fast=%lumin", tag, g_last_io36, (unsigned long)charging_fast_minutes);
   } else if (!held && g_dc_logged) {
     g_dc_refused_logged = true;
-    const char* why = veto ? veto : g_cadence_reason ? g_cadence_reason : "not-dc";
+    const char* why = veto ? veto : g_cadence_reason ? g_cadence_reason : ac ? "not-charging" : "not-dc";
 #if ENABLE_MEMS
     if (veto && !strcmp(veto, "motion"))
-      logEvent("DC_AWAKE off reason=motion rail=%.2f peak=%.3f axmax=%.3f", g_last_io36, motion_window_peak,
+      logEvent("%s off reason=motion rail=%.2f peak=%.3f axmax=%.3f", tag, g_last_io36, motion_window_peak,
         motion_window_axmax);
     else
 #endif
-      logEvent("DC_AWAKE off reason=%s rail=%.2f", why, g_last_io36);
-  } else if (!held && g_dc_confirmed && veto && !g_dc_refused_logged) {
-    logEvent("DC_AWAKE refused reason=%s rail=%.2f", veto, g_last_io36);
+      logEvent("%s off reason=%s rail=%.2f", tag, why, g_last_io36);
+  } else if (!held && (g_dc_confirmed || g_ac_confirmed) && veto && !g_dc_refused_logged) {
+    logEvent("%s refused reason=%s rail=%.2f", tag, veto, g_last_io36);
     g_dc_refused_logged = true;
   }
 #endif
+  if (held) g_ac_logged = !g_dc_confirmed;
   g_dc_logged = held;
 }
 
@@ -215,9 +228,10 @@ void handleActivityState() {
   // car is already exempt via is_currently_parked - and both transfers carry their own inactivity
   // timeouts (plus the OTA session cap) to bound the exposure.
   // A DC charge the hold would keep (DC_EARLY_HOLD, #128) is exempt, read as ACTIVE so the BLE state is too (its cadence
-  // stays the app's): it often follows an hour's drive, and WAKE_CHARGING_MAX_MINUTES bounds it.
+  // stays the app's): it often follows an hour's drive, and WAKE_CHARGING_MAX_MINUTES bounds it. An AC hold is not
+  // (AC_CHARGING_AWAKE_SECONDS): its next wake is WAKE_CHARGING_MINUTES and the poke holds again.
   if (!maintenance_mode && !g_ota_active && !g_logdump_active && current_state != UNINITIALIZED &&
-      is_currently_parked && !(DC_EARLY_HOLD && dcAwakeHeld(ACTIVE)) &&
+      is_currently_parked && !(DC_EARLY_HOLD && g_dc_confirmed && dcAwakeHeld(ACTIVE)) &&
       millis() > (unsigned long)MAX_AWAKE_MINUTES * 60UL * 1000UL) {
     Serial.printf("MAX_AWAKE backstop: awake %lus while parked -> forcing deep sleep\n", millis() / 1000UL);
 #if ENABLE_LOGGING
@@ -280,7 +294,7 @@ void handleActivityState() {
   case CHARGING:
     // Removed the "connected -> BLE" revive: a connection ALONE must not pull us back to the awake state (that
     // was the stay-awake-while-connected behaviour). Real motion still revives; otherwise progress to sleep.
-    // A confirmed DC charge holds here, awake (DC_CHARGING_AWAKE_SECONDS); WAKE_CHARGING_MAX_MINUTES bounds it.
+    // A held charge stays here, awake (DC_ or AC_CHARGING_AWAKE_SECONDS); WAKE_CHARGING_MAX_MINUTES bounds it.
     if (active) {
       changeState(ACTIVE);
     } else if (now - last_active > CHARGING_TIMER && !dcAwakeHeld(current_state)) {

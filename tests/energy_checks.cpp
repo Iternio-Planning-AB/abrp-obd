@@ -81,6 +81,7 @@ struct ChargePoll {
   unsigned long g_last_discharge_ms = 0, now = 0;
   // The DC hold: the session latch (RTC), and the decision and its veto inputs (RAM).
   bool dc_session = false, g_dc_confirmed = false, g_dc_logged = false, g_dc_refused_logged = false, alarm = false;
+  bool g_ac_confirmed = false, g_ac_logged = false;  // the AC hold (AC_CHARGING_AWAKE_SECONDS)
   uint8_t g_dc_inferred_polls = 0;
   unsigned long g_dc_silent_since_ms = 0, g_fast_anchor_ms = 0;
   unsigned long g_last_motion_ms = 0, last_active = 0;
@@ -419,7 +420,7 @@ void pdwArmAtLadderEnd() {
 }
 std::vector<OBDVector> obd_result_vector;
 std::string slept, dc_off;
-bool g_dc_logged = false;
+bool g_dc_logged = false, g_ac_logged = false;
 void logSleep(bool modem_on, const char* reason) {
   bool modem_down = modem_on;
 #include "sleep_log.inc"
@@ -444,7 +445,8 @@ enum { UNINITIALIZED, ACTIVE, STANDBY } current_state = STANDBY;
 unsigned long millis() { return (MAX_AWAKE_MINUTES + 1) * 60UL * 1000UL; }
 struct { void printf(const char*, ...) {} } Serial;
 bool g_dc_confirmed = true;  // a DC charge whose hold has ended (here: no rail) is bounded by the backstop
-bool dcAwakeHeld(decltype(current_state)) { return false; }  // not held (no rail)
+bool hold_wanted = false;  // false: a hold that has ended (here: no rail)
+bool dcAwakeHeld(decltype(current_state)) { return hold_wanted; }
 void backstopSleep() {
 #include "backstop_sleep.inc"
 }
@@ -466,6 +468,18 @@ void checks() {
   check(dc_off.find("DC_AWAKE off reason=backstop ") == 0, "a backstop after a DC hold closes its DC_AWAKE line");
   g_dc_logged = false;
   check(g_next_wake_minutes == WAKE_CHARGING_MINUTES, "the backstop still ends the ladder with the post-drive window");
+  // A held DC charge skips the backstop (DC_EARLY_HOLD, #128); a held AC charge does not (AC_CHARGING_AWAKE_SECONDS).
+  hold_wanted = true;
+  slept.clear();
+  backstopSleep();
+  check(slept.empty() == (DC_EARLY_HOLD != 0), "a held DC charge skips the backstop");
+  g_dc_confirmed = false;
+  g_dc_logged = g_ac_logged = true;
+  backstopSleep();
+  check(has("reason=backstop ") && dc_off.find("AC_AWAKE off reason=backstop ") == 0,
+        "a held AC charge takes the backstop, and closes its AC_AWAKE line");
+  g_dc_logged = g_ac_logged = hold_wanted = false;
+  g_dc_confirmed = true;
   g_cadence_reason = "parked-held";
   g_next_wake_minutes = WAKE_PARKED_MINUTES;
   enterDeepSleep(true);
@@ -496,6 +510,7 @@ unsigned long now = 600000, g_last_motion_ms = 0;
 unsigned long millis() { return now; }
 ActivityState current_state = CHARGING;
 bool g_dc_confirmed = false, g_dc_logged = false, g_dc_refused_logged = false;
+bool g_ac_confirmed = false, g_ac_logged = false;
 float g_last_io36 = 14.9f, motion_window_peak = 0.21f, motion_window_axmax = 0.12f;
 uint32_t charging_fast_minutes = 7;
 const char* g_cadence_reason = nullptr;
@@ -523,6 +538,29 @@ void checks() {
   g_dc_confirmed = false;
   g_cadence_reason = "parked-cap";
   check(edge("DC_AWAKE off reason=parked-cap "), "a cadence decision names itself");
+  // The AC hold (AC_CHARGING_AWAKE_SECONDS) logs the same edges under its own name.
+  g_cadence_reason = nullptr;
+  g_dc_refused_logged = false;
+  g_ac_confirmed = true;
+  g_last_io36 = 12.9f;
+  check(edge("AC_AWAKE refused reason=rail "), "an AC poll that cannot hold says why, once");
+  g_last_io36 = 14.9f;
+  check(edge("AC_AWAKE on rail=14.90 fast=7min"), "the AC hold logs its start once");
+  g_ac_confirmed = false;
+  g_dc_confirmed = true;
+  const size_t before = lines.size();
+  dcAwakeTrack();
+  dcAwakeTrack();
+  check(lines.size() == before + 2 && lines[before].rfind("AC_AWAKE off reason=dc ", 0) == 0 &&
+        lines[before + 1].rfind("DC_AWAKE on ", 0) == 0, "an AC hold that turns DC closes one line and opens the other");
+  g_dc_confirmed = false;
+  g_cadence_reason = "parked-held";
+  check(edge("DC_AWAKE off reason=parked-held "), "and the DC line is the one that closes");
+  g_ac_confirmed = true;
+  g_cadence_reason = nullptr;
+  check(edge("AC_AWAKE on "), "an AC hold after it opens under its own name");
+  g_ac_confirmed = false;
+  check(edge("AC_AWAKE off reason=not-charging "), "an AC hold's end with no reason or veto says not-charging");
 }
 }  // namespace dc_track
 // The crash-loop guard: the real store and advance (Helpers/wdt_streak.h), the setup() accounting and the
@@ -1377,6 +1415,7 @@ struct Dongle : ChargePoll {
     g_next_wake_minutes = WAKE_PARKED_MINUTES;
     g_cadence_reason = nullptr;
     g_dc_confirmed = g_dc_logged = g_dc_refused_logged = ble_up = false;
+    g_ac_confirmed = g_ac_logged = false;
     g_dc_inferred_polls = 0;
     g_dc_silent_since_ms = g_fast_anchor_ms = 0;
     g_last_motion_ms = last_active = 0;
@@ -1831,7 +1870,7 @@ void dcLadderChecks() {
     town.charge(15, motion_ms);
     check(!town.asleep && town.heldFrom(town.firstHeld(from)), "a held DC charge with motion stays held and awake");
     const unsigned long ended = town.now;
-    if (rail_drop) town.charge(15, 0, 13.1f, -60);
+    if (rail_drop) town.charge(15, 0, AC_HOLD_RAIL_VOLTS - 0.05f, -60);
     else town.run(15 * 60000UL, UNPLUGGED);
     check(town.asleep && !town.sleep_reason && !town.dcAwakeHeld(town.current_state) &&
           town.now - ended <= (unsigned long)ACTIVE_TIMER + 5000,
@@ -1872,6 +1911,99 @@ void dcLadderChecks() {
         "a drive-away ends the hold at its first poll, at most one DC poll late, then polls at ACTIVE's cadence");
 }
 
+// The AC hold (AC_CHARGING_AWAKE_SECONDS): an AC charge with the DC-DC up stays awake on one reused session instead of
+// a 3-minute sleep loop that paid a modem attach and a TLS open per sample. The DC hold's vetoes and ends apply.
+void acAwakeChecks() {
+  static_assert(AC_CHARGING_AWAKE_SECONDS > 0, "the shipped build holds an AC charge awake");
+  const unsigned long ac_ms = AC_CHARGING_AWAKE_SECONDS * 1000UL;
+  const double AC = -12;  // 4.8 kW at 400 V
+  Dongle d;
+  d.wake(14.9f, dcFrame(30, AC));
+  check(d.polled && d.dcAwakeHeld(CHARGING) && d.g_ac_confirmed && !d.g_dc_confirmed && !d.dc_session &&
+        d.next == WAKE_CHARGING_MINUTES,
+        "an AC charge with the DC-DC up holds the dongle awake, and arms the 3-minute wake should the hold end");
+  check(d.dcAwakeDelay(CHARGING, 60000) == ac_ms && d.dcAwakeDelay(ACTIVE, 5000) == ac_ms &&
+        d.dcAwakeDelay(BLE, 3000) == 3000, "a held AC charge polls and uploads every AC_CHARGING_AWAKE_SECONDS; BLE keeps its own");
+  check(d.hold(dcFrame(30.2, AC)) && d.g_rail_before_poke == 14.9f, "it stays held, judging silence on the latest rail");
+  PokeEnd poke;
+  poke.g_ac_confirmed = true;
+  check(!poke.sleeps(), "a sample poke held by an AC charge stays awake");
+
+  // Overnight at the hold's real period: the fast budget counts the wall clock, not a 3-minute tier per poll.
+  Dongle night;
+  night.wake(14.9f, dcFrame(20, AC));
+  const uint32_t fast_at_entry = night.charging_fast_minutes;
+  const unsigned long entered = night.now;
+  double soc = 20;
+  bool all_held = true;
+  while (night.now - entered < 8UL * 3600000UL) all_held &= night.hold(dcFrame(soc += 0.05, AC));
+  const uint32_t spent = night.charging_fast_minutes - fast_at_entry, wall = (night.now - entered) / 60000UL;
+  check(all_held && spent + 1 >= wall && spent <= wall + WAKE_CHARGING_MINUTES,
+        "an 8-hour AC charge stays held, its fast budget counting the wall clock");
+  while (night.now - entered < 13UL * 3600000UL && night.hold(dcFrame(soc += 0.05, AC))) {}
+  check(!night.dcAwakeHeld(CHARGING) && night.reason("parked-cap") && night.now - entered >= 11UL * 3600000UL,
+        "WAKE_CHARGING_MAX_MINUTES still bounds it, on the wall clock");
+
+  // FIELD (11-14, Scenic): a full 12 V battery after a drive floated the DC-DC at 13.13-13.16 V through a 6.3 kW
+  // charge. A poke there starts the hold, which rides the taper (~13.18 V) under DC_HOLD_RAIL_VOLTS.
+  Dongle floated;
+  floated.wake(14.9f, dcFrame(30, AC));  // the latch, from an earlier poke
+  floated.next = WAKE_CHARGING_MINUTES;
+  floated.wake(13.15f, dcFrame(30.1, AC));
+  const bool float_held = floated.dcAwakeHeld(CHARGING) && floated.g_ac_confirmed;
+  check(float_held && floated.hold(dcFrame(30.2, AC), 13.14f) && floated.hold(dcFrame(30.3, AC), 13.18f),
+        "a poke at a DC-DC float of 13.15 V starts the AC hold, and the taper rail keeps it");
+  check(13.15f < DC_HOLD_RAIL_VOLTS && 13.15f >= AC_HOLD_RAIL_VOLTS, "the field float sits between the two floors");
+
+  // A rail under AC_HOLD_RAIL_VOLTS (the 12 V losing support) ends it, live, and leaves the 3-minute wake.
+  Dongle taper;
+  taper.wake(14.9f, dcFrame(30, AC));
+  const bool taper_held = taper.hold(dcFrame(30.2, AC), AC_HOLD_RAIL_VOLTS - 0.05f);
+  const char* veto = taper.dcAwakeVeto(CHARGING);
+  check(!taper_held && !taper.g_ac_confirmed && veto && !strcmp(veto, "rail") && taper.next == WAKE_CHARGING_MINUTES,
+        "a rail under AC_HOLD_RAIL_VOLTS ends the AC hold and leaves the 3-minute wake");
+  Dongle sag;
+  sag.wake(14.9f, dcFrame(30, AC));
+  sag.g_last_io36 = AC_HOLD_RAIL_VOLTS - 0.05f;  // between polls, as the loop's rail refresh reads it
+  const char* sag_veto = sag.dcAwakeVeto(CHARGING);
+  check(sag.g_ac_confirmed && sag_veto && !strcmp(sag_veto, "rail"), "the veto reads the AC floor live, between polls");
+  sag.g_last_io36 = 13.15f;
+  check(!sag.dcAwakeVeto(CHARGING), "a held AC charge is not vetoed at the float rail");
+
+  // A running hold rides out a silent car by the clock (CHARGE_SILENT_HOLD_POLLS 3-minute tiers), then waits parked.
+  Dongle quiet;
+  quiet.wake(14.9f, dcFrame(30, AC));
+  quiet.hold(dcFrame(30.2, AC));
+  const unsigned long quiet_from = quiet.now, tolerance = CHARGE_SILENT_HOLD_POLLS * WAKE_CHARGING_MINUTES * 60000UL;
+  for (int i = 0; i < 100 && quiet.hold({}); ++i) {}
+  // At most one tier late, as the DC hold's silence (the count is the elapsed tiers plus the poll that counts them).
+  check(quiet.now - quiet_from >= tolerance &&
+        quiet.now - quiet_from <= tolerance + WAKE_CHARGING_MINUTES * 60000UL + ac_ms + 5000 &&
+        quiet.reason("parked-held") && quiet.next == WAKE_PARKED_MINUTES && quiet.recently_charging,
+        "a silent car keeps the AC hold for the 3-minute tier's silence tolerance, then waits at the parked cadence");
+  // Silence never starts one: a latched charge whose next poke is silent sleeps (and may retry, #131) as before.
+  Dongle latched;
+  latched.wake(14.9f, dcFrame(30, AC));
+  latched.wake(14.9f, {});
+  check(latched.polled && !latched.dcAwakeHeld(CHARGING) && latched.recently_charging,
+        "a silent poke of a latched AC charge does not start the hold");
+
+  // The charge end, a drive and the alarm gate end or refuse it.
+  Dongle ended;
+  ended.wake(14.9f, dcFrame(30, AC));
+  check(!ended.hold({{"current", 0.4}, {"voltage", 400.0}, {"soc", 30.0}}) && ended.recently_charging &&
+        ended.next == WAKE_CHARGING_MINUTES, "an answered poll with no charge ends the hold; the release confirms on the 3-minute wake");
+  Dongle drive;
+  drive.wake(14.9f, dcFrame(30, AC));
+  drive.now += ac_ms;
+  drive.poll(dcFrame(30.2, AC), false);
+  check(!drive.g_ac_confirmed && !drive.dcAwakeHeld(CHARGING), "a drive ends it");
+  Dongle flagged;
+  flagged.alarm = true;
+  flagged.awake(14.9f, false, dcFrame(30, AC));
+  check(!flagged.dcAwakeHeld(CHARGING), "a flagged car is never held awake parked");
+}
+
 void dcAwakeChecks() {
   const unsigned long dc_ms = DC_CHARGING_AWAKE_SECONDS * 1000UL;
   for (const int car : {-1, 1}) {
@@ -1886,11 +2018,13 @@ void dcAwakeChecks() {
   Dongle glitch;
   glitch.wake(14.9f, dcFrame(30, -12));
   glitch.hold(dcFrame(30.3, -150));
-  check(!glitch.hold(dcFrame(30.6, -12)) && !glitch.dc_session && glitch.next == WAKE_CHARGING_MINUTES,
-        "one inferred DC frame in an AC charge latches nothing");
+  check(glitch.hold(dcFrame(30.6, -12)) == (AC_CHARGING_AWAKE_SECONDS > 0) && !glitch.g_dc_confirmed &&
+        !glitch.dc_session && glitch.next == WAKE_CHARGING_MINUTES,
+        "one inferred DC frame in an AC charge latches nothing (the AC hold, if built, keeps it awake as AC)");
   Dongle ac;
   ac.wake(14.9f, dcFrame(30, -12));
-  check(!ac.g_dc_confirmed && !ac.dc_session && ac.next == WAKE_CHARGING_MINUTES, "an AC charge keeps its 3-minute wake");
+  check(!ac.g_dc_confirmed && !ac.dc_session && ac.next == WAKE_CHARGING_MINUTES,
+        "an AC charge is never DC and arms its 3-minute wake should the hold end");
 
   // The cadence and the two places that would otherwise sleep.
   Dongle cadence;
@@ -2001,9 +2135,14 @@ void dcAwakeChecks() {
   check(stale.recently_charging && !stale.dc_session, "the stale reset drops the DC session with the old budget");
   stale.wake(14.9f, dcFrame(40, -12));
   check(!stale.g_dc_confirmed && stale.next == WAKE_CHARGING_MINUTES, "and the next AC charge is AC");
+  // Under DC_HOLD_RAIL_VOLTS a still-charging session is held as AC down to AC_HOLD_RAIL_VOLTS; under that it sleeps.
+  Dongle sagged = held();
+  check(sagged.hold(dcFrame(31, -60), 13.1f) && !sagged.g_dc_confirmed && sagged.g_ac_confirmed &&
+        sagged.dcAwakeDelay(CHARGING, 0) == (unsigned long)AC_CHARGING_AWAKE_SECONDS * 1000UL,
+        "a DC session's rail at 13.1 V falls to the AC hold");
   Dongle rail = held();
-  check(!rail.hold(dcFrame(31, -60), 13.1f) && rail.next == WAKE_CHARGING_MINUTES,
-        "a rail drop ends the session's hold and sleeps as before");
+  check(!rail.hold(dcFrame(31, -60), AC_HOLD_RAIL_VOLTS - 0.05f) && rail.next == WAKE_CHARGING_MINUTES,
+        "a rail drop under the AC floor ends the session's hold and sleeps as before");
   // A DC session holds down to DC_HOLD_RAIL_VOLTS, under RAIL_AWAKE_VOLTS (an MEB rail sat at 13.31 V on DC):
   // a fresh DC reading, and the taper under DC_CHARGING_MIN_KW.
   for (const float rail_v : {13.25f, 13.15f}) {
@@ -2016,13 +2155,15 @@ void dcAwakeChecks() {
           up ? "a DC reading at 13.25 V is held" : "a DC reading at 13.15 V is vetoed (rail), and keeps the 1-minute DC wake");
     check(rail_dc.g_rail_before_poke == rail_v, "a held poke judges silence on the latest rail, not the wake's");
     Dongle taper = held();
-    check(taper.hold(dcFrame(31, -60), rail_v) == up && taper.g_dc_confirmed == up &&
-          taper.next == (up ? WAKE_DC_CHARGING_MINUTES : WAKE_CHARGING_MINUTES),
-          up ? "the taper at 13.25 V stays DC" : "the taper at 13.15 V ends the hold");
+    const bool ac_built = AC_CHARGING_AWAKE_SECONDS > 0;
+    check(taper.hold(dcFrame(31, -60), rail_v) == (up || ac_built) && taper.g_dc_confirmed == up &&
+          taper.g_ac_confirmed == (!up && ac_built) && taper.next == (up ? WAKE_DC_CHARGING_MINUTES : WAKE_CHARGING_MINUTES),
+          up ? "the taper at 13.25 V stays DC" : "the taper at 13.15 V ends the DC hold (the AC hold, if built, keeps it)");
   }
   Dongle car_ac = held();
-  check(!car_ac.hold(dcFrame(31, -150, 0)) && !car_ac.dc_session && car_ac.next == WAKE_CHARGING_MINUTES,
-        "the car's is_dcfc=0 ends the session, over 60 kW");
+  check(car_ac.hold(dcFrame(31, -150, 0)) == (AC_CHARGING_AWAKE_SECONDS > 0) && !car_ac.g_dc_confirmed &&
+        !car_ac.dc_session && car_ac.next == WAKE_CHARGING_MINUTES,
+        "the car's is_dcfc=0 ends the session, over 60 kW (the AC hold, if built, keeps it awake as AC)");
   Dongle drive = held();
   drive.now += dc_ms;
   drive.poll(dcFrame(31), false);
@@ -2069,10 +2210,11 @@ void dcAwakeChecks() {
   drew.dcPromotePoke();
   check(!drew.g_sample_poke && !drew.poll(dcFrame(30.4)).charging, "a promote keeps a discharge seen this wake");
   Dongle unheld;
-  unheld.wake(14.9f, dcFrame(30, -12));
+  // Not charging (an AC charge is held too, AC_CHARGING_AWAKE_SECONDS).
+  unheld.wake(14.9f, {{"current", 0.3}, {"voltage", 400.0}, {"soc", 30.0}});
   unheld.g_last_motion_ms = unheld.now;
   unheld.dcPromotePoke();
-  check(unheld.g_sample_poke && !unheld.ble_up, "a poke no DC charge holds is not promoted; it sleeps as before");
+  check(unheld.g_sample_poke && !unheld.ble_up, "a poke no charge holds is not promoted; it sleeps as before");
   // A drive off a promoted poke on a car with no speed PID: its first discharge ends the hold.
   Dongle regen = held();
   regen.g_last_motion_ms = regen.now;
@@ -2229,19 +2371,29 @@ void silentRetryChecks() {
   const std::string after = "OBD retry after " + std::to_string(OBD_SILENT_RETRY_SECONDS) + "s -> ";
 
   // Acceptance 1: silent, then the retry answers a charge: the charge cadence starts, as one answered poll starts it.
+  // An AC charge is held awake (AC_CHARGING_AWAKE_SECONDS), so both are compared right after their answering poll.
   Poke<OBD_SILENT_RETRY_SECONDS> resumed(14.9f, {SILENT, CHARGE});
   Poke<0> answered(14.9f, {CHARGE});
-  resumed.go(5 * minute);
-  answered.go(5 * minute);
+  resumed.go(retry_ms + 10000);
+  answered.go(10000);
   check(resumed.requests.size() == 2 && resumed.requests[1] - resumed.requests[0] > retry_ms &&
         resumed.requests[1] - resumed.requests[0] <= retry_ms + 500,
         "a silent high-rail poke asks the car exactly once more, OBD_SILENT_RETRY_SECONDS after the first poll");
+  const bool ac_held = AC_CHARGING_AWAKE_SECONDS > 0;
   check(resumed.recently_charging && resumed.g_next_wake_minutes == WAKE_CHARGING_MINUTES &&
-        sameOutcome(resumed, answered), "a retry that answers a charge starts the charge cadence, as an answered poll does");
+        resumed.energy_polls == 1 && answered.energy_polls == 1 && answered.requests.size() == 1 &&
+        resumed.g_next_wake_minutes == answered.g_next_wake_minutes &&
+        resumed.recently_charging == answered.recently_charging &&
+        resumed.charging_fast_minutes == answered.charging_fast_minutes &&
+        resumed.charge_release_polls == answered.charge_release_polls && resumed.dc_session == answered.dc_session &&
+        resumed.asleep == !ac_held && answered.asleep == !ac_held &&
+        resumed.dcAwakeHeld(resumed.current_state) == ac_held && answered.dcAwakeHeld(answered.current_state) == ac_held,
+        "a retry that answers a charge starts the charge cadence and the AC hold, as an answered poll does");
   check(resumed.logged("OBD retry armed ") == 1 && resumed.said(after + "answered 2 pids"),
         "the retry logs its arming and its outcome");
-  check(resumed.polls.size() == 1 && resumed.requests.size() == 2 && resumed.now - resumed.requests[1] <= 500,
-        "the provisional poll is dropped and the poke sleeps after the retry");
+  check(resumed.polls.size() == 1 && resumed.requests.size() == 2 &&
+        (ac_held || resumed.now - resumed.requests[1] <= 500),
+        "the provisional poll is dropped; the retry's answer alone counts");
 
   // Acceptance 2: silent twice ends the wake like one silent poll: same cadence, reason and counted inputs.
   struct Start { const char* what; void (*set)(ChargePoll&); };
@@ -2399,7 +2551,7 @@ int main(int argc, char** argv) {
   if (group == "all" || group == "transport") transportChecks();
   if (group == "all" || group == "ble-frame") { bleFrameChecks(); ble_frame_log::checks(); }
   if (group == "all" || group == "sleep-reason") sleep_reason::checks();
-  if (group == "all" || group == "dc-awake") { dcAwakeChecks(); dcLadderChecks(); dc_track::checks(); }
+  if (group == "all" || group == "dc-awake") { dcAwakeChecks(); acAwakeChecks(); dcLadderChecks(); dc_track::checks(); }
   if (group == "all" || group == "silent-retry") silentRetryChecks();
   if (group == "all" || group == "wdt-streak") wdt_streak::checks();
   if (argc > 2 && (group == "all" || group == "profiles")) profileChecks(argv[2]);

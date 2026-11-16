@@ -45,7 +45,7 @@ Flash/monitor with `pio run -e esp32dev -t upload -t monitor`, 115200 baud.
   tag. Fetch GitHub tags; never hand-edit these values. Use the manual Release workflow;
   see [RELEASING.md](../RELEASING.md).
 - CI's `variants` job links the default image and logging-off, BLE-off, network-off
-  (`ENABLE_CELL 0`) and DC-rollback (`DC_EARLY_HOLD 0`) variants using `tools/check_variants.sh`. WiFi-on/cell-off only compiles:
+  (`ENABLE_CELL 0`), DC-rollback (`DC_EARLY_HOLD 0`) and AC-hold-rollback (`AC_CHARGING_AWAKE_SECONDS 0`) variants using `tools/check_variants.sh`. WiFi-on/cell-off only compiles:
   it overflows IRAM and its TLS is unverified, so it remains bench-only.
 
 ## Hardware verification

@@ -213,7 +213,7 @@ bool reconnectGate() {
 }
 bool uploadGate() {
 #include "upload_grace.inc"
-  const unsigned long upload_delay = 0;
+  const unsigned long upload_delay = 0, held_upload_delay = upload_delay;
   const bool dc_first_upload = false;
   return
 #include "upload_gate.inc"

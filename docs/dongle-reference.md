@@ -445,6 +445,31 @@ awake.** Polling a sleeping EV wakes its ECUs, which then stay awake on the *car
     charge end (an answered poll with no charge evidence, so a DC plug swapped for AC starts fresh), a fresh latch, a
     drive, the car's `is_dcfc` 0 or the stale reset. A sleep inside the session uses the 1-minute DC tier; the charge
     end and the rail drop sleep as before (3 min while latched). AC charging never latches.
+- **An AC charge stays awake too** (`AC_CHARGING_AWAKE_SECONDS` 50; `0` is the rollback). Field data (Hologram, a Scenic
+  on AC) showed the 3-minute sleep loop costing ~6.8 KB and one carrier session per 22 s wake, almost all of it the
+  modem attach and TLS handshake. A poll with charge evidence that is not DC, at a rail of `AC_HOLD_RAIL_VOLTS` (13.0 V), sets
+  `g_ac_confirmed`, and the hold (`dcAwakeHeld`, same vetoes: BLE, rail, alarm) polls every 50 s and uploads every
+  `AC_CHARGING_UPLOAD_SECONDS` (110 s), the two polls' points in one gzip batch, on one session. 50 s is the driving cadence where reuse was measured; a longer interval cannot reuse it (a flow idle ~60 s
+  dies, `SESSION_IDLE_MAX_MS`), and a slow poll may still reopen it once. Differences from DC:
+  - Silence keeps a running hold (counted by time in 3-minute tiers) but never starts one, so a silent poke sleeps and
+    retries (#131) as before.
+  - On a sample poke the fast budget counts elapsed time, not a 3-minute tier per poll, so `WAKE_CHARGING_MAX_MINUTES`
+    (720) is about 12 h of wall clock.
+  - It does not skip the `MAX_AWAKE_MINUTES` backstop: about one 3-minute sleep per awake hour, then the poke holds again.
+  - Its rail floor, `AC_HOLD_RAIL_VOLTS` (`RAIL_TAPER_FLOOR`, 13.0 V), sits under `DC_HOLD_RAIL_VOLTS`. Field data (a
+    Scenic, 11-14): the hold ran on a depleted 12 V battery, but after a drive left it full the DC-DC floated at
+    13.13-13.16 V through the same 6.3 kW charge and every poke slept. With charge evidence the floor is only a safety
+    floor: a 12 V battery losing support while polls keep the car's ECUs awake falls under it within minutes. The taper
+    (~13.18 V) stays held; a rail under 13.0 V ends the hold and the 3-minute wake and `CHARGE_END` follow as before.
+    A latched DC session whose rail sags under 13.2 V while still charging falls to the AC hold. Its edges log as
+    `AC_AWAKE on/off/refused`.
+  - Data and power: one TLS session for the whole charge. Field (11-14, Hologram): uploading every 50 s ran ~87 KB/h,
+    close to driving, for a charge that runs nightly and is rarely watched live; each request costs ~1.2 KB and an
+    extra gzip point ~100 B, so it uploads every 110 s (~40 KB/h). The session may idle `AC_SESSION_IDLE_MAX_MS`
+    (120 s) for these uploads only: on the bench (11-14, parked) a reused SH session survived 110 s idle 3/3 and raw
+    TCP 100 s without keepalive, and the server closes idle sessions at 125-200 s. #8's failures past ~60 s were mostly
+    while driving, which keeps `SESSION_IDLE_MAX_MS` (57 s). A failed reuse costs one http=0 and a fresh open. The
+    ESP32 and modem stay powered from the 12 V rail while the DC-DC is up.
   - Each held poll of a sample poke counts a whole `WAKE_DC_CHARGING_MINUTES` toward the cap, so it trips sooner (the
     safe way). A streaming wake (motion, a promoted poke) counts its elapsed time, at most a tier per poll, so somebody
     moving about the car for an hour costs an hour of budget, not a tier per 5 s poll. The

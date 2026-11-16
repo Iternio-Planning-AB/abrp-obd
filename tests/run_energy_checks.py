@@ -41,11 +41,12 @@ ota = (root / "baseLogger/Helpers/ota_update.h").read_text()
 WORST_EVENT_ARGS = {
     "SAMPLE_POLL ": (99, 1, 1, 255, 1, 99, 15.99, 15.99, 1, 255, 1, 15),
     "ATRVGATE atrv=": (15.99, 15.99, "ASLEEP", "poll(taper-confirm)", 9999999, 999999, 999999, 1, "ENFORCE"),
-    "DC_AWAKE on ": (15.99, 4294967295),
-    "DC_AWAKE off reason=motion": (15.99, 99.999, 99.999),
-    "DC_AWAKE off reason=%s": ("parked-uncorroborated", 15.99),
-    "DC_AWAKE refused ": ("motion", 15.99),
-    "DC_AWAKE poke promoted": (1, 1),
+    # The hold's lines lead with its kind, DC_AWAKE or AC_AWAKE (the same length).
+    "%s on ": ("DC_AWAKE", 15.99, 4294967295),
+    "%s off reason=motion": ("DC_AWAKE", 15.99, 99.999, 99.999),
+    "%s off reason=%s": ("DC_AWAKE", "parked-uncorroborated", 15.99),
+    "%s refused ": ("DC_AWAKE", "motion", 15.99),
+    "%s poke promoted": ("DC_AWAKE", 1, 1),
     "POSTDRIVE window %s": ("recheck", "WIFI_RECOVERY", 15.99, 4294967295),
     # #124: kmh clamped to [0, 999.9] for this line (sm rules pin the clamp), the longest reason, a rail far past the ADC range, a 32-bit long.
     "LEASH gnss=%.1fkm/h hold refused": (999.9, "charging", -99.99, -2147483648),
@@ -99,6 +100,9 @@ for gate in ("( millis() - last_poll ) > dcAwakeDelay(current_state, polling_del
              "? getTransmissionDelay(ACTIVE) : dcAwakeDelay(current_state, transmission_delay);",
              "const bool dc_first_upload = dcAwakeHeld(current_state) && last_broadcast == 0;",
              "(ble_handoff_fire || dc_first_upload || ",
+             "const bool ac_upload_held = g_ac_confirmed && !g_dc_confirmed && dcAwakeHeld(current_state);",
+             "> held_upload_delay)) {",
+             "network.set_session_idle_max_ms(ac_upload_held ? AC_SESSION_IDLE_MAX_MS : SESSION_IDLE_MAX_MS);",
              "  handleActivityState();\n  dcPromotePoke();\n  dcAwakeTrack();\n",
              "    dcPromotePoke();\n    if (g_sample_poke && !maintenance_mode"):
     if logger.count(gate) != 1:
@@ -128,7 +132,7 @@ with tempfile.TemporaryDirectory(prefix="obd-energy-checks-") as temporary:
         r"CHARGE_RELEASE_POLLS|CHARGE_SILENT_HOLD_POLLS|CHARGE_STALE_RESET_MINUTES|CHARGE_CORROBORATE_MINUTES|WAKE_PARKED_MINUTES|"
         r"WAKE_CHARGING_MINUTES|WAKE_DC_CHARGING_MINUTES|WAKE_CHARGING_MAX_MINUTES|CLOCK_MAX_EPOCH|GEO_MAX_SEND_AGE_SECONDS|RAIL_AWAKE_VOLTS|RAIL_TAPER_FLOOR|"
         r"CHARGE_END_POLL_FLOOR|MAX_AWAKE_MINUTES|TAPER_CONFIRM_MAX_WAKES|IO36_LOCKOUT_\w+|POST_DRIVE_\w+|OBD_ALARM_GATE|ENABLE_IO36_RAIL|DC_CHARGING_MIN_KW|DC_CHARGING_AWAKE_SECONDS|"
-        r"SESSION_IDLE_MAX_MS|CHARGING_TIMER|ACTIVE_TIMER|DC_CHARGING_POLL_MARGIN_MS|DC_EARLY_HOLD|DC_RELEASE_POLLS|DC_HOLD_RAIL_VOLTS|BLE_CONNECTED_HOLDS_AWAKE|OBD_SILENT_RETRY_SECONDS)\b.*(?:\n[ \t]+.*)*",
+        r"AC_CHARGING_AWAKE_SECONDS|AC_CHARGING_UPLOAD_SECONDS|AC_SESSION_IDLE_MAX_MS|AC_HOLD_RAIL_VOLTS|SESSION_IDLE_MAX_MS|CHARGING_TIMER|ACTIVE_TIMER|DC_CHARGING_POLL_MARGIN_MS|DC_EARLY_HOLD|DC_RELEASE_POLLS|DC_HOLD_RAIL_VOLTS|BLE_CONNECTED_HOLDS_AWAKE|OBD_SILENT_RETRY_SECONDS)\b.*(?:\n[ \t]+.*)*",
         config, re.MULTILINE)))
     # loop()'s poll is energyOnPoll (energy_state.h), sliced at the same code; its call site runs dcAwakeTrack() next.
     call_site = "    const EnergyPoll ep = energyOnPoll(current_frame, obd_count);\n    dcAwakeTrack();\n"
@@ -214,8 +218,8 @@ with tempfile.TemporaryDirectory(prefix="obd-energy-checks-") as temporary:
         "bool dcMotionRecent()", "const char* dcAwakeVeto(", "bool dcAwakeHeld(", "unsigned long dcAwakeDelay(",
         "void dcAwakeTrack()")))
     (build / "dc_promote.inc").write_text(block(logger, "void dcPromotePoke() {"))
-    (build / "dc_rail_refresh.inc").write_text(line(logger, "    if (g_sample_poke && g_dc_confirmed) g_rail_before_poke"))
-    (build / "dc_sleep_log.inc").write_text(line(sleep, "  if (g_dc_logged) logEvent(\"DC_AWAKE off"))
+    (build / "dc_rail_refresh.inc").write_text(line(logger, "    if (g_sample_poke && (g_dc_confirmed || g_ac_confirmed)) g_rail_before_poke"))
+    (build / "dc_sleep_log.inc").write_text(line(sleep, "  if (g_dc_logged) logEvent(\"%s off"))
     start = state_machine.index("  case CHARGING:\n", state_machine.index("void handleActivityState() {"))
     end = state_machine.index("    break;\n", start) + len("    break;\n")
     (build / "charging_case.inc").write_text(state_machine[start:end])

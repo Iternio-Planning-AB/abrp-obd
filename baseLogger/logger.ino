@@ -285,6 +285,10 @@ unsigned long g_fast_anchor_ms = 0;  // a streaming wake's fast time is counted 
 // RAM, so every wake earns it again. g_dc_logged: the hold as last logged.
 RTC_DATA_ATTR bool dc_session = false;
 bool g_dc_confirmed = false;
+// g_ac_confirmed: the last poll wants the AC hold (AC_CHARGING_AWAKE_SECONDS), never with g_dc_confirmed; RAM, as above.
+// g_ac_logged: the hold last logged on was AC, so its off line says AC_AWAKE after both flags have cleared.
+bool g_ac_confirmed = false;
+bool g_ac_logged = false;
 bool g_dc_logged = false;
 bool g_dc_refused_logged = false;  // DC_AWAKE refused: once per wake, and not after a hold this wake ended
 uint8_t g_dc_inferred_polls = 0;  // consecutive inferred-DC polls; one garbage frame must not latch a session
@@ -507,6 +511,12 @@ static_assert(WEAK_RAIL_COLD_BOOT_AWAKE_MS > AUTH_RESET_WINDOW_MS,
 // A held DC charge's upload must reuse the session: its cadence plus a slow poll under the reopen limit.
 static_assert((unsigned long)DC_CHARGING_AWAKE_SECONDS * 1000UL + DC_CHARGING_POLL_MARGIN_MS <= SESSION_IDLE_MAX_MS,
   "a DC_CHARGING_AWAKE_SECONDS upload would reopen the session instead of reusing it");
+// A held AC charge's normal cycle must reuse it too; only a slow poll may reopen it (see config.h).
+static_assert(AC_CHARGING_UPLOAD_SECONDS >= AC_CHARGING_AWAKE_SECONDS &&
+              (unsigned long)AC_CHARGING_UPLOAD_SECONDS * 1000UL < AC_SESSION_IDLE_MAX_MS,
+  "an AC_CHARGING_UPLOAD_SECONDS upload would reopen the session every cycle");
+static_assert(AC_SESSION_IDLE_MAX_MS >= SESSION_IDLE_MAX_MS && AC_SESSION_IDLE_MAX_MS < 125000UL,
+  "the held AC reuse limit sits between the driving limit and the server's measured idle close");
 // The ladder must not leave ACTIVE during the wait: changeState would overwrite the retry's polling_delay. A poke's
 // leash runs from boot, so the bound is the modem attach before the first poll, that poll (up to ~5 s on a silent car,
 // DC_CHARGING_POLL_MARGIN_MS covers it) and the wait.
@@ -579,8 +589,8 @@ bool silentRetryArm(bool attempted, int obd_count) {
   if (!attempted || g_silent_retry != RETRY_UNUSED) return false;  // only a request that was sent, the wake's first
   g_silent_retry = RETRY_SPENT;
 #if ENABLE_IO36_RAIL
-  // !g_dc_confirmed is a guard: no poll has set it before the wake's first, but a held DC charge must never arm.
-  if (OBD_SILENT_RETRY_SECONDS > 0 && g_sample_poke && obd_count == 0 && !g_dc_confirmed &&
+  // !g_dc_confirmed/!g_ac_confirmed guard: no poll sets them before the wake's first, but a held charge must never arm.
+  if (OBD_SILENT_RETRY_SECONDS > 0 && g_sample_poke && obd_count == 0 && !g_dc_confirmed && !g_ac_confirmed &&
       g_rail_before_poke >= RAIL_AWAKE_VOLTS && g_last_io36 >= RAIL_AWAKE_VOLTS) {
     g_silent_retry = RETRY_ARMED;
     g_silent_retry_ms = last_poll = millis();
@@ -596,7 +606,7 @@ bool silentRetryArm(bool attempted, int obd_count) {
 }
 
 /*
-  Motion while a DC charge holds a sample poke awake: somebody is at the car. Become the wake motion would have
+  Motion while a charge (DC or AC) holds a sample poke awake: somebody is at the car. Become the wake motion would have
   started instead of sleeping, because configureWOM() clears motion already seen and WOM would not fire again
   for a person sitting still. BLE and GNSS come up, and the charge stays trusted (DC_EARLY_HOLD, #128): people sit in
   the car while it charges, and a drive-away ends the hold through the drive latch (speed, GNSS, discharge). The
@@ -606,7 +616,7 @@ bool silentRetryArm(bool attempted, int obd_count) {
   budget rule of a sample poke.
 */
 void dcPromotePoke() {
-  if (!g_sample_poke || !g_dc_confirmed || !dcMotionRecent()) return;
+  if (!g_sample_poke || !(g_dc_confirmed || g_ac_confirmed) || !dcMotionRecent()) return;
   g_sample_poke = false;
 #if DC_EARLY_HOLD
   if (!g_last_discharge_ms) energyOnDcRelease();
@@ -618,7 +628,8 @@ void dcPromotePoke() {
   if (!g_gps_powered) g_gps_powered = sys.gpsBegin();  // the next poll reads it; a failure retries per poll
 #endif
 #if ENABLE_LOGGING
-  logEvent("DC_AWAKE poke promoted (motion): ble=%d gps=%d", g_ble_up ? 1 : 0, g_gps_powered ? 1 : 0);
+  logEvent("%s poke promoted (motion): ble=%d gps=%d", g_dc_confirmed ? "DC_AWAKE" : "AC_AWAKE",
+           g_ble_up ? 1 : 0, g_gps_powered ? 1 : 0);
 #endif
 }
 
@@ -1369,8 +1380,8 @@ void loop() {
     // precisely why they are safe to take before the permit exists.
 #if ENABLE_IO36_RAIL
     g_last_io36 = readIO36Rail();
-    // A poke held by a DC charge judges silence on this poll's rail, not the wake's (high_rail_unanswered).
-    if (g_sample_poke && g_dc_confirmed) g_rail_before_poke = g_last_io36;
+    // A poke held by a DC charge, or an AC one, judges silence on this poll's rail, not the wake's (high_rail_unanswered).
+    if (g_sample_poke && (g_dc_confirmed || g_ac_confirmed)) g_rail_before_poke = g_last_io36;
 #endif
 #if ENABLE_GPS
     if (g_gps_powered) {
@@ -1764,12 +1775,17 @@ void loop() {
       // and cannot track later changes in relay status.
       const unsigned long upload_delay = (current_state == BLE && !bleRelaying())
         ? getTransmissionDelay(ACTIVE) : dcAwakeDelay(current_state, transmission_delay);
-      // A held DC charge's first frame goes now, as the 1-minute wake's pre-sleep flush would have sent it.
+      // A held AC charge uploads every AC_CHARGING_UPLOAD_SECONDS, batching the polls between, on a session allowed to
+      // idle AC_SESSION_IDLE_MAX_MS; everything else keeps the driving limit (#8).
+      const bool ac_upload_held = g_ac_confirmed && !g_dc_confirmed && dcAwakeHeld(current_state);
+      const unsigned long held_upload_delay =
+        ac_upload_held ? (unsigned long)AC_CHARGING_UPLOAD_SECONDS * 1000UL : upload_delay;
+      // A held charge's first frame goes now, as the short wake's pre-sleep flush would have sent it.
       const bool dc_first_upload = dcAwakeHeld(current_state) && last_broadcast == 0;
       // Refuse a missing token before spending modem power on a guaranteed 401.
       if (!bleRelaying() && !g_ota_active && !ble_upload_grace && !g_logdump_active && uploadQueued() &&
           !tlm_push_token.empty() &&
-          (ble_handoff_fire || dc_first_upload || ( millis() - last_broadcast ) > upload_delay)) {
+          (ble_handoff_fire || dc_first_upload || ( millis() - last_broadcast ) > held_upload_delay)) {
         // Cap failures only while parked and silent to prevent overnight 12V drain. Applying the cap
         // while awake let a mid-drive cellular hiccup silence the rest of the drive.
         bool car_awake = (obd_count > 0) || !is_currently_parked;
@@ -1777,6 +1793,8 @@ void loop() {
         if (!backed_off && network.connected()) {
           // Registered: the backlog can go now. Before connect(), whose session-reuse idle check a parse would outlast.
           if (uploadBacklogUnread()) loadUploadBacklog();
+          // The reuse limit connect() applies: a held AC charge's (AC_SESSION_IDLE_MAX_MS), else the driving one (#8).
+          network.set_session_idle_max_ms(ac_upload_held ? AC_SESSION_IDLE_MAX_MS : SESSION_IDLE_MAX_MS);
           // Keep connect() inside this block so open failures count toward recovery and get cleanup.
           // The old outer-gate check bypassed both, causing ~2-minute stalls after http=0 under car load.
 #if ENABLE_LOGGING

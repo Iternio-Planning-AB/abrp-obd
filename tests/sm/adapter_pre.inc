@@ -31,12 +31,14 @@
   X(int, g_next_wake_minutes, WAKE_PARKED_MINUTES) \
   X(unsigned long, g_fast_anchor_ms, 0) \
   X(bool, g_dc_confirmed, false) \
+  X(bool, g_ac_confirmed, false) \
   X(uint8_t, g_dc_inferred_polls, 0) \
   X(unsigned long, g_dc_silent_since_ms, 0) \
   X(bool, g_pdw_ladder_done, false) \
   X(bool, g_pdw_recheck, false) \
   X(const char*, g_cadence_reason, nullptr) \
   X(bool, g_dc_logged, false) \
+  X(bool, g_ac_logged, false) \
   X(bool, g_dc_refused_logged, false) \
   X(unsigned long, g_last_motion_ms, 0) \
   X(float, g_last_voltage, 0.0f) \
