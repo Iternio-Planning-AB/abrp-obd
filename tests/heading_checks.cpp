@@ -49,7 +49,7 @@ void check(bool condition, const std::string& message) {
   }
 }
 
-unsigned long fake_ms = 1000, last_active = 0, g_last_speed_ms = 0;
+unsigned long fake_ms = 1000, last_active = 0, g_last_speed_ms = 0, g_parked_since_ms = 0, g_parked_ms_total = 0;
 unsigned long millis() { return fake_ms; }
 struct SerialStub {
   void printf(const char* text) { std::fputs(text, stdout); }
@@ -195,7 +195,7 @@ void resetFixture() {
   g_geo_accepted = g_geo_queued = {};
   g_geo_queued_seeded = true;
   g_backlog_unread = false;
-  last_active = g_last_speed_ms = 0;
+  last_active = g_last_speed_ms = g_parked_since_ms = g_parked_ms_total = 0;
   gps = HostGPS{};
   gpsData = last_gd = GPS_DATA{};
   gd = &gpsData;
